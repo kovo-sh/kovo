@@ -25,6 +25,10 @@ import type { DatabaseSync } from 'node:sqlite'
 import { cancelOobDrainForRun } from './oob-drain.ts'
 import { assertValidRunId } from './run-context.ts'
 import {
+  RUN_SAFETY_BUDGET_HARD_CEILINGS,
+  resolveRunSafetyBudgets,
+} from './run-safety-budgets.ts'
+import {
   SQLITE_DEFAULT_BUSY_TIMEOUT_MS,
   SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
   openSqliteDatabase,
@@ -43,6 +47,10 @@ export type OobRejectionReason =
   | 'artifact_missing'
   | 'artifact_mismatch'
   | 'subscription_expired'
+  | 'token_quota_exceeded'
+  | 'run_quota_exceeded'
+  | 'protected_quota_exceeded'
+  | 'ip_rate_limited'
 
 export interface OobDnsAnswer {
   type: 'A' | 'AAAA' | 'TXT' | 'CNAME' | 'NS'
@@ -266,6 +274,33 @@ export interface OobCorrelateOptions {
   signal?: AbortSignal
 }
 
+export interface OobIpRateLimitResult {
+  allowed: boolean
+  sourceIp: string
+  count: number
+  limit: number
+  resetAt: number
+}
+
+export interface OobQuotaTelemetry {
+  totalDropped: number
+  droppedPerToken: number
+  droppedPerRun: number
+  droppedProtected: number
+  droppedPerIp: number
+  pruneRuns: number
+  prunedRows: number
+  trackedSourceIps: number
+  budgets: {
+    maxCallbacksPerToken: number
+    maxCallbacksPerRun: number
+    maxProtectedCallbacks: number
+    maxCallbacksPerIpWindow: number
+    ipRateLimitWindowMs: number
+    maxTrackedSourceIps: number
+  }
+}
+
 export interface OobRelayStatus {
   mode: 'loopback' | 'public'
   publicEnabled: boolean
@@ -279,6 +314,7 @@ export interface OobRelayStatus {
   immediateMs: number
   windowMs: number
   problems: string[]
+  quota: OobQuotaTelemetry
 }
 
 export interface OobUnsubscribeRunResult {
@@ -311,6 +347,99 @@ export const DEFAULT_CLAIMED_CALLBACK_TTL_MS = 7 * 24 * 60 * 60_000
 export const DEFAULT_UNCLAIMED_CALLBACK_TTL_MS = 24 * 60 * 60_000
 /** Bounded ring-cap for `oob_rejections` so external OOB spam cannot fill host disk. */
 export const MAX_STORED_OOB_REJECTIONS = 5_000
+const DEFAULT_IP_RATE_LIMIT_WINDOW_MS = 60_000
+const DEFAULT_MAX_TRACKED_SOURCE_IPS = 4_096
+const HARD_MAX_TRACKED_SOURCE_IPS = 65_536
+const DEFAULT_PRUNE_BATCH_SIZE = 64
+const DEFAULT_PRUNE_INTERVAL_MS = 5_000
+const MAX_CACHED_TOKEN_COUNTS = 16_384
+const MAX_CACHED_RUN_COUNTS = 4_096
+const LRU_EXPIRED_PROBE_LIMIT = 8
+
+interface IpWindowEntry {
+  windowStart: number
+  count: number
+}
+
+/**
+ * Bounded-memory (LRU) per-IP fixed-window rate limiter for OOB callback ingest.
+ *
+ * Guarantees O(1) memory and O(1) time per check even under spoofed-IP floods:
+ *  - Active entries are refreshed to the MRU tail on every access.
+ *  - When full, up to `LRU_EXPIRED_PROBE_LIMIT` oldest entries are checked for expiry before
+ *    evicting the least-recently-used entry.
+ */
+class BoundedIpRateLimiter {
+  private readonly entries = new Map<string, IpWindowEntry>()
+  readonly maxPerWindow: number
+  readonly windowMs: number
+  readonly maxTrackedIps: number
+
+  constructor(options: { maxPerWindow: number; windowMs: number; maxTrackedIps: number }) {
+    this.maxPerWindow = Math.max(1, Math.trunc(options.maxPerWindow))
+    this.windowMs = Math.max(100, Math.trunc(options.windowMs))
+    this.maxTrackedIps = Math.max(1, Math.min(HARD_MAX_TRACKED_SOURCE_IPS, Math.trunc(options.maxTrackedIps)))
+  }
+
+  get size(): number {
+    return this.entries.size
+  }
+
+  consume(rawIp: string | undefined, now: number): OobIpRateLimitResult {
+    const key = normalizeIp(rawIp) || '(unknown)'
+    let entry = this.entries.get(key)
+    if (entry) {
+      // Refresh LRU position.
+      this.entries.delete(key)
+      if (now - entry.windowStart >= this.windowMs) {
+        entry = { windowStart: now, count: 0 }
+      }
+      this.entries.set(key, entry)
+    } else {
+      if (this.entries.size >= this.maxTrackedIps) {
+        this.evictOne(now)
+      }
+      entry = { windowStart: now, count: 0 }
+      this.entries.set(key, entry)
+    }
+
+    const resetAt = entry.windowStart + this.windowMs
+    if (entry.count >= this.maxPerWindow) {
+      return {
+        allowed: false,
+        sourceIp: key,
+        count: entry.count,
+        limit: this.maxPerWindow,
+        resetAt,
+      }
+    }
+    entry.count += 1
+    return {
+      allowed: true,
+      sourceIp: key,
+      count: entry.count,
+      limit: this.maxPerWindow,
+      resetAt,
+    }
+  }
+
+  private evictOne(now: number): void {
+    let checked = 0
+    let oldestKey: string | undefined
+    for (const [k, v] of this.entries) {
+      if (oldestKey === undefined) oldestKey = k
+      if (now - v.windowStart >= this.windowMs) {
+        this.entries.delete(k)
+        return
+      }
+      checked += 1
+      if (checked >= LRU_EXPIRED_PROBE_LIMIT) break
+    }
+    if (oldestKey !== undefined) {
+      this.entries.delete(oldestKey)
+    }
+  }
+}
 
 interface SubscriptionRow {
   id: string
@@ -633,6 +762,24 @@ export interface OobRelayOptions {
   claimedCallbackTtlMs?: number
   /** Retention TTL (ms) for orphaned unclaimed callbacks (0 disables TTL eviction). */
   unclaimedCallbackTtlMs?: number
+  /** Per-token persisted callback quota (`run-safety-budgets.ts` `oobMaxCallbacksPerToken`). */
+  maxCallbacksPerToken?: number
+  /** Per-run persisted callback quota (`run-safety-budgets.ts` `oobMaxCallbacksPerRun`). */
+  maxCallbacksPerRun?: number
+  /** Separate hard cap on total protected unclaimed callbacks across active `pending_oob` subscriptions. */
+  maxProtectedCallbacks?: number
+  /** Per-IP callback rate limit per window (`run-safety-budgets.ts` `oobMaxCallbacksPerIpWindow`). */
+  maxCallbacksPerIpWindow?: number
+  /** Window duration in ms for per-IP ingest rate limiting (defaults to 60_000 ms). */
+  ipRateLimitWindowMs?: number
+  /** Bounded LRU capacity for tracked source IPs in the per-IP rate limiter (defaults to 4_096). */
+  maxTrackedSourceIps?: number
+  /** Optional assignment count for scaling run-level OOB safety budgets. */
+  maxAssignments?: number
+  /** Amortized pruning cadence: accepted inserts/claims between prune sweeps (defaults to 64 for production caps). */
+  pruneBatchSize?: number
+  /** Amortized pruning cadence: minimum ms between prune sweeps (defaults to 5_000 ms). */
+  pruneIntervalMs?: number
   logger?: (rejection: OobRejection) => void
 }
 
@@ -651,13 +798,31 @@ export class OobRelay {
   private readonly maxUnclaimedCallbacks: number
   private readonly claimedCallbackTtlMs: number
   private readonly unclaimedCallbackTtlMs: number
+  private readonly maxCallbacksPerToken: number
+  private readonly maxCallbacksPerRun: number
+  private readonly maxProtectedCallbacks: number
+  private readonly ipRateLimiter: BoundedIpRateLimiter
+  private readonly pruneBatchSize: number
+  private readonly pruneIntervalMs: number
+  private readonly tokenCallbackCounts = new Map<string, number>()
+  private readonly runCallbackCounts = new Map<string, number>()
+  private protectedCallbackCount: number | null = null
+  private opsSinceLastPrune = 0
+  private lastPruneAt: number | null = null
+  private droppedPerToken = 0
+  private droppedPerRun = 0
+  private droppedProtected = 0
+  private droppedPerIp = 0
+  private pruneRuns = 0
+  private prunedRows = 0
   private closed = false
 
   constructor(options: OobRelayOptions = {}) {
     this.options = options
     this.directory = options.directory ?? null
     this.now = options.now ?? (() => Date.now())
-    this.profile = resolveOobRelayProfile(options.profile, options.env ?? process.env)
+    const env = options.env ?? process.env
+    this.profile = resolveOobRelayProfile(options.profile, env)
     this.defaultImmediateMs = Math.max(0, options.immediateMs ?? defaultImmediateMs)
     this.defaultWindowMs = Math.min(Math.max(1_000, options.windowMs ?? defaultOobWindowMs), maxWindowMs)
     this.defaultAllowlist = [...(options.allowlist ?? [])]
@@ -666,6 +831,41 @@ export class OobRelay {
     this.maxUnclaimedCallbacks = Math.max(1, Math.trunc(options.maxUnclaimedCallbacks ?? MAX_STORED_UNCLAIMED_OOB_CALLBACKS))
     this.claimedCallbackTtlMs = Math.max(0, Math.trunc(options.claimedCallbackTtlMs ?? DEFAULT_CLAIMED_CALLBACK_TTL_MS))
     this.unclaimedCallbackTtlMs = Math.max(0, Math.trunc(options.unclaimedCallbackTtlMs ?? DEFAULT_UNCLAIMED_CALLBACK_TTL_MS))
+
+    const budgets = resolveRunSafetyBudgets({
+      maxAssignments: options.maxAssignments,
+      env,
+      overrides: {
+        ...(options.maxCallbacksPerToken !== undefined ? { oobMaxCallbacksPerToken: options.maxCallbacksPerToken } : {}),
+        ...(options.maxCallbacksPerRun !== undefined ? { oobMaxCallbacksPerRun: options.maxCallbacksPerRun } : {}),
+        ...(options.maxProtectedCallbacks !== undefined ? { oobMaxProtectedCallbacks: options.maxProtectedCallbacks } : {}),
+        ...(options.maxCallbacksPerIpWindow !== undefined ? { oobMaxCallbacksPerIpWindow: options.maxCallbacksPerIpWindow } : {}),
+      },
+    })
+    this.maxCallbacksPerToken = budgets.oobMaxCallbacksPerToken
+    this.maxCallbacksPerRun = budgets.oobMaxCallbacksPerRun
+    this.maxProtectedCallbacks = budgets.oobMaxProtectedCallbacks
+    this.ipRateLimiter = new BoundedIpRateLimiter({
+      maxPerWindow: budgets.oobMaxCallbacksPerIpWindow,
+      windowMs: options.ipRateLimitWindowMs ?? DEFAULT_IP_RATE_LIMIT_WINDOW_MS,
+      maxTrackedIps: options.maxTrackedSourceIps ?? DEFAULT_MAX_TRACKED_SOURCE_IPS,
+    })
+
+    const smallestRetentionCap = Math.min(
+      Math.max(1, this.maxClaimedCallbacks),
+      this.maxUnclaimedCallbacks,
+    )
+    const defaultBatch = Math.min(
+      DEFAULT_PRUNE_BATCH_SIZE,
+      Math.max(1, Math.floor(smallestRetentionCap / 4)),
+    )
+    this.pruneBatchSize = Math.max(1, Math.trunc(options.pruneBatchSize ?? defaultBatch))
+    const positiveTtls = [this.claimedCallbackTtlMs, this.unclaimedCallbackTtlMs].filter(ttl => ttl > 0)
+    const minTtl = positiveTtls.length > 0 ? Math.min(...positiveTtls) : DEFAULT_PRUNE_INTERVAL_MS
+    this.pruneIntervalMs = Math.max(
+      1,
+      Math.trunc(options.pruneIntervalMs ?? Math.min(DEFAULT_PRUNE_INTERVAL_MS, minTtl)),
+    )
 
     const path = this.directory ? join(this.directory, 'oob-relay.sqlite') : ':memory:'
     this.client = openSqliteDatabase(path, {
@@ -714,6 +914,7 @@ export class OobRelay {
         detail TEXT
       );
       CREATE INDEX IF NOT EXISTS oob_callbacks_token ON oob_callbacks(token);
+      CREATE INDEX IF NOT EXISTS oob_callbacks_run ON oob_callbacks(run_id);
       CREATE INDEX IF NOT EXISTS oob_callbacks_claim ON oob_callbacks(token, claimed_by);
       CREATE INDEX IF NOT EXISTS oob_callbacks_claim_received ON oob_callbacks(claimed_by, received_at);
       CREATE TABLE IF NOT EXISTS oob_bindings (
@@ -790,6 +991,7 @@ export class OobRelay {
         input.protocol ?? 'http', now, immediateMs, windowMs, now + windowMs,
         allowlist.length ? JSON.stringify(allowlist) : null,
       )
+      this.protectedCallbackCount = null
       return this.subscription(id)
     })
   }
@@ -811,6 +1013,8 @@ export class OobRelay {
       const removed = this.client.prepare(
         'DELETE FROM oob_bindings WHERE run_id = ?',
       ).run(validRunId) as { changes?: number | bigint }
+      this.protectedCallbackCount = null
+      this.runCallbackCounts.delete(validRunId)
       return {
         runId: validRunId,
         expiredSubscriptions: Number(expired?.changes ?? 0),
@@ -826,10 +1030,64 @@ export class OobRelay {
   }
 
   /**
-   * Ingest a callback. Validates token↔canary binding, source allowlist, and causal artifact
-   * before persisting. Rejections are persisted as `oob_rejected` events and never promote.
+   * Enforce the bounded-memory (LRU) per-IP ingest rate limit.
+   * Shared as the single authoritative gate for both `CanaryBroker` listeners and direct `recordCallback()`.
    */
-  recordCallback(input: OobCallbackInput): OobRecordResult {
+  consumeIpRateLimit(sourceIp: string | undefined, now = this.now()): OobIpRateLimitResult {
+    const result = this.ipRateLimiter.consume(sourceIp, now)
+    if (!result.allowed) {
+      this.droppedPerIp += 1
+      this.notifyQuotaOverflow({
+        event: 'oob_rejected',
+        callbackId: `oob_ip_rl_${result.sourceIp}`,
+        token: null,
+        reason: 'ip_rate_limited',
+        detail: {
+          sourceIp: result.sourceIp,
+          count: result.count,
+          limit: result.limit,
+          resetAt: result.resetAt,
+        },
+        at: now,
+      }, this.droppedPerIp)
+    }
+    return result
+  }
+
+  /** Structured quota and pruning telemetry (overflow counts, prune sweeps, bounded IP tracker size). */
+  quotaTelemetry(): OobQuotaTelemetry {
+    const totalDropped =
+      this.droppedPerToken + this.droppedPerRun + this.droppedProtected + this.droppedPerIp
+    return {
+      totalDropped,
+      droppedPerToken: this.droppedPerToken,
+      droppedPerRun: this.droppedPerRun,
+      droppedProtected: this.droppedProtected,
+      droppedPerIp: this.droppedPerIp,
+      pruneRuns: this.pruneRuns,
+      prunedRows: this.prunedRows,
+      trackedSourceIps: this.ipRateLimiter.size,
+      budgets: {
+        maxCallbacksPerToken: this.maxCallbacksPerToken,
+        maxCallbacksPerRun: this.maxCallbacksPerRun,
+        maxProtectedCallbacks: this.maxProtectedCallbacks,
+        maxCallbacksPerIpWindow: this.ipRateLimiter.maxPerWindow,
+        ipRateLimitWindowMs: this.ipRateLimiter.windowMs,
+        maxTrackedSourceIps: this.ipRateLimiter.maxTrackedIps,
+      },
+    }
+  }
+
+  /**
+   * Ingest a callback. Validates token↔canary binding, source allowlist, causal artifact,
+   * per-IP rate limit, and per-token/per-run/protected quotas BEFORE inserting into SQLite.
+   * Validation rejections are persisted as `oob_rejected` events; quota/rate-limit overflows
+   * are counted in structured telemetry without writing unbounded rows.
+   */
+  recordCallback(
+    input: OobCallbackInput,
+    options?: { ipRateLimitAlreadyConsumed?: boolean },
+  ): OobRecordResult {
     this.assertOpen()
     const now = this.now()
     const token = input.token.trim().toLowerCase()
@@ -857,8 +1115,37 @@ export class OobRelay {
       return { accepted: false, duplicate: false, rejection }
     }
 
+    const rejectQuota = (
+      reason: 'token_quota_exceeded' | 'run_quota_exceeded' | 'protected_quota_exceeded' | 'ip_rate_limited',
+      detail: Record<string, unknown>,
+      counter: number,
+    ): OobRecordResult => {
+      const rejection: OobRejection = {
+        event: 'oob_rejected',
+        callbackId,
+        token: token || null,
+        reason,
+        detail,
+        at: now,
+      }
+      this.notifyQuotaOverflow(rejection, counter)
+      return { accepted: false, duplicate: false, rejection }
+    }
+
     if (!callbackTokenPattern.test(token)) {
       return reject('invalid_token')
+    }
+
+    if (!options?.ipRateLimitAlreadyConsumed) {
+      const rate = this.ipRateLimiter.consume(sourceIp, now)
+      if (!rate.allowed) {
+        this.droppedPerIp += 1
+        return rejectQuota(
+          'ip_rate_limited',
+          { sourceIp: rate.sourceIp, count: rate.count, limit: rate.limit, resetAt: rate.resetAt },
+          this.droppedPerIp,
+        )
+      }
     }
 
     const binding = this.client.prepare('SELECT * FROM oob_bindings WHERE token = ?')
@@ -894,6 +1181,50 @@ export class OobRelay {
       }
     }
 
+    // Idempotency check BEFORE storage quotas: redelivery of an already-persisted callback succeeds without consuming quota.
+    const existing = this.callback(callbackId)
+    if (existing) {
+      return { accepted: true, duplicate: true, callback: existing }
+    }
+
+    const resolvedRunId = binding?.run_id ?? subscriptions[0]?.runId ?? input.runId ?? null
+    const isProtected = subscriptions.length > 0
+
+    // Quota-first ingest enforcement BEFORE writing to SQLite.
+    const tokenCount = this.getTokenCallbackCount(token)
+    if (tokenCount >= this.maxCallbacksPerToken) {
+      this.droppedPerToken += 1
+      return rejectQuota(
+        'token_quota_exceeded',
+        { count: tokenCount, limit: this.maxCallbacksPerToken },
+        this.droppedPerToken,
+      )
+    }
+    let runCount = 0
+    if (resolvedRunId) {
+      runCount = this.getRunCallbackCount(resolvedRunId)
+      if (runCount >= this.maxCallbacksPerRun) {
+        this.droppedPerRun += 1
+        return rejectQuota(
+          'run_quota_exceeded',
+          { runId: resolvedRunId, count: runCount, limit: this.maxCallbacksPerRun },
+          this.droppedPerRun,
+        )
+      }
+    }
+    let protectedCount = 0
+    if (isProtected) {
+      protectedCount = this.getProtectedCallbackCount()
+      if (protectedCount >= this.maxProtectedCallbacks) {
+        this.droppedProtected += 1
+        return rejectQuota(
+          'protected_quota_exceeded',
+          { count: protectedCount, limit: this.maxProtectedCallbacks },
+          this.droppedProtected,
+        )
+      }
+    }
+
     const row: CallbackRow = {
       callback_id: callbackId,
       token,
@@ -904,7 +1235,7 @@ export class OobRelay {
       path: (input.path ?? '').slice(0, 512),
       query: input.query?.slice(0, 512) ?? null,
       artifact,
-      run_id: binding?.run_id ?? subscriptions[0]?.runId ?? input.runId ?? null,
+      run_id: resolvedRunId,
       assignment_id: binding?.assignment_id ?? subscriptions[0]?.assignmentId ?? input.assignmentId ?? null,
       canary_id: declaredCanary ?? binding?.canary_id ?? subscriptions[0]?.canaryId ?? null,
       received_at: input.receivedAt ?? now,
@@ -927,7 +1258,14 @@ export class OobRelay {
     if (!inserted || Number(inserted.changes ?? 0) === 0) {
       return { accepted: true, duplicate: true, callback }
     }
-    this.pruneCallbacks(now, callbackId)
+    this.setCachedCount(this.tokenCallbackCounts, token, tokenCount + 1, MAX_CACHED_TOKEN_COUNTS)
+    if (resolvedRunId) {
+      this.setCachedCount(this.runCallbackCounts, resolvedRunId, runCount + 1, MAX_CACHED_RUN_COUNTS)
+    }
+    if (isProtected) {
+      this.protectedCallbackCount = protectedCount + 1
+    }
+    this.maybePruneCallbacks(now, callbackId)
     return { accepted: true, duplicate: false, callback }
   }
 
@@ -937,11 +1275,18 @@ export class OobRelay {
     return row ? callbackFromRow(row) : null
   }
 
-  callbacksForToken(token: string): OobCallback[] {
+  callbacksForToken(token: string, limit?: number): OobCallback[] {
     const normalized = token.trim().toLowerCase()
+    const effectiveLimit = Math.max(
+      1,
+      Math.min(
+        Math.trunc(limit ?? this.maxCallbacksPerToken),
+        RUN_SAFETY_BUDGET_HARD_CEILINGS.oobMaxCallbacksPerToken,
+      ),
+    )
     const rows = this.client.prepare(
-      'SELECT * FROM oob_callbacks WHERE token = ? ORDER BY received_at ASC',
-    ).all(normalized) as unknown as CallbackRow[]
+      'SELECT * FROM oob_callbacks WHERE token = ? ORDER BY received_at ASC LIMIT ?',
+    ).all(normalized, effectiveLimit) as unknown as CallbackRow[]
     return rows.map(callbackFromRow)
   }
 
@@ -986,13 +1331,13 @@ export class OobRelay {
       callbacks.push(...this.callbacksForToken(query.token))
     } else if (query.canaryId) {
       const rows = this.client.prepare(
-        'SELECT * FROM oob_callbacks WHERE canary_id = ? ORDER BY received_at ASC',
-      ).all(query.canaryId) as unknown as CallbackRow[]
+        'SELECT * FROM oob_callbacks WHERE canary_id = ? ORDER BY received_at ASC LIMIT ?',
+      ).all(query.canaryId, this.maxCallbacksPerToken) as unknown as CallbackRow[]
       callbacks.push(...rows.map(callbackFromRow))
     } else if (query.runId) {
       const rows = this.client.prepare(
-        'SELECT * FROM oob_callbacks WHERE run_id = ? ORDER BY received_at ASC',
-      ).all(query.runId) as unknown as CallbackRow[]
+        'SELECT * FROM oob_callbacks WHERE run_id = ? ORDER BY received_at ASC LIMIT ?',
+      ).all(query.runId, this.maxCallbacksPerRun) as unknown as CallbackRow[]
       callbacks.push(...rows.map(callbackFromRow))
     }
     const filtered = callbacks.filter(callback => {
@@ -1075,9 +1420,16 @@ export class OobRelay {
    * Promote late callbacks into verified candidates. Idempotent: a subscription is promoted
    * once and a callback can be claimed by at most one subscription.
    */
-  promoteLate(options: { runId?: string; now?: number } = {}): OobPromotion[] {
+  promoteLate(options: { runId?: string; now?: number; maxCallbacksPerToken?: number } = {}): OobPromotion[] {
     this.assertOpen()
     const now = options.now ?? this.now()
+    const callbackLimit = Math.max(
+      1,
+      Math.min(
+        Math.trunc(options.maxCallbacksPerToken ?? this.maxCallbacksPerToken),
+        RUN_SAFETY_BUDGET_HARD_CEILINGS.oobMaxCallbacksPerToken,
+      ),
+    )
     const rows = options.runId
       ? this.client.prepare(
           'SELECT * FROM pending_oob WHERE status = ? AND run_id = ? ORDER BY created_at ASC',
@@ -1087,11 +1439,12 @@ export class OobRelay {
         ).all('pending') as unknown as SubscriptionRow[]
 
     const promotions: OobPromotion[] = []
+    let expiredAny = false
     for (const row of rows) {
       const subscription = subscriptionFromRow(row)
       const callbacks = this.client.prepare(
-        'SELECT * FROM oob_callbacks WHERE token = ? AND claimed_by IS NULL ORDER BY received_at ASC',
-      ).all(subscription.token) as unknown as CallbackRow[]
+        'SELECT * FROM oob_callbacks WHERE token = ? AND claimed_by IS NULL ORDER BY received_at ASC LIMIT ?',
+      ).all(subscription.token, callbackLimit) as unknown as CallbackRow[]
       const candidate = callbacks
         .map(callbackFromRow)
         .find(callback => this.matchesSubscription(subscription, callback))
@@ -1103,9 +1456,13 @@ export class OobRelay {
         continue
       }
       if (now > subscription.expiresAt) {
-        this.client.prepare('UPDATE pending_oob SET status = ? WHERE id = ? AND status = ?')
-          .run('expired', subscription.id, 'pending')
+        const exp = this.client.prepare('UPDATE pending_oob SET status = ? WHERE id = ? AND status = ?')
+          .run('expired', subscription.id, 'pending') as { changes?: number | bigint }
+        if (Number(exp?.changes ?? 0) > 0) expiredAny = true
       }
+    }
+    if (expiredAny) {
+      this.protectedCallbackCount = null
     }
     return promotions
   }
@@ -1148,7 +1505,8 @@ export class OobRelay {
       throw err
     }
     if (claimed) {
-      this.pruneCallbacks(now, callback.callbackId)
+      this.protectedCallbackCount = null
+      this.maybePruneCallbacks(now, callback.callbackId)
     }
     const updated = this.subscription(subscription.id)
     const updatedCb = this.callback(callback.callbackId) ?? callback
@@ -1195,7 +1553,16 @@ export class OobRelay {
       immediateMs: this.defaultImmediateMs,
       windowMs: this.defaultWindowMs,
       problems: [...this.profile.problems],
+      quota: this.quotaTelemetry(),
     }
+  }
+
+  /** Run a retention prune sweep immediately and return the number of rows evicted. */
+  pruneNow(now = this.now()): number {
+    this.assertOpen()
+    this.opsSinceLastPrune = 0
+    this.lastPruneAt = now
+    return this.pruneCallbacks(now)
   }
 
   /** Resolve an authoritative DNS query through the configured provider hook. */
@@ -1239,35 +1606,125 @@ export class OobRelay {
     `).run(this.maxStoredRejections)
   }
 
+  private notifyQuotaOverflow(rejection: OobRejection, countForReason: number): void {
+    // Emit structured logger notifications on powers of 10 (1, 10, 100, 1000, ...) so floods
+    // never spam stderr while operators still see first-hit and order-of-magnitude escalation.
+    if (
+      this.options.logger &&
+      (countForReason === 1 ||
+        countForReason === 10 ||
+        countForReason === 100 ||
+        countForReason % 1_000 === 0)
+    ) {
+      this.options.logger(rejection)
+    }
+  }
+
+  private setCachedCount(cache: Map<string, number>, key: string, value: number, maxEntries: number): void {
+    if (cache.has(key)) {
+      cache.delete(key)
+    } else if (cache.size >= maxEntries) {
+      const oldest = cache.keys().next().value
+      if (oldest !== undefined) cache.delete(oldest)
+    }
+    cache.set(key, value)
+  }
+
+  private getTokenCallbackCount(token: string): number {
+    const cached = this.tokenCallbackCounts.get(token)
+    if (cached !== undefined) return cached
+    const row = this.client.prepare(
+      'SELECT COUNT(*) AS n FROM oob_callbacks WHERE token = ?',
+    ).get(token) as unknown as { n: number | bigint } | undefined
+    const count = Number(row?.n ?? 0)
+    this.setCachedCount(this.tokenCallbackCounts, token, count, MAX_CACHED_TOKEN_COUNTS)
+    return count
+  }
+
+  private getRunCallbackCount(runId: string): number {
+    const cached = this.runCallbackCounts.get(runId)
+    if (cached !== undefined) return cached
+    const row = this.client.prepare(
+      'SELECT COUNT(*) AS n FROM oob_callbacks WHERE run_id = ?',
+    ).get(runId) as unknown as { n: number | bigint } | undefined
+    const count = Number(row?.n ?? 0)
+    this.setCachedCount(this.runCallbackCounts, runId, count, MAX_CACHED_RUN_COUNTS)
+    return count
+  }
+
+  private getProtectedCallbackCount(): number {
+    if (this.protectedCallbackCount !== null) return this.protectedCallbackCount
+    const row = this.client.prepare(`
+      SELECT COUNT(*) AS n FROM oob_callbacks c
+      WHERE c.claimed_by IS NULL
+        AND EXISTS (
+          SELECT 1 FROM pending_oob p
+          WHERE p.token = c.token AND p.status = 'pending'
+        )
+    `).get() as unknown as { n: number | bigint } | undefined
+    const count = Number(row?.n ?? 0)
+    this.protectedCallbackCount = count
+    return count
+  }
+
+  private invalidateQuotaCaches(): void {
+    this.tokenCallbackCounts.clear()
+    this.runCallbackCounts.clear()
+    this.protectedCallbackCount = null
+  }
+
+  /**
+   * Amortized / interval-gated pruning trigger: avoids running synchronous SQLite retention
+   * sweeps on every insert/claim while bounding excess rows to at most `pruneBatchSize`.
+   */
+  private maybePruneCallbacks(now: number, protectedCallbackId?: string): void {
+    this.opsSinceLastPrune += 1
+    const elapsed = this.lastPruneAt === null ? 0 : Math.max(0, now - this.lastPruneAt)
+    if (this.lastPruneAt === null) {
+      this.lastPruneAt = now
+    }
+    if (this.opsSinceLastPrune < this.pruneBatchSize && elapsed < this.pruneIntervalMs) {
+      return
+    }
+    this.opsSinceLastPrune = 0
+    this.lastPruneAt = now
+    this.pruneCallbacks(now, protectedCallbackId)
+  }
+
   /**
    * Enforce independent retention caps and TTLs for historical claimed rows (`claimed_by IS NOT NULL`)
-   * vs. unclaimed rows (`claimed_by IS NULL`).
+   * vs. orphaned unprotected unclaimed rows (`claimed_by IS NULL` without an active `pending_oob`).
    *
    * Critical invariants:
    * - Historical claimed rows are pruned ONLY against `maxClaimedCallbacks` / `claimedCallbackTtlMs`
    *   (oldest first) and can NEVER trigger eviction of unclaimed rows.
-   * - Unclaimed rows matching an active `pending_oob` subscription (`status = 'pending'`) and the
-   *   just-inserted `protectedCallbackId` are NEVER evicted.
+   * - Protected unclaimed rows matching an active `pending_oob` subscription (`status = 'pending'`)
+   *   are bounded separately at ingest by `maxProtectedCallbacks` and are excluded from the
+   *   unprotected unclaimed count so they never trigger wasted O(n) anti-join prune scans.
    */
-  private pruneCallbacks(now = this.now(), protectedCallbackId?: string): void {
+  private pruneCallbacks(now = this.now(), protectedCallbackId?: string): number {
     const protectedId = protectedCallbackId ?? null
-    this.inImmediateTx(() => {
+    this.pruneRuns += 1
+    const deleted = this.inImmediateTx(() => {
+      let totalDeleted = 0
+
       // 1. Historical claimed rows (`claimed_by IS NOT NULL`): TTL first, then bounded oldest-first cap.
       if (this.claimedCallbackTtlMs > 0) {
         const cutoff = now - this.claimedCallbackTtlMs
-        this.client.prepare(`
+        const res = this.client.prepare(`
           DELETE FROM oob_callbacks
           WHERE claimed_by IS NOT NULL
             AND received_at < ?
             AND (? IS NULL OR callback_id != ?)
-        `).run(cutoff, protectedId, protectedId)
+        `).run(cutoff, protectedId, protectedId) as { changes?: number | bigint }
+        totalDeleted += Number(res?.changes ?? 0)
       }
       const claimedRow = this.client.prepare(
         'SELECT COUNT(*) AS n FROM oob_callbacks WHERE claimed_by IS NOT NULL',
       ).get() as unknown as { n: number | bigint } | undefined
       const claimedTotal = Number(claimedRow?.n ?? 0)
       if (claimedTotal > this.maxClaimedCallbacks) {
-        this.client.prepare(`
+        const res = this.client.prepare(`
           DELETE FROM oob_callbacks
           WHERE callback_id IN (
             SELECT callback_id FROM oob_callbacks
@@ -1276,14 +1733,15 @@ export class OobRelay {
             ORDER BY received_at ASC, rowid ASC
             LIMIT ?
           )
-        `).run(protectedId, protectedId, claimedTotal - this.maxClaimedCallbacks)
+        `).run(protectedId, protectedId, claimedTotal - this.maxClaimedCallbacks) as { changes?: number | bigint }
+        totalDeleted += Number(res?.changes ?? 0)
       }
 
-      // 2. Unclaimed rows (`claimed_by IS NULL`): only evict orphaned rows with NO active pending_oob
-      // subscription and never evict the just-accepted callback.
+      // 2. Orphaned unclaimed rows (`claimed_by IS NULL` with NO active pending_oob subscription):
+      //    protected pending rows are enforced by `maxProtectedCallbacks` at ingest and excluded here.
       if (this.unclaimedCallbackTtlMs > 0) {
         const unclaimedCutoff = now - this.unclaimedCallbackTtlMs
-        this.client.prepare(`
+        const res = this.client.prepare(`
           DELETE FROM oob_callbacks
           WHERE claimed_by IS NULL
             AND received_at < ?
@@ -1292,14 +1750,20 @@ export class OobRelay {
               SELECT 1 FROM pending_oob p
               WHERE p.token = oob_callbacks.token AND p.status = 'pending'
             )
-        `).run(unclaimedCutoff, protectedId, protectedId)
+        `).run(unclaimedCutoff, protectedId, protectedId) as { changes?: number | bigint }
+        totalDeleted += Number(res?.changes ?? 0)
       }
-      const unclaimedRow = this.client.prepare(
-        'SELECT COUNT(*) AS n FROM oob_callbacks WHERE claimed_by IS NULL',
-      ).get() as unknown as { n: number | bigint } | undefined
-      const unclaimedTotal = Number(unclaimedRow?.n ?? 0)
-      if (unclaimedTotal > this.maxUnclaimedCallbacks) {
-        this.client.prepare(`
+      const unprotectedRow = this.client.prepare(`
+        SELECT COUNT(*) AS n FROM oob_callbacks c
+        WHERE c.claimed_by IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM pending_oob p
+            WHERE p.token = c.token AND p.status = 'pending'
+          )
+      `).get() as unknown as { n: number | bigint } | undefined
+      const unprotectedTotal = Number(unprotectedRow?.n ?? 0)
+      if (unprotectedTotal > this.maxUnclaimedCallbacks) {
+        const res = this.client.prepare(`
           DELETE FROM oob_callbacks
           WHERE callback_id IN (
             SELECT c.callback_id FROM oob_callbacks c
@@ -1312,9 +1776,18 @@ export class OobRelay {
             ORDER BY c.received_at ASC, c.rowid ASC
             LIMIT ?
           )
-        `).run(protectedId, protectedId, unclaimedTotal - this.maxUnclaimedCallbacks)
+        `).run(protectedId, protectedId, unprotectedTotal - this.maxUnclaimedCallbacks) as { changes?: number | bigint }
+        totalDeleted += Number(res?.changes ?? 0)
       }
+
+      return totalDeleted
     })
+
+    if (deleted > 0) {
+      this.prunedRows += deleted
+      this.invalidateQuotaCaches()
+    }
+    return deleted
   }
 }
 
@@ -1328,6 +1801,7 @@ export function summarizeOobRelayStatus(status: OobRelayStatus): Record<string, 
     promoted: status.promoted,
     expired: status.expired,
     rejected: status.rejected,
+    quotaDropped: status.quota.totalDropped,
     lastCallbackAt: status.lastCallbackAt,
     windowMs: status.windowMs,
     immediateMs: status.immediateMs,

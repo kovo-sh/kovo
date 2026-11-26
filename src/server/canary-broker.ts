@@ -27,6 +27,7 @@ import type {
   OobDnsQuery,
   OobPromotion,
   OobPublicRelayConfig,
+  OobQuotaTelemetry,
   OobRecordResult,
   OobRelayProfile,
   OobRelayStatus,
@@ -763,6 +764,7 @@ function detailToCanaryHit(token: string, detail: Record<string, unknown>): Cana
 export class CanaryBroker {
   private readonly secret = randomBytes(32)
   private readonly defaultStorage?: Store | SecondOrderStore
+  private readonly now: () => number
   private readonly oobRelayInstance: OobRelay
   private readonly publicProfileConfig?: OobPublicRelayConfig
   private server?: Server
@@ -796,8 +798,16 @@ export class CanaryBroker {
     oobWindowMs?: number
     oobImmediateMs?: number
     now?: () => number
+    maxCallbacksPerToken?: number
+    maxCallbacksPerRun?: number
+    maxProtectedCallbacks?: number
+    maxCallbacksPerIpWindow?: number
+    ipRateLimitWindowMs?: number
+    maxTrackedSourceIps?: number
+    maxAssignments?: number
   } = {}) {
     this.defaultStorage = options.storage
+    this.now = options.now ?? (() => Date.now())
     this.publicProfileConfig = options.publicProfile
     this.publicBaseUrl = normalizePublicBaseUrl(
       process.env.KOVO_CANARY_PUBLIC_URL ?? process.env.KOVO_CANARY_BASE_URL,
@@ -810,6 +820,13 @@ export class CanaryBroker {
       ...(options.now ? { now: options.now } : {}),
       ...(options.oobWindowMs !== undefined ? { windowMs: options.oobWindowMs } : {}),
       ...(options.oobImmediateMs !== undefined ? { immediateMs: options.oobImmediateMs } : {}),
+      ...(options.maxCallbacksPerToken !== undefined ? { maxCallbacksPerToken: options.maxCallbacksPerToken } : {}),
+      ...(options.maxCallbacksPerRun !== undefined ? { maxCallbacksPerRun: options.maxCallbacksPerRun } : {}),
+      ...(options.maxProtectedCallbacks !== undefined ? { maxProtectedCallbacks: options.maxProtectedCallbacks } : {}),
+      ...(options.maxCallbacksPerIpWindow !== undefined ? { maxCallbacksPerIpWindow: options.maxCallbacksPerIpWindow } : {}),
+      ...(options.ipRateLimitWindowMs !== undefined ? { ipRateLimitWindowMs: options.ipRateLimitWindowMs } : {}),
+      ...(options.maxTrackedSourceIps !== undefined ? { maxTrackedSourceIps: options.maxTrackedSourceIps } : {}),
+      ...(options.maxAssignments !== undefined ? { maxAssignments: options.maxAssignments } : {}),
       logger: rejection => {
         // Structured, token-free rejection log line; full detail stays in the relay store.
         try {
@@ -827,6 +844,11 @@ export class CanaryBroker {
   /** Durable async OOB correlation surface for the verifier/executor. */
   get oob(): OobRelay {
     return this.oobRelayInstance
+  }
+
+  /** Structured OOB quota, rate-limit, and amortized pruning telemetry. */
+  oobQuotaTelemetry(): OobQuotaTelemetry {
+    return this.oobRelayInstance.quotaTelemetry()
   }
 
   relayProfile(): OobRelayProfile {
@@ -941,7 +963,12 @@ export class CanaryBroker {
       const token = match ? match[0].toLowerCase() : null
       const queryType = dnsTypeNames[parsed.qtype] ?? `TYPE${parsed.qtype}`
       if (token) {
-        const now = Date.now()
+        const now = this.now()
+        const rate = this.oobRelayInstance.consumeIpRateLimit(remoteIp, now)
+        if (!rate.allowed) {
+          respond(buildDnsResponse(msg, parsed, false, this.dnsSinkIp))
+          return
+        }
         const hit: CanaryHit = {
           protocol: 'dns',
           token,
@@ -956,7 +983,7 @@ export class CanaryBroker {
           receivedAt: new Date(now).toISOString(),
           timestamp: now,
         }
-        this.appendHit(hit)
+        this.appendHit(hit, { ipRateLimitChecked: true })
       }
       const provider = this.dnsProvider
       if (provider) {
@@ -1081,6 +1108,20 @@ export class CanaryBroker {
    */
   private callbackHandler(host: string) {
     return (req: IncomingMessage, res: ServerResponse) => {
+      const now = this.now()
+      const remoteIp = (req.socket?.remoteAddress ?? '').slice(0, 128)
+      const rate = this.oobRelayInstance.consumeIpRateLimit(remoteIp, now)
+      if (!rate.allowed) {
+        req.resume()
+        const retryAfterSec = Math.max(1, Math.ceil(Math.max(0, rate.resetAt - now) / 1000))
+        res.writeHead(429, {
+          'content-type': 'text/plain; charset=utf-8',
+          'cache-control': 'no-store',
+          'retry-after': String(retryAfterSec),
+          connection: 'close',
+        }).end('kovo-canary-rate-limited')
+        return
+      }
       const maxCallbackBodyBytes = 4096
       const chunks: Buffer[] = []
       let received = 0
@@ -1105,7 +1146,7 @@ export class CanaryBroker {
           const token = extractTokenFromRequest(url, req.headers.host)
           const artifact = extractArtifact(url, req.headers['x-kovo-artifact'])
           if (token) {
-            const now = Date.now()
+            const receivedTs = this.now()
             const rawBody = Buffer.concat(chunks).toString('utf8')
             const bodyPreview = rawBody
               ? redact(rawBody, []).slice(0, maxCallbackBodyBytes) + (truncated ? '…[truncated]' : '')
@@ -1116,15 +1157,15 @@ export class CanaryBroker {
               method: (req.method ?? 'GET').toUpperCase().slice(0, 16),
               path: redact(url.pathname).slice(0, 512),
               query: redact(url.search).slice(0, 512),
-              remoteIp: (req.socket?.remoteAddress ?? '').slice(0, 128),
+              remoteIp,
               userAgent: redact(String(req.headers['user-agent'] ?? '')).slice(0, 200),
               headers: normalizeIncomingHeaders(req.headers),
               ...(bodyPreview ? { bodyPreview, bodyBytes: totalBytes } : {}),
               ...(artifact ? { artifact } : {}),
-              receivedAt: new Date(now).toISOString(),
-              timestamp: now,
+              receivedAt: new Date(receivedTs).toISOString(),
+              timestamp: receivedTs,
             }
-            this.appendHit(hit)
+            this.appendHit(hit, { ipRateLimitChecked: true })
           }
         } catch {
           // Ignore malformed URLs on callback listener; still return benign 200.
@@ -1392,7 +1433,11 @@ export class CanaryBroker {
     return { ...relayResult, evictedCanaries }
   }
 
-  private appendHit(hit: CanaryHit) {
+  private appendHit(hit: CanaryHit, options?: { ipRateLimitChecked?: boolean }) {
+    if (!options?.ipRateLimitChecked) {
+      const rate = this.oobRelayInstance.consumeIpRateLimit(hit.remoteIp, hit.timestamp)
+      if (!rate.allowed) return
+    }
     let list = this.hitsByToken.get(hit.token)
     if (!list) {
       if (this.hitsByToken.size >= maxTrackedTokens) {
@@ -1464,7 +1509,7 @@ export class CanaryBroker {
           userAgent: hit.userAgent,
           ...(hit.bodyBytes !== undefined ? { bodyBytes: hit.bodyBytes } : {}),
         },
-      })
+      }, { ipRateLimitAlreadyConsumed: true })
     } catch {
       // Relay persistence is best-effort; in-memory hits remain authoritative for local checks.
     }
