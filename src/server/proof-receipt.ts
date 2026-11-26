@@ -15,7 +15,7 @@
 import { createHmac } from 'node:crypto'
 import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
-import { HostFactLog, type HostExchangeFact } from './host-fact-log.ts'
+import { HostFactLog, parseBodyFromCarrierText, type HostExchangeFact } from './host-fact-log.ts'
 import {
   assessBooleanDifferential,
   assessImpactEvidence,
@@ -422,14 +422,10 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     const extractCarrierRequestBody = (entry: ReceiptTranscriptEntry): string | undefined => {
       if (typeof entry.step.requestJson === 'string' && entry.step.requestJson.length > 0) return entry.step.requestJson
       if (entry.step.requestJson !== undefined || !entry.carrierText) return undefined
-      const lines = entry.carrierText.split('\n').map(l => l.trim()).filter(Boolean)
-      for (let i = lines.length - 1; i >= 0; i -= 1) {
-        const line = lines[i]!
-        if (/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\//i.test(line)) continue
-        if (/^[A-Za-z0-9-]+:\s/.test(line)) continue
-        return line
-      }
-      return undefined
+      const response = typeof entry.step.body === 'string'
+        ? entry.step.body
+        : entry.step.json !== undefined ? JSON.stringify(entry.step.json) : null
+      return parseBodyFromCarrierText(entry.carrierText, entry.step.requestHeaders, response) ?? undefined
     }
     const toArm = (entry: ReceiptTranscriptEntry): BooleanDifferentialArm => {
       const requestBody = extractCarrierRequestBody(entry)
@@ -1261,20 +1257,76 @@ function canonicalRequestHeaderMap(headers: Record<string, string> | null | unde
   return out
 }
 
+const AUTH_BYPASS_PARAM_KEY_RE = /^(?:token|access_?token|id_?token|auth|auth_?token|jwt|session|sid|api_?key|apikey|key|sig|signature|bypass|admin|role|impersonate|user|debug|password|passcode|otp|code|assertion|saml|credential|claims)$/i
+
+function parseQueryMap(pathAndQuery: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {}
+  const q = queryPartOf(pathAndQuery)
+  if (!q) return out
+  for (const [k, v] of new URLSearchParams(q).entries()) {
+    const lk = k.trim().toLowerCase()
+    if (lk) out[lk] = v
+  }
+  return out
+}
+
+function collectBodyEntries(value: unknown, prefix = '', depth = 0, out: Record<string, string> = {}): Record<string, string> {
+  if (depth > 4 || value === null || value === undefined) return out
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    out[prefix || '$'] = String(value)
+    return out
+  }
+  if (Array.isArray(value)) {
+    value.slice(0, 16).forEach((item, idx) => collectBodyEntries(item, `${prefix}[${idx}]`, depth + 1, out))
+    return out
+  }
+  if (typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      const next = prefix ? `${prefix}.${k.toLowerCase()}` : k.toLowerCase()
+      collectBodyEntries(v, next, depth + 1, out)
+    }
+  }
+  return out
+}
+
 function authBypassRequestDifferential(
   control: ImpactStep,
   probe: ImpactStep,
 ): 'header' | 'query' | 'body' | null {
   const controlHeaders = canonicalRequestHeaderMap(control.requestHeaders)
   const probeHeaders = canonicalRequestHeaderMap(probe.requestHeaders)
+  // C-4: Reject any non-auth query or body resource-ID swap (e.g. ?id=bob_item vs ?id=alice_item).
+  const ctlQuery = parseQueryMap(control.pathAndQuery)
+  const prbQuery = parseQueryMap(probe.pathAndQuery)
+  const queryKeys = new Set([...Object.keys(ctlQuery), ...Object.keys(prbQuery)])
+  let authQueryAddedOrMutated = false
+  for (const key of queryKeys) {
+    if (ctlQuery[key] === prbQuery[key]) continue
+    if (!AUTH_BYPASS_PARAM_KEY_RE.test(key)) return null
+    if ((prbQuery[key] ?? '').trim().length > 0) authQueryAddedOrMutated = true
+  }
+  const ctlBody = collectBodyEntries(control.requestJson)
+  const prbBody = collectBodyEntries(probe.requestJson)
+  const bodyKeys = new Set([...Object.keys(ctlBody), ...Object.keys(prbBody)])
+  let authBodyAddedOrMutated = false
+  for (const key of bodyKeys) {
+    if (ctlBody[key] === prbBody[key]) continue
+    const leafKey = key.split('.').pop()?.replace(/\[\d+\]$/, '') ?? ''
+    if (!AUTH_BYPASS_PARAM_KEY_RE.test(leafKey)) return null
+    if ((prbBody[key] ?? '').trim().length > 0) authBodyAddedOrMutated = true
+  }
+  // C-4: Header differential must ADD or MUTATE a non-empty security/bypass header on probe
+  // (never merely remove an invalid/sabotaged auth header that was sent on control).
   const headerKeys = new Set([...Object.keys(controlHeaders), ...Object.keys(probeHeaders)])
   for (const key of headerKeys) {
     if (key === 'cookie') continue
     if (!AUTH_BYPASS_SECURITY_HEADER_RE.test(key)) continue
-    if (controlHeaders[key] !== probeHeaders[key]) return 'header'
+    const prbVal = (probeHeaders[key] ?? '').trim()
+    const ctlVal = (controlHeaders[key] ?? '').trim()
+    if (prbVal.length > 0 && prbVal !== ctlVal) return 'header'
   }
-  if (queryPartOf(control.pathAndQuery) !== queryPartOf(probe.pathAndQuery)) return 'query'
-  if (JSON.stringify(control.requestJson ?? null) !== JSON.stringify(probe.requestJson ?? null)) return 'body'
+  if (authQueryAddedOrMutated) return 'query'
+  if (authBodyAddedOrMutated) return 'body'
   return null
 }
 
@@ -1323,20 +1375,51 @@ function probeCarriedHostCredentialControlLacked(
     return 'Auth bypass rejected: probe used an authenticated session jar that the control lacked.'
   }
 
-  // Login-issued token check: if probe sent an Authorization token that matches a token returned by
-  // an earlier 2xx response in the host transcript, it is a real login credential, not a forgery.
-  const prbAuth = prbHeaders.authorization
-  if (prbAuth && prbAuth !== ctlHeaders.authorization) {
-    const rawToken = prbAuth.replace(/^(?:Bearer|Token|Basic)\s+/i, '').trim()
-    if (rawToken.length >= 12) {
-      for (const prior of allEntries) {
-        if (prior.exchangeId === probe.exchangeId || prior.exchangeId === control.exchangeId) continue
-        if (!is2xxStatus(prior.step.status)) continue
-        const priorBody = typeof prior.step.body === 'string'
-          ? prior.step.body
-          : prior.step.json !== undefined ? JSON.stringify(prior.step.json) : ''
-        const priorSetCookie = headerValue(prior.step.responseHeaders, 'set-cookie') ?? ''
-        if (priorBody.includes(rawToken) || priorSetCookie.includes(rawToken)) {
+  // C-4: Reject self-sabotaged controls (control carries an extra security header absent from an
+  // authenticated probe carrying a cookie/session/persona, e.g., cookie + invalid Bearer vs cookie).
+  const probeAuthenticated = prbHandle !== null || Boolean(prbHeaders.cookie) || Boolean(probe.sessionId)
+  if (probeAuthenticated) {
+    for (const [k, v] of Object.entries(ctlHeaders)) {
+      if (k === 'cookie' || !AUTH_BYPASS_SECURITY_HEADER_RE.test(k)) continue
+      if (v.trim().length > 0 && !(prbHeaders[k] ?? '').trim()) {
+        return 'Auth bypass rejected: control carried an extra auth header absent from the authenticated probe (self-sabotaged control is not an authentication bypass).'
+      }
+    }
+  }
+
+  // C-4: Login-issued token check across ALL AUTH_BYPASS_SECURITY_HEADER_RE headers, query params,
+  // and request body fields: if probe sent a token returned by a prior 2xx exchange, it is a real
+  // login credential, not a forgery.
+  const candidateTokens = new Set<string>()
+  const addCandidate = (raw: string | undefined) => {
+    if (!raw) return
+    const stripped = raw.replace(/^(?:Bearer|Token|Basic|ApiKey)\s+/i, '').trim()
+    if (stripped.length >= 12) candidateTokens.add(stripped)
+  }
+  for (const [k, v] of Object.entries(prbHeaders)) {
+    if (k === 'cookie' || !AUTH_BYPASS_SECURITY_HEADER_RE.test(k)) continue
+    if (v !== ctlHeaders[k]) addCandidate(v)
+  }
+  const ctlQuery = parseQueryMap(control.step.pathAndQuery)
+  const prbQuery = parseQueryMap(probe.step.pathAndQuery)
+  for (const [k, v] of Object.entries(prbQuery)) {
+    if (v !== ctlQuery[k]) addCandidate(v)
+  }
+  const ctlBody = collectBodyEntries(control.step.requestJson)
+  const prbBody = collectBodyEntries(probe.step.requestJson)
+  for (const [k, v] of Object.entries(prbBody)) {
+    if (v !== ctlBody[k]) addCandidate(v)
+  }
+  if (candidateTokens.size > 0) {
+    for (const prior of allEntries) {
+      if (prior.exchangeId === probe.exchangeId || prior.exchangeId === control.exchangeId) continue
+      if (!is2xxStatus(prior.step.status)) continue
+      const priorBody = typeof prior.step.body === 'string'
+        ? prior.step.body
+        : prior.step.json !== undefined ? JSON.stringify(prior.step.json) : ''
+      const priorRespHeaders = Object.values(prior.step.responseHeaders ?? {}).join('\n')
+      for (const rawToken of candidateTokens) {
+        if (priorBody.includes(rawToken) || priorRespHeaders.includes(rawToken)) {
           return 'Auth bypass rejected: probe used a credential issued by a prior 2xx login/token exchange in the host transcript (normal authentication, not a bypass).'
         }
       }
@@ -1457,6 +1540,14 @@ function verifyAuthBypassReceipt(
       const differential = authBypassRequestDifferential(control.step, probe.step)
       if (!differential) {
         lastRejection = 'Control and probe requests carry no distinct auth header, forged token, bypass parameter, or request body differential.'
+        continue
+      }
+      const controlHeaders = canonicalRequestHeaderMap(control.step.requestHeaders)
+      const authenticatedControl = normalizedAuthHandle(control.step.actor.handle) !== null ||
+        ['cookie', 'bearer', 'header'].includes(control.step.actor.auth) ||
+        Boolean(controlHeaders.cookie || controlHeaders.authorization || control.sessionId)
+      if (differential !== 'header' && (control.step.status !== 401 || authenticatedControl)) {
+        lastRejection = 'Auth bypass rejected: an authenticated/forbidden control changing only a query or body field is an authorization or ordinary request difference, not an authentication bypass.'
         continue
       }
       const probeBodyRaw = typeof probe.step.body === 'string'

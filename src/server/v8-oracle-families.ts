@@ -196,22 +196,18 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
     if (!hasTenantRoleAtLeast(input.actor, dst, input.requiredDestRole ?? 'admin')) return deny(f, 'actor_lacks_dest_tenant_privilege', sub)
     if (hasTenantRoleAtLeast(input.actor, src, input.requiredSourceRole ?? 'admin')) return deny(f, 'actor_authorized_in_source_tenant', sub)
 
-    const pairs: [HostSignedRecord | undefined, string][] = [[input.transferRecord, 'transfer'], [input.postTransferReadback, 'post_transfer_readback']]
-    if (input.sourceControlDenied) pairs.push([input.sourceControlDenied, 'source_control'])
-    const recErr = checkRecords(pairs, input.verifySignature)
+    const recErr = checkRecords([[input.sourceControlDenied, 'source_control'], [input.transferRecord, 'transfer'], [input.postTransferReadback, 'post_transfer_readback']], input.verifySignature)
     if (recErr) return deny(f, recErr, sub)
-    if (input.sourceControlDenied && !isDenied(input.sourceControlDenied.status)) return deny(f, 'source_control_not_denied', sub)
-    if (!isOk(input.transferRecord.status)) return deny(f, 'transfer_not_accepted', sub)
-    if (!isOk(input.postTransferReadback.status)) return deny(f, 'readback_not_accepted', sub)
+    if (!isDenied(input.sourceControlDenied!.status)) return deny(f, 'source_control_not_denied', sub)
+    if (!isOk(input.transferRecord.status) || /^(?:GET|HEAD|OPTIONS)$/i.test(normStr(input.transferRecord.method))) return deny(f, 'transfer_not_accepted', sub)
+    if (!isOk(input.postTransferReadback.status) || input.postTransferReadback.id === input.transferRecord.id) return deny(f, 'readback_not_accepted', sub)
+    const aKey = normKey(input.actor.actorId), tAct = normKey(input.transferRecord.actorId), cAct = normKey(input.sourceControlDenied!.actorId)
+    if ((tAct && tAct !== aKey) || (cAct && cAct !== aKey)) return deny(f, 'actor_record_mismatch', sub)
+    if (input.sourceControlDenied!.status === 401 && (!cAct || cAct !== aKey)) return deny(f, 'unauthenticated_baseline_control', sub)
     if (stubRec(input.postTransferReadback)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
     if (input.postTransferReadback.timestampMs < input.transferRecord.timestampMs) return deny(f, 'non_monotonic_readback_timestamp', sub)
     if (normKey(input.observedOwnerTenantId) !== dst) return deny(f, 'transfer_not_persisted_to_dest_tenant', sub)
-
-    return ok(f, sub, 'cross_org_transfer_without_source_tenant_authorization', {
-      actorId: input.actor.actorId, sourceTenantId: src, destTenantId: dst, entityId: input.entityId,
-      sourceRole: resolveTenantRole(input.actor, src), destRole: resolveTenantRole(input.actor, dst),
-      transferId: input.transferRecord.id, readbackId: input.postTransferReadback.id,
-    })
+    return ok(f, sub, 'cross_org_transfer_without_source_tenant_authorization', { actorId: input.actor.actorId, sourceTenantId: src, destTenantId: dst, entityId: input.entityId, sourceRole: resolveTenantRole(input.actor, src), destRole: resolveTenantRole(input.actor, dst), transferId: input.transferRecord.id, readbackId: input.postTransferReadback.id })
   }
 
   if (input.mode === 'dual_org_cache_bleed') {
@@ -220,24 +216,24 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
     if (prime === target) return deny(f, 'same_tenant_not_cache_bleed', sub)
     if (!hasTenantRoleAtLeast(input.actor, prime, req)) return deny(f, 'actor_lacks_prime_tenant_privilege', sub)
     if (hasTenantRoleAtLeast(input.actor, target, req)) return deny(f, 'actor_authorized_in_target_tenant', sub)
-
     const recErr = checkRecords([[input.baselineDeniedControl, 'baseline_control'], [input.primeAction, 'prime_action'], [input.bledAccess, 'bled_access']], input.verifySignature)
     if (recErr) return deny(f, recErr, sub)
     if (!isDenied(input.baselineDeniedControl.status)) return deny(f, 'baseline_control_not_denied', sub)
     if (!isOk(input.primeAction.status)) return deny(f, 'prime_action_failed', sub)
     if (!isOk(input.bledAccess.status)) return deny(f, 'bled_access_denied_or_failed', sub)
+    const cRt = normRoute(input.baselineDeniedControl.route), bRt = normRoute(input.bledAccess.route)
+    if (cRt && bRt && cRt !== bRt) return deny(f, 'baseline_control_and_bled_route_mismatch', sub)
+    if (input.baselineDeniedControl.status === 401 && normKey(input.baselineDeniedControl.actorId) !== normKey(input.actor.actorId)) return deny(f, 'unauthenticated_baseline_control', sub)
     if (!input.isolatedControl && input.primeAction.timestampMs < input.baselineDeniedControl.timestampMs) return deny(f, 'non_monotonic_prime_timestamp', sub)
     if (input.bledAccess.timestampMs < input.primeAction.timestampMs) return deny(f, 'non_monotonic_bled_timestamp', sub)
-    if (input.observedTenantId && normKey(input.observedTenantId) !== target) return deny(f, 'observed_tenant_mismatch', sub)
+    const obsT = normKey(input.observedTenantId)
+    if (obsT && obsT !== target) return deny(f, 'observed_tenant_mismatch', sub)
     if (stubRec(input.bledAccess)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
     const bledTenants = extractTenantMarkers(input.bledAccess.json, input.bledAccess.body)
     if (bledTenants.size > 0 && bledTenants.has(prime) && !bledTenants.has(target)) return deny(f, 'bled_access_own_tenant_only', sub)
+    if (!bledTenants.has(target) && obsT !== target) return deny(f, 'bled_access_missing_target_tenant_marker', sub)
     if (!normStr(input.targetRecordId) && !hasSubstantivePayload(input.bledAccess)) return deny(f, 'bled_access_missing_substantive_data', sub)
-
-    return ok(f, sub, 'dual_org_permission_cache_bleed_confirmed', {
-      actorId: input.actor.actorId, primeTenantId: prime, targetTenantId: target,
-      baselineControlId: input.baselineDeniedControl.id, primeActionId: input.primeAction.id, bledAccessId: input.bledAccess.id,
-    })
+    return ok(f, sub, 'dual_org_permission_cache_bleed_confirmed', { actorId: input.actor.actorId, primeTenantId: prime, targetTenantId: target, baselineControlId: input.baselineDeniedControl.id, primeActionId: input.primeAction.id, bledAccessId: input.bledAccess.id })
   }
 
   if (input.mode === 'batch_partial_authz') {
@@ -256,6 +252,8 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
     if (recErr) return deny(f, recErr, sub)
     if (!isDenied(input.singleForeignControlDenied.status)) return deny(f, 'single_foreign_control_not_denied', sub)
     if (!isOk(input.batchRequest.status)) return deny(f, 'batch_request_denied_or_failed', sub)
+    const cAct = normKey(input.singleForeignControlDenied.actorId), bAct = normKey(input.batchRequest.actorId)
+    if (input.singleForeignControlDenied.status === 401 && (!cAct || !bAct || cAct !== bAct)) return deny(f, 'unauthenticated_baseline_control', sub)
 
     const foreignRead = !stubRec(input.batchRequest) &&
       new Set((input.returnedForeignIds ?? []).map(normStr)).has(foreignId) &&
@@ -381,10 +379,13 @@ export function evaluateEconomicConservation(input: EconomicConservationInput): 
   if (!isOk(input.finalReadback.status)) return deny(f, 'final_readback_failed', sub)
 
   let maxActionTs = -Infinity, anyActionOk = false
+  const seenActIds = new Set<string>()
   for (let i = 0; i < input.actions.length; i++) {
     const act = input.actions[i]
     const err = checkRecord(act, `action_${i}`, input.verifySignature)
     if (err) return deny(f, err, sub)
+    if (seenActIds.has(act.id)) return deny(f, 'duplicate_action_exchange_id', sub)
+    seenActIds.add(act.id)
     if (act.timestampMs < input.baselineReadback.timestampMs) return deny(f, 'action_precedes_baseline_readback', sub)
     if (act.timestampMs > maxActionTs) maxActionTs = act.timestampMs
     if (isOk(act.status)) anyActionOk = true
@@ -400,28 +401,17 @@ export function evaluateEconomicConservation(input: EconomicConservationInput): 
     if (!allFiniteNonNeg(input.paidAmount, baseRef)) return deny(f, 'invalid_refund_parameters', sub)
     if (!Array.isArray(input.refundedAmounts) || input.refundedAmounts.length === 0) return deny(f, 'missing_refunded_amounts', sub)
     let totalRefunded = 0
-    for (const amt of input.refundedAmounts) {
-      if (!allFiniteNonNeg(amt)) return deny(f, 'invalid_refund_amount', sub)
-      totalRefunded += amt
-    }
+    for (const amt of input.refundedAmounts) { if (!allFiniteNonNeg(amt)) return deny(f, 'invalid_refund_amount', sub); totalRefunded += amt }
     if (totalRefunded <= input.paidAmount + tol || totalRefunded <= baseRef + tol) return deny(f, 'refund_ledger_conserved', sub, { paidAmount: input.paidAmount, totalRefunded })
-    return ok(f, sub, 'over_refund_conservation_violated', {
-      paidAmount: input.paidAmount, totalRefunded, excessRefunded: Number((totalRefunded - input.paidAmount).toFixed(6)),
-      baselineId: input.baselineReadback.id, finalReadbackId: input.finalReadback.id,
-    })
+    return ok(f, sub, 'over_refund_conservation_violated', { paidAmount: input.paidAmount, totalRefunded, excessRefunded: Number((totalRefunded - input.paidAmount).toFixed(6)), baselineId: input.baselineReadback.id, finalReadbackId: input.finalReadback.id })
   }
-
   if (input.equation === 'balance_minting') {
-    const beforeSum = sumFiniteMap(input.balancesBefore), afterSum = sumFiniteMap(input.balancesAfter)
-    const deposits = input.authorizedDeposits, withdrawals = input.authorizedWithdrawals ?? 0
+    const beforeSum = sumFiniteMap(input.balancesBefore), afterSum = sumFiniteMap(input.balancesAfter), deposits = input.authorizedDeposits, withdrawals = input.authorizedWithdrawals ?? 0
     if (beforeSum === null || afterSum === null) return deny(f, 'invalid_balance_snapshot', sub)
     if (!allFiniteNonNeg(deposits, withdrawals)) return deny(f, 'invalid_deposit_or_withdrawal', sub)
     const ceiling = beforeSum + deposits - withdrawals
     if (afterSum <= ceiling + tol) return deny(f, 'balance_ledger_conserved', sub, { beforeSum, afterSum, deposits, withdrawals })
-    return ok(f, sub, 'balance_conservation_violated_value_minted', {
-      beforeSum, afterSum, authorizedDeposits: deposits, authorizedWithdrawals: withdrawals,
-      mintedDelta: Number((afterSum - ceiling).toFixed(6)), baselineId: input.baselineReadback.id, finalReadbackId: input.finalReadback.id,
-    })
+    return ok(f, sub, 'balance_conservation_violated_value_minted', { beforeSum, afterSum, authorizedDeposits: deposits, authorizedWithdrawals: withdrawals, mintedDelta: Number((afterSum - ceiling).toFixed(6)), baselineId: input.baselineReadback.id, finalReadbackId: input.finalReadback.id })
   }
 
   if (input.equation === 'underpaid_fulfillment') {
@@ -494,9 +484,9 @@ export function evaluateCryptographicScopeReplay(input: CryptographicScopeReplay
   if (!srcT || !srcS || !dstT || !dstS) return deny(f, 'missing_tenant_or_scope_context')
   if (srcT === dstT && srcS === dstS) return deny(f, 'same_tenant_and_scope_not_replay')
 
-  const tamperedDigest = normStr(input.tamperedSignatureDigest ?? input.tamperedSignatureControl.artifactDigest)
-  const validDigest = normStr(input.signatureDigest ?? input.sourceValidIssuance.artifactDigest)
-  const replayedDigest = normStr(input.replayedSignatureDigest ?? input.replayedAcceptance.artifactDigest)
+  const tamperedDigest = normStr(input.tamperedSignatureDigest)
+  const validDigest = normStr(input.signatureDigest)
+  const replayedDigest = normStr(input.replayedSignatureDigest)
   if (!tamperedDigest || !validDigest || !replayedDigest) return deny(f, 'missing_signature_digest_binding')
   if (tamperedDigest === validDigest) return deny(f, 'tampered_digest_matches_valid_signature')
   if (replayedDigest !== validDigest) return deny(f, 'replayed_signature_digest_mismatch')
@@ -533,7 +523,7 @@ export function evaluateParserCacheDifferential(input: ParserCacheDifferentialIn
   if (input.mode === 'parser_differential') {
     const sub = input.differentialKind
     if (!normStr(input.differentialFeature)) return deny(f, 'missing_differential_feature', sub)
-    if (input.canonicalValue !== undefined && input.variantValue !== undefined && input.canonicalValue === input.variantValue) {
+    if (input.canonicalValue === undefined || input.variantValue === undefined || input.canonicalValue === input.variantValue) {
       return deny(f, 'no_request_differential_between_control_and_probe', sub)
     }
 
@@ -541,6 +531,12 @@ export function evaluateParserCacheDifferential(input: ParserCacheDifferentialIn
     if (recErr) return deny(f, recErr, sub)
     if (!isDenied(input.cleanControl.status)) return deny(f, 'clean_control_not_denied', sub)
     if (!isOk(input.differentialProbe.status)) return deny(f, 'differential_probe_rejected', sub)
+    const cMeth = normKey(input.cleanControl.method), pMeth = normKey(input.differentialProbe.method)
+    if (cMeth && pMeth && cMeth !== pMeth) return deny(f, 'control_and_probe_method_mismatch', sub)
+    const cAct = normKey(input.cleanControl.actorId), pAct = normKey(input.differentialProbe.actorId)
+    if (cAct !== pAct && (cAct || pAct)) return deny(f, 'control_and_probe_actor_mismatch', sub)
+    const cRt = normRoute(input.cleanControl.route), pRt = normRoute(input.differentialProbe.route)
+    if (sub !== 'path_normalization' && cRt && pRt && cRt !== pRt) return deny(f, 'control_and_probe_route_mismatch', sub)
     if (!input.isolatedControl && input.differentialProbe.timestampMs < input.cleanControl.timestampMs) return deny(f, 'probe_precedes_clean_control', sub)
 
     if (input.impactKind === 'mutation') {

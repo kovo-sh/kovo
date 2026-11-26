@@ -238,7 +238,14 @@ function defaultV8FamilyHandler(
   opts?: { econCtx?: EconomicAutoHydrateContext; fallbackSig?: string; verifySignature?: SignatureVerifier },
 ): V8OracleDecision {
   const transcript = factLog.toHostSignedTranscript()
-  const entriesById = new Map((transcript.entries ?? []).map(e => [e.exchangeId, e]))
+  const signedEntriesById = new Map((transcript.entries ?? []).map(e => [e.exchangeId, e]))
+  const entriesById = new Map([...signedEntriesById].map(([id, e]) => {
+    const rawRequest = factLog.getExchange(id)?.rawRequestBody
+    const entry = e.step.requestJson === undefined && rawRequest !== null && rawRequest !== undefined
+      ? { ...e, step: { ...e.step, requestJson: rawRequest } }
+      : e
+    return [id, entry] as const
+  }))
   const oobById = new Map((transcript.oobEvents ?? []).map(o => [o.id, o]))
   const tracesById = new Map((transcript.browserTraces ?? []).map(t => [t.id, t]))
   const pollsById = new Map((transcript.asyncPollRecords ?? []).map(p => [p.id, p]))
@@ -248,34 +255,13 @@ function defaultV8FamilyHandler(
     if (policy.allowedExchangeIds && entriesById.has(rec.id) && !policy.allowedExchangeIds.has(rec.id)) return false
     const e = entriesById.get(rec.id) ?? oobById.get(rec.id) ?? tracesById.get(rec.id) ?? pollsById.get(rec.id)
     if (!e) return false
-    if (policy.signingKey && (e.hostSignature !== rec.hostSignature || !verifyHostRecordSignature(e, policy.signingKey))) {
+    const signed = signedEntriesById.get(rec.id) ?? e
+    if (policy.signingKey && (signed.hostSignature !== rec.hostSignature || !verifyHostRecordSignature(signed, policy.signingKey))) {
       return false
     }
     return pollsById.has(rec.id) || matchesHydratedRecord(rec, idx, fallbackSig)
   })
   const hydrated = hydrateV8OracleInput(family, rawInput, idx, fallbackSig, opts?.econCtx)
-  // An internal transfer amount moves value between ledger accounts; it is not an external
-  // authorized deposit. Do not let hydration erase a host-observed increase in total balances.
-  if (family === 'economic_conservation' && hydrated.equation === 'balance_minting' && Array.isArray(hydrated.actions)) {
-    const successful = hydrated.actions.filter((action): action is V8OracleRecord => {
-      if (!action || typeof action !== 'object') return false
-      const status = (action as V8OracleRecord).status
-      return typeof status === 'number' && status >= 200 && status < 300
-    })
-    const transferPairs = [['from', 'to'], ['source', 'destination'], ['fromaccount', 'toaccount'], ['sourceaccount', 'destinationaccount'], ['debitaccount', 'creditaccount']]
-    const transferOnly = successful.length > 0 && successful.every(action => {
-      const request = entriesById.get(action.id)?.step.requestJson
-      if (!request || typeof request !== 'object' || Array.isArray(request)) return false
-      const keys = new Set(Object.keys(request).map(key => key.replace(/[_-]/g, '').toLowerCase()))
-      return transferPairs.some(([from, to]) => keys.has(from) && keys.has(to))
-    })
-    if (transferOnly) {
-      const declaredDeposits = rawInput.authorizedDeposits
-      hydrated.authorizedDeposits = typeof declaredDeposits === 'number' && Number.isFinite(declaredDeposits) && declaredDeposits >= 0
-        ? declaredDeposits
-        : 0
-    }
-  }
   if (family === 'economic_conservation' && isHydratedStub(hydrated.finalReadback)) {
     return {
       family,
@@ -360,6 +346,8 @@ export class TerminalOracleRegistry {
         ...(policyContext.forbiddenShortcutPersonas ? { forbiddenShortcutPersonas: policyContext.forbiddenShortcutPersonas } : {}),
         ...(policyContext.benchmarkMode !== undefined ? { benchmarkMode: policyContext.benchmarkMode } : {}),
         ...(policyContext.requireCleanSessionFlag !== undefined ? { requireCleanSessionFlag: policyContext.requireCleanSessionFlag } : {}),
+        strictHostDerivation: true,
+        factLog,
       })
       return {
         confirmed: composite.confirmed,
@@ -449,6 +437,8 @@ export class TerminalOracleRegistry {
         ...(policyContext.forbiddenShortcutPersonas ? { forbiddenShortcutPersonas: policyContext.forbiddenShortcutPersonas } : {}),
         ...(policyContext.benchmarkMode !== undefined ? { benchmarkMode: policyContext.benchmarkMode } : {}),
         ...(policyContext.requireCleanSessionFlag !== undefined ? { requireCleanSessionFlag: policyContext.requireCleanSessionFlag } : {}),
+        strictHostDerivation: true,
+        factLog,
       })
       const singleHop = compRes.terminalVerification ?? {
         confirmed: compRes.confirmed,

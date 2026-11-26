@@ -9,20 +9,24 @@
  * and boolean impact predicates exclusively from host-recorded transcript records.
  */
 import { createHash } from 'node:crypto'
-import { normalizeRole, parseRoleLabel, parseRoleMemberships, stepReadsState } from './oracle-invariants.ts'
+import { parseBodyFromCarrierText } from './host-fact-log.ts'
+import { ROLE_RANK, normalizeRole, parseRoleLabel, parseRoleMemberships, stepReadsState, type RoleName } from './oracle-invariants.ts'
 import { extractTenantMarkers, isJobOrHandleStub, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
 
 export interface HydratableEntry {
   exchangeId: string
+  seq?: number
   timestampMs?: number
   actorPersona?: string | null
   actorRoleLabel?: string | null
   emittedCapabilities?: readonly string[]
   observedResponseDigests?: readonly string[]
   consumedCapabilities?: readonly string[]
+  injectedRequestDigests?: readonly string[]
   cryptoAttestations?: readonly { derivedFromCapabilityId: string; derivedCapabilityId?: string; artifactDigest?: string }[]
   entityId?: string
   correlationIds?: readonly string[]
+  carrierText?: string
   hostSignature?: string
   evidenceRole?: string
   step: {
@@ -157,6 +161,7 @@ function findFirstStringByKeys(val: unknown, keys: ReadonlySet<string>, depth = 
 export interface CapOriginIndex {
   loginTenantOf(cap: string): string | null
   loginActorOf(cap: string): { actor: string | null; role: string | null; roleLabel: string | null } | null
+  nonProbeOriginActorOf(cap: string): { actor: string | null; role: string | null; roleLabel: string | null } | null
   actorOf(cap: string): string | null
 }
 
@@ -214,6 +219,24 @@ export function buildCapOriginIndex(entries: Iterable<HydratableEntry>, anonActo
       : null
   }
 
+  const nonProbeOriginActorOf = (cap: string, visited = new Set<string>()): { actor: string | null; role: string | null; roleLabel: string | null } | null => {
+    const e = emitterByCap.get(cap)
+    if (!e || visited.has(cap) || visited.size > 8) return null
+    visited.add(cap)
+    if (!isLoginEx(e) && e.step.arm === 'probe') return null
+    const a = actorOfEntry(e)
+    const cleanActor = (!a || anonActorRe.test(a) || a.startsWith('cap:')) ? null : a
+    const r = roleOfEntry(e)
+    if (cleanActor || r || e.actorRoleLabel) return { actor: cleanActor, role: r, roleLabel: e.actorRoleLabel ?? null }
+    const parents = [...(a?.startsWith('cap:') ? [a] : []), ...(e.consumedCapabilities ?? []), ...(e.cryptoAttestations ?? []).map(x => x.derivedFromCapabilityId)]
+    for (const parent of parents) {
+      const origin = nonProbeOriginActorOf(parent, visited)
+      if (origin) return origin
+    }
+    // A non-login capability with no attributable attacker origin is host privilege, not DAG-minted evidence.
+    return isLoginEx(e) ? null : { actor: 'unattributed', role: 'owner', roleLabel: 'owner (unattributed)' }
+  }
+
   const actorOf = (cap: string, visited = new Set<string>()): string | null => {
     if (visited.has(cap) || visited.size > 8) return null
     visited.add(cap)
@@ -237,7 +260,7 @@ export function buildCapOriginIndex(entries: Iterable<HydratableEntry>, anonActo
     return null
   }
 
-  return { loginTenantOf, loginActorOf, actorOf: (cap: string) => actorOf(cap) }
+  return { loginTenantOf, loginActorOf, nonProbeOriginActorOf, actorOf: (cap: string) => actorOf(cap) }
 }
 
 /** True when a hydrated `HostSignedRecord` is an intermediate job/export/handle stub rather than terminal impact. */
@@ -591,54 +614,223 @@ function collectJsonStringLeaves(node: unknown, out: Set<string>, depth = 0): vo
   else if (typeof node === 'object') for (const x of Object.values(node as Record<string, unknown>)) collectJsonStringLeaves(x, out, depth + 1)
 }
 
+const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+function delimitedTokenMatch(text: string, needle: string): boolean {
+  if (!text || !needle) return false
+  if (text.trim() === needle) return true
+  if (needle.length < 4) return false
+  return new RegExp(`(?:^|[^A-Za-z0-9_-])${escapeRegExp(needle)}(?:$|[^A-Za-z0-9_-])`).test(text)
+}
+
 function recordContainsToken(rec: HostSignedRecord | undefined, token: string): boolean {
   const needle = token.trim()
   if (!rec || !needle) return false
   const leaves = new Set<string>()
   collectJsonStringLeaves(parseRecJson(rec), leaves)
   if (leaves.has(needle)) return true
-  for (const leaf of leaves) if (leaf.includes(needle)) return true
-  return typeof rec.body === 'string' && rec.body.includes(needle)
+  if (needle.length >= 4) {
+    for (const leaf of leaves) if (delimitedTokenMatch(leaf, needle)) return true
+    if (typeof rec.body === 'string' && delimitedTokenMatch(rec.body, needle)) return true
+  }
+  return false
+}
+
+function entryReferencesToken(entry: HydratableEntry | undefined, token: string): boolean {
+  const needle = token.trim()
+  if (!entry || !needle) return false
+  if (entry.entityId === needle || entry.correlationIds?.includes(needle)) return true
+  const pq = entry.step.pathAndQuery ?? entry.step.route ?? ''
+  if (pq) {
+    const [rawPath = '', rawQuery = ''] = pq.split('?', 2)
+    for (const seg of rawPath.split('/')) {
+      if (seg === needle) return true
+      try { if (decodeURIComponent(seg) === needle) return true } catch { /* ignore */ }
+    }
+    if (rawQuery) {
+      for (const v of new URLSearchParams(rawQuery).values()) {
+        if (v === needle || v.split(',').map(x => x.trim()).includes(needle)) return true
+      }
+    }
+  }
+  const leaves = new Set<string>()
+  collectJsonStringLeaves(entry.step.requestJson, leaves)
+  if (leaves.has(needle)) return true
+  if (typeof entry.step.requestJson === 'string' && delimitedTokenMatch(entry.step.requestJson, needle)) return true
+  if (entry.carrierText && delimitedTokenMatch(entry.carrierText, needle)) return true
+  return false
 }
 
 function entryContainsCorrelation(entry: HydratableEntry | undefined, token: string): boolean {
   const needle = token.trim()
   if (!entry || !needle) return false
   if (entry.correlationIds?.includes(needle) || entry.entityId === needle) return true
-  if ((entry.step.pathAndQuery ?? entry.step.route ?? '').includes(needle)) return true
-  if (typeof entry.step.body === 'string' && entry.step.body.includes(needle)) return true
+  if (entryReferencesToken(entry, needle)) return true
   const leaves = new Set<string>()
-  collectJsonStringLeaves(entry.step.requestJson, leaves)
   collectJsonStringLeaves(entry.step.json, leaves)
-  for (const leaf of leaves) if (leaf === needle || leaf.includes(needle)) return true
+  if (leaves.has(needle)) return true
+  if (needle.length >= 4) {
+    for (const leaf of leaves) if (delimitedTokenMatch(leaf, needle)) return true
+    if (typeof entry.step.body === 'string' && delimitedTokenMatch(entry.step.body, needle)) return true
+  }
   return false
 }
 
-function extractRequestSigDigest(rec: HostSignedRecord | undefined): string | undefined {
-  if (!rec?.requestHeaders) return undefined
-  for (const [k, v] of Object.entries(rec.requestHeaders)) {
-    if (SIG_HEADER_NAMES.has(k.toLowerCase()) && typeof v === 'string') {
-      const trimmed = v.trim()
-      if (trimmed && !trimmed.includes('[redacted')) return sha256Hex(trimmed)
+const SIG_QUERY_KEYS = new Set(['sig', 'signature', 'hmac', 'mac', 'token', 'x-amz-signature'])
+const VOLATILE_DIFF_HEADERS = new Set([
+  'host', 'content-length', 'connection', 'user-agent', 'accept', 'accept-encoding',
+  'x-request-id', 'x-correlation-id', 'x-trace-id', 'traceparent', 'tracestate', 'date',
+])
+const INTERNAL_TRANSFER_PAIRS: readonly [string, string][] = [
+  ['from', 'to'], ['source', 'destination'], ['fromaccount', 'toaccount'],
+  ['sourceaccount', 'destinationaccount'], ['debitaccount', 'creditaccount'],
+]
+
+function extractRequestSigDigest(rec: HostSignedRecord | undefined, entry?: HydratableEntry): string | undefined {
+  if (rec?.requestHeaders) {
+    for (const [k, v] of Object.entries(rec.requestHeaders)) {
+      if (SIG_HEADER_NAMES.has(k.toLowerCase()) && typeof v === 'string') {
+        const trimmed = v.trim()
+        if (trimmed && !trimmed.includes('[redacted')) return sha256Hex(trimmed)
+      }
+    }
+  }
+  const pq = entry?.step.pathAndQuery ?? rec?.route ?? ''
+  const qIdx = pq.indexOf('?')
+  if (qIdx >= 0) {
+    for (const [k, v] of new URLSearchParams(pq.slice(qIdx + 1)).entries()) {
+      if (SIG_QUERY_KEYS.has(k.toLowerCase()) && v.trim() && !v.includes('[redacted')) return sha256Hex(v.trim())
     }
   }
   return undefined
 }
 
-function sanitizeDualActor(rawActor: unknown): { actorId: string; rolesByTenant: Record<string, string> } | undefined {
-  if (!rawActor || typeof rawActor !== 'object' || Array.isArray(rawActor)) return undefined
-  const obj = rawActor as Record<string, unknown>
-  const actorId = pickStr(obj, 'actorId', 128)
-  if (!actorId) return undefined
-  const rolesByTenant: Record<string, string> = {}
-  if (obj.rolesByTenant && typeof obj.rolesByTenant === 'object' && !Array.isArray(obj.rolesByTenant)) {
-    for (const [k, v] of Object.entries(obj.rolesByTenant as Record<string, unknown>).slice(0, 16)) {
-      if (!FORBIDDEN_KEYS.has(k) && typeof v === 'string' && v.trim().length > 0 && v.length <= 64) {
-        rolesByTenant[k.trim()] = v.trim()
-      }
+function extractIssuedSigDigest(entry: HydratableEntry | undefined): string | undefined {
+  if (!entry) return undefined
+  const json = entry.step.json
+  if (json && typeof json === 'object') {
+    const sigVal = findStringField(json, ['signature', 'sig', 'hmac', 'mac', 'signedurl', 'signed_url', 'presignedurl', 'presigned_url'])
+    if (sigVal && !sigVal.includes('[redacted')) {
+      const m = /[?&](?:sig|signature|hmac|mac)=([^&]+)/i.exec(sigVal)
+      if (!m?.[1]) return sha256Hex(sigVal)
+      try { return sha256Hex(decodeURIComponent(m[1])) } catch { return sha256Hex(m[1]) }
     }
   }
+  return undefined
+}
+
+const ANON_HANDLE_RE = /^(?:anon(?:ymous)?|unauth(?:enticated)?|guest)$/i
+
+function deriveDualActorFromTranscript(
+  idx: HydratableTranscriptIndex,
+  citedEntries: readonly (HydratableEntry | undefined)[],
+  rawActor: unknown,
+): { actorId: string; rolesByTenant: Record<string, RoleName> } | undefined {
+  const rawId = rawActor && typeof rawActor === 'object' && !Array.isArray(rawActor)
+    ? pickStr(rawActor as Record<string, unknown>, 'actorId', 128)
+    : undefined
+  const citedActors = citedEntries
+    .map(e => (e ? actorOfEntry(e)?.trim() ?? '' : ''))
+    .filter(a => Boolean(a) && !ANON_HANDLE_RE.test(a) && !a.startsWith('cap:'))
+  if (citedActors.length === 0) return undefined
+  let actorId: string | undefined
+  if (rawId) {
+    actorId = citedActors.find(a => a.toLowerCase() === rawId.toLowerCase())
+    if (!actorId) return undefined
+  } else {
+    actorId = citedActors[0]
+  }
+  if (!actorId) return undefined
+  const rolesByTenant: Record<string, RoleName> = {}
+  const recordRole = (tenant: string | null | undefined, role: RoleName | null | undefined) => {
+    const t = tenant?.trim().toLowerCase()
+    if (!t || !role || FORBIDDEN_KEYS.has(t)) return
+    const prev = rolesByTenant[t]
+    if (!prev || ROLE_RANK[role] > ROLE_RANK[prev]) rolesByTenant[t] = role
+  }
+  const actorLower = actorId.toLowerCase()
+  for (const e of idx.entriesById.values()) {
+    const ea = actorOfEntry(e)?.trim().toLowerCase() ?? ''
+    if (ea !== actorLower) continue
+    if (e.actorRoleLabel) {
+      for (const m of parseRoleMemberships(e.actorRoleLabel)) recordRole(m.tenant, m.role)
+      const pl = parseRoleLabel(e.actorRoleLabel)
+      recordRole(pl.tenant, pl.role)
+    }
+    recordRole(e.step.actor.tenant ?? parseRoleLabel(e.actorPersona ?? '').tenant, normalizeRole(roleOfEntry(e) ?? undefined))
+  }
   return { actorId, rolesByTenant }
+}
+
+function canonicalDiffHeaders(headers: Readonly<Record<string, string>> | null | undefined): string {
+  if (!headers) return ''
+  return Object.entries(headers)
+    .map(([k, v]) => [k.trim().toLowerCase(), String(v).trim()] as const)
+    .filter(([k]) => Boolean(k) && !VOLATILE_DIFF_HEADERS.has(k))
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([k, v]) => `${k}:${v}`)
+    .join('\n')
+}
+
+function headerLookupCI(headers: Readonly<Record<string, string>> | null | undefined, name: string): string {
+  if (!headers) return ''
+  const target = name.toLowerCase()
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.trim().toLowerCase() === target) return String(v).trim()
+  }
+  return ''
+}
+
+function rawRequestBodyText(entry: HydratableEntry | undefined): string {
+  if (!entry) return ''
+  const req = entry.step.requestJson
+  if (typeof req === 'string') return req.trim()
+  if (req !== undefined && req !== null) {
+    try { return JSON.stringify(req) } catch { return '' }
+  }
+  const response = typeof entry.step.body === 'string'
+    ? entry.step.body
+    : entry.step.json !== undefined ? JSON.stringify(entry.step.json) : null
+  return parseBodyFromCarrierText(entry.carrierText, entry.step.requestHeaders, response)?.trim() ?? ''
+}
+
+function hasDuplicateJsonKeyInRaw(raw: string): boolean {
+  const s = raw.trim()
+  if (!s.startsWith('{') && !s.startsWith('[')) return false
+  const stack: Array<Set<string> | null> = []
+  let i = 0
+  while (i < s.length) {
+    const ch = s[i]!
+    if (ch === '{') { stack.push(new Set<string>()); i += 1; continue }
+    if (ch === '[') { stack.push(null); i += 1; continue }
+    if (ch === '}' || ch === ']') { stack.pop(); i += 1; continue }
+    if (ch === '"') {
+      let j = i + 1
+      while (j < s.length) {
+        if (s[j] === '\\') { j += 2; continue }
+        if (s[j] === '"') break
+        j += 1
+      }
+      const key = s.slice(i + 1, j)
+      let k = j + 1
+      while (k < s.length && /\s/.test(s[k]!)) k += 1
+      const top = stack[stack.length - 1]
+      if (s[k] === ':' && top instanceof Set) {
+        if (top.has(key)) return true
+        top.add(key)
+      }
+      i = j + 1
+      continue
+    }
+    i += 1
+  }
+  return false
+}
+
+function isInternalTransferRequest(request: unknown): boolean {
+  if (!request || typeof request !== 'object' || Array.isArray(request)) return false
+  const keys = new Set(Object.keys(request as Record<string, unknown>).map(key => key.replace(/[_-]/g, '').toLowerCase()))
+  return INTERNAL_TRANSFER_PAIRS.some(([from, to]) => keys.has(from) && keys.has(to))
 }
 
 /**
@@ -663,24 +855,53 @@ export function hydrateV8OracleInput(
   if (family === 'dual_tenant_abac') {
     const mode = pickEnum(rawInput, 'mode', DUAL_MODE_SET)
     if (mode) out.mode = mode
-    const actor = sanitizeDualActor(rawInput.actor)
+    const citedEntry = (field: string): HydratableEntry | undefined =>
+      isRecObj(out[field]) ? idx.entriesById.get((out[field] as HostSignedRecord).id) : undefined
+    const cited = [
+      citedEntry('transferRecord'), citedEntry('postTransferReadback'), citedEntry('sourceControlDenied'),
+      citedEntry('baselineDeniedControl'), citedEntry('primeAction'), citedEntry('bledAccess'),
+      citedEntry('singleForeignControlDenied'), citedEntry('batchRequest'), citedEntry('postMutationReadback'),
+    ]
+    const actor = deriveDualActorFromTranscript(idx, cited, rawInput.actor)
     if (actor) out.actor = actor
-    for (const k of ['sourceTenantId', 'destTenantId', 'entityId', 'requiredSourceRole', 'requiredDestRole', 'primeTenantId', 'targetTenantId', 'requiredRole', 'ownTenantId', 'foreignTenantId', 'ownRecordId', 'foreignRecordId'] as const) {
+    // Allowlist ONLY record selector IDs; tenant scope and role requirements are host-derived.
+    for (const k of ['entityId', 'ownRecordId', 'foreignRecordId'] as const) {
       const v = pickStr(rawInput, k, 128)
       if (v) out[k] = v
     }
+    const tenantOf = (e: HydratableEntry | undefined): string | null =>
+      (e?.step.actor.tenant ?? parseRoleLabel(e?.actorRoleLabel ?? e?.actorPersona ?? '').tenant ?? '').trim().toLowerCase() || null
+    const markersOf = (e: HydratableEntry | undefined): Set<string> => new Set([
+      ...extractTenantMarkers(e?.step.json, e?.step.body),
+      ...extractTenantMarkers(e?.step.requestJson),
+      ...extractTenantMarkers(undefined, typeof e?.step.requestJson === 'string' ? e.step.requestJson : undefined),
+    ])
     if (mode === 'cross_org_transfer') {
       const rb = isRecObj(out.postTransferReadback) ? out.postTransferReadback : undefined
-      const ownerTenant = findStringField(
-        parseRecJson(rb),
-        ['ownertenantid', 'owner_tenant_id', 'ownerorgid', 'owner_org_id', 'destinationtenant', 'destination_tenant', 'desttenantid', 'dest_tenant_id', 'tenantid', 'tenant_id', 'tenant', 'orgid', 'org_id'],
-        rawInput.ownerTenantFieldPath,
+      const xferEntry = citedEntry('transferRecord')
+      const ctrlEntry = citedEntry('sourceControlDenied')
+      const sourceTenant = tenantOf(ctrlEntry)
+      const ownerTenant = findStringField(parseRecJson(rb), ['ownertenantid', 'owner_tenant_id', 'ownerorgid', 'owner_org_id', 'destinationtenant', 'destination_tenant', 'desttenantid', 'dest_tenant_id', 'tenantid', 'tenant_id', 'tenant', 'orgid', 'org_id'])?.trim().toLowerCase()
+      if (sourceTenant) out.sourceTenantId = sourceTenant
+      if (ownerTenant) out.destTenantId = ownerTenant
+      const eid = typeof out.entityId === 'string' ? out.entityId : ''
+      const entityBound = Boolean(
+        eid && rb && recordContainsToken(rb, eid)
+        && (entryReferencesToken(xferEntry, eid) || entryReferencesToken(ctrlEntry, eid) || recordContainsToken(isRecObj(out.transferRecord) ? out.transferRecord : undefined, eid)),
       )
+      if (!entityBound) delete out.entityId
       if (ownerTenant) out.observedOwnerTenantId = ownerTenant
     } else if (mode === 'dual_org_cache_bleed') {
       const bled = isRecObj(out.bledAccess) ? out.bledAccess : undefined
+      const primeEntry = citedEntry('primeAction'), controlEntry = citedEntry('baselineDeniedControl')
+      const primeTenant = tenantOf(primeEntry) ?? tenantOf(controlEntry)
+      const markers = markersOf(citedEntry('bledAccess'))
+      if (primeTenant) out.primeTenantId = primeTenant
+      if (markers.size === 1) {
+        const target = [...markers][0]!
+        if (target !== primeTenant) out.targetTenantId = target
+      }
       if (bled) {
-        const markers = extractTenantMarkers(bled.json, bled.body)
         const target = typeof out.targetTenantId === 'string' ? out.targetTenantId.trim().toLowerCase() : ''
         if (target && markers.has(target)) out.observedTenantId = out.targetTenantId
         else if (markers.size > 0) out.observedTenantId = [...markers][0]
@@ -690,18 +911,23 @@ export function hydrateV8OracleInput(
     } else if (mode === 'batch_partial_authz') {
       const batchRec = isRecObj(out.batchRequest) ? out.batchRequest : undefined
       const batchEntry = batchRec ? idx.entriesById.get(batchRec.id) : undefined
-      if (Array.isArray(rawInput.requestedIds)) {
+      const ctrlEntry = citedEntry('singleForeignControlDenied')
+      const ownTenant = tenantOf(batchEntry) ?? tenantOf(ctrlEntry)
+      const foreignTenants = new Set([...markersOf(batchEntry), ...markersOf(ctrlEntry)])
+      if (ownTenant) {
+        out.ownTenantId = ownTenant
+        foreignTenants.delete(ownTenant)
+      }
+      if (foreignTenants.size === 1) out.foreignTenantId = [...foreignTenants][0]
+      if (Array.isArray(rawInput.requestedIds) && batchEntry) {
         const rawIds = rawInput.requestedIds.filter((x): x is string => typeof x === 'string' && x.trim().length > 0 && x.length <= 128).map(x => x.trim()).slice(0, 32)
-        if (batchEntry && (batchEntry.step.requestJson !== undefined || (batchEntry.step.pathAndQuery ?? '').includes('?'))) {
-          const reqLeaves = new Set<string>()
-          collectJsonStringLeaves(batchEntry.step.requestJson, reqLeaves)
-          const pq = batchEntry.step.pathAndQuery ?? ''
-          out.requestedIds = rawIds.filter(id => reqLeaves.has(id) || pq.includes(id))
-        } else {
-          out.requestedIds = rawIds
-        }
+        // Strictly derive requestedIds from host-recorded batch request payload/path/query (never verbatim rawInput).
+        out.requestedIds = rawIds.filter(id => entryReferencesToken(batchEntry, id))
       }
       const foreignId = typeof out.foreignRecordId === 'string' ? out.foreignRecordId : ''
+      if (ctrlEntry && foreignId && (ctrlEntry.step.pathAndQuery || ctrlEntry.step.requestJson !== undefined)) {
+        if (!entryReferencesToken(ctrlEntry, foreignId)) delete out.foreignRecordId
+      }
       if (batchRec && foreignId && recordContainsToken(batchRec, foreignId) && !isHydratedStub(batchRec)) {
         out.returnedForeignIds = [foreignId]
         out.foreignDataObserved = true
@@ -750,25 +976,33 @@ export function hydrateV8OracleInput(
     const tEntry = tRec ? idx.entriesById.get(tRec.id) : undefined
     const sEntry = sRec ? idx.entriesById.get(sRec.id) : undefined
     const rEntry = rRec ? idx.entriesById.get(rRec.id) : undefined
+    // Bind sourceTenant / targetTenant to host-observed tenants when present.
+    const hostSrcTenant = (sEntry?.step.actor.tenant ?? parseRoleLabel(sEntry?.actorRoleLabel ?? '').tenant)?.trim().toLowerCase()
+    if (hostSrcTenant) out.sourceTenant = hostSrcTenant
+    if (rEntry) {
+      const rMarkers = extractTenantMarkers(rEntry.step.json, rEntry.step.body)
+      const rawTarget = typeof out.targetTenant === 'string' ? out.targetTenant.trim().toLowerCase() : ''
+      if (rMarkers.size > 0) {
+        if (rawTarget && rMarkers.has(rawTarget)) out.targetTenant = rawTarget
+        else out.targetTenant = [...rMarkers][0]
+      }
+    }
+    // Bind cryptographic digests STRICTLY to cryptoAttestations or request signature/token headers/query —
+    // NEVER response-body hashes (`observedResponseDigests` / `rec.artifactDigest`).
     const emittedSet = new Set(sEntry?.emittedCapabilities ?? [])
     const linkedAtt = rEntry?.cryptoAttestations?.find(a => emittedSet.has(a.derivedFromCapabilityId))
     const replayedDigest = linkedAtt?.artifactDigest
       ?? rEntry?.cryptoAttestations?.[0]?.artifactDigest
-      ?? rEntry?.observedResponseDigests?.[0]
-      ?? extractRequestSigDigest(rRec)
-      ?? rRec?.artifactDigest
-      ?? undefined
+      ?? extractRequestSigDigest(rRec, rEntry)
     const sourceDigest = linkedAtt?.artifactDigest
-      ?? sEntry?.observedResponseDigests?.[0]
-      ?? sRec?.artifactDigest
-      ?? undefined
-    const tamperedDigest = tEntry?.observedResponseDigests?.[0]
-      ?? extractRequestSigDigest(tRec)
-      ?? tRec?.artifactDigest
-      ?? undefined
-    if (tamperedDigest) out.tamperedSignatureDigest = tamperedDigest
-    if (sourceDigest) out.signatureDigest = sourceDigest
-    if (replayedDigest) out.replayedSignatureDigest = replayedDigest
+      ?? sEntry?.cryptoAttestations?.[0]?.artifactDigest
+      ?? extractRequestSigDigest(sRec, sEntry)
+      ?? extractIssuedSigDigest(sEntry)
+    const tamperedDigest = tEntry?.cryptoAttestations?.[0]?.artifactDigest
+      ?? extractRequestSigDigest(tRec, tEntry)
+    out.tamperedSignatureDigest = tamperedDigest ?? ''
+    out.signatureDigest = sourceDigest ?? ''
+    out.replayedSignatureDigest = replayedDigest ?? ''
     return out
   }
 
@@ -782,11 +1016,35 @@ export function hydrateV8OracleInput(
       if (dk) out.differentialKind = dk
       if (df) out.differentialFeature = df
       if (ik) out.impactKind = ik
-      const cv = pickStr(rawInput, 'canonicalValue', 512)
-      const vv = pickStr(rawInput, 'variantValue', 512)
-      if (cv !== undefined) out.canonicalValue = cv
-      if (vv !== undefined) out.variantValue = vv
       const ctrl = isRecObj(out.cleanControl) ? out.cleanControl : undefined
+      const probe = isRecObj(out.differentialProbe) ? out.differentialProbe : undefined
+      const ctlEntry = ctrl ? idx.entriesById.get(ctrl.id) : undefined
+      const prbEntry = probe ? idx.entriesById.get(probe.id) : undefined
+      // Inspect actual HostFactLog request headers/paths/bodies to verify a real differential occurred;
+      // NEVER trust worker-supplied canonicalValue/variantValue verbatim.
+      if (dk && ctlEntry && prbEntry) {
+        if (dk === 'path_normalization') {
+          out.canonicalValue = ctlEntry.step.pathAndQuery ?? ctlEntry.step.route ?? ''
+          out.variantValue = prbEntry.step.pathAndQuery ?? prbEntry.step.route ?? ''
+        } else if (dk === 'content_type_confusion') {
+          const cCt = headerLookupCI(ctlEntry.step.requestHeaders, 'content-type')
+          const pCt = headerLookupCI(prbEntry.step.requestHeaders, 'content-type')
+          out.canonicalValue = cCt
+          out.variantValue = pCt || cCt
+        } else if (dk === 'header_normalization' || dk === 'hop_by_hop_smuggling') {
+          out.canonicalValue = canonicalDiffHeaders(ctlEntry.step.requestHeaders)
+          out.variantValue = canonicalDiffHeaders(prbEntry.step.requestHeaders)
+        } else if (dk === 'duplicate_json_key') {
+          const cBody = rawRequestBodyText(ctlEntry)
+          const pBody = rawRequestBodyText(prbEntry)
+          const hasDup = pBody.length > 0 && hasDuplicateJsonKeyInRaw(pBody)
+          out.canonicalValue = cBody
+          out.variantValue = hasDup ? pBody : cBody
+        }
+      } else {
+        out.canonicalValue = ''
+        out.variantValue = ''
+      }
       const rb = isRecObj(out.postMutationReadback) ? out.postMutationReadback : undefined
       if (ik === 'mutation' && rb) {
         const rbHasData = rb.json !== undefined || (typeof rb.body === 'string' && rb.body.trim().length > 0)
@@ -937,20 +1195,31 @@ export function hydrateV8OracleInput(
 
     const baseRec = isRecObj(out.baselineReadback) ? out.baselineReadback : undefined
     const finRec = isRecObj(out.finalReadback) ? out.finalReadback : undefined
-    const actRecs = Array.isArray(out.actions) ? (out.actions as unknown[]).filter(isRecObj) : []
+    // Deduplicate action exchange IDs so citing the same refund/deposit exchange twice cannot double-count.
+    const rawActRecs = Array.isArray(out.actions) ? (out.actions as unknown[]).filter(isRecObj) : []
+    const seenActIds = new Set<string>()
+    const actRecs: HostSignedRecord[] = []
+    for (const a of rawActRecs) {
+      if (seenActIds.has(a.id)) continue
+      seenActIds.add(a.id)
+      actRecs.push(a)
+    }
+    if (Array.isArray(out.actions) && actRecs.length !== rawActRecs.length) {
+      out.actions = actRecs
+    }
     const baseJson = parseRecJson(baseRec), finJson = parseRecJson(finRec)
 
     if (eq === 'over_refund') {
       const paidKeys = ['paidamount', 'paid_amount', 'paid', 'paidcents', 'paid_cents', 'orderamount', 'order_amount', 'amountpaid', 'amount_paid', 'totalpaid', 'total_paid', 'amount', 'total']
       const refTotKeys = ['refundedtotal', 'refunded_total', 'baselinerefunded', 'baseline_refunded', 'refundedamount', 'refunded_amount', 'refunded', 'totalrefunded', 'total_refunded']
       const actRefKeys = ['refunded', 'refundamount', 'refund_amount', 'refundedamount', 'refunded_amount', 'refundedcents', 'credited', 'amount']
-      const hostPaid = findNumericField(baseJson, paidKeys, rawInput.paidAmountFieldPath)
-        ?? findNumericField(finJson, paidKeys, rawInput.paidAmountFieldPath)
+      const hostPaid = findNumericField(baseJson, paidKeys)
+        ?? findNumericField(finJson, paidKeys)
       const hostBaseRef = findNumericField(baseJson, refTotKeys) ?? (hostPaid !== undefined ? 0 : undefined)
       const hostFinRef = findNumericField(finJson, refTotKeys)
       const hostActRefs = actRecs
         .filter(a => is2xx(a.status))
-        .map(a => findNumericField(parseRecJson(a), actRefKeys, rawInput.refundFieldPath))
+        .map(a => findNumericField(parseRecJson(a), actRefKeys))
         .filter((n): n is number => n !== undefined && n >= 0)
       const sumNums = (xs: readonly number[]) => xs.reduce((a, b) => a + b, 0)
       let derivedRefs: number[] | undefined
@@ -977,30 +1246,53 @@ export function hydrateV8OracleInput(
         out.refundedAmounts = rawRefs && sumNums(rawRefs) < sumNums(derivedRefs) ? rawRefs : derivedRefs
       }
     } else if (eq === 'balance_minting') {
-      const hostBefore = extractBalanceMap(baseRec, rawInput.balanceFieldPath)
-      const hostAfter = extractBalanceMap(finRec, rawInput.balanceFieldPath)
+      const hostBefore = extractBalanceMap(baseRec)
+      const hostAfter = extractBalanceMap(finRec)
       if (hostBefore && hostAfter) {
         out.balancesBefore = hostBefore
         out.balancesAfter = hostAfter
         const depKeys = ['credited', 'deposited', 'depositamount', 'deposit_amount', 'deposit', 'credit', 'amount', 'amountcents', 'amount_cents', 'delta']
-        const actDeps = actRecs
-          .filter(a => is2xx(a.status))
-          .map(a => {
-            const e = idx.entriesById.get(a.id)
-            return findNumericField(parseRecJson(a), depKeys) ?? findNumericField(e?.step.requestJson, depKeys)
-          })
-          .filter((n): n is number => n !== undefined && n >= 0)
-        const minAuthorized = actDeps.length > 0 ? Math.max(...actDeps) : 0
-        const rawDep = pickFiniteNonNeg(rawInput.authorizedDeposits) ?? 0
-        out.authorizedDeposits = Math.max(rawDep, minAuthorized)
+        // Sum ALL distinct non-transfer 2xx mutating/deposit exchanges across the entire host log
+        // window [baseline, final] (union with cited actions) so workers can neither omit real
+        // deposits nor undercount multiple deposits via Math.max.
+        const baseEntry = baseRec ? idx.entriesById.get(baseRec.id) : undefined
+        const finEntry = finRec ? idx.entriesById.get(finRec.id) : undefined
+        const baseSeq = typeof baseEntry?.seq === 'number' ? baseEntry.seq : null
+        const finSeq = typeof finEntry?.seq === 'number' ? finEntry.seq : null
+        const baseTs = baseRec?.timestampMs ?? 0
+        const finTs = finRec?.timestampMs ?? Number.POSITIVE_INFINITY
+        const depositEntries = new Map<string, HydratableEntry>()
+        for (const a of actRecs) {
+          const e = idx.entriesById.get(a.id)
+          if (e) depositEntries.set(e.exchangeId, e)
+        }
+        for (const e of idx.entriesById.values()) {
+          if (e.exchangeId === baseRec?.id || e.exchangeId === finRec?.id) continue
+          if (!is2xx(e.step.status) || stepReadsState(e.step)) continue
+          const inSeq = baseSeq !== null && finSeq !== null && typeof e.seq === 'number'
+            ? (e.seq >= baseSeq && e.seq <= finSeq)
+            : true
+          const eTs = isPosTs(e.timestampMs) ? e.timestampMs : null
+          const inTs = eTs !== null ? (eTs >= baseTs && eTs <= finTs) : true
+          if (inSeq && inTs) depositEntries.set(e.exchangeId, e)
+        }
+        let summedDeposits = 0
+        for (const e of depositEntries.values()) {
+          if (!is2xx(e.step.status) || stepReadsState(e.step)) continue
+          // Internal transfers between two ledger accounts do not inject external value.
+          if (isInternalTransferRequest(e.step.requestJson)) continue
+          const amt = findNumericField(e.step.json, depKeys) ?? findNumericField(e.step.requestJson, depKeys)
+          if (amt !== undefined && amt > 0) summedDeposits += amt
+        }
+        out.authorizedDeposits = summedDeposits
         out.authorizedWithdrawals = 0
       }
     } else if (eq === 'underpaid_fulfillment') {
-      const hostPaid = findNumericField(finJson, ['paidamount', 'paid_amount', 'paid', 'amountpaid', 'amount_paid', 'chargedamount', 'charged'], rawInput.paidAmountFieldPath)
-        ?? findNumericField(baseJson, ['paidamount', 'paid_amount', 'paid', 'amountpaid', 'amount_paid', 'chargedamount', 'charged'], rawInput.paidAmountFieldPath)
-      const hostVal = findNumericField(finJson, ['fulfilledvalue', 'fulfilled_value', 'ordertotal', 'order_total', 'totalamount', 'total_amount', 'itemvalue', 'subtotal', 'price', 'value'], rawInput.fulfilledValueFieldPath)
-        ?? findNumericField(baseJson, ['fulfilledvalue', 'fulfilled_value', 'ordertotal', 'order_total', 'totalamount', 'total_amount', 'itemvalue', 'subtotal', 'price', 'value'], rawInput.fulfilledValueFieldPath)
-      const hostState = findStringField(finJson, ['fulfillmentstate', 'fulfillment_state', 'orderstatus', 'order_status', 'status', 'state'], rawInput.fulfillmentStateFieldPath)
+      const hostPaid = findNumericField(finJson, ['paidamount', 'paid_amount', 'paid', 'amountpaid', 'amount_paid', 'chargedamount', 'charged'])
+        ?? findNumericField(baseJson, ['paidamount', 'paid_amount', 'paid', 'amountpaid', 'amount_paid', 'chargedamount', 'charged'])
+      const hostVal = findNumericField(finJson, ['fulfilledvalue', 'fulfilled_value', 'ordertotal', 'order_total', 'totalamount', 'total_amount', 'itemvalue', 'subtotal', 'price', 'value'])
+        ?? findNumericField(baseJson, ['fulfilledvalue', 'fulfilled_value', 'ordertotal', 'order_total', 'totalamount', 'total_amount', 'itemvalue', 'subtotal', 'price', 'value'])
+      const hostState = findStringField(finJson, ['fulfillmentstate', 'fulfillment_state', 'orderstatus', 'order_status', 'status', 'state'])
       if (hostPaid !== undefined) {
         const rawPaid = pickFiniteNonNeg(rawInput.paidAmount)
         out.paidAmount = rawPaid !== undefined && rawPaid > hostPaid ? rawPaid : hostPaid
@@ -1011,12 +1303,12 @@ export function hydrateV8OracleInput(
       }
       if (hostState) out.fulfillmentState = hostState
     } else if (eq === 'ineligible_discount') {
-      const hostSub = findNumericField(finJson, ['subtotalamount', 'subtotal_amount', 'subtotal', 'cartsubtotal', 'prediscounttotal'], rawInput.subtotalFieldPath)
-        ?? findNumericField(baseJson, ['subtotalamount', 'subtotal_amount', 'subtotal', 'cartsubtotal', 'prediscounttotal'], rawInput.subtotalFieldPath)
-      const hostThr = findNumericField(finJson, ['requiredthreshold', 'required_threshold', 'minorderamount', 'min_order_amount', 'minimumsubtotal', 'threshold', 'minspend'], rawInput.thresholdFieldPath)
-        ?? findNumericField(baseJson, ['requiredthreshold', 'required_threshold', 'minorderamount', 'min_order_amount', 'minimumsubtotal', 'threshold', 'minspend'], rawInput.thresholdFieldPath)
-      const hostDisc = findNumericField(finJson, ['discountapplied', 'discount_applied', 'discountamount', 'discount_amount', 'discount'], rawInput.discountFieldPath)
-      const hostTotal = findNumericField(finJson, ['finaltotalpaid', 'final_total_paid', 'totalpaid', 'total_paid', 'finaltotal', 'total'], rawInput.finalTotalFieldPath)
+      const hostSub = findNumericField(finJson, ['subtotalamount', 'subtotal_amount', 'subtotal', 'cartsubtotal', 'prediscounttotal'])
+        ?? findNumericField(baseJson, ['subtotalamount', 'subtotal_amount', 'subtotal', 'cartsubtotal', 'prediscounttotal'])
+      const hostThr = findNumericField(finJson, ['requiredthreshold', 'required_threshold', 'minorderamount', 'min_order_amount', 'minimumsubtotal', 'threshold', 'minspend'])
+        ?? findNumericField(baseJson, ['requiredthreshold', 'required_threshold', 'minorderamount', 'min_order_amount', 'minimumsubtotal', 'threshold', 'minspend'])
+      const hostDisc = findNumericField(finJson, ['discountapplied', 'discount_applied', 'discountamount', 'discount_amount', 'discount'])
+      const hostTotal = findNumericField(finJson, ['finaltotalpaid', 'final_total_paid', 'totalpaid', 'total_paid', 'finaltotal', 'total'])
       if (hostSub !== undefined) out.subtotalAmount = hostSub
       if (hostThr !== undefined) out.requiredThreshold = hostThr
       if (hostDisc !== undefined) out.discountApplied = hostDisc

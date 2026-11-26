@@ -26,7 +26,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } 
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import { EgressDeniedError, EgressGateway } from './egress-gateway.ts'
 import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
@@ -58,7 +58,7 @@ import type {
   HostJwtAlg,
   InjectCapabilityTarget,
 } from './derived-custody.ts'
-import { signHostRecord, verifyCompositeReceipt } from './composite-receipt.ts'
+import { signHostRecord } from './composite-receipt.ts'
 import type {
   CompositeReceiptVerification,
   CompositeVerifyOptions,
@@ -69,6 +69,8 @@ import type {
   HostSignedTranscript,
   HostTranscriptEntry,
 } from './composite-receipt.ts'
+import { HostFactLog, deriveAmbientAuthFromHeaders } from './host-fact-log.ts'
+import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
 import { isReadMethod, normalizeRole, parseRoleLabel } from './oracle-invariants.ts'
 import type { ImpactStep } from './oracle-invariants.ts'
 import {
@@ -393,12 +395,21 @@ export class VerifyRpcServer {
       mkdirSync(configured, { recursive: true, mode: 0o711 })
       this.hostDirValue = configured
     } else {
-      // Prefer a real tmpfs so the socket directory is memory-backed on the host too.
-      const tmpfsBase = existsSync('/dev/shm') ? '/dev/shm' : tmpdir()
-      try {
-        this.hostDirValue = mkdtempSync(join(tmpfsBase, 'kovo-verify-rpc-'))
-      } catch {
-        this.hostDirValue = mkdtempSync(join(tmpdir(), 'kovo-verify-rpc-'))
+      const containerScratch = process.env.KOVO_CONTAINER_SCRATCH_DIR?.trim() || ''
+      if (containerScratch) {
+        if (/[\0,\r\n]/.test(containerScratch) || !containerScratch.startsWith('/') || containerScratch.split('/').includes('..')) throw new Error('Invalid KOVO_CONTAINER_SCRATCH_DIR path.')
+        const scratchRoot = resolve(containerScratch)
+        if (scratchRoot === '/') throw new Error('KOVO_CONTAINER_SCRATCH_DIR must not be root "/".')
+        mkdirSync(scratchRoot, { recursive: true, mode: 0o711 })
+        this.hostDirValue = mkdtempSync(join(scratchRoot, 'kovo-verify-rpc-'))
+      } else {
+        // Prefer a real tmpfs so the socket directory is memory-backed on the host too.
+        const tmpfsBase = existsSync('/dev/shm') ? '/dev/shm' : tmpdir()
+        try {
+          this.hostDirValue = mkdtempSync(join(tmpfsBase, 'kovo-verify-rpc-'))
+        } catch {
+          this.hostDirValue = mkdtempSync(join(tmpdir(), 'kovo-verify-rpc-'))
+        }
       }
     }
     // 0711: the sandbox uid can traverse to the mounted files without listing the host directory.
@@ -2093,7 +2104,7 @@ export class VerifyRpcServer {
             handle,
             role,
             tenant,
-            auth: 'unknown',
+            auth: deriveAmbientAuthFromHeaders(record.request?.headers ?? null),
             sameSite: sameSiteFromRecord(record),
           },
           ...(parsedJson !== undefined ? { json: parsedJson } : {}),
@@ -2133,11 +2144,18 @@ export class VerifyRpcServer {
     options?: Omit<CompositeVerifyOptions, 'signingKey'>,
   ): CompositeReceiptVerification {
     const transcript = this.buildHostSignedTranscript()
-    return verifyCompositeReceipt(rawReceipt, transcript, {
-      ...this.options.compositeVerifyOptions,
-      ...options,
-      signingKey: this.compositeSigningKey,
-    })
+    const factLog = HostFactLog.fromTranscript(transcript)
+    const compositeOptions = { ...this.options.compositeVerifyOptions, ...options }
+    const res = defaultTerminalOracleRegistry.evaluate(
+      factLog,
+      { kind: 'composite', receipt: rawReceipt },
+      {
+        compositeOptions,
+        signingKey: this.compositeSigningKey,
+        strictHostDerivation: true,
+      },
+    )
+    return res.composite!
   }
 
   private handleCompositeVerify(args: Record<string, unknown>): unknown {

@@ -214,11 +214,11 @@ test('TerminalOracleRegistry: dispatches single-hop ProofReceipt rules (incl. 1-
     entries: [
       signedEntry({
         exchangeId: 'dt-ctrl', seq: 1, timestampMs: 1000, actorPersona: 'bob', actorRoleLabel: 'member (tenant-a)',
-        step: { id: 'dt-ctrl', arm: 'control', method: 'POST', route: '/api/transfer', pathAndQuery: '/api/transfer', status: 403, actor: { handle: 'bob', role: 'member', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, body: '{"error":"forbidden"}' },
+        step: { id: 'dt-ctrl', arm: 'control', method: 'POST', route: '/api/transfer', pathAndQuery: '/api/transfer', status: 403, actor: { handle: 'bob', role: 'member', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, requestJson: { entityId: 'ent-9', destTenant: 'tenant-b' }, body: '{"error":"forbidden"}' },
       }),
       signedEntry({
         exchangeId: 'dt-xfer', seq: 2, timestampMs: 1100, actorPersona: 'bob', actorRoleLabel: 'admin (tenant-b)',
-        step: { id: 'dt-xfer', arm: 'probe', method: 'POST', route: '/api/transfer', pathAndQuery: '/api/transfer', status: 200, actor: { handle: 'bob', role: 'admin', tenant: 'tenant-b', auth: 'bearer', sameSite: null }, body: '{"transferred":true}' },
+        step: { id: 'dt-xfer', arm: 'probe', method: 'POST', route: '/api/transfer', pathAndQuery: '/api/transfer', status: 200, actor: { handle: 'bob', role: 'admin', tenant: 'tenant-b', auth: 'bearer', sameSite: null }, requestJson: { entityId: 'ent-9', destTenant: 'tenant-b' }, body: '{"transferred":true}' },
       }),
       signedEntry({
         exchangeId: 'dt-rb', seq: 3, timestampMs: 1200, actorPersona: 'bob', actorRoleLabel: 'admin (tenant-b)',
@@ -325,7 +325,7 @@ test('TerminalOracleRegistry: dispatches single-hop ProofReceipt rules (incl. 1-
     entries: [
       signedEntry({
         exchangeId: 'cr-tamp', seq: 1, timestampMs: 4000, observedResponseDigests: [tamperedSigDigest],
-        step: { id: 'cr-tamp', arm: 'control', method: 'POST', route: '/api/webhooks/ingest', pathAndQuery: '/api/webhooks/ingest', status: 401, actor: { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null }, body: '{"error":"invalid_sig"}' },
+        step: { id: 'cr-tamp', arm: 'control', method: 'POST', route: '/api/webhooks/ingest', pathAndQuery: '/api/webhooks/ingest', status: 401, actor: { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null }, requestHeaders: { 'x-signature': 'tampered-hmac-sig' }, body: '{"error":"invalid_sig"}' },
       }),
       signedEntry({
         exchangeId: 'cr-iss', seq: 2, timestampMs: 4100, emittedCapabilities: ['cap:hop_1:sig'], observedResponseDigests: [validSigDigest],
@@ -333,7 +333,7 @@ test('TerminalOracleRegistry: dispatches single-hop ProofReceipt rules (incl. 1-
       }),
       signedEntry({
         exchangeId: 'cr-rep', seq: 3, timestampMs: 4200, cryptoAttestations: [{ derivedFromCapabilityId: 'cap:hop_1:sig', alg: 'hmac-sha256', artifactDigest: validSigDigest, timestampMs: 4150 }],
-        step: { id: 'cr-rep', arm: 'probe', method: 'POST', route: '/api/webhooks/ingest', pathAndQuery: '/api/webhooks/ingest', status: 200, actor: { handle: 'alice', role: 'member', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, json: { tenantId: 'tenant-b', invoicePaid: true, amountCents: 9900 }, body: '{"tenantId":"tenant-b","invoicePaid":true,"amountCents":9900}' },
+        step: { id: 'cr-rep', arm: 'probe', method: 'POST', route: '/api/webhooks/ingest', pathAndQuery: '/api/webhooks/ingest', status: 200, actor: { handle: 'alice', role: 'member', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, requestHeaders: { 'x-signature': 'valid-hmac-sig-tenant-a' }, json: { tenantId: 'tenant-b', invoicePaid: true, amountCents: 9900 }, body: '{"tenantId":"tenant-b","invoicePaid":true,"amountCents":9900}' },
       }),
     ],
   })
@@ -361,11 +361,11 @@ test('TerminalOracleRegistry: dispatches single-hop ProofReceipt rules (incl. 1-
     entries: [
       signedEntry({
         exchangeId: 'pd-ctl', seq: 1, timestampMs: 5000, observedResponseDigests: [sha256('{"error":"denied"}')],
-        step: { id: 'pd-ctl', arm: 'control', method: 'POST', route: '/api/reports/export', pathAndQuery: '/api/reports/export', status: 403, actor: { handle: 'alice', role: 'member', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, body: '{"error":"denied"}' },
+        step: { id: 'pd-ctl', arm: 'control', method: 'POST', route: '/api/reports/export', pathAndQuery: '/api/reports/export', status: 403, actor: { handle: 'alice', role: 'member', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, requestHeaders: { 'content-type': 'application/json' }, requestJson: '{"tenantId":"tenant-b"}', body: '{"error":"denied"}' },
       }),
       signedEntry({
         exchangeId: 'pd-prb', seq: 2, timestampMs: 5100, observedResponseDigests: [sha256('{"records":[{"tenant":"tenant-b","amount":4200}]}')],
-        step: { id: 'pd-prb', arm: 'probe', method: 'POST', route: '/api/reports/export', pathAndQuery: '/api/reports/export', status: 200, actor: { handle: 'alice', role: 'member', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, json: { records: [{ tenant: 'tenant-b', amount: 4200 }] }, body: '{"records":[{"tenant":"tenant-b","amount":4200}]}' },
+        step: { id: 'pd-prb', arm: 'probe', method: 'POST', route: '/api/reports/export', pathAndQuery: '/api/reports/export', status: 200, actor: { handle: 'alice', role: 'member', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, requestHeaders: { 'content-type': 'application/json' }, requestJson: '{"tenantId":"tenant-a","tenantId":"tenant-b"}', json: { records: [{ tenant: 'tenant-b', amount: 4200 }] }, body: '{"records":[{"tenant":"tenant-b","amount":4200}]}' },
       }),
     ],
   })
