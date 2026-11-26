@@ -108,7 +108,6 @@ import {
   computePlannerBackoffMs,
   deriveRunActorState,
   drainTimedOutRunActor,
-  evictRunFromExecutionState,
   installRunActorRejectionGuard,
   isExecutionRunTrackedActive,
   isTrustedHostControlFact,
@@ -205,9 +204,9 @@ import {
   circuitBreakAction,
   DET_LEAD_CONCURRENT_CAP,
   ReinvestigationGuard,
+  RunOrchestrationStateStore,
   isDetLeadDispatchStep,
   isMultiHopChainStep,
-  planRoundRobinDispatch,
   PHASE_B_MIN_CONCURRENCY_FLOOR,
   PhaseBConcurrencyController,
   parseEnvPhaseBConcurrencyOverride,
@@ -216,11 +215,8 @@ import {
   countConsecutiveDrySteps,
   computeHostTiers,
   computeStepMaxTurns,
-  isMultiStepAssignment,
-  resolveWorkerSettlementMs,
-  resolveWorkerWallClockMs,
+  resolveAssignmentBudget,
   singleStepWallClockMs,
-  planAssignmentBudget,
   requeueInterruptedAssignments,
   CODE_AUDIT_WAVE1_MAX_STEPS,
   convertCodeAuditSuspectsToChainSteps,
@@ -231,6 +227,8 @@ import {
   type DispatchFunnelCounts,
   type AssignmentBudget,
   type AssignmentThroughputMetrics,
+  type RunOobDrainSummary,
+  type RunOrchestrationState,
 } from './exec-dispatch.ts'
 export * from './exec-dispatch.ts'
 import { ExecBoardManager } from './exec-board.ts'
@@ -349,106 +347,76 @@ export class Execution {
   readonly personaAuth: PersonaAuthManager
   readonly labRunner: LabRunner
   private readonly active = new Map<string, Active>()
-  private readonly coordinator = new Map<string, CoordinatorTask>()
-  private readonly threatModeling = new Map<string, CoordinatorTask>()
-  private readonly plannerTasks = new Map<string, CoordinatorTask>()
-  private readonly plannerTimers = new Map<string, () => void>()
-  private readonly plannerDirty = new Set<string>()
-  private readonly plannerDoneRound = new Map<string, number>()
-  private readonly plannerErrorState = new Map<string, {
-    goalRevision: number
-    consecutiveErrors: number
-    backoffUntil: number
-    breakerTripped: boolean
-  }>()
+  /** Unified per-run orchestration state (Move O5: single-call atomic cleanup on run disposal). */
+  readonly runState = new RunOrchestrationStateStore()
+  // Live projection views over `runState` keeping legacy external hosts & test seams intact.
+  private readonly coordinator = this.runState.mapView('coordinatorTask')
+  private readonly threatModeling = this.runState.mapView('threatModelingTask')
+  private readonly plannerTasks = this.runState.mapView('plannerTask')
+  private readonly plannerTimers = this.runState.mapView('plannerTimerCancel')
+  private readonly plannerDirty = this.runState.setView('plannerDirty')
+  private readonly plannerDoneRound = this.runState.mapView('plannerDoneRound')
+  private readonly plannerErrorState = this.runState.mapView('plannerErrorState')
   private readonly plannerBackoffBaseMs: number
   private readonly plannerBackoffCapMs: number
   private readonly plannerMaxConsecutiveErrors: number
-  /** runId → last dry-streak length reported as telemetry (never a halt signal in v6). */
-  private readonly dryStreakObserved = new Map<string, number>()
+  private readonly dryStreakObserved = this.runState.mapView('dryStreakObserved')
   /** Phase-0 ranked probe plans (probe breadth hint; the endpoint store stays lossless). */
   private readonly probePlans = new ProbePlanRegistry()
-  /** `${runId}\0${hypothesisId}` leads already persisted as det_lead facts (idempotent seeding). */
-  private readonly programGraphLeadsSeeded = new Set<string>()
-  /** runId → latest structured dispatch funnel (run meta for the final report / metrics). */
-  private readonly dispatchFunnels = new Map<string, DispatchFunnelCounts>()
-  /** runId → count of `planner.ready_steps_stranded` violations (never silently tolerated). */
-  private readonly strandedReadyEvents = new Map<string, number>()
-  /** runId → `(route, class)` reinvestigation guard (v7 precision; cap 2 unless evidence unlocks). */
-  private readonly reinvestigationGuards = new Map<string, ReinvestigationGuard>()
-  private readonly recordedPersonaResources = new Map<string, Set<string>>()
-  private readonly circuitNotified = new Set<string>()
-  private readonly runAuthStarted = new Map<string, string>()
-  private readonly runAuthInFlight = new Map<string, AbortController>()
-  private readonly startedLabRuns = new Set<string>()
-  private readonly startedLabHandles = new Map<string, LabTargetHandle>()
+  private readonly programGraphLeadsSeeded = this.runState.prefixedSetView('programGraphLeadsSeeded', '\0')
+  private readonly dispatchFunnels = this.runState.mapView('dispatchFunnel')
+  private readonly strandedReadyEvents = this.runState.mapView('strandedReadyEvents')
+  private readonly reinvestigationGuards = this.runState.mapView('reinvestigationGuard')
+  private readonly recordedPersonaResources = this.runState.mapView('recordedPersonaResources')
+  private readonly circuitNotified = this.runState.prefixedSetView('circuitNotified', ':')
+  private readonly runAuthStarted = this.runState.mapView('runAuthStarted')
+  private readonly runAuthInFlight = this.runState.mapView('runAuthInFlight')
+  private readonly startedLabRuns = this.runState.setView('startedLabRun')
+  private readonly startedLabHandles = this.runState.mapView('startedLabHandle')
   private readonly variantSweptFindings = new Set<string>()
   private readonly variantSweepInFlight = new Set<string>()
   private readonly pendingTier3ApprovalKeys = new Set<string>()
   /** Exact, single-use Tier-3 approvals consumed by the broker fast path (see authorizeStateChange). */
   private readonly stateChangeApprovals = new StateChangeApprovalLedger()
-  /**
-   * Per-fingerprint instance quota for synchronized multi-request operations (race bursts). A
-   * legitimate N-way burst of identical requests registers N single-use instances under the exact
-   * same fingerprint; each broker retry consumes one, and the entry disappears after the last.
-   * Same 60 s TTL and scope binding as the single-use ledger.
-   */
   private readonly burstApprovalInstances = new Map<string, { remaining: number; expiresAt: number }>()
-  private readonly deterministicInFlight = new Set<string>()
-  private readonly deterministicCompleted = new Set<string>()
+  private readonly deterministicInFlight = this.runState.prefixedSetView('deterministicInFlight', ':')
+  private readonly deterministicCompleted = this.runState.prefixedSetView('deterministicCompleted', ':')
   private readonly deterministicOnly: boolean
   /** Slice 3 concurrent lane bookkeeping (never reuses the deterministicInFlight/Completed sets). */
   private readonly deterministicSweep: DeterministicSweepMode
   private readonly maxDurationMs: number
-  private readonly prePhase0SeededSteps = new Map<string, boolean>()
-  private readonly agenticLaneJobs = new Map<string, { controller: AbortController; promise: Promise<void>; key: string; assignmentId: string; allowThreatModelPhase?: boolean }>()
-  private readonly agenticLaneCompleted = new Set<string>()
-  private readonly agenticLaneStopping = new Set<string>()
+  private readonly prePhase0SeededSteps = this.runState.prefixedMapView<boolean, 'prePhase0SeededSteps'>('prePhase0SeededSteps', ':')
+  private readonly agenticLaneJobs = this.runState.mapView('agenticLaneJob')
+  private readonly agenticLaneCompleted = this.runState.prefixedSetView('agenticLaneCompleted', ':')
+  private readonly agenticLaneStopping = this.runState.setView('agenticLaneStopping')
   private readonly agenticLaneAssignmentIds = new Set<string>()
   /** Floor assignment IDs explicitly launched to overlap Phase A (`threat_model` -> `investigation`). */
   private readonly overlappedFloorAssignmentIds = new Set<string>()
-  /** runIds whose report is waiting on the bounded pre-report OOB drain (single-flight). */
-  private readonly verificationDraining = new Set<string>()
-  /** Last drain outcome per run: recorded in run-event meta and exposed for tests/benchmarks. */
-  private readonly lastOobDrain = new Map<string, { oobDrainMs: number; promotedLate: number; remaining: number }>()
+  private readonly verificationDraining = this.runState.setView('verificationDraining')
+  /** Post-completion drain/throughput summaries (retained after disposeRun, cleared on deleteRun). */
+  private readonly lastOobDrain = new Map<string, RunOobDrainSummary>()
   /** assignmentId → per-worker composite persona session clones (v6 credential isolation). */
   private readonly workerSessionClones = new Map<string, Array<{ handle: string; clone: PersonaSessionClone }>>()
-  /** v6 Phase 1 gate counters (observed inputs, not asserted capability claims). */
-  private readonly laneStartedAt = new Map<string, number>()
-  private readonly laneWallByRun = new Map<string, number>()
-  /** Phase-B throughput telemetry: per-run assignment wall samples and provider turn latencies. */
-  private readonly assignmentWallByRun = new Map<string, number[]>()
-  /** Wall samples for assignments that actually completed (the slot turned over on its own). */
-  private readonly completedAssignmentWallByRun = new Map<string, number[]>()
-  private readonly turnLatencyByRun = new Map<string, number[]>()
-  /** Turns saved by earned early exits (`agent.early_exit`) in this run. */
-  private readonly earlyExitTurnsSavedByRun = new Map<string, number>()
-  private readonly proofObligationByRun = new Map<string, {
-    probedRoutes: number
-    coveredRoutes: number
-    gapRoutes: number
-    demandedRoutes: number
-    dischargedByGap: number
-  }>()
-  private readonly gapValidationByRun = new Map<string, {
-    accepted: number
-    rejected: number
-    byCode: Record<string, { accepted: number; rejected: number }>
-  }>()
-  private readonly providerStallTurnsByRun = new Map<string, number>()
-  private readonly providerStallRetriesByRun = new Map<string, number>()
-  private readonly providerStallTimeoutsByRun = new Map<string, number>()
-  private readonly providerStallWallSavedByRun = new Map<string, number>()
-  private readonly wallClockRotationsByRun = new Map<string, number>()
+  private readonly laneStartedAt = this.runState.mapView('laneStartedAt')
+  private readonly laneWallByRun = this.runState.mapView('laneWallMs')
+  private readonly assignmentWallByRun = this.runState.mapView('assignmentWalls')
+  private readonly completedAssignmentWallByRun = this.runState.mapView('completedAssignmentWalls')
+  private readonly turnLatencyByRun = this.runState.mapView('turnLatencies')
+  private readonly earlyExitTurnsSavedByRun = this.runState.mapView('earlyExitTurnsSaved')
+  private readonly proofObligationByRun = this.runState.mapView('proofObligation')
+  private readonly gapValidationByRun = this.runState.mapView('gapValidation')
+  private readonly providerStallTurnsByRun = this.runState.mapView('providerStallTurns')
+  private readonly providerStallRetriesByRun = this.runState.mapView('providerStallRetries')
+  private readonly providerStallTimeoutsByRun = this.runState.mapView('providerStallTimeouts')
+  private readonly providerStallWallSavedByRun = this.runState.mapView('providerStallWallSaved')
+  private readonly wallClockRotationsByRun = this.runState.mapView('wallClockRotations')
   private readonly wallClockRotatedAssignments = new Set<string>()
-  private readonly warmSecretEpochByRun = new Map<string, string>()
-  private readonly warmPoolPolicyRotationsByRun = new Map<string, number>()
+  private readonly warmSecretEpochByRun = this.runState.mapView('warmSecretEpoch')
+  private readonly warmPoolPolicyRotationsByRun = this.runState.mapView('warmPoolPolicyRotations')
   private readonly lastAssignmentMetrics = new Map<string, AssignmentThroughputMetrics>()
-  /** runId → first agent dispatch time after Phase A, for phase-timing telemetry. */
-  private readonly agenticFloorDispatchedAt = new Map<string, number>()
-  /** runId → Phase A window (start/finish), retained for finalize-time summaries. */
-  private readonly agenticFloorStartedAt = new Map<string, number>()
-  private readonly agenticFloorFinishedAt = new Map<string, number>()
+  private readonly agenticFloorDispatchedAt = this.runState.mapView('agenticFloorDispatchedAt')
+  private readonly agenticFloorStartedAt = this.runState.mapView('agenticFloorStartedAt')
+  private readonly agenticFloorFinishedAt = this.runState.mapView('agenticFloorFinishedAt')
   /** v6 budget split: null = legacy single shared budget. */
   private readonly phaseRequestBudgets: PhaseRequestBudgets | null
   private readonly budgetTracker: PhaseRequestBudgetTracker
@@ -465,26 +433,22 @@ export class Execution {
   private stopPromise: Promise<void> | null = null
   private activeDetLeadRunId: string | null = null
   private readonly detLeadConsumed = new Set<string>()
-  private readonly detLeadConsumedByRun = new Map<string, Set<string>>()
+  private readonly detLeadConsumedByRun = this.runState.mapView('detLeadConsumedIds')
   /** Tier-A Program-Graph facts/steps: seeded first, exempt from the generic lead cap. */
   private readonly tierAFactIds = new Set<string>()
   private readonly tierAStepIds = new Set<string>()
-  /** Opt-in per-run agentic trace (only populated when KOVO_TRACE_DIR / KOVO_TRACE is set). */
-  private readonly runTraces = new Map<string, AgentTrace>()
+  private readonly runTraces = this.runState.mapView('runTrace')
   private readonly onCheckpoint?: (event: { runId: string; checkpoint: ExecutionCheckpoint }) => void
   private readonly assignmentWallClockOverrideMs?: number
   private readonly workerConcurrencyOverride?: number
-  /** runId → dynamic AIMD Phase-B worker concurrency controller (ceiling 12 on 16c/11GiB hosts). */
-  private readonly phaseBControllers = new Map<string, PhaseBConcurrencyController>()
+  private readonly phaseBControllers = this.runState.mapView('phaseBController')
   /** v5 M5: chain-scoped warm specialist lifecycle (pure in-memory; mirrored to board_members). */
   private readonly warm = new WarmSpecialistController()
-  /** v6 staging counters (per run): tagged mutations, locally skipped untaggable probes, cleanup. */
-  private readonly stagingTaggedMutations = new Map<string, number>()
-  private readonly stagingUntaggedSkipped = new Map<string, number>()
-  private readonly stagingCleaned = new Map<string, number>()
-  private readonly stagingCreatedEntities = new Map<string, Set<string>>()
-  /** runId → grant captured while tagging, so teardown can call the run-scoped cleanup hook. */
-  private readonly stagingGrants = new Map<string, Grant>()
+  private readonly stagingTaggedMutations = this.runState.mapView('stagingTaggedMutations')
+  private readonly stagingUntaggedSkipped = this.runState.mapView('stagingUntaggedSkipped')
+  private readonly stagingCleaned = this.runState.mapView('stagingCleaned')
+  private readonly stagingCreatedEntities = this.runState.mapView('stagingCreatedEntities')
+  private readonly stagingGrants = this.runState.mapView('stagingGrant')
   private readonly boardHandleByAssignment = new Map<string, string>()
   private readonly board: ExecBoardManager
   private readonly floorLane: ExecFloorLane
@@ -492,8 +456,7 @@ export class Execution {
   private readonly reconPlanner: ExecReconPlanner
   private readonly workerRunner: ExecWorkerRunner
   private readonly tier3Approvals: RunTier3ApprovalCoordinator
-  /** v8 Layer-1 run-scoped derived capability custody shared across all VerifyRpcServer worker sessions. */
-  private readonly capabilityVaults = new Map<string, DerivedCapabilityVault>()
+  private readonly capabilityVaults = this.runState.mapView('capabilityVault')
   private safetyTimer?: NodeJS.Timeout
   private reclaimTimer?: NodeJS.Timeout
   private unsubWake?: () => void
@@ -661,7 +624,7 @@ export class Execution {
       capabilityVaultFor: runId => this.capabilityVaultFor(runId),
     })
     this.reconPlanner = new ExecReconPlanner({
-      ...core, labRunner: this.labRunner, maxDurationMs: this.maxDurationMs,
+      ...core, runState: this.runState, labRunner: this.labRunner, maxDurationMs: this.maxDurationMs,
       active: this.active, coordinator: this.coordinator, probePlans: this.probePlans,
       startedLabRuns: this.startedLabRuns, startedLabHandles: this.startedLabHandles,
       prePhase0SeededSteps: this.prePhase0SeededSteps, plannerDoneRound: this.plannerDoneRound,
@@ -815,8 +778,18 @@ export class Execution {
     return false
   }
 
+  /** Return the cohesive per-run orchestration state record for `runId`, if tracked. */
+  getRunOrchestrationState(runId: string): RunOrchestrationState | undefined {
+    return this.runState.get(runId)
+  }
+
   private cleanupRunState(runId: string, actor?: RunActor): void {
-    evictRunFromExecutionState(runId, this as unknown as Parameters<typeof evictRunFromExecutionState>[1])
+    this.reconPlanner.clearRunState(runId)
+    this.runState.disposeRun(runId, {
+      onDetLeadConsumedIds: ids => { for (const factId of ids) this.detLeadConsumed.delete(factId) },
+    })
+    this.budgetTracker.deleteRun(runId)
+    this.board.cleanupRun(runId)
     if (!actor || this.actors.get(runId) === actor) this.actors.delete(runId)
   }
 
@@ -1107,24 +1080,10 @@ export class Execution {
       })
     }
 
-    for (const cancelTimer of this.plannerTimers.values()) {
-      try { cancelTimer() } catch { /* ignore */ }
-    }
-    this.plannerTimers.clear()
-    this.plannerErrorState.clear()
-    this.detLeadConsumed.clear()
-    this.detLeadConsumedByRun.clear()
-    this.warm.clear()
     for (const job of this.active.values()) job.controller.abort()
     for (const task of this.coordinator.values()) task.controller.abort()
     for (const task of this.threatModeling.values()) task.controller.abort()
     for (const task of this.plannerTasks.values()) task.controller.abort()
-    for (const ctrl of this.runAuthInFlight.values()) ctrl.abort()
-    this.runAuthInFlight.clear()
-    this.runAuthStarted.clear()
-    for (const lane of this.agenticLaneJobs.values()) {
-      try { lane.controller.abort(new Error('execution stopped')) } catch { /* already aborted */ }
-    }
     try { await this.backend.closeWarmPool?.() } catch { /* teardown is best-effort */ }
     for (const [assignmentId, tracked] of this.workerSessionClones) {
       for (const entry of tracked) entry.clone.dispose()
@@ -1133,24 +1092,23 @@ export class Execution {
     for (const trace of this.runTraces.values()) {
       try { trace.closeTrace() } catch { /* tracing must never break shutdown */ }
     }
-    this.runTraces.clear()
     for (const runId of [...this.capabilityVaults.keys()]) {
       this.evictCapabilityVault(runId)
       try { this.canaryBroker.unsubscribeRun(runId) } catch { /* ignore */ }
     }
-    this.phaseBControllers.clear()
-    this.agenticLaneJobs.clear()
-    this.agenticLaneStopping.clear()
+    const labRunIds = [...new Set([...this.startedLabRuns, ...this.startedLabHandles.keys()])]
+    this.runState.clear({
+      onDetLeadConsumedIds: ids => { for (const factId of ids) this.detLeadConsumed.delete(factId) },
+    })
+    this.detLeadConsumed.clear()
+    this.warm.clear()
     this.overlappedFloorAssignmentIds.clear()
     this.personaAuth.stopAll()
     if (this.ownsLabRunner) {
       await this.labRunner.stopAll().catch(() => undefined)
     } else {
-      const labRunIds = [...new Set([...this.startedLabRuns, ...this.startedLabHandles.keys()])]
       await Promise.allSettled(labRunIds.map(runId => this.labRunner.stopLabTarget(runId)))
     }
-    this.startedLabRuns.clear()
-    this.startedLabHandles.clear()
     await this.canaryBroker.stopListener().catch(() => undefined)
     const releaseGuard = this.releaseRejectionGuard
     this.releaseRejectionGuard = null
@@ -3155,12 +3113,14 @@ export class Execution {
       [...this.approvedOriginsSet(run)],
       this.storage.latestThreatModel(run.id, run.goalRevision)?.entries,
     )
-    const dispatchPlan = planRoundRobinDispatch(readySteps, slots, {
+    const sourceMounted = this.projectReposMount(run.projectId).mountedRepos.length > 0
+    const dispatchPlan = this.reconPlanner.frontierDispatcherFor(run.id).dispatch(readySteps, slots, {
       leadCap: DET_LEAD_CONCURRENT_CAP,
       activeLeadCount,
       activeChainCount,
       hostTiers,
       tierALeadIds: this.tierAStepIds,
+      sourceMounted,
     })
     const activeStepIds = new Set(
       [...this.active.values()]
@@ -3198,6 +3158,10 @@ export class Execution {
             activeLeadCount,
             leadConcurrentCap: DET_LEAD_CONCURRENT_CAP,
             deferredLeads: dispatchPlan.deferredLeads,
+            sourceMounted,
+            whiteBoxSelected: dispatchPlan.whiteBoxSelected,
+            runtimeChainReserved: dispatchPlan.runtimeChainReserved,
+            eviRankedCount: dispatchPlan.eviRankedCount,
             stepIds: dispatchedStepIds,
           },
         )
@@ -3503,38 +3467,32 @@ export class Execution {
       Math.min(specialistConfig.maxTurnsCeiling, run.workerMaxTurns > 0 ? Math.min(run.workerMaxTurns, specialistConfig.defaultMaxTurns) : specialistConfig.defaultMaxTurns),
     )
     const stepMaxTurns = computeStepMaxTurns(targetOrigins, hostTiers, baseSpecialistTurns)
-    // Throughput: standalone single-route steps rotate quickly at 120s; multi-hop chain and
-    // continuation steps scale proportionally (180s–300s) so 3–6 hop chains reach ctx.prove_composite.
+    // Single unified assignment budget resolver (Move O5): eliminates the silent overwrite that
+    // previously clamped multiStep race/BOLA/cross-persona assignments back down to 120s.
     const runMaxDuration = Number((run as { maxDurationMs?: number }).maxDurationMs)
     const effectiveRunDurationMs = Number.isFinite(runMaxDuration) && runMaxDuration > 0
       ? runMaxDuration
       : this.maxDurationMs
-    const multiHopChain = isMultiHopChainStep(step)
-    const rawBudget = planAssignmentBudget({
-      routes: this.reconPlanner.stepMentionedRoutes(step),
-      parentEvidenceIds: step.dependsOnFactIds,
-      dependsOnStepIds: step.dependsOnStepIds,
-      multiHopChain,
-      runDurationMs: effectiveRunDurationMs,
-      multiStep: isMultiStepAssignment({
+    const budget: AssignmentBudget = resolveAssignmentBudget(
+      {
         title: step.title,
         hypothesis: step.hypothesis,
         category: step.category,
         skills: step.skills,
-      }),
-      baseMaxTurns: stepMaxTurns,
-      baseWallClockMs: this.specialistWallClockMs(stepMaxTurns),
-      singleStepWallClockMs: singleStepWallClockMs(),
-    })
-    const resolvedWallClockMs = resolveWorkerWallClockMs(step, effectiveRunDurationMs, {
-      singleStepWallClockMs: singleStepWallClockMs(),
-    })
-    const effectiveWallClockMs = this.assignmentWallClockOverrideMs ?? resolvedWallClockMs
-    const budget: AssignmentBudget = {
-      ...rawBudget,
-      wallClockMs: effectiveWallClockMs,
-      wallClockSettlementMs: resolveWorkerSettlementMs(effectiveWallClockMs, multiHopChain),
-    }
+        routes: this.reconPlanner.stepMentionedRoutes(step),
+        dependsOnFactIds: step.dependsOnFactIds,
+        dependsOnStepIds: step.dependsOnStepIds,
+      },
+      {
+        baseMaxTurns: stepMaxTurns,
+        baseWallClockMs: this.specialistWallClockMs(stepMaxTurns),
+        runDurationMs: effectiveRunDurationMs,
+        singleStepWallClockMs: singleStepWallClockMs(),
+        ...(this.assignmentWallClockOverrideMs !== undefined
+          ? { wallClockOverrideMs: this.assignmentWallClockOverrideMs }
+          : {}),
+      },
+    )
 
     const assignment = this.storage.transaction(() => {
       const worker = this.storage.makeWorker(run, 'investigation', primaryAsset, step.title, step.hypothesis, {
