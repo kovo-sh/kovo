@@ -21,7 +21,7 @@ import { useToast } from '../toast.tsx'
 import { cn, runBtn, RW } from '../tw.ts'
 import { getTriageStatusMeta, getTriageStatusOptions } from './findings.tsx'
 import type { FindingWithTriage } from './findings.tsx'
-import { CodeLocations, CopyCurlButton, FoundBy, OnSurface } from './queue-read.tsx'
+import { CodeLocations, CopyCurlButton, extractReplayInfraFailure, FoundBy, OnSurface, ReplayFailureCallout } from './queue-read.tsx'
 
 /** Unified Verify Fix gate across FindingInspector and ReportView: server requires `replaySpecId`. */
 export function canVerifyFix(f: Pick<FindingRow, 'status' | 'replaySpecId'>): boolean {
@@ -325,6 +325,7 @@ export function FindingInspector({ sel }: InspectorProps) {
   const obs = f.check?.observed
   const codeLocs = f.codeLocations ?? []
   const diff = replay?.lastVerificationDiff as unknown
+  const replayInfraFailure = extractReplayInfraFailure(f, diff)
   const hasPatches = (model.detail.patchProposals ?? []).some(p => p.findingId === f.id)
   const triage = (f as FindingWithTriage).operatorTriage ?? null
   const triageMeta = triage ? getTriageStatusMeta(triage.status) : null
@@ -378,6 +379,7 @@ export function FindingInspector({ sel }: InspectorProps) {
             </div>
           </div>}
         </Section>}
+        {replayInfraFailure && <ReplayFailureCallout reason={replayInfraFailure} />}
 
         {f.impact && <Section title="Why it matters">
           <p>{f.impact}</p>

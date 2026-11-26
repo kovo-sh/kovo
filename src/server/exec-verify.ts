@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, readFileSync, statSync } from 'node:fs'
-import { join, sep } from 'node:path'
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { join, relative, sep } from 'node:path'
 import { and, eq } from 'drizzle-orm'
 import type { AccessPolicySnapshot } from '../access-policy.ts'
 import {
@@ -26,6 +26,7 @@ import {
   LEGACY_PYTHON_PROOF_REASON,
   runAgentScriptProof,
   safeVaultRunId,
+  verifyPersistedScriptIntegrity,
   type AgentScriptProofParams,
   type AgentScriptProofResult,
   type V8CompositeProofBundle,
@@ -79,7 +80,7 @@ import {
   type ReceiptVerification,
 } from './proof-receipt.ts'
 import { BudgetExceededError } from './provider.ts'
-import { redact, redactJsonValue, type NamedSecret } from './redact.ts'
+import { redact, redactExactValues, redactJsonValue, type NamedSecret } from './redact.ts'
 import {
   buildInlineVerifyFeedback,
   persistedAgentScriptOf,
@@ -250,9 +251,95 @@ export function extractSpecEndpointAndMethod(
 }
 
 /**
- * H-18: Bind a confirmed/static_verified finding's identity (`cwe`, `category`, `origin`, `title`,
- * and `fingerprintHash` derived from endpoint/method) strictly to the confirming spec and receipt
- * so a stale proposed finding can never retain a mismatched CWE/origin/endpoint/title.
+ * R2-H-14 / H-18: Canonical CWE + accepted CWE family for a verified ProofReceipt `vulnClass`.
+ * Confirmed finding CWE/category must bind to the verified receipt class rather than arbitrary
+ * model-declared `spec.cwe`.
+ */
+export function cweFamilyForReceiptClass(vulnClass: string): {
+  cwe: string
+  family: readonly string[]
+  category: OwaspCategory
+} {
+  const key = vulnClass.trim().toLowerCase()
+  const attr = agentProofAttribution(key)
+  if (/^(?:sqli|sqli_error|sql_boolean|sql_boolean_diff|blind_sqli|sqli_status|sqli_time)$/.test(key)) {
+    return { cwe: 'CWE-89', family: ['CWE-89'], category: 'injection-input' }
+  }
+  if (/^(?:nosqli|nosql_injection)$/.test(key)) {
+    return { cwe: attr.cwe, family: ['CWE-943', 'CWE-74', 'CWE-89'], category: 'injection-input' }
+  }
+  if (/^(?:ssti|template_injection)$/.test(key)) {
+    return { cwe: 'CWE-1336', family: ['CWE-1336', 'CWE-94', 'CWE-74'], category: 'injection-input' }
+  }
+  if (/^(?:command_injection|cmdi|rce)$/.test(key)) {
+    return { cwe: 'CWE-78', family: ['CWE-78', 'CWE-77', 'CWE-94'], category: 'injection-input' }
+  }
+  if (/^(?:path_traversal|directory_traversal|lfi)$/.test(key)) {
+    return { cwe: 'CWE-22', family: ['CWE-22', 'CWE-23', 'CWE-73'], category: 'injection-input' }
+  }
+  if (/^(?:xss|xss_stored|xss_reflected|markup|html_injection|dom_xss)$/.test(key)) {
+    return { cwe: 'CWE-79', family: ['CWE-79'], category: 'injection-input' }
+  }
+  if (/^(?:xxe|blind_xxe)$/.test(key)) {
+    return { cwe: 'CWE-611', family: ['CWE-611'], category: 'ssrf-redirects' }
+  }
+  if (/^(?:ssrf|blind_ssrf|oob|webhook_forgery|cross_surface_pivot)$/.test(key)) {
+    return { cwe: 'CWE-918', family: ['CWE-918'], category: 'ssrf-redirects' }
+  }
+  if (/^(?:open_redirect|redirect)$/.test(key)) {
+    return { cwe: 'CWE-601', family: ['CWE-601'], category: 'ssrf-redirects' }
+  }
+  if (/^(?:bol[ai]|idor|cross_tenant|authorization|access_control|broken-access-control|dual_tenant_abac)$/.test(key)) {
+    return { cwe: 'CWE-639', family: ['CWE-639', 'CWE-284', 'CWE-285', 'CWE-862', 'CWE-863'], category: 'broken-access-control' }
+  }
+  if (/^(?:bfla|privilege_escalation)$/.test(key)) {
+    return { cwe: 'CWE-285', family: ['CWE-285', 'CWE-862', 'CWE-863', 'CWE-639', 'CWE-284'], category: 'broken-access-control' }
+  }
+  if (/^mass_assignment$/.test(key)) {
+    return { cwe: 'CWE-915', family: ['CWE-915', 'CWE-285', 'CWE-863'], category: 'broken-access-control' }
+  }
+  if (/^csrf$/.test(key)) {
+    return { cwe: 'CWE-352', family: ['CWE-352'], category: 'auth-identity' }
+  }
+  if (/^(?:jwt_forgery|token_forgery|cryptographic_scope_replay)$/.test(key)) {
+    return { cwe: 'CWE-347', family: ['CWE-347', 'CWE-287', 'CWE-345'], category: 'auth-identity' }
+  }
+  if (/^(?:auth_bypass|broken_auth|auth_protocol|authentication_bypass)$/.test(key)) {
+    return { cwe: 'CWE-287', family: ['CWE-287', 'CWE-306', 'CWE-347', 'CWE-345', 'CWE-613', 'CWE-384'], category: 'auth-identity' }
+  }
+  if (/^(?:temporal_revocation|session_revocation|session_fixation)$/.test(key)) {
+    return { cwe: 'CWE-613', family: ['CWE-613', 'CWE-384', 'CWE-287'], category: 'auth-identity' }
+  }
+  if (/^(?:race|race_double_spend|race_condition|race_burst|double_spend|oversell|inventory_oversell|conserved_balance|toctou)$/.test(key)) {
+    return { cwe: 'CWE-362', family: ['CWE-362', 'CWE-367', 'CWE-840'], category: 'business-logic-race' }
+  }
+  if (/^(?:business_logic|invariant_violation|workflow_skip|economic_conservation)$/.test(key)) {
+    return { cwe: 'CWE-840', family: ['CWE-840', 'CWE-362', 'CWE-367'], category: 'business-logic-race' }
+  }
+  if (/^(?:parser_cache_differential|cache_poisoning|cache_deception|request_smuggling)$/.test(key)) {
+    return { cwe: 'CWE-444', family: ['CWE-444', 'CWE-436', 'CWE-525'], category: 'misconfig-exposure' }
+  }
+  if (/^(?:disclosure|info_disclosure|sensitive_data_exposure)$/.test(key)) {
+    return { cwe: 'CWE-200', family: ['CWE-200', 'CWE-209', 'CWE-359'], category: 'misconfig-exposure' }
+  }
+  return { cwe: attr.cwe, family: [attr.cwe], category: attr.category }
+}
+
+/** Check whether a finding CWE belongs to the accepted CWE family of a verified receipt class. */
+export function isCweConsistentWithReceiptClass(
+  cwe: string | null | undefined,
+  receiptVulnClass: string,
+): boolean {
+  const normalized = cwe ? normalizeCwe(cwe) : ''
+  if (!normalized) return false
+  const family = cweFamilyForReceiptClass(receiptVulnClass)
+  return family.family.includes(normalized)
+}
+
+/**
+ * H-18 / R2-H-14: Bind a confirmed/static_verified finding's identity (`cwe`, `category`, `origin`,
+ * `title`, and `fingerprintHash` derived from endpoint/method) strictly to the confirming receipt
+ * class and spec so a stale or mislabelled spec can never persist a mismatched CWE/origin/endpoint.
  */
 export function bindConfirmedFindingIdentity(
   existingFinding: Finding,
@@ -265,16 +352,37 @@ export function bindConfirmedFindingIdentity(
   const evidenceClass = payload && typeof payload.evidenceClass === 'string' ? payload.evidenceClass : null
   const evidenceAligned = alignClaimClass({ cwe: spec.cwe, category: spec.category }, evidenceClass)
   const confirmedReceipt = replay.receipt?.verification.confirmed ? replay.receipt.receipt : null
-  const receiptAttr = confirmedReceipt?.vulnClass ? agentProofAttribution(confirmedReceipt.vulnClass) : null
+  const receiptFamily = confirmedReceipt?.vulnClass ? cweFamilyForReceiptClass(confirmedReceipt.vulnClass) : null
+  const specCwe = spec.cwe ? normalizeCwe(spec.cwe) : null
   const boundOrigin = confirmedReceipt?.target.origin ?? spec.origin
-  const boundCwe = evidenceAligned?.cwe
-    ?? (spec.cwe ? normalizeCwe(spec.cwe) : null)
-    ?? receiptAttr?.cwe
-    ?? aligned.cwe
-  const boundCategory = evidenceAligned?.category
-    ?? spec.category
-    ?? receiptAttr?.category
-    ?? aligned.category
+  // R2-H-14 / H-18: When a confirmed ProofReceipt exists, strictly enforce its CWE family.
+  // Keep spec.cwe only when it falls within the proven receipt class family; otherwise override
+  // with the receipt's canonical CWE and category so model labels cannot relabel the proven class.
+  let boundCwe: string | undefined
+  let boundCategory: Finding['category']
+  if (receiptFamily) {
+    const specMatchesReceiptFamily = Boolean(specCwe && receiptFamily.family.includes(specCwe))
+    const evidenceMatchesReceiptFamily = Boolean(
+      evidenceAligned?.cwe && receiptFamily.family.includes(normalizeCwe(evidenceAligned.cwe)),
+    )
+    if (evidenceMatchesReceiptFamily && evidenceAligned) {
+      boundCwe = normalizeCwe(evidenceAligned.cwe)
+      boundCategory = evidenceAligned.category
+    } else if (specMatchesReceiptFamily && specCwe) {
+      boundCwe = specCwe
+      boundCategory = spec.category ?? receiptFamily.category
+    } else {
+      boundCwe = receiptFamily.cwe
+      boundCategory = receiptFamily.category
+    }
+  } else {
+    boundCwe = evidenceAligned?.cwe
+      ?? specCwe
+      ?? aligned.cwe
+    boundCategory = evidenceAligned?.category
+      ?? spec.category
+      ?? aligned.category
+  }
   const boundTitle = redact(spec.title, secretsList).slice(0, 200) || aligned.title
   const { endpoint, method } = extractSpecEndpointAndMethod(spec, replay)
   const computedFp = endpoint
@@ -342,7 +450,7 @@ export function guardConfirmedFindingMutation(
   return { allowed: blockedFields.length === 0, blockedFields, sanitizedPatch }
 }
 
-function buildReplayFindingPatch(
+export function buildReplayFindingPatch(
   spec: DeclarativeReplaySpec,
   replay: ReplayVerificationResult,
   existingFinding: Finding,
@@ -361,8 +469,18 @@ function buildReplayFindingPatch(
         label: staticSpec.sourceToSinkTrace?.slice(0, 180),
       }]
     : existingFinding.codeLocations
-  const cleanReason = redact(replay.outcome.reason || replay.outcome.observed || existingFinding.reason, secretsList)
+  const cleanReplayReason = redact(replay.outcome.reason || '', secretsList)
   const cleanObserved = redact(replay.outcome.observed, secretsList)
+  const existingReason = existingFinding.reason?.trim() ? existingFinding.reason : ''
+  // UX fix: when replay ends inconclusive (e.g. "Replay execution failed: ..."), preserve the
+  // finding's vulnerability description (`existingFinding.reason`) under "What happened" and keep
+  // the replay failure details in `verification` (and `last_verification_diff`).
+  const cleanReason = finalStatus === 'inconclusive' && existingReason
+    ? existingReason
+    : redact(replay.outcome.reason || replay.outcome.observed || existingFinding.reason, secretsList)
+  const verificationDetail = cleanReplayReason && cleanReplayReason !== cleanObserved
+    ? `${cleanObserved}; ${cleanReplayReason}`
+    : cleanObserved
   const isConfirming = finalStatus === 'confirmed' || finalStatus === 'static_verified'
   const bound = isConfirming
     ? bindConfirmedFindingIdentity(existingFinding, spec, replay, secretsList)
@@ -376,7 +494,7 @@ function buildReplayFindingPatch(
       : finalStatus === 'dismissed'
         ? 'medium'
         : 'low',
-    verification: `${staticSpec ? 'Deterministic offline static_ast_proof' : `Zero-LLM ${spec.kind} ${verificationVerb}`} verdict: ${finalStatus} (controlPassed=${replay.outcome.controlPassed}, observed: ${cleanObserved}).`,
+    verification: `${staticSpec ? 'Deterministic offline static_ast_proof' : `Zero-LLM ${spec.kind} ${verificationVerb}`} verdict: ${finalStatus} (controlPassed=${replay.outcome.controlPassed}, observed: ${verificationDetail}).`,
     ...(bound ? {
       origin: bound.origin,
       cwe: bound.cwe,
@@ -949,6 +1067,15 @@ export function agentProofAttribution(vulnClass: string): {
       remediation: 'Allowlist outbound destinations and disable external entity resolution for XML parsers.',
     }
   }
+  if (/^(?:open_redirect|redirect)$/.test(key)) {
+    return {
+      label: 'open redirect',
+      cwe: 'CWE-601',
+      category: 'ssrf-redirects',
+      impact: 'An attacker-controlled redirect target sent users to an untrusted external origin.',
+      remediation: 'Restrict redirect targets to relative paths or an explicit allowlist of trusted origins.',
+    }
+  }
   if (/^(?:race|race_double_spend|race_condition|race_burst|double_spend|oversell|inventory_oversell|conserved_balance|toctou)$/.test(key)) {
     return {
       label: 'race condition',
@@ -1035,7 +1162,7 @@ export function probeCanaryClass(purpose: string): { vulnClass: 'ssrf' | 'xxe'; 
   if (!match) return null
   const vulnClass = match[1] as 'ssrf' | 'xxe'
   const segment = match[2] ?? ''
-  const variant = new Set(['http', 'dns', 'header', 'custom', 'general_entity', 'param_entity', 'svg_dtd'])
+  const variant = new Set(['http', 'dns', 'header', 'custom', 'general_entity', 'param_entity', 'svg_dtd', 'prove_oob'])
   const param = vulnClass === 'ssrf' && segment && !variant.has(segment)
     ? segment.split(':')[0] ?? null
     : null
@@ -1551,8 +1678,143 @@ export function syncVerifyArtifactsToLedger(input: {
   }
 }
 
+const SENSITIVE_REPO_DOT_DIRS = new Set(['.ssh', '.aws', '.gnupg', '.kube', '.docker'])
+const SENSITIVE_REPO_EXACT_FILES = new Set([
+  '.git-credentials',
+  '.netrc',
+  '.npmrc',
+  '.pypirc',
+  '.htpasswd',
+  'id_rsa',
+  'id_ed25519',
+  'id_ecdsa',
+  'id_dsa',
+  'github-app.json',
+  'credentials.json',
+  'service-account.json',
+  'vault.json',
+  'vault.key',
+  'token.txt',
+  'secrets.json',
+])
+const SENSITIVE_REPO_EXT_RE = /\.(?:pat|salt|pem|key|p12|pfx|jks|keystore|kdbx|token)$/i
+const SAFE_REPO_ENV_TEMPLATE_RE = /^\.env\.(?:example|sample|template|dist|schema)$/i
+const REPO_SOURCE_CODE_EXT_RE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|cs|c|h|cc|cpp|hpp|swift|scala|sql|graphql|gql|md|html|css|scss|vue|svelte)$/i
+const REPO_GIT_CREDENTIAL_FILE_RE = /(?:^|\/)\.git\/(?:config|credentials|fetch_head)$/i
+
+/**
+ * H-39: Sensitive repository entry policy matching worker repo-staging exclusions so host-side
+ * `scriptPath` reads cannot leak worker-excluded secrets (`.env*`, `.ssh/*`, `.git/config`, keys).
+ */
+export function isSensitiveRepoEntry(relPosixPath: string, entryName: string, isDir: boolean): boolean {
+  const relLower = relPosixPath.toLowerCase()
+  const nameLower = entryName.toLowerCase()
+  if (isDir) {
+    if (SENSITIVE_REPO_DOT_DIRS.has(nameLower)) return true
+    if (relLower === '.git/hooks' || relLower.endsWith('/.git/hooks')) return true
+    return false
+  }
+  if (REPO_GIT_CREDENTIAL_FILE_RE.test(relLower)) return true
+  if (SENSITIVE_REPO_EXACT_FILES.has(nameLower)) return true
+  if (SENSITIVE_REPO_EXT_RE.test(nameLower)) return true
+  if (nameLower === '.env' || (nameLower.startsWith('.env.') && !SAFE_REPO_ENV_TEMPLATE_RE.test(nameLower))) {
+    return true
+  }
+  const parentSegments = relLower.split('/').slice(0, -1)
+  if (parentSegments.includes('credentials') && !REPO_SOURCE_CODE_EXT_RE.test(nameLower)) {
+    return true
+  }
+  return false
+}
+
+export function isSensitiveRepoRelativePath(relPosixPath: string): boolean {
+  const normalized = relPosixPath.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '')
+  if (!normalized) return true
+  const segments = normalized.split('/').filter(Boolean)
+  if (segments.length === 0) return true
+  for (let i = 0; i < segments.length - 1; i += 1) {
+    const prefix = segments.slice(0, i + 1).join('/')
+    if (isSensitiveRepoEntry(prefix, segments[i]!, true)) return true
+  }
+  const leaf = segments[segments.length - 1]!
+  return isSensitiveRepoEntry(segments.join('/'), leaf, false)
+}
+
+/** H-20: Run-scoped request-side carrier recorded for late async OOB callback promotion. */
+export interface OobCarrierRecord {
+  exchangeId: string
+  origin: string
+  method: string
+  pathAndQuery: string
+  status: number
+  personaHandle: string | null
+  assignmentId: string | null
+  reqHeaders: Record<string, string>
+  respHeaders: Record<string, string>
+  requestBody: string
+  responseBody: string
+}
+
+/**
+ * H-18 step 7: Select a replay spec for OOB promotion strictly by structured fields
+ * (`origin`, `recipe.args.oobSubscriptionId`/`subscriptionId`, `agentScript.exchangeIds`,
+ * or top-level `oobSubscriptionId`) rather than substring-scanning `JSON.stringify(row.spec)`.
+ */
+export function findOobMatchingReplaySpec(
+  specs: readonly ReplaySpecRow[],
+  input: { subscriptionId: string; carrierExchangeId: string; origin: string; cwe?: string },
+): ReplaySpecRow | undefined {
+  const targetOrigin = normalizeOrigin(input.origin)
+  return specs.find(row => {
+    const specRecord = row.spec as Record<string, unknown>
+    const specOrigin = typeof row.spec.origin === 'string' ? normalizeOrigin(row.spec.origin) : ''
+    if (specOrigin && specOrigin !== targetOrigin) return false
+    if (typeof specRecord.oobSubscriptionId === 'string' && specRecord.oobSubscriptionId === input.subscriptionId) {
+      return true
+    }
+    const recipe = specRecord.recipe as { args?: Record<string, unknown> } | undefined
+    const recipeArgs = recipe && typeof recipe === 'object' ? recipe.args : undefined
+    if (recipeArgs && typeof recipeArgs === 'object') {
+      if (recipeArgs.oobSubscriptionId === input.subscriptionId || recipeArgs.subscriptionId === input.subscriptionId) {
+        return true
+      }
+      if (recipeArgs.carrierExchangeId === input.carrierExchangeId) {
+        return true
+      }
+    }
+    const agentScript = persistedAgentScriptOf(row.spec)
+    if (agentScript?.envelope.exchangeIds.includes(input.carrierExchangeId)) {
+      return true
+    }
+    return false
+  })
+}
+
 export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
   private readonly fallbackVaults = new Map<string, DerivedCapabilityVault>()
+  private readonly oobCarriersByRun = new Map<string, Map<string, OobCarrierRecord>>()
+
+  /** H-20: Record a host-observed request-side carrier for a canary token so late OOB callbacks promote reliably. */
+  recordOobCarrier(runId: string, token: string, carrier: OobCarrierRecord): void {
+    const cleanToken = token.trim()
+    if (!runId || !cleanToken) return
+    const reqSide = `${carrier.pathAndQuery}\n${JSON.stringify(carrier.reqHeaders ?? {})}\n${carrier.requestBody ?? ''}`
+    if (!reqSide.includes(cleanToken)) return
+    let byToken = this.oobCarriersByRun.get(runId)
+    if (!byToken) {
+      byToken = new Map<string, OobCarrierRecord>()
+      this.oobCarriersByRun.set(runId, byToken)
+    }
+    byToken.set(cleanToken, carrier)
+  }
+
+  getOobCarrier(runId: string, token: string): OobCarrierRecord | undefined {
+    return this.oobCarriersByRun.get(runId)?.get(token.trim())
+  }
+
+  clearOobCarriers(runId: string): void {
+    this.oobCarriersByRun.delete(runId)
+  }
 
   /** Return the shared run-scoped Layer-1 DerivedCapabilityVault across worker sessions. */
   capabilityVaultFor(runId: string): DerivedCapabilityVault {
@@ -1566,18 +1828,55 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
   }
 
   /** Execute a `kovo_verify` script bound to this run's shared `DerivedCapabilityVault`. */
-  runAgentScriptProof(
+  async runAgentScriptProof(
     params: Omit<V8AgentScriptProofParams, 'broker' | 'backend' | 'canaryBroker' | 'capabilityVault'> & {
       capabilityVault?: DerivedCapabilityVault
     },
   ): Promise<V8AgentScriptProofResult> {
-    return runAgentScriptProof({
+    const result = await runAgentScriptProof({
       ...params,
       broker: this.broker,
       backend: this.backend,
       canaryBroker: this.canaryBroker,
       capabilityVault: params.capabilityVault ?? this.capabilityVaultFor(params.runId),
     })
+    // H-20: Index any request-side canary carriers from `prove.oob` / `kovo_verify` exchanges into
+    // the run-scoped OOB carrier map so late callbacks promote even when exchanges are not in SQLite.
+    const mintedTokens = new Set<string>()
+    for (const rec of result.transcriptRecords ?? []) {
+      const resp = rec.response && typeof rec.response === 'object' ? rec.response as unknown as Record<string, unknown> : null
+      if (typeof resp?.token === 'string' && resp.token.trim().length >= 8) {
+        mintedTokens.add(resp.token.trim())
+      }
+      const handle = resp?.handle && typeof resp.handle === 'object' ? resp.handle as Record<string, unknown> : null
+      if (typeof handle?.token === 'string' && handle.token.trim().length >= 8) {
+        mintedTokens.add(handle.token.trim())
+      }
+    }
+    if (mintedTokens.size > 0) {
+      for (const token of mintedTokens) {
+        const carrierEx = result.exchanges.find(ex => {
+          const reqSide = `${ex.pathAndQuery}\n${JSON.stringify(ex.requestHeaders ?? {})}\n${ex.requestBody ?? ''}`
+          return reqSide.includes(token)
+        })
+        if (carrierEx) {
+          this.recordOobCarrier(params.runId, token, {
+            exchangeId: carrierEx.exchangeId,
+            origin: carrierEx.origin,
+            method: carrierEx.method.toUpperCase(),
+            pathAndQuery: carrierEx.pathAndQuery,
+            status: carrierEx.status ?? 0,
+            personaHandle: carrierEx.personaHandle ?? null,
+            assignmentId: params.assignmentId,
+            reqHeaders: carrierEx.requestHeaders ?? {},
+            respHeaders: carrierEx.responseHeaders ?? {},
+            requestBody: carrierEx.requestBody ?? '',
+            responseBody: carrierEx.body ?? '',
+          })
+        }
+      }
+    }
+    return result
   }
 
   /** Persist sealed capabilities and verified hops from a `kovo_verify` run into `CapabilityLedger`. */
@@ -1741,14 +2040,63 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       const classified = probeCanaryClass(canary.purpose)
       if (!classified) continue
       if (!approved.has(classified.origin)) continue
-      // The exact request that carried the canary is the causal binding; a callback alone does not
-      // prove that this target reached the listener.
-      let carrier: ReturnType<Store['searchExchanges']>[number] | undefined
-      try {
-        carrier = this.storage.searchExchanges(runId, subscription.token, { approvedOrigins: approved, limit: 10 })
-          .find(ex => [ex.pathAndQuery, ex.bodyPreview, JSON.stringify(ex.reqHeaders ?? {})]
-            .some(text => String(text).includes(subscription.token)))
-      } catch { carrier = undefined }
+      // H-20: The exact request that carried the canary is the causal binding; consult the
+      // run-scoped request-side carrier map first (captures `prove.oob` / `kovo_verify` injections
+      // that bypass `broker_exchanges`), then fall back to stored exchanges using request-side
+      // fields ONLY (never echo-only response bodies).
+      const recordedCarrier = this.getOobCarrier(runId, subscription.token)
+      let carrier: {
+        id: string
+        origin: string
+        method: string
+        pathAndQuery: string
+        status: number
+        personaHandle: string | null
+        assignmentId: string | null
+        reqHeaders: Record<string, string>
+        respHeaders: Record<string, string>
+        bodyPreview: string
+        requestBody?: string
+      } | undefined
+      if (recordedCarrier && approved.has(recordedCarrier.origin)) {
+        const reqSide = `${recordedCarrier.pathAndQuery}\n${JSON.stringify(recordedCarrier.reqHeaders ?? {})}\n${recordedCarrier.requestBody ?? ''}`
+        if (reqSide.includes(subscription.token)) {
+          carrier = {
+            id: recordedCarrier.exchangeId,
+            origin: recordedCarrier.origin,
+            method: recordedCarrier.method,
+            pathAndQuery: recordedCarrier.pathAndQuery,
+            status: recordedCarrier.status,
+            personaHandle: recordedCarrier.personaHandle,
+            assignmentId: recordedCarrier.assignmentId,
+            reqHeaders: recordedCarrier.reqHeaders,
+            respHeaders: recordedCarrier.respHeaders,
+            bodyPreview: recordedCarrier.responseBody.slice(0, 4_096),
+            requestBody: recordedCarrier.requestBody,
+          }
+        }
+      }
+      if (!carrier) {
+        try {
+          const found = this.storage.searchExchanges(runId, subscription.token, { approvedOrigins: approved, limit: 10 })
+            .find(ex => [ex.pathAndQuery, JSON.stringify(ex.reqHeaders ?? {})]
+              .some(text => String(text).includes(subscription.token)))
+          if (found) {
+            carrier = {
+              id: found.id,
+              origin: found.origin,
+              method: found.method,
+              pathAndQuery: found.pathAndQuery,
+              status: found.status,
+              personaHandle: found.personaHandle,
+              assignmentId: found.assignmentId,
+              reqHeaders: found.reqHeaders ?? {},
+              respHeaders: found.respHeaders ?? {},
+              bodyPreview: found.bodyPreview,
+            }
+          }
+        } catch { carrier = undefined }
+      }
       if (!carrier) continue
       const receipt = buildOobReceipt({
         vulnClass: classified.vulnClass,
@@ -1772,7 +2120,14 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         latencyMs: promotion.latencyMs,
       }
       let body = carrier.bodyPreview
-      try { body = this.storage.getExchange(runId, carrier.id).body } catch { /* preview is enough */ }
+      if (carrier.requestBody === undefined) {
+        try { body = this.storage.getExchange(runId, carrier.id).body } catch { /* preview is enough */ }
+      }
+      const carrierText = [
+        carrier.pathAndQuery,
+        JSON.stringify(carrier.reqHeaders ?? {}),
+        carrier.requestBody ?? '',
+      ].filter(Boolean).join('\n')
       const verification = verifyReceipt(receipt, {
         entries: [{
           exchangeId: carrier.id,
@@ -1788,7 +2143,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
             requestHeaders: carrier.reqHeaders ?? null,
             responseHeaders: carrier.respHeaders ?? null,
           },
-          carrierText: `${carrier.pathAndQuery}\n${JSON.stringify(carrier.reqHeaders ?? {})}\n${body}`,
+          carrierText,
         }],
         oobEvents: [oobEvent],
       })
@@ -1822,7 +2177,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     vulnClass: 'ssrf' | 'xxe'
     origin: string
     param: string | null
-    carrier: ReturnType<Store['searchExchanges']>[number]
+    carrier: { id: string; assignmentId: string | null }
     receipt: ReturnType<typeof buildOobReceipt>
     verification: ReturnType<typeof verifyReceipt>
     subscriptionId: string
@@ -1858,17 +2213,20 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       [],
     )
 
-    // Prefer the replay spec whose probe carried this canary (it has the chain context), else keep
-    // `replay_spec_id` null for a receipt-only finding.
+    // H-18 step 7: Select the replay spec strictly by structured fields (origin + oobSubscriptionId /
+    // carrierExchangeId), never by substring-scanning `JSON.stringify(row.spec)`.
     let specRow: ReplaySpecRow | undefined
     try {
-      specRow = this.storage.listReplaySpecs(run.id).find(row => {
-        const text = JSON.stringify(row.spec)
-        return text.includes(input.subscriptionId) || text.includes(input.carrier.id)
+      specRow = findOobMatchingReplaySpec(this.storage.listReplaySpecs(run.id), {
+        subscriptionId: input.subscriptionId,
+        carrierExchangeId: input.carrier.id,
+        origin: input.origin,
+        cwe: template.cwe,
       })
     } catch { specRow = undefined }
-    const existing = specRow
-      ? rows.find(row => row.id === specRow!.findingId)
+    const specExisting = specRow ? rows.find(row => row.id === specRow!.findingId) : undefined
+    const existing = specExisting && (specExisting.finding.status !== 'confirmed' || specExisting.finding.cwe === template.cwe)
+      ? specExisting
       : rows.find(row => row.finding.origin === input.origin && row.finding.cwe === template.cwe && row.finding.status !== 'confirmed')
     const findingId = existing?.id ?? randomUUID()
     const finding: Finding = {
@@ -2094,20 +2452,41 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
   }
 
 
-  /** Resolve a workspace-relative script path inside the read-only repo mount, bounded. */
+  /** Resolve a workspace-relative script path inside the read-only repo mount, bounded and H-39 filtered. */
   readAgentProofScript(reposDir: string | undefined, scriptPath: string): string {
     if (!reposDir) throw new Error('kovo_verify scriptPath requires a mounted workspace; pass `script` inline.')
     const clean = scriptPath.trim().replace(/^\/+/, '')
     if (!clean || clean.includes('\0') || clean.split(/[\\/]/).includes('..')) {
       throw new Error('kovo_verify scriptPath must stay inside the mounted workspace.')
     }
+    if (isSensitiveRepoRelativePath(clean)) {
+      throw new Error('kovo_verify scriptPath cannot read sensitive repository files.')
+    }
     const full = join(reposDir, clean)
     if (!full.startsWith(reposDir + sep) || !existsSync(full)) {
       throw new Error('kovo_verify scriptPath was not found in the mounted workspace; pass the script inline via `script` instead.')
     }
-    const size = statSync(full).size
-    if (size <= 0 || size > 64 * 1024) throw new Error('kovo_verify script must be between 1 byte and 64 KiB.')
-    return readFileSync(full, 'utf8')
+    let realRoot: string
+    let realFull: string
+    try {
+      realRoot = realpathSync(reposDir)
+      realFull = realpathSync(full)
+    } catch {
+      throw new Error('kovo_verify scriptPath was not found in the mounted workspace; pass the script inline via `script` instead.')
+    }
+    if (!realFull.startsWith(realRoot + sep)) {
+      throw new Error('kovo_verify scriptPath must stay inside the mounted workspace.')
+    }
+    const resolvedRelPosix = relative(realRoot, realFull).split(sep).join('/')
+    if (isSensitiveRepoRelativePath(resolvedRelPosix)) {
+      throw new Error('kovo_verify scriptPath cannot read sensitive repository files.')
+    }
+    const st = statSync(realFull)
+    if (!st.isFile()) {
+      throw new Error('kovo_verify scriptPath must reference a regular file.')
+    }
+    if (st.size <= 0 || st.size > 64 * 1024) throw new Error('kovo_verify script must be between 1 byte and 64 KiB.')
+    return readFileSync(realFull, 'utf8')
   }
 
 
@@ -2170,7 +2549,12 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       ? proof.severity as Finding['severity']
       : 'high'
     const scriptSha256 = createHash('sha256').update(input.script).digest('hex')
-    const scriptRedacted = scrubDerivedSecrets(redact(input.script, allSecrets), vault)
+    // R2-H-16: Never heuristically redact the executable script persisted in `envelope.script`
+    // (heuristic keyword regexes corrupt JWT/password/Bearer literals and turn live findings into
+    // `fixed`/`dismissed` on retest). Apply exact-known-secret substitution at most; if any known
+    // secret was scrubbed, the sha256 check on re-execution will safely return `inconclusive`.
+    const executableScript = scrubDerivedSecrets(redactExactValues(input.script, allSecrets), vault)
+    const scriptDisplay = scrubDerivedSecrets(redact(input.script, allSecrets), vault)
     const cleanTitle = scrubDerivedSecrets(redact(title, allSecrets), vault)
 
     const artifact = this.storage.addArtifact(
@@ -2182,7 +2566,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         mode: cleanCompositeBundle ? 'agent_script_composite' : 'agent_script',
         runtime: input.runtime,
         scriptSha256,
-        script: scriptRedacted,
+        script: scriptDisplay,
         receipt,
         verification,
         ...(cleanCompositeBundle ? {
@@ -2206,7 +2590,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     const envelope: AgentScriptProofEnvelope = {
       kind: 'agent_script',
       runtime: input.runtime,
-      script: scriptRedacted,
+      script: executableScript,
       scriptSha256,
       verdict: 'confirmed',
       ...(claim ? { vulnClass: claim } : {}),
@@ -2620,9 +3004,71 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
           finding: {
             status,
             verificationTier: undefined,
-            reason: LEGACY_PYTHON_PROOF_REASON,
+            reason: findingRow.finding.reason?.trim() ? findingRow.finding.reason : LEGACY_PYTHON_PROOF_REASON,
             confidence: 'low',
             verification: `Agent script proof re-verification returned inconclusive (${LEGACY_PYTHON_PROOF_REASON}).`,
+            exchangeIds: [],
+          },
+        })
+      }
+      this.host.postVerificationVerdict(run, {
+        replaySpecId: updatedSpec.id,
+        findingId: findingRow?.id ?? null,
+        title: findingRow?.finding.title ?? 'Agent script proof',
+        status,
+        feedback,
+        assignmentId: updatedSpec.assignmentId ?? params.job.assignment.id,
+        refStepId: params.job.assignment.stepId,
+        attempt: updatedSpec.attemptCount,
+      })
+      return {
+        findingId: findingRow?.id ?? specRow.findingId,
+        replaySpecId: updatedSpec.id,
+        attemptCount: updatedSpec.attemptCount,
+        status,
+        feedback,
+      }
+    }
+
+    // R2-H-16: Assert sha256(envelope.script) === scriptSha256 BEFORE re-executing any persisted
+    // proof script; on mismatch (e.g. legacy redacted/corrupted script), fail closed as
+    // `inconclusive` — never `dismissed` or `fixed`.
+    const integrity = verifyPersistedScriptIntegrity(envelope, proof.scriptSha256)
+    if (!integrity.ok) {
+      const status: Finding['status'] = 'inconclusive'
+      const feedback: InlineVerifyFeedback = {
+        verdict: 'inconclusive',
+        controlPassed: false,
+        assertionSummary: {
+          observed: integrity.reason,
+          expected: 'the persisted proof script SHA-256 matches its recorded confirmation digest',
+          reason: integrity.reason,
+        },
+        stepStatuses: [],
+        retriesRemaining: maxInlineVerifyRetries,
+      }
+      const updatedSpec = this.storage.incrementReplaySpecAttempt(specRow.id, feedback, {
+        spec: specRow.spec,
+        sourceOrigins: specRow.sourceOrigins,
+        secrets: params.currentSecrets(),
+      })
+      this.storage.setReplaySpecProof(run.id, updatedSpec.id, {
+        ...proof,
+        replaySpecId: updatedSpec.id,
+        verdict: 'inconclusive',
+        receipt: null,
+        createdAt: Date.now(),
+      })
+      if (findingRow) {
+        this.storage.updateProposedFinding(run, findingRow.id, {
+          replaySpecId: updatedSpec.id,
+          verificationTier: null,
+          finding: {
+            status,
+            verificationTier: undefined,
+            reason: findingRow.finding.reason?.trim() ? findingRow.finding.reason : integrity.reason,
+            confidence: 'low',
+            verification: `Agent script proof re-verification returned inconclusive (${integrity.reason}).`,
             exchangeIds: [],
           },
         })
@@ -2658,23 +3104,41 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     })
     const receiptOk = result.receipt?.verification.confirmed === true
       || result.compositeReceipt?.verification.confirmed === true
-    const confirmed = result.verdict.confirmed && receiptOk
+    const rawConfirmed = result.verdict.confirmed && receiptOk
+    // H-18 step 6: Reject receipt class drift on reverify when the re-verified receipt class
+    // disagrees with the confirmed finding's CWE family.
+    const provenVulnClass = result.compositeReceipt?.receipt.terminalVulnClass
+      ?? result.receipt?.receipt.vulnClass
+      ?? null
+    const classDriftReason = rawConfirmed && findingRow?.finding.cwe && provenVulnClass
+      && !isCweConsistentWithReceiptClass(findingRow.finding.cwe, provenVulnClass)
+      ? `Re-verification receipt class "${provenVulnClass}" (${cweFamilyForReceiptClass(provenVulnClass).cwe}) drifted from confirmed finding CWE ${normalizeCwe(findingRow.finding.cwe)}.`
+      : null
+    const confirmed = rawConfirmed && !classDriftReason
     const status: Finding['status'] = confirmed
       ? 'confirmed'
-      : result.verdict.reason === 'oracle_failed'
-        ? 'dismissed'
-        : 'inconclusive'
+      : classDriftReason
+        ? 'inconclusive'
+        : result.verdict.reason === 'oracle_failed'
+          ? 'dismissed'
+          : 'inconclusive'
     const verificationTier: VerificationTier | undefined = confirmed ? 'runtime_confirmed' : undefined
     const feedback: InlineVerifyFeedback = {
       verdict: status === 'confirmed' ? 'confirmed' : status === 'dismissed' ? 'dismissed' : 'inconclusive',
       ...(verificationTier ? { verificationTier } : {}),
-      controlPassed: result.verdict.attempts.every(attempt => attempt.oraclePassed),
+      controlPassed: !classDriftReason && result.verdict.attempts.every(attempt => attempt.oraclePassed),
       assertionSummary: {
         observed: confirmed
           ? `Agent script ${envelope.runtime} proof reproduced and its receipt re-validated.`
-          : `Agent script proof did not re-confirm: ${result.verdict.reason}.`,
+          : classDriftReason
+            ? classDriftReason
+            : `Agent script proof did not re-confirm: ${result.verdict.reason}.`,
         expected: 'the persisted script reproduces the confirmation and its receipt re-validates',
-        ...(result.verdict.detail ? { reason: result.verdict.detail } : {}),
+        ...(classDriftReason
+          ? { reason: classDriftReason }
+          : result.verdict.detail
+            ? { reason: result.verdict.detail }
+            : {}),
       },
       stepStatuses: [],
       retriesRemaining: maxInlineVerifyRetries,
@@ -2708,17 +3172,25 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     })
 
     if (findingRow) {
+      const preservedReason = status === 'inconclusive' && findingRow.finding.reason?.trim()
+        ? findingRow.finding.reason
+        : null
       const nextFinding: Finding & { evidence?: Record<string, unknown> } = {
         ...findingRow.finding,
         status,
         verificationTier,
-        reason: cleanReverifyComposite?.verification.reason ?? (result.verdict.detail || result.verdict.reason),
+        reason: preservedReason
+          ?? cleanReverifyComposite?.verification.reason
+          ?? classDriftReason
+          ?? (result.verdict.detail || result.verdict.reason),
         confidence: confirmed ? 'high' : 'low',
         verification: confirmed
           ? cleanReverifyComposite
             ? `ProofReceipt (Composite) ${cleanReverifyComposite.receipt.chainId} · ${cleanReverifyComposite.verification.hopCount} hops · ${cleanReverifyComposite.receipt.replayMode} · ${cleanReverifyComposite.verification.reason}`
             : `ProofReceipt · ${result.receipt?.verification.rule ?? 'script'} rule · ${result.receipt?.verification.reason ?? result.verdict.reason}`
-          : `Agent script proof re-verification returned ${status} (${result.verdict.reason}).`,
+          : classDriftReason
+            ? `Agent script proof re-verification returned inconclusive (${classDriftReason}).`
+            : `Agent script proof re-verification returned ${status} (${result.verdict.reason}).`,
         exchangeIds: result.exchanges.map(exchange => exchange.exchangeId),
         replaySpecId: updatedSpec.id,
         ...(cleanReverifyComposite ? {

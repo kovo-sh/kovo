@@ -140,6 +140,31 @@ export interface ExecBrokeredTransportContext {
   ) => Promise<{ evidenceId: string; stagedPath: string | null }>
 }
 
+const UNSAFE_PROTO_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype'])
+
+/**
+ * R2-C-2: Reject prototype-accessor segments (`__proto__`, `constructor`, `prototype`) in any
+ * dotted or bracketed parameter path before it can reach JSON/GraphQL injection helpers.
+ */
+export function isSafeParamName(name: string): boolean {
+  if (typeof name !== 'string') return false
+  const trimmed = name.trim()
+  if (!trimmed || /[\0\r\n]/.test(trimmed)) return false
+  const segments = trimmed
+    .split(/[.[\]]+/)
+    .map(seg => seg.trim().replace(/^['"]|['"]$/g, ''))
+    .filter(Boolean)
+  if (segments.length === 0) return false
+  return segments.every(seg => !UNSAFE_PROTO_SEGMENTS.has(seg))
+}
+
+export function assertSafeParamName(name: string, fieldLabel = 'paramName'): string {
+  if (!isSafeParamName(name)) {
+    throw new Error(`Invalid ${fieldLabel}: prototype accessor segments (__proto__, constructor, prototype) are forbidden.`)
+  }
+  return name.trim()
+}
+
 export interface ExecWorkerHost extends ExecCoreServices {
   personaAuth: PersonaAuthManager
   board: ExecBoardManager
@@ -602,11 +627,12 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         assignmentId: job.assignment.id, stepId: step.id, previous: priorEpoch, next: secretEpoch,
       })
     }
+    const warmPoolPolicy = `${run.id}:${secretEpoch}`
     const { reposDir, mountedRepos } = this.host.projectReposMount(run.projectId)
     this.host.warmSecretEpochByRun.set(run.id, secretEpoch)
     try {
       this.backend.setWarmPoolPolicy?.(
-        `${run.id}:${secretEpoch}`,
+        warmPoolPolicy,
         reposDir ? { reposDir } : undefined,
       )
     } catch { /* pooling is best-effort */ }
@@ -630,7 +656,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       session = await this.backend.openSession(
         job.assignment.id,
         job.controller.signal,
-        reposDir ? { reposDir } : undefined,
+        { warmPoolPolicy, ...(reposDir ? { reposDir } : {}) },
       )
     } catch (err) {
       clearPreSessionTimer()
@@ -921,12 +947,15 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
 
         probe_surface: async (args, signal) => {
           const { curRun, cleanOrigin, cappedMax } = prepareBudgetedProbe(args.origin, args.maxRequests, 150)
+          const safeParams = args.mode === 'params' && args.candidates?.length
+            ? args.candidates.map(candidate => assertSafeParamName(candidate, 'candidates'))
+            : undefined
           const res = await probeSurface({
             origin: cleanOrigin,
             mode: args.mode,
             wordlists: args.wordlists?.length ? args.wordlists : (args.wordlist ? [args.wordlist] : undefined),
             paths: args.mode === 'paths' ? args.candidates : undefined,
-            params: args.mode === 'params' ? args.candidates : undefined,
+            params: safeParams,
             basePath: args.basePath,
             paramLocation: args.paramLocation,
             methods: args.methods,
@@ -948,17 +977,29 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         probe_differential: async (args, signal) => {
           const { curRun, cleanOrigin, cappedMax } = prepareBudgetedProbe(args.origin, args.maxRequests, 60)
 
+          // R2-C-2: Reject prototype-accessor segments in worker-supplied parameter paths before injection.
+          const explicitParamName = args.paramName !== undefined
+            ? assertSafeParamName(args.paramName, 'paramName')
+            : undefined
+          const explicitSsrfParams = args.ssrfParams?.length
+            ? args.ssrfParams.map(name => assertSafeParamName(name, 'ssrfParams'))
+            : undefined
+
           const requestedTemplate = normalizeEndpointTemplate(args.pathAndQuery.split('?')[0] || '/')
           const originEndpoints = this.storage.listEndpoints(curRun.id, { origin: cleanOrigin })
           const targetEndpoint = originEndpoints.find(ep => ep.pathTemplate === requestedTemplate && (!args.method || ep.method === args.method.toUpperCase()))
             ?? originEndpoints.find(ep => ep.pathTemplate === requestedTemplate)
           const targetParams = targetEndpoint ? this.storage.listEndpointParams(curRun.id, targetEndpoint.id) : []
-          const injectableParams = targetParams.filter(p => ['query', 'json', 'form', 'path', 'graphql_var'].includes(p.location) && !p.isCsrf)
+          const injectableParams = targetParams.filter(p =>
+            ['query', 'json', 'form', 'path', 'graphql_var'].includes(p.location)
+            && !p.isCsrf
+            && isSafeParamName(p.name),
+          )
           const preferredParam = [...injectableParams].sort((a, b) =>
             Number(DETERMINISTIC_PARAM_HINT_RE.test(b.name)) - Number(DETERMINISTIC_PARAM_HINT_RE.test(a.name)) ||
             Number(a.isObjectId) - Number(b.isObjectId),
           )[0]
-          const resolvedParamName = args.paramName ?? preferredParam?.name
+          const resolvedParamName = explicitParamName ?? preferredParam?.name
           const resolvedParamLocation = args.paramLocation ?? (preferredParam && preferredParam.location !== 'cookie' ? preferredParam.location : undefined)
           const resourceSamples = this.storage.listResourceSamples(curRun.id)
             .filter(sample => sample.origin === cleanOrigin && sample.resourceId !== '[redacted]')
@@ -971,9 +1012,8 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             ...resourceSamples.map(sample => sample.resourceId),
           ])].slice(0, 10)
           const resolvedResourceIds = args.resourceIds?.length ? args.resourceIds : matchingResourceIds
-          const resolvedSsrfParams = args.ssrfParams?.length
-            ? args.ssrfParams
-            : injectableParams
+          const resolvedSsrfParams = explicitSsrfParams
+            ?? injectableParams
                 .map(param => param.name)
                 .filter(name => /(?:url|uri|link|redirect|callback|dest|host|path|file|fetch|webhook|next|return)/i.test(name))
                 .slice(0, 16)

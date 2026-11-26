@@ -1381,6 +1381,8 @@ export class FindingsRepository {
 
     const isExistingVerified = existing.finding.status === 'confirmed' || existing.finding.status === 'static_verified'
     const rawIncomingFinding: Partial<Finding> = patch.finding ? { ...patch.finding } : {}
+    const staysVerified = isExistingVerified
+      && (rawIncomingFinding.status === undefined || rawIncomingFinding.status === existing.finding.status)
     if (isExistingVerified) {
       // H-4 / H-18: Never allow post-confirmation updates to mutate confirmed finding identity/severity/category.
       delete rawIncomingFinding.cwe
@@ -1389,12 +1391,18 @@ export class FindingsRepository {
       delete rawIncomingFinding.category
       delete rawIncomingFinding.severity
       delete rawIncomingFinding.fingerprintHash
+      if (staysVerified && existing.replaySpecId) {
+        delete rawIncomingFinding.replaySpecId
+      }
     }
+    const effectiveReplaySpecId = staysVerified && existing.replaySpecId
+      ? existing.replaySpecId
+      : (patch.replaySpecId ?? existing.replaySpecId)
     const mergedFinding: Finding = {
       ...existing.finding,
       ...rawIncomingFinding,
       id: existing.id,
-      ...(patch.replaySpecId !== undefined ? { replaySpecId: patch.replaySpecId } : {}),
+      ...(effectiveReplaySpecId !== undefined && effectiveReplaySpecId !== null ? { replaySpecId: effectiveReplaySpecId } : {}),
       ...(patch.verificationTier !== undefined ? { verificationTier: patch.verificationTier ?? undefined } : {}),
       ...(!isExistingVerified && patch.fingerprintHash !== undefined ? { fingerprintHash: patch.fingerprintHash } : {}),
       ...(patch.supersededByFindingId !== undefined ? { supersededByFindingId: patch.supersededByFindingId } : {}),
@@ -1425,7 +1433,7 @@ export class FindingsRepository {
     if (mergedFinding.status === 'confirmed') {
       this.assertConfirmationEvidence(run.id, {
         findingId: existing.id,
-        replaySpecId: patch.replaySpecId ?? existing.replaySpecId,
+        replaySpecId: effectiveReplaySpecId,
         verification: mergedFinding.verification,
         findingKind: existing.findingKind,
         verificationTier: mergedFinding.verificationTier ?? existing.verificationTier,
@@ -1442,10 +1450,12 @@ export class FindingsRepository {
     } as Finding
 
     this.session.db.update(tables.findings).set({
-      replaySpecId: patch.replaySpecId ?? existing.replaySpecId,
+      replaySpecId: effectiveReplaySpecId ?? null,
       sourceOrigins: cleanOrigins,
       verificationTier: patch.verificationTier !== undefined ? patch.verificationTier : (mergedFinding.verificationTier ?? existing.verificationTier),
-      fingerprintHash: patch.fingerprintHash !== undefined ? patch.fingerprintHash : (mergedFinding.fingerprintHash ?? existing.fingerprintHash),
+      fingerprintHash: !isExistingVerified && patch.fingerprintHash !== undefined
+        ? patch.fingerprintHash
+        : (mergedFinding.fingerprintHash ?? existing.fingerprintHash),
       supersededByFindingId: patch.supersededByFindingId !== undefined ? patch.supersededByFindingId : (mergedFinding.supersededByFindingId ?? existing.supersededByFindingId),
       counterevidence: patch.counterevidence !== undefined ? patch.counterevidence : (mergedFinding.counterevidence ?? existing.counterevidence),
       confidenceRationale: patch.confidenceRationale !== undefined ? patch.confidenceRationale : (mergedFinding.confidenceRationale ?? existing.confidenceRationale),
@@ -1667,9 +1677,24 @@ export class FindingsRepository {
       return targetRow.finding
     }
 
-    const storedFinding: Finding = targetRow
+    const rawStoredFinding: Finding = targetRow
       ? mergeChainFindings(targetRow.finding, incoming)
       : incoming
+    const targetIsVerified = Boolean(
+      targetRow && (targetRow.finding.status === 'confirmed' || targetRow.finding.status === 'static_verified'),
+    )
+    const preservesVerifiedIdentity = targetIsVerified && targetRow!.finding.status === rawStoredFinding.status
+    const storedFinding: Finding = preservesVerifiedIdentity && targetRow
+      ? {
+          ...rawStoredFinding,
+          cwe: targetRow.finding.cwe,
+          origin: targetRow.finding.origin,
+          title: targetRow.finding.title,
+          category: targetRow.finding.category,
+          severity: targetRow.finding.severity,
+          ...(targetRow.finding.fingerprintHash !== undefined ? { fingerprintHash: targetRow.finding.fingerprintHash } : {}),
+        }
+      : rawStoredFinding
 
     const parentFindingIds = options.parentFindingIds
       ? [...new Set(options.parentFindingIds.filter(id => typeof id === 'string' && id.length > 0))]
