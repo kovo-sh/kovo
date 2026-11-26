@@ -20,75 +20,105 @@ export class DerivedCustodyError extends Error {
   }
 }
 
+export interface CapabilitySourceProvenance { sourceExchangeId?: string; sourcePersonaHandle?: string | null; sourceActorRoleLabel?: string | null; sourceActorRole?: string | null; sourceActorTenant?: string | null }
 export interface DerivedCapabilityMeta {
   handle: DerivedCapabilityHandle; runId: string; hopReceiptId: string; slot: string
   kind: DerivedSecretKind; sha256: string; sha256Prefix: string; createdAtMs: number; expiresAtMs: number | null
-  derivedFromCapabilityId?: DerivedCapabilityHandle; defaultHeaderName?: string; defaultCookieName?: string
-  allowedOrigins?: readonly string[]
+  derivedFromCapabilityId?: DerivedCapabilityHandle; defaultHeaderName?: string; defaultCookieName?: string; allowedOrigins?: readonly string[]
 }
-export interface DerivedCapabilityVaultOptions {
-  runId: string; persistPath?: string; defaultTtlMs?: number | null; maxEntries?: number; maxSealAttempts?: number; now?: () => number
-}
+export interface DerivedCapabilityVaultOptions { runId: string; persistPath?: string; defaultTtlMs?: number | null; maxEntries?: number; maxSealAttempts?: number; now?: () => number }
 export interface SealDerivedCapabilityInput {
   hopReceiptId: string; slot: string; rawValue: string; kind?: DerivedSecretKind; ttlMs?: number | null
   derivedFromCapabilityId?: DerivedCapabilityHandle; defaultHeaderName?: string; defaultCookieName?: string
-  allowedOrigins?: readonly string[]
+  allowedOrigins?: readonly string[]; sourceProvenance?: CapabilitySourceProvenance
 }
 export interface MatchedSealedHandle { handleId: DerivedCapabilityHandle; rawDigest: string }
 export interface MatchSealedHandlesInput { runId?: string; targetOrigin?: string; parts: readonly string[]; minLength?: number }
 
-const SAFE_ID_RE = /^[A-Za-z0-9._-]{1,128}$/
-const SAFE_SLOT_RE = /^[A-Za-z0-9._-]{1,64}$/
+const SAFE_ID_RE = /^[A-Za-z0-9._-]{1,128}$/, SAFE_SLOT_RE = /^[A-Za-z0-9._-]{1,64}$/
 const HANDLE_RE = /^cap:hop_([A-Za-z0-9._-]{1,128}):([A-Za-z0-9._-]{1,64})$/
-const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,64}$/
-const COOKIE_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,256}$/
-const CRLF_RE = /[\r\n\0]/
-const MAX_SECRET_BYTES = 32_768
-const DEFAULT_MAX_ENTRIES = 512
-const DEFAULT_MAX_SEAL_ATTEMPTS = 1_024
-export const MIN_SCRUB_LENGTH = 6
-const DEFAULT_AUTOBIND_MIN_LENGTH = 8
-const TRIVIAL_AUTOBIND_VALUES = new Set([
-  'undefined', 'approved', 'accepted', 'rejected', 'completed', 'complete', 'processing', 'succeeded', 'disabled', 'password',
-  'username', 'anonymous', 'localhost', 'application/json', 'text/plain', 'text/html', 'authorization', 'content-type', 'connection',
-  'keep-alive', 'transfer-encoding', 'not_found', 'internal_error', 'forbidden', 'unauthorized', 'bad_request', 'placeholder',
-  'default_value', 'readonly', 'readwrite',
-  // Common 6-7 char English/JSON/HTTP words safely excluded from exact-value scrubbing.
-  'status', 'active', 'public', 'failed', 'errors', 'result', 'object', 'string', 'number', 'delete',
-  'create', 'update', 'cancel', 'submit', 'search', 'header', 'cookie', 'bearer', 'tokens', 'secret',
-  'health', 'method', 'origin', 'target', 'client', 'server', 'system', 'normal', 'medium', 'simple',
-  'custom', 'strict', 'legacy', 'verify', 'access', 'denied', 'closed', 'opened', 'paused', 'queued',
-  'pending', 'success', 'warning', 'message', 'payload', 'request', 'headers', 'cookies', 'session',
-  'account', 'profile', 'default', 'enabled', 'unknown', 'invalid', 'missing', 'timeout', 'aborted',
-  'allowed', 'blocked', 'content', 'charset', 'options', 'connect', 'upgrade', 'expires', 'max-age',
-  'boolean', 'nullish', 'integer', 'version', 'headers', 'referer', 'refresh',
-])
+const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,64}$/, COOKIE_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,256}$/, CRLF_RE = /[\r\n\0]/
+const MAX_SECRET_BYTES = 32_768, DEFAULT_MAX_ENTRIES = 512, DEFAULT_MAX_SEAL_ATTEMPTS = 1_024, DEFAULT_AUTOBIND_MIN_LENGTH = 8, MAX_TRACKED_RUN_BUDGETS = 2_048
+export const DEFAULT_MAX_SEALS_PER_RUN = 256, DEFAULT_MAX_SEALS_PER_ENDPOINT = 24, DEFAULT_MAX_COMPOSITE_VERIFIES_PER_RUN = 32
+export const MIN_CRYPTO_KEY_LENGTH = 8, MIN_CRYPTO_KEY_ENTROPY_BITS = 1.5, MIN_SCRUB_LENGTH = 6
 
+interface RunCustodyBudgetState { sealTotal: number; sealByEndpoint: Map<string, number>; compositeVerifyTotal: number }
+const runCustodyBudgets = new Map<string, RunCustodyBudgetState>()
+function getOrCreateRunBudget(runId: string): RunCustodyBudgetState {
+  const key = runId.trim() || '__default__'
+  let state = runCustodyBudgets.get(key)
+  if (!state) {
+    if (runCustodyBudgets.size >= MAX_TRACKED_RUN_BUDGETS) { const oldest = runCustodyBudgets.keys().next().value; if (oldest !== undefined) runCustodyBudgets.delete(oldest) }
+    state = { sealTotal: 0, sealByEndpoint: new Map(), compositeVerifyTotal: 0 }
+    runCustodyBudgets.set(key, state)
+  }
+  return state
+}
+export function consumeRunSealBudget(runId: string, endpointKey?: string, limits: { maxPerRun?: number; maxPerEndpoint?: number } = {}): { runTotal: number; endpointTotal: number } {
+  const maxPerRun = Math.max(1, Math.floor(limits.maxPerRun ?? DEFAULT_MAX_SEALS_PER_RUN))
+  const maxPerEndpoint = Math.max(1, Math.floor(limits.maxPerEndpoint ?? DEFAULT_MAX_SEALS_PER_ENDPOINT))
+  const state = getOrCreateRunBudget(runId)
+  assertCustody(state.sealTotal < maxPerRun, 'CAPACITY_EXCEEDED', `Run capability custody budget exceeded (max ${maxPerRun} per run).`)
+  let endpointTotal = 0
+  if (endpointKey) {
+    endpointTotal = (state.sealByEndpoint.get(endpointKey) ?? 0) + 1
+    assertCustody(endpointTotal <= maxPerEndpoint, 'CAPACITY_EXCEEDED', `Capability seal budget exceeded for endpoint (max ${maxPerEndpoint} per endpoint per run).`)
+    state.sealByEndpoint.set(endpointKey, endpointTotal)
+  }
+  state.sealTotal += 1
+  return { runTotal: state.sealTotal, endpointTotal }
+}
+export function consumeRunCompositeVerifyBudget(runId: string, maxPerRun = DEFAULT_MAX_COMPOSITE_VERIFIES_PER_RUN): number {
+  const cap = Math.max(1, Math.floor(maxPerRun)), state = getOrCreateRunBudget(runId)
+  assertCustody(state.compositeVerifyTotal < cap, 'CAPACITY_EXCEEDED', `composite.verify run budget exceeded (max ${cap} per run).`)
+  return ++state.compositeVerifyTotal
+}
+export function resetRunCustodyBudgets(runId?: string): void {
+  if (runId === undefined) runCustodyBudgets.clear(); else runCustodyBudgets.delete(runId.trim() || '__default__')
+}
+function shannonEntropyPerChar(value: string): number {
+  if (!value.length) return 0
+  const counts = new Map<string, number>()
+  for (const ch of value) counts.set(ch, (counts.get(ch) ?? 0) + 1)
+  let h = 0
+  for (const c of counts.values()) { const p = c / value.length; h -= p * Math.log2(p) }
+  return h
+}
+export function assertSecretKeyEntropy(rawValue: string, label = 'secret key'): void {
+  const t = rawValue.trim()
+  assertCustody(t.length >= MIN_CRYPTO_KEY_LENGTH && !/^(.)\1+$/.test(t) && new Set(t).size >= 3 && shannonEntropyPerChar(t) >= MIN_CRYPTO_KEY_ENTROPY_BITS, 'INVALID_INPUT', `Derived ${label} does not meet minimum length/entropy requirements.`)
+}
+export function computeNonSecretLiteralHmac(options: { literalKey: string; payload: string; alg: HostHmacAlg; encoding: HostHmacEncoding; isRedacted: (text: string) => boolean; vault: DerivedCapabilityVault }): { signature: string; payloadDigest: string; signatureDigest: string } {
+  assertCustody(ALLOWED_HMAC_ALGS.has(options.alg), 'INVALID_INPUT', `Unsupported HMAC alg "${String(options.alg)}".`)
+  assertCustody(ALLOWED_HMAC_ENC.has(options.encoding), 'INVALID_INPUT', `Unsupported HMAC encoding "${String(options.encoding)}".`)
+  assertCustody(!isDerivedCapabilityHandle(options.literalKey), 'INVALID_INPUT', 'crypto.hmacSign literalKey must not be a capability handle; pass secretHandle instead.')
+  assertCustody(!options.isRedacted(options.literalKey) && options.vault.matchSealedHandlesInRequest({ runId: options.vault.runId, parts: [options.literalKey], minLength: 4 }).length === 0, 'INVALID_INPUT', 'crypto.hmacSign rejected literalKey referencing host or sealed secret material.')
+  const signature = createHmac(options.alg, options.literalKey).update(options.payload).digest(options.encoding)
+  return { signature, payloadDigest: sha256Hex(options.payload), signatureDigest: sha256Hex(signature) }
+}
+export function resolveVerifyRpcScratchRoot(env: NodeJS.ProcessEnv = process.env): string | null {
+  const explicit = env.KOVO_CONTAINER_SCRATCH_DIR?.trim() || ''
+  if (!explicit && !env.KOVO_HOST_SCRATCH_DIR?.trim() && !env.KOVO_WORKER_SCRATCH_VOLUME?.trim()) return null
+  const dir = explicit || '/scratch'
+  if (/[\0,\r\n]/.test(dir) || !dir.startsWith('/') || dir.split(/[\\/]+/).includes('..')) throw new Error('Invalid KOVO_CONTAINER_SCRATCH_DIR path.')
+  const normalized = dir.replace(/\/+$/, '') || '/'
+  if (normalized === '/') throw new Error('KOVO_CONTAINER_SCRATCH_DIR must not be root "/".')
+  return normalized
+}
+const TRIVIAL_AUTOBIND_VALUES = new Set(['undefined','approved','accepted','rejected','completed','complete','processing','succeeded','disabled','password','username','anonymous','localhost','application/json','text/plain','text/html','authorization','content-type','connection','keep-alive','transfer-encoding','not_found','internal_error','forbidden','unauthorized','bad_request','placeholder','default_value','readonly','readwrite','status','active','public','failed','errors','result','object','string','number','delete','create','update','cancel','submit','search','header','cookie','bearer','tokens','secret','health','method','origin','target','client','server','system','normal','medium','simple','custom','strict','legacy','verify','access','denied','closed','opened','paused','queued','pending','success','warning','message','payload','request','headers','cookies','session','account','profile','default','enabled','unknown','invalid','missing','timeout','aborted','allowed','blocked','content','charset','options','connect','upgrade','expires','max-age','boolean','nullish','integer','version','referer','refresh'])
 export function isScrubbableCapabilityValue(rawValue: string, minLength = MIN_SCRUB_LENGTH): boolean {
-  const floor = Math.max(1, minLength)
-  const trimmed = rawValue.trim()
-  if (!trimmed || rawValue.length < floor || trimmed.length < floor) return false
-  if (/^(.)\1+$/.test(trimmed)) return false
-  if (TRIVIAL_AUTOBIND_VALUES.has(trimmed.toLowerCase())) return false
-  // For short 6-7 char values, require at least 3 distinct characters so trivial low-entropy
-  // patterns (like `ababab`) do not corrupt benign JSON/text while real 6-7 char tokens/OTPs do scrub.
-  if (trimmed.length < 8 && new Set(trimmed).size < 3) return false
-  return true
+  const floor = Math.max(1, minLength), trimmed = rawValue.trim()
+  if (!trimmed || rawValue.length < floor || trimmed.length < floor || /^(.)\1+$/.test(trimmed) || TRIVIAL_AUTOBIND_VALUES.has(trimmed.toLowerCase())) return false
+  return !(trimmed.length < 8 && new Set(trimmed).size < 3)
 }
 const UNSAFE_HEADERS = new Set(['host', 'content-length', 'connection', 'transfer-encoding', 'upgrade', 'keep-alive', 'te', 'trailer', 'proxy-connection'])
-
-function assertCustody(cond: unknown, code: DerivedCustodyErrorCode, msg: string): asserts cond {
-  if (!cond) throw new DerivedCustodyError(code, msg)
-}
+function assertCustody(cond: unknown, code: DerivedCustodyErrorCode, msg: string): asserts cond { if (!cond) throw new DerivedCustodyError(code, msg) }
 export function formatDerivedHandle(hopReceiptId: string, slot: string): DerivedCapabilityHandle {
   assertCustody(SAFE_ID_RE.test(hopReceiptId), 'INVALID_HANDLE', `Invalid hopReceiptId "${hopReceiptId}".`)
   assertCustody(SAFE_SLOT_RE.test(slot), 'INVALID_HANDLE', `Invalid capability slot "${slot}".`)
   return `cap:hop_${hopReceiptId}:${slot}`
 }
-export function parseDerivedHandle(handle: string): { hopReceiptId: string; slot: string } | null {
-  const m = HANDLE_RE.exec(handle)
-  return m ? { hopReceiptId: m[1]!, slot: m[2]! } : null
-}
+export function parseDerivedHandle(handle: string): { hopReceiptId: string; slot: string } | null { const m = HANDLE_RE.exec(handle); return m ? { hopReceiptId: m[1]!, slot: m[2]! } : null }
 export function isDerivedCapabilityHandle(value: string): value is DerivedCapabilityHandle { return HANDLE_RE.test(value) }
 function sha256Hex(value: string | Uint8Array): string { return createHash('sha256').update(value).digest('hex') }
 function normalizeOrigin(raw: string): string {
@@ -97,14 +127,15 @@ function normalizeOrigin(raw: string): string {
   assertCustody(parsed.protocol === 'http:' || parsed.protocol === 'https:', 'INVALID_INPUT', `Unsupported origin protocol in "${raw}".`)
   return parsed.origin
 }
-function cloneMeta(meta: DerivedCapabilityMeta): DerivedCapabilityMeta {
-  return { ...meta, ...(meta.allowedOrigins ? { allowedOrigins: [...meta.allowedOrigins] } : {}) }
-}
+function cloneMeta(meta: DerivedCapabilityMeta): DerivedCapabilityMeta { return { ...meta, ...(meta.allowedOrigins ? { allowedOrigins: [...meta.allowedOrigins] } : {}) } }
 
 // --- Module-Private Custody Store & 0600 Persistence ---
-interface SealedEntry { meta: DerivedCapabilityMeta; rawValue: string }
+interface SealedEntry { meta: DerivedCapabilityMeta; rawValue: string; sourceProvenance?: CapabilitySourceProvenance }
 interface ScrubRecord { handle: DerivedCapabilityHandle; rawValue: string }
 interface PersistedVaultPayload { v: 1; runId: string; entries: SealedEntry[]; scrubHistory: ScrubRecord[] }
+function cloneProvenance(prov: CapabilitySourceProvenance | undefined): CapabilitySourceProvenance | null {
+  return prov ? { ...prov } : null
+}
 interface VaultInternals {
   readonly runId: string; readonly persistPath?: string; readonly defaultTtlMs: number | null
   readonly maxEntries: number; readonly maxSealAttempts: number; sealAttempts: number; readonly now: () => number
@@ -226,48 +257,27 @@ export class DerivedCapabilityVault {
       ...(input.defaultCookieName ? { defaultCookieName: input.defaultCookieName } : {}),
       ...(allowedOrigins?.length ? { allowedOrigins } : {}),
     }
-    state.entries.set(handle, { meta, rawValue: input.rawValue })
+    state.entries.set(handle, {
+      meta, rawValue: input.rawValue,
+      ...(input.sourceProvenance ? { sourceProvenance: { ...input.sourceProvenance } } : {}),
+    })
     state.sealedDigests.set(handle, digest)
     state.scrubHistory.set(input.rawValue, { handle, rawValue: input.rawValue })
     writePersistedVault(state)
     return cloneMeta(meta)
   }
 
-  hasEverSealed(handle: string): boolean {
-    const state = getInternals(this)
-    return isDerivedCapabilityHandle(handle) && (state.entries.has(handle) || state.sealedDigests.has(handle))
-  }
-
-  getMeta(handle: string): DerivedCapabilityMeta | null {
-    const entry = isDerivedCapabilityHandle(handle) ? getInternals(this).entries.get(handle) : undefined
-    return entry ? cloneMeta(entry.meta) : null
-  }
-  isExpired(handle: string): boolean {
-    const state = getInternals(this)
-    const entry = isDerivedCapabilityHandle(handle) ? state.entries.get(handle) : undefined
-    return Boolean(entry && entry.meta.expiresAtMs !== null && state.now() >= entry.meta.expiresAtMs)
-  }
-  hasActive(handle: string): boolean {
-    const state = getInternals(this)
-    const entry = isDerivedCapabilityHandle(handle) ? state.entries.get(handle) : undefined
-    return Boolean(entry && (entry.meta.expiresAtMs === null || state.now() < entry.meta.expiresAtMs))
-  }
+  hasEverSealed(handle: string): boolean { const s = getInternals(this); return isDerivedCapabilityHandle(handle) && (s.entries.has(handle) || s.sealedDigests.has(handle)) }
+  getSourceProvenance(handle: string): CapabilitySourceProvenance | null { return cloneProvenance(isDerivedCapabilityHandle(handle) ? getInternals(this).entries.get(handle)?.sourceProvenance : undefined) }
+  getMeta(handle: string): DerivedCapabilityMeta | null { const e = isDerivedCapabilityHandle(handle) ? getInternals(this).entries.get(handle) : undefined; return e ? cloneMeta(e.meta) : null }
+  isExpired(handle: string): boolean { const s = getInternals(this), e = isDerivedCapabilityHandle(handle) ? s.entries.get(handle) : undefined; return Boolean(e && e.meta.expiresAtMs !== null && s.now() >= e.meta.expiresAtMs) }
+  hasActive(handle: string): boolean { const s = getInternals(this), e = isDerivedCapabilityHandle(handle) ? s.entries.get(handle) : undefined; return Boolean(e && (e.meta.expiresAtMs === null || s.now() < e.meta.expiresAtMs)) }
   list(): DerivedCapabilityMeta[] { return Array.from(getInternals(this).entries.values(), e => cloneMeta(e.meta)) }
-  revoke(handle: string): boolean {
-    const state = getInternals(this)
-    const removed = isDerivedCapabilityHandle(handle) && state.entries.delete(handle)
-    if (removed) writePersistedVault(state)
-    return removed
-  }
+  revoke(handle: string): boolean { const s = getInternals(this), rm = isDerivedCapabilityHandle(handle) && s.entries.delete(handle); if (rm) writePersistedVault(s); return rm }
   purgeExpired(): number {
-    const state = getInternals(this)
-    const nowMs = state.now()
-    let removed = 0
-    for (const [handle, entry] of state.entries) {
-      if (entry.meta.expiresAtMs !== null && nowMs >= entry.meta.expiresAtMs) { state.entries.delete(handle); removed += 1 }
-    }
-    if (removed > 0) writePersistedVault(state)
-    return removed
+    const s = getInternals(this), nowMs = s.now(); let removed = 0
+    for (const [h, e] of s.entries) if (e.meta.expiresAtMs !== null && nowMs >= e.meta.expiresAtMs) { s.entries.delete(h); removed += 1 }
+    if (removed > 0) writePersistedVault(s); return removed
   }
   injectCapabilityIntoRequest(options: Omit<InjectCapabilityOptions, 'vault'>): InjectCapabilityResult { return injectCapabilityIntoRequest({ ...options, vault: this }) }
   hostHmacSign(options: Omit<HostHmacSignOptions, 'vault'>): HostHmacSignResult { return hostHmacSign({ ...options, vault: this }) }
@@ -354,34 +364,19 @@ export interface CapabilityConsumptionAttestation {
 }
 export interface InjectCapabilityResult { request: HostInjectableRequest; attestation: CapabilityConsumptionAttestation }
 
-function setHeaderCI(headers: Record<string, string>, name: string, value: string): void {
-  const lower = name.toLowerCase()
-  for (const key of Object.keys(headers)) if (key.toLowerCase() === lower) delete headers[key]
-  headers[name] = value
-}
-function getHeaderCI(headers: Record<string, string>, name: string): string | undefined {
-  const lower = name.toLowerCase()
-  return Object.entries(headers).find(([k]) => k.toLowerCase() === lower)?.[1]
-}
+function setHeaderCI(headers: Record<string, string>, name: string, value: string): void { const lower = name.toLowerCase(); for (const key of Object.keys(headers)) if (key.toLowerCase() === lower) delete headers[key]; headers[name] = value }
+function getHeaderCI(headers: Record<string, string>, name: string): string | undefined { const lower = name.toLowerCase(); return Object.entries(headers).find(([k]) => k.toLowerCase() === lower)?.[1] }
 function mergeCookieHeader(existing: string | undefined, cookieName: string, rawValue: string): string {
-  const pairs: string[] = []
-  let replaced = false
+  const pairs: string[] = []; let replaced = false
   for (const seg of (existing ?? '').split(';')) {
-    const t = seg.trim()
-    if (!t) continue
+    const t = seg.trim(); if (!t) continue
     const eq = t.indexOf('=')
-    if (eq > 0 && t.slice(0, eq).trim() === cookieName) {
-      if (!replaced) { pairs.push(`${cookieName}=${rawValue}`); replaced = true }
-    } else pairs.push(t)
+    if (eq > 0 && t.slice(0, eq).trim() === cookieName) { if (!replaced) { pairs.push(`${cookieName}=${rawValue}`); replaced = true } } else pairs.push(t)
   }
   if (!replaced) pairs.push(`${cookieName}=${rawValue}`)
   return pairs.join('; ')
 }
-function resolveVault(optVault: DerivedCapabilityVault | undefined, argVault: DerivedCapabilityVault | undefined): DerivedCapabilityVault {
-  const vault = optVault ?? argVault
-  assertCustody(vault, 'INVALID_INPUT', 'A DerivedCapabilityVault instance is required.')
-  return vault
-}
+function resolveVault(optVault: DerivedCapabilityVault | undefined, argVault: DerivedCapabilityVault | undefined): DerivedCapabilityVault { const v = optVault ?? argVault; assertCustody(v, 'INVALID_INPUT', 'A DerivedCapabilityVault instance is required.'); return v }
 
 export function injectCapabilityIntoRequest(options: InjectCapabilityOptions & { vault: DerivedCapabilityVault }): InjectCapabilityResult
 export function injectCapabilityIntoRequest(options: InjectCapabilityOptions, vault: DerivedCapabilityVault): InjectCapabilityResult
@@ -443,12 +438,15 @@ const ALLOWED_HMAC_ENC = new Set<HostHmacEncoding>(['hex', 'base64', 'base64url'
 export interface HostHmacSignOptions {
   vault?: DerivedCapabilityVault; secretHandle: string; payload: string | Uint8Array
   alg: HostHmacAlg; encoding?: HostHmacEncoding; runId?: string
+  hopReceiptId?: string; slot?: string; ttlMs?: number | null; allowedOrigins?: readonly string[]
+  sealOutput?: boolean; enforceKeyEntropy?: boolean
 }
 export interface HmacDerivationAttestation {
-  derivedFromCapabilityId: DerivedCapabilityHandle; alg: HostHmacAlg; encoding: HostHmacEncoding
+  derivedFromCapabilityId: DerivedCapabilityHandle; derivedHandle?: DerivedCapabilityHandle
+  alg: HostHmacAlg; encoding: HostHmacEncoding
   payloadDigest: string; signatureDigest: string; sourceSecretDigest: string; runId: string; timestampMs: number
 }
-export interface HostHmacSignResult { signature: string; attestation: HmacDerivationAttestation }
+export interface HostHmacSignResult { signature: string; derivedHandle?: DerivedCapabilityHandle; attestation: HmacDerivationAttestation }
 
 export function hostHmacSign(options: HostHmacSignOptions & { vault: DerivedCapabilityVault }): HostHmacSignResult
 export function hostHmacSign(options: HostHmacSignOptions, vault: DerivedCapabilityVault): HostHmacSignResult
@@ -460,12 +458,23 @@ export function hostHmacSign(options: HostHmacSignOptions, vaultArg?: DerivedCap
   assertCustody(ALLOWED_HMAC_ENC.has(encoding), 'INVALID_INPUT', `Unsupported HMAC encoding "${String(encoding)}".`)
   assertCustody(typeof options.payload === 'string' || options.payload instanceof Uint8Array, 'INVALID_INPUT', 'HMAC payload must be string or Uint8Array.')
   const entry = resolveActiveEntry(vault, options.secretHandle, { runId: options.runId })
+  if (options.enforceKeyEntropy) assertSecretKeyEntropy(entry.rawValue, 'HMAC key')
   const signature = createHmac(options.alg, entry.rawValue).update(options.payload).digest(encoding)
+  const timestampMs = state.now()
+  let derivedHandle: DerivedCapabilityHandle | undefined
+  if (options.sealOutput) {
+    derivedHandle = vault.seal({
+      hopReceiptId: options.hopReceiptId ?? entry.meta.hopReceiptId, slot: options.slot ?? `hmac_${sha256Hex(`${entry.meta.handle}:${signature}`).slice(0, 12)}`,
+      rawValue: signature, kind: 'header_secret', ttlMs: options.ttlMs, derivedFromCapabilityId: entry.meta.handle,
+      allowedOrigins: options.allowedOrigins ?? entry.meta.allowedOrigins, ...(entry.sourceProvenance ? { sourceProvenance: entry.sourceProvenance } : {}),
+    }).handle
+  }
   return {
-    signature,
+    signature, ...(derivedHandle ? { derivedHandle } : {}),
     attestation: {
-      derivedFromCapabilityId: entry.meta.handle, alg: options.alg, encoding, payloadDigest: sha256Hex(options.payload),
-      signatureDigest: sha256Hex(signature), sourceSecretDigest: entry.meta.sha256, runId: state.runId, timestampMs: state.now(),
+      derivedFromCapabilityId: entry.meta.handle, ...(derivedHandle ? { derivedHandle } : {}),
+      alg: options.alg, encoding, payloadDigest: sha256Hex(options.payload),
+      signatureDigest: sha256Hex(signature), sourceSecretDigest: entry.meta.sha256, runId: state.runId, timestampMs,
     },
   }
 }
@@ -476,7 +485,7 @@ const JWT_ALG_TO_NODE: Record<HostJwtAlg, HostHmacAlg> = { HS256: 'sha256', HS38
 export interface HostJwtSignOptions {
   vault?: DerivedCapabilityVault; secretHandle: string; claims: Record<string, unknown>
   header?: Record<string, unknown>; alg: HostJwtAlg; hopReceiptId?: string; slot?: string
-  ttlMs?: number | null; allowedOrigins?: readonly string[]; runId?: string
+  ttlMs?: number | null; allowedOrigins?: readonly string[]; runId?: string; enforceKeyEntropy?: boolean
 }
 export interface JwtDerivationAttestation {
   derivedFromCapabilityId: DerivedCapabilityHandle; derivedHandle: DerivedCapabilityHandle; alg: HostJwtAlg
@@ -495,6 +504,7 @@ export function hostJwtSign(options: HostJwtSignOptions, vaultArg?: DerivedCapab
   assertCustody(options.header === undefined || (options.header && typeof options.header === 'object' && !Array.isArray(options.header)), 'INVALID_INPUT', 'JWT header must be a plain object.')
   assertCustody(options.header?.alg === undefined || options.header.alg === options.alg, 'INVALID_INPUT', 'JWT header.alg must match options.alg.')
   const entry = resolveActiveEntry(vault, options.secretHandle, { runId: options.runId })
+  if (options.enforceKeyEntropy) assertSecretKeyEntropy(entry.rawValue, 'JWT key')
   let headerJson: string, claimsJson: string
   try {
     headerJson = JSON.stringify({ typ: 'JWT', ...(options.header ?? {}), alg: options.alg })
@@ -509,6 +519,7 @@ export function hostJwtSign(options: HostJwtSignOptions, vaultArg?: DerivedCapab
     hopReceiptId: options.hopReceiptId ?? entry.meta.hopReceiptId, slot: options.slot ?? `jwt_${sha256Hex(token).slice(0, 12)}`,
     rawValue: token, kind: 'jwt', ttlMs: options.ttlMs, derivedFromCapabilityId: entry.meta.handle,
     allowedOrigins: options.allowedOrigins ?? entry.meta.allowedOrigins,
+    ...(entry.sourceProvenance ? { sourceProvenance: entry.sourceProvenance } : {}),
   })
   return {
     token, derivedHandle: sealedMeta.handle,
@@ -554,17 +565,14 @@ function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
     signal.addEventListener('abort', onAbort, { once: true })
   })
 }
-
 async function raceWithAbortAndDeadline<T>(work: () => Promise<T> | T, signal: AbortSignal, remainingMs: number): Promise<{ kind: 'ok'; value: T } | { kind: 'aborted' } | { kind: 'timeout' }> {
   if (signal.aborted) return { kind: 'aborted' }
   if (remainingMs <= 0) return { kind: 'timeout' }
-  let timer: ReturnType<typeof setTimeout> | undefined
-  let onAbort: (() => void) | undefined
+  let timer: ReturnType<typeof setTimeout> | undefined, onAbort: (() => void) | undefined
   try {
     const workP = Promise.resolve().then(work).then(value => ({ kind: 'ok' as const, value }))
     const gateP = new Promise<{ kind: 'aborted' } | { kind: 'timeout' }>(resolve => {
-      onAbort = () => resolve({ kind: 'aborted' })
-      signal.addEventListener('abort', onAbort, { once: true })
+      onAbort = () => resolve({ kind: 'aborted' }); signal.addEventListener('abort', onAbort, { once: true })
       timer = setTimeout(() => resolve({ kind: 'timeout' }), remainingMs)
     })
     return await Promise.race([workP, gateP])
@@ -573,34 +581,21 @@ async function raceWithAbortAndDeadline<T>(work: () => Promise<T> | T, signal: A
     if (onAbort) signal.removeEventListener('abort', onAbort)
   }
 }
-
 export async function awaitAsyncConvergence<T>(options: AwaitAsyncConvergenceOptions<T>): Promise<AsyncConvergenceResult<T>> {
   const now = options.now ?? Date.now
   const profile: AsyncPollProfile = options.profile ?? (options.timeoutMs !== undefined && options.timeoutMs > 5_000 ? 'wan' : 'fast_lab')
-  const bounds = ASYNC_CONVERGENCE_PROFILES[profile]
-  const timeoutMs = options.timeoutMs ?? bounds.defaultTimeoutMs
-  const intervalMs = options.intervalMs ?? bounds.defaultIntervalMs
-  const maxAttempts = options.maxAttempts ?? bounds.defaultMaxAttempts
+  const bounds = ASYNC_CONVERGENCE_PROFILES[profile], timeoutMs = options.timeoutMs ?? bounds.defaultTimeoutMs, intervalMs = options.intervalMs ?? bounds.defaultIntervalMs, maxAttempts = options.maxAttempts ?? bounds.defaultMaxAttempts
   assertCustody(Number.isFinite(timeoutMs) && timeoutMs > 0 && timeoutMs <= bounds.maxTimeoutMs, 'INVALID_INPUT', `timeoutMs (${timeoutMs}) must be in (0, ${bounds.maxTimeoutMs}] for "${profile}".`)
   assertCustody(Number.isFinite(intervalMs) && intervalMs >= 0 && intervalMs <= bounds.maxTimeoutMs, 'INVALID_INPUT', `intervalMs (${intervalMs}) is out of bounds.`)
   assertCustody(Number.isInteger(maxAttempts) && maxAttempts >= 1, 'INVALID_INPUT', 'maxAttempts must be a positive integer.')
   const startMs = now(), tTriggerMs = options.tTriggerMs ?? startMs
   assertCustody(Number.isFinite(tTriggerMs), 'INVALID_INPUT', 'tTriggerMs must be a finite timestamp.')
-  const deadlineMs = startMs + timeoutMs
-  const attemptLog: AsyncConvergenceAttemptRecord[] = []
-  const controller = new AbortController()
+  const deadlineMs = startMs + timeoutMs, attemptLog: AsyncConvergenceAttemptRecord[] = [], controller = new AbortController()
   const onExternalAbort = () => controller.abort(options.signal?.reason)
-  if (options.signal) {
-    if (options.signal.aborted) controller.abort(options.signal.reason)
-    else options.signal.addEventListener('abort', onExternalAbort, { once: true })
-  }
+  if (options.signal) { if (options.signal.aborted) controller.abort(options.signal.reason); else options.signal.addEventListener('abort', onExternalAbort, { once: true }) }
   const finish = (status: AsyncConvergenceStatus, tObservedMs: number | null, value?: T): AsyncConvergenceResult<T> => ({
     converged: status === 'converged', status, ...(value !== undefined ? { value } : {}),
-    evidence: {
-      profile, tTriggerMs, tObservedMs, elapsedMs: Math.max(0, (tObservedMs ?? now()) - tTriggerMs),
-      attempts: attemptLog.length, timeoutMs, intervalMs, maxAttempts,
-      aborted: status === 'aborted', timedOut: status === 'timeout', attemptLog,
-    },
+    evidence: { profile, tTriggerMs, tObservedMs, elapsedMs: Math.max(0, (tObservedMs ?? now()) - tTriggerMs), attempts: attemptLog.length, timeoutMs, intervalMs, maxAttempts, aborted: status === 'aborted', timedOut: status === 'timeout', attemptLog },
   })
   try {
     if (controller.signal.aborted) return finish('aborted', null)
@@ -614,21 +609,13 @@ export async function awaitAsyncConvergence<T>(options: AwaitAsyncConvergenceOpt
         const raced = await raceWithAbortAndDeadline(() => options.pollFn({ attempt, elapsedMs: Math.max(0, startedAtMs - tTriggerMs), signal: controller.signal }), controller.signal, remainingMs)
         if (raced.kind === 'aborted') return finish('aborted', null)
         if (raced.kind === 'timeout') { controller.abort(new Error('convergence_timeout')); return finish(sawMonotonicRejection ? 'monotonic_violation' : 'timeout', null) }
-        const completedAtMs = now()
-        const extracted = options.extractObservedAtMs?.(raced.value)
+        const completedAtMs = now(), extracted = options.extractObservedAtMs?.(raced.value)
         const observedAtMs = typeof extracted === 'number' && Number.isFinite(extracted) ? extracted : completedAtMs
         const matched = Boolean(await options.matchPredicate(raced.value, { attempt, observedAtMs }))
-        if (matched && completedAtMs < tTriggerMs) {
-          attemptLog.push({ attempt, startedAtMs, completedAtMs, observedAtMs, matched: true, rejectedReason: 'clock_before_trigger' })
-          return finish('monotonic_violation', null)
-        }
-        if (matched && observedAtMs < tTriggerMs) {
-          sawMonotonicRejection = true
-          attemptLog.push({ attempt, startedAtMs, completedAtMs, observedAtMs, matched: true, rejectedReason: 'non_monotonic_observed_timestamp' })
-        } else if (matched) {
-          attemptLog.push({ attempt, startedAtMs, completedAtMs, observedAtMs, matched: true })
-          return finish('converged', observedAtMs, raced.value)
-        } else attemptLog.push({ attempt, startedAtMs, completedAtMs, observedAtMs, matched: false })
+        if (matched && completedAtMs < tTriggerMs) { attemptLog.push({ attempt, startedAtMs, completedAtMs, observedAtMs, matched: true, rejectedReason: 'clock_before_trigger' }); return finish('monotonic_violation', null) }
+        if (matched && observedAtMs < tTriggerMs) { sawMonotonicRejection = true; attemptLog.push({ attempt, startedAtMs, completedAtMs, observedAtMs, matched: true, rejectedReason: 'non_monotonic_observed_timestamp' }) }
+        else if (matched) { attemptLog.push({ attempt, startedAtMs, completedAtMs, observedAtMs, matched: true }); return finish('converged', observedAtMs, raced.value) }
+        else attemptLog.push({ attempt, startedAtMs, completedAtMs, observedAtMs, matched: false })
       } catch (err) {
         if (controller.signal.aborted) return finish('aborted', null)
         const completedAtMs = now()
