@@ -165,8 +165,20 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
       },
     }))
     try {
+      const cfg = persona.loginConfig
+      const preferredOrigin = typeof cfg?.verifyOrigin === 'string' && persona.originAllowlist.includes(cfg.verifyOrigin)
+        ? cfg.verifyOrigin
+        : undefined
+      const preferredPath = typeof cfg?.verifyPath === 'string' && cfg.verifyPath.startsWith('/') && !cfg.verifyPath.startsWith('//')
+        ? cfg.verifyPath
+        : undefined
       const res = await testPersonaAuthAction({
-        data: { projectId: project.id, personaId: persona.id },
+        data: {
+          projectId: project.id,
+          personaId: persona.id,
+          ...(preferredOrigin ? { origin: preferredOrigin } : {}),
+          ...(preferredPath ? { path: preferredPath } : {}),
+        },
       })
       setPersonaTests(prev => ({
         ...prev,
@@ -343,6 +355,7 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
             <ProjectPersonasTab
               key={project.id}
               data={data}
+              assets={assets}
               personaTests={personaTests}
               onTestPersona={persona => void handleTestPersonaAuth(persona)}
               onPersonaCreated={created => {

@@ -8,7 +8,11 @@ import { pipeline } from 'node:stream/promises'
 import { assetOriginForEnvironment, isLocalLabEnvEnabled } from '../src/domain.ts'
 import { getAppRuntime } from '../src/server/app-runtime.ts'
 import type { AppRuntime } from '../src/server/app-runtime.ts'
-import { BrowserCaptureManager } from '../src/server/browser-session-auth.ts'
+import {
+  BrowserCaptureManager,
+  updateBrowserSessionPersonaMeta,
+  wwwSiblingOrigin,
+} from '../src/server/browser-session-auth.ts'
 import type { CaptureKeyInput, CaptureMouseInput } from '../src/server/browser-session-auth.ts'
 import { configureGlobalKillSwitch } from '../src/server/kill-switch.ts'
 import type { GlobalKillSwitch } from '../src/server/kill-switch.ts'
@@ -25,6 +29,7 @@ const pairingLinkPath = '/_kovo/auth/pairing-link'
 const rotateSessionPath = '/_kovo/auth/rotate-session'
 const authStatusPath = '/_kovo/auth/status'
 const authCaptureStartPath = '/_kovo/auth-capture/start'
+const authCapturePersonaConfigPath = '/_kovo/auth-capture/persona-config'
 const authCaptureActionRegex = /^\/_kovo\/auth-capture\/([A-Za-z0-9_-]{6,128})\/(stream|input|complete|cancel)$/
 const killSwitchPath = '/api/ops/kill-switch'
 const receiptExportPathRegex = /^\/api\/runs\/([A-Za-z0-9_-]{1,128})\/receipts\/export$/
@@ -642,17 +647,21 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
       }
       let allowLocalLab = false
       let projectEnv: 'public' | 'local-lab' = 'public'
-      let rawAllowedOrigins: string[] | undefined = Array.isArray(body.allowedOrigins)
+      const explicitAllowedOrigins: string[] = Array.isArray(body.allowedOrigins)
         ? body.allowedOrigins.filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
-        : undefined
+        : []
+      const projectAutoOrigins: string[] = []
       if (storeHandle) {
         try {
-          const proj = storeHandle.project(projectId)
+          const detail = storeHandle.projectDetail(projectId)
+          const proj = detail.project
           projectEnv = proj.environment
           allowLocalLab = proj.environment === 'local-lab' && isLocalLabEnvEnabled()
-          if (!rawAllowedOrigins || rawAllowedOrigins.length === 0) {
-            rawAllowedOrigins = [...proj.seeds]
-          }
+          projectAutoOrigins.push(
+            ...(proj.defaultScope ?? []),
+            ...(proj.seeds ?? []),
+            ...(detail.assets ?? []).filter(a => !a.thirdParty).map(a => a.origin),
+          )
         } catch (err) {
           return sendJson(res, 404, { error: err instanceof Error ? err.message : 'Project not found.' })
         }
@@ -667,20 +676,38 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
           error: parsedTarget.error.issues[0]?.message ?? `targetOrigin is not allowed for this ${projectEnv} project.`,
         })
       }
-      let allowedOrigins: string[] | undefined
-      if (rawAllowedOrigins && rawAllowedOrigins.length > 0) {
-        const validated: string[] = []
-        for (const candidate of rawAllowedOrigins.slice(0, 64)) {
-          const parsedCandidate = originPolicy.safeParse(candidate)
-          if (!parsedCandidate.success) {
-            return sendJson(res, 400, {
-              error: parsedCandidate.error.issues[0]?.message ?? `allowedOrigins entry "${candidate}" is not allowed for this ${projectEnv} project.`,
-            })
-          }
-          validated.push(parsedCandidate.data)
-        }
-        allowedOrigins = validated
+      const mergedAllowed = new Set<string>([parsedTarget.data])
+      const targetSibling = wwwSiblingOrigin(parsedTarget.data)
+      if (targetSibling) {
+        const parsedSib = originPolicy.safeParse(targetSibling)
+        if (parsedSib.success) mergedAllowed.add(parsedSib.data)
       }
+      for (const candidate of explicitAllowedOrigins.slice(0, 64)) {
+        const parsedCandidate = originPolicy.safeParse(candidate)
+        if (!parsedCandidate.success) {
+          return sendJson(res, 400, {
+            error: parsedCandidate.error.issues[0]?.message ?? `allowedOrigins entry "${candidate}" is not allowed for this ${projectEnv} project.`,
+          })
+        }
+        mergedAllowed.add(parsedCandidate.data)
+        const sibling = wwwSiblingOrigin(parsedCandidate.data)
+        if (sibling) {
+          const parsedSib = originPolicy.safeParse(sibling)
+          if (parsedSib.success) mergedAllowed.add(parsedSib.data)
+        }
+      }
+      for (const candidate of projectAutoOrigins) {
+        if (mergedAllowed.size >= 64) break
+        const parsedCandidate = originPolicy.safeParse(candidate)
+        if (!parsedCandidate.success) continue
+        mergedAllowed.add(parsedCandidate.data)
+        const sibling = wwwSiblingOrigin(parsedCandidate.data)
+        if (sibling && mergedAllowed.size < 64) {
+          const parsedSib = originPolicy.safeParse(sibling)
+          if (parsedSib.success) mergedAllowed.add(parsedSib.data)
+        }
+      }
+      const allowedOrigins = [...mergedAllowed].slice(0, 64)
       const ttlMs = typeof body.ttlMs === 'number' && Number.isFinite(body.ttlMs) ? body.ttlMs : undefined
       try {
         const capture = await captureManager.startCapture({
@@ -695,12 +722,59 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
           projectId: capture.projectId,
           targetOrigin: capture.targetOrigin,
           currentUrl: capture.currentUrl(),
+          lastError: capture.lastError(),
           expiresAt: capture.expiresAt,
           viewport: capture.viewport,
         })
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Unable to start browser login capture.'
         return sendJson(res, 400, { error: message })
+      }
+    }
+
+    if (path.pathname === authCapturePersonaConfigPath) {
+      if (method !== 'POST') return reject(res, 405, 'Method not allowed.')
+      if (req.headers.origin !== origin) return reject(res, 403, 'Unexpected origin.')
+      let body: Record<string, unknown>
+      try {
+        body = await readBoundedJsonBody(req)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Invalid JSON body.'
+        return sendJson(res, msg.includes('too large') ? 413 : 400, { error: msg })
+      }
+      const projectId = typeof body.projectId === 'string' ? body.projectId.trim() : ''
+      const personaId = typeof body.personaId === 'string' ? body.personaId.trim() : ''
+      if (!projectId || !personaId) {
+        return sendJson(res, 400, { error: 'projectId and personaId are required.' })
+      }
+      const verifyOrigin = body.verifyOrigin === null
+        ? null
+        : typeof body.verifyOrigin === 'string'
+          ? body.verifyOrigin.trim()
+          : undefined
+      const verifyPath = body.verifyPath === null
+        ? null
+        : typeof body.verifyPath === 'string'
+          ? body.verifyPath.trim()
+          : undefined
+      const idpOrigins = body.idpOrigins === null
+        ? null
+        : Array.isArray(body.idpOrigins)
+          ? body.idpOrigins.filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+          : undefined
+      try {
+        const db = storeHandle ?? store()
+        updateBrowserSessionPersonaMeta(db, {
+          projectId,
+          personaId,
+          ...(verifyOrigin !== undefined ? { verifyOrigin } : {}),
+          ...(verifyPath !== undefined ? { verifyPath } : {}),
+          ...(idpOrigins !== undefined ? { idpOrigins } : {}),
+        })
+        return sendJson(res, 200, { ok: true })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Unable to update browser session metadata.'
+        return sendJson(res, /not found/i.test(msg) ? 404 : 400, { error: msg })
       }
     }
 
@@ -721,6 +795,7 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
             captureId: capture.id,
             state: capture.state,
             url: capture.currentUrl(),
+            lastError: capture.lastError(),
             expiresAt: capture.expiresAt,
             viewport: capture.viewport,
             frame: capture.latestFrame(),
@@ -739,12 +814,14 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
         sendEvent('init', {
           captureId: capture.id,
           url: capture.currentUrl(),
+          lastError: capture.lastError(),
           expiresAt: capture.expiresAt,
           viewport: capture.viewport,
         })
         const unsubscribe = capture.subscribe(ev => {
           if (ev.type === 'frame') sendEvent('frame', ev.frame)
           else if (ev.type === 'url') sendEvent('url', { url: ev.url })
+          else if (ev.type === 'error') sendEvent('nav_error', { message: ev.message, ...(ev.url ? { url: ev.url } : {}) })
           else if (ev.type === 'status') {
             sendEvent('status', { state: ev.state, ...(ev.reason ? { reason: ev.reason } : {}) })
             if (ev.state !== 'active' && !res.writableEnded) res.end()
@@ -774,12 +851,16 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
         req.resume()
         try {
           // Move U2: Keep raw captured BrowserStorageBundle strictly server-side in a single-use
-          // project-bound escrow map and return ONLY { captureToken, expiresAt, summary } to the UI.
+          // project-bound escrow map and return ONLY { captureToken, expiresAt, verifyOrigin, verifyPath, capturedAppOrigins, capturedIdpOrigins, summary } to the UI.
           const escrowed = await captureManager.completeToEscrow(captureId)
           return sendJson(res, 200, {
             ok: true,
             captureToken: escrowed.captureToken,
             expiresAt: escrowed.expiresAt,
+            verifyOrigin: escrowed.summary.verifyOrigin,
+            verifyPath: escrowed.summary.verifyPath,
+            capturedAppOrigins: escrowed.summary.capturedAppOrigins,
+            capturedIdpOrigins: escrowed.summary.capturedIdpOrigins,
             summary: escrowed.summary,
           })
         } catch (err) {
