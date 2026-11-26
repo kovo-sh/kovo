@@ -178,6 +178,12 @@ export interface AdmissionRequest {
   tierOverride?: CapabilityTier | AdmissionTier
   /** H-3: Optional per-request confirmed GraphQL endpoints list. */
   confirmedGraphqlEndpoints?: readonly string[]
+  /**
+   * Q4: Optional run-scoped predicate returning true ONLY when the exact SHA-256 digest of a
+   * caller-supplied `Authorization: Bearer` token was observed in an in-scope non-privileged
+   * exchange response during the same run (and is never a Vault secret).
+   */
+  isAuthorizedEphemeralBearer?: (tokenDigestSha256: string) => boolean
   runId?: string
   assignmentId?: string
 }
@@ -197,6 +203,8 @@ export interface AdmissionDecision {
   parsedUrl?: URL
   classification?: RequestMutationClassification
   normalizedHeaders?: Record<string, string>
+  /** Q4: True when a caller-supplied Authorization header passed via provenance-bound ephemeral digest match. */
+  ephemeralObservedAuth?: boolean
   approvalContext?: StateChangeApprovalContext
   retryAfterMs?: number
 }
@@ -385,6 +393,24 @@ export function isSelfMintedBearer(name: string, value: string): boolean {
   }
 }
 
+/**
+ * Extract the credential token from an `Authorization: Bearer <token>` header and compute its
+ * SHA-256 hex digest for provenance-bound ephemeral channel verification. Returns null for
+ * non-Bearer, malformed, or implausibly short/long values.
+ */
+export function extractBearerTokenDigest(
+  name: string,
+  value: string,
+): { token: string; sha256: string } | null {
+  if (!/^authorization$/i.test(name)) return null
+  const match = /^Bearer\s+([^\s\r\n\0]+)\s*$/i.exec(value.trim())
+  if (!match) return null
+  const token = match[1]!
+  if (token.length < 16 || token.length > 8192) return null
+  const sha256 = createHash('sha256').update(token, 'utf8').digest('hex')
+  return { token, sha256 }
+}
+
 const HTTP_TOKEN_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
 const WS_SUBPROTOCOL_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
 
@@ -397,13 +423,22 @@ export function isValidWebsocketSubprotocol(value: string): boolean {
   return value.length > 0 && WS_SUBPROTOCOL_RE.test(value) && !/[\x00-\x20\x7f]/.test(value)
 }
 
+export interface ValidateCallerHeadersOptions {
+  allowSelfMintedBearer?: boolean
+  stripPseudoHeaders?: boolean
+  isAuthorizedEphemeralBearer?: (tokenDigestSha256: string) => boolean
+}
+
 export function validateCallerHeaders(
   headers: Record<string, string> | undefined,
-  options: { allowSelfMintedBearer?: boolean; stripPseudoHeaders?: boolean } = {},
-): { ok: true; headers: Record<string, string> } | { ok: false; reasonCode: 'forbidden_header' | 'invalid_header'; reason: string } {
+  options: ValidateCallerHeadersOptions = {},
+):
+  | { ok: true; headers: Record<string, string>; ephemeralObservedAuth?: boolean }
+  | { ok: false; reasonCode: 'forbidden_header' | 'invalid_header'; reason: string } {
   const allowSelfMinted = options.allowSelfMintedBearer ?? true
   const stripPseudo = options.stripPseudoHeaders ?? false
   const normalized: Record<string, string> = {}
+  let ephemeralObservedAuth = false
   for (const [k, v] of Object.entries(headers ?? {})) {
     if (stripPseudo && k.trimStart().startsWith(':')) continue
     if (!isValidHttpToken(k) || /[\r\n\0]/.test(v)) {
@@ -417,16 +452,29 @@ export function validateCallerHeaders(
         reason: `Duplicate case-insensitive request header "${canonicalName}".`,
       }
     }
-    if (FORBIDDEN_CALLER_HEADERS.test(canonicalName) && !(allowSelfMinted && isSelfMintedBearer(canonicalName, v))) {
-      return {
-        ok: false,
-        reasonCode: 'forbidden_header',
-        reason: `Header "${k}" cannot be set directly; reference an approved persona handle instead.`,
+    if (FORBIDDEN_CALLER_HEADERS.test(canonicalName)) {
+      const selfMintedOk = allowSelfMinted && isSelfMintedBearer(canonicalName, v)
+      let ephemeralOk = false
+      if (!selfMintedOk && canonicalName === 'authorization' && options.isAuthorizedEphemeralBearer) {
+        const bearer = extractBearerTokenDigest(canonicalName, v)
+        if (bearer && options.isAuthorizedEphemeralBearer(bearer.sha256)) {
+          ephemeralOk = true
+          ephemeralObservedAuth = true
+        }
+      }
+      if (!selfMintedOk && !ephemeralOk) {
+        return {
+          ok: false,
+          reasonCode: 'forbidden_header',
+          reason: `Header "${k}" cannot be set directly; reference an approved persona handle instead.`,
+        }
       }
     }
     normalized[canonicalName] = v
   }
-  return { ok: true, headers: normalized }
+  return ephemeralObservedAuth
+    ? { ok: true, headers: normalized, ephemeralObservedAuth: true }
+    : { ok: true, headers: normalized }
 }
 
 export function hasDestructiveContent(text: string): boolean {
@@ -1398,10 +1446,14 @@ export class RequestAdmissionEngine {
 
     // 5. Validate and canonicalize caller headers once. Every later check uses this map.
     let normalizedHeaders = request.normalizedHeaders ?? {}
+    let ephemeralObservedAuth = false
     if (request.checkCallerHeaders !== false) {
       const hdrCheck = validateCallerHeaders(request.headers, {
         allowSelfMintedBearer: kind !== 'websocket',
         stripPseudoHeaders: request.stripPseudoHeaders ?? kind === 'http2',
+        ...(kind !== 'websocket' && request.isAuthorizedEphemeralBearer
+          ? { isAuthorizedEphemeralBearer: request.isAuthorizedEphemeralBearer }
+          : {}),
       })
       if (!hdrCheck.ok) {
         return build('deny', hdrCheck.reasonCode, `header:${hdrCheck.reasonCode}`,
@@ -1409,6 +1461,7 @@ export class RequestAdmissionEngine {
           { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
       }
       normalizedHeaders = hdrCheck.headers
+      ephemeralObservedAuth = Boolean(hdrCheck.ephemeralObservedAuth)
     }
     const serializedHeaders = Object.entries(normalizedHeaders).map(([k, v]) => `${k}: ${v}`).join('\n')
     const wsSubprotocols = request.wsSubprotocols ?? []
@@ -1745,6 +1798,7 @@ export class RequestAdmissionEngine {
       parsedUrl: url,
       classification,
       normalizedHeaders: decisionHeaders,
+      ...(ephemeralObservedAuth ? { ephemeralObservedAuth: true } : {}),
     })
   }
 

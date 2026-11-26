@@ -509,41 +509,90 @@ function buildImportedBundle(params: {
     })
   }
 
-  const storage: PersonaStorageSnapshot = {}
+  const storageByOrigin: Record<string, PersonaStorageSnapshot> = {}
+  const storageOrigins: string[] = []
   for (const [origin, snapshot] of params.storageByOrigin) {
     if (!origins.has(origin)) continue
-    if (snapshot.localStorage) Object.assign(storage.localStorage ??= {}, snapshot.localStorage)
-    if (snapshot.sessionStorage) Object.assign(storage.sessionStorage ??= {}, snapshot.sessionStorage)
+    const perOrigin: PersonaStorageSnapshot = {}
+    if (snapshot.localStorage && Object.keys(snapshot.localStorage).length) {
+      perOrigin.localStorage = { ...snapshot.localStorage }
+    }
+    if (snapshot.sessionStorage && Object.keys(snapshot.sessionStorage).length) {
+      perOrigin.sessionStorage = { ...snapshot.sessionStorage }
+    }
+    if (perOrigin.localStorage || perOrigin.sessionStorage) {
+      storageByOrigin[origin] = perOrigin
+      storageOrigins.push(origin)
+    }
   }
 
-  if (!cookies.length && !attachments.some(a => a.headers) && !storage.localStorage && !storage.sessionStorage) {
+  const hasStorage = storageOrigins.length > 0
+  if (!cookies.length && !attachments.some(a => a.headers) && !hasStorage) {
     throw new PersonaAuthError('AUTH_FAILED', 'Imported session state contains no usable cookies, headers, or storage for the persona allowlist.')
   }
 
-  const firstOrigin = [...origins][0]
-  const firstHeaders = firstOrigin ? params.headersByOrigin.get(firstOrigin) : undefined
-  const authorization = firstHeaders?.Authorization ?? firstHeaders?.authorization
+  const orderedOrigins = [...origins]
+  const primaryOrigin =
+    (params.fallbackOrigin && origins.has(params.fallbackOrigin) ? params.fallbackOrigin : undefined) ??
+    knownOrigins.find(origin => origins.has(origin)) ??
+    orderedOrigins[0]
+  const pickHeadersForTopLevel = (): Record<string, string> | undefined => {
+    if (primaryOrigin) {
+      const primaryHdrs = params.headersByOrigin.get(primaryOrigin)
+      if (primaryHdrs && Object.keys(primaryHdrs).length) return primaryHdrs
+    }
+    for (const origin of orderedOrigins) {
+      const hdrs = params.headersByOrigin.get(origin)
+      if (hdrs && Object.keys(hdrs).length) return hdrs
+    }
+    return undefined
+  }
+  const topHeaders = pickHeadersForTopLevel()
+  const authorization = topHeaders?.Authorization ?? topHeaders?.authorization
   const bearer = authorization?.replace(/^Bearer\s+/i, '').trim()
-  const applicableCookies = firstOrigin
+  const applicableCookies = primaryOrigin
     ? cookies.filter(cookie => {
-        const host = new URL(firstOrigin).hostname
+        const host = new URL(primaryOrigin).hostname
         return host === cookie.domain || host.endsWith(`.${cookie.domain}`)
       })
     : cookies
-  const cookieHeader = applicableCookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ')
+  const cookieHeader = (applicableCookies.length ? applicableCookies : cookies)
+    .map(cookie => `${cookie.name}=${cookie.value}`)
+    .join('; ')
+  const primaryStorage = primaryOrigin ? storageByOrigin[primaryOrigin] : undefined
+  const fallbackStorage = primaryStorage ?? (storageOrigins[0] ? storageByOrigin[storageOrigins[0]] : undefined)
   const bundle = normalizePersonaBundle({
     cookies,
-    ...(Object.keys(storage).length ? { storage } : {}),
+    ...(hasStorage
+      ? {
+          ...(fallbackStorage ? { storage: fallbackStorage } : {}),
+          storageOrigins,
+          storageByOrigin,
+        }
+      : {}),
     attachments,
   })
+  const firstCustomHeader = topHeaders
+    ? Object.entries(topHeaders).find(([k]) => k.toLowerCase() !== 'cookie')
+    : undefined
+  const headerType: 'cookie' | 'bearer' | 'header' = bearer
+    ? 'bearer'
+    : cookieHeader
+      ? 'cookie'
+      : firstCustomHeader
+        ? 'header'
+        : 'cookie'
   const session: MintedPersonaSession = {
-    headerType: bearer ? 'bearer' : 'cookie',
-    ...(bearer ? { value: bearer } : { value: cookieHeader || 'imported-session-state' }),
+    headerType,
+    ...(headerType === 'header' && firstCustomHeader ? { headerName: firstCustomHeader[0] } : {}),
+    ...(bearer
+      ? { value: bearer }
+      : { value: cookieHeader || firstCustomHeader?.[1] || 'imported-session-state' }),
     adapterUsed: 'import',
     scrubTokens: [...bundleSecrets(bundle)],
     ...(bundle ? { bundle } : {}),
   }
-  return { session, origins: [...origins] }
+  return { session, origins: orderedOrigins }
 }
 
 /** Import a Playwright `storageState` object (passkey / hardware-MFA apps). */
