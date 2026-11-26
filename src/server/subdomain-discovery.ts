@@ -2,8 +2,16 @@ import { randomBytes } from 'node:crypto'
 import { resolve4, resolve6, resolveCname } from 'node:dns/promises'
 import { isIP } from 'node:net'
 import type { Candidate, DnsSource } from '../domain.ts'
-import { isPublicSuffixHost, registrableDomain } from './public-suffix.ts'
+import {
+  icannRegistrableDomain,
+  isMultiTenantPublicSuffix,
+  isPublicSuffixHost,
+  registrableApex,
+  registrableDomain,
+} from './public-suffix.ts'
 import type { Run, Store } from './store.ts'
+
+export { icannRegistrableDomain, isMultiTenantPublicSuffix, registrableApex }
 
 export interface DnsLookupResult {
   cnames: string[]
@@ -16,7 +24,9 @@ export type SubdomainDiscoverySource = 'crt.sh' | 'certspotter' | 'hackertarget'
 
 export interface ThirdPartyCnameClassification {
   thirdParty: boolean
+  externalCname: boolean
   matchedVendor: string | null
+  cnameApex: string | null
   cnameTarget: string | null
 }
 
@@ -44,6 +54,11 @@ export interface SubdomainDiscoveryOptions {
   dnsConcurrency?: number
   maxCandidates?: number
   wildcardProbeLabel?: string
+  /**
+   * When true, allows local/private suffixes (`.local`, `.internal`, `.test`, `.home.arpa`)
+   * via local DNS sweep only — external internet CT APIs are never queried for local domains.
+   */
+  allowLocal?: boolean
   signal?: AbortSignal
   /** Invoked incrementally as each discovery source finishes resolving live subdomains. */
   onBatch?: (hosts: DiscoveredSubdomain[]) => void
@@ -58,83 +73,57 @@ export interface SubdomainDiscoveryResult {
 }
 
 /**
- * Conservative managed third-party SaaS CNAME suffix list.
- * First-party PaaS/CDN hosting providers (Vercel, Cloudflare, CloudFront, Render, Fly, Netlify,
- * Fastly, AWS/GCP/Azure) are intentionally excluded so first-party apps hosted on them stay
- * eligible for wildcard subdomain admission.
+ * @deprecated Superseded by universal PSL CNAME apex ownership checks in
+ * `classifyThirdPartyCname` (any CNAME resolving to a different registrable apex outside
+ * pure CDN / first-party PaaS hosting proxies is classified as external automatically).
  */
-export const THIRD_PARTY_SAAS_CNAME_SUFFIXES: readonly string[] = [
-  'statuspage.io',
-  'gitbook.io',
-  'zendesk.com',
-  'intercom.io',
-  'helpscoutdocs.com',
-  'freshdesk.com',
-  'atlassian.net',
-  'hubspot.net',
-  'myshopify.com',
-  'squarespace.com',
-  'webflow.io',
-  'ghost.io',
-  'notion.site',
-  'mailgun.org',
-  'sendgrid.net',
-  'googlehosted.com',
-  'readme.io',
-]
+export const THIRD_PARTY_SAAS_CNAME_SUFFIXES: readonly string[] = []
 
 /**
- * Shared multi-tenant PaaS / cloud hosting suffixes whose subdomains belong to unrelated tenants.
- * Origins hosted directly on these suffixes must NEVER collapse to a shared apex or auto-admit
- * sibling subdomains during passive discovery.
+ * Pure CDN / edge proxy and first-party PaaS hosting apexes where organizations host
+ * their own first-party application code behind a custom subdomain CNAME.
+ * Any OTHER external CNAME apex (known or unknown/unlisted SaaS) is automatically
+ * flagged as third-party via PSL apex ownership comparison.
  */
-export const SHARED_PAAS_HOST_SUFFIXES: readonly string[] = [
+const FIRST_PARTY_HOSTING_PROXY_APEXES: ReadonlySet<string> = new Set([
+  // Pure CDN / edge / DNS traffic managers
+  'cloudfront.net',
+  'cloudflare.net',
+  'fastly.net',
+  'fastlylb.net',
+  'akamai.net',
+  'akamaiedge.net',
+  'akamaized.net',
+  'edgekey.net',
+  'edgesuite.net',
+  'azureedge.net',
+  'azurefd.net',
+  'trafficmanager.net',
+  'b-cdn.net',
+  // First-party PaaS / cloud compute hosting endpoints
+  'vercel-dns.com',
   'vercel.app',
-  'now.sh',
   'netlify.app',
   'netlify.com',
-  'herokuapp.com',
-  'herokudns.com',
-  'github.io',
-  'gitlab.io',
-  'bitbucket.io',
-  'pages.dev',
-  'workers.dev',
-  'r2.dev',
-  'trycloudflare.com',
   'onrender.com',
   'fly.dev',
-  'railway.app',
-  'up.railway.app',
-  'web.app',
-  'firebaseapp.com',
+  'amazonaws.com',
   'azurewebsites.net',
   'azurestaticapps.net',
-  'cloudapp.azure.com',
-  'cloudfront.net',
-  'amazonaws.com',
-  'amplifyapp.com',
-  'appspot.com',
   'run.app',
-  'cloudfunctions.net',
-  'storage.googleapis.com',
-  'replit.app',
-  'repl.co',
-  'surge.sh',
-  'glitch.me',
+  'appspot.com',
+  'web.app',
+  'firebaseapp.com',
+  'herokuapp.com',
+  'herokudns.com',
+  'pages.dev',
+  'workers.dev',
+  'railway.app',
   'deno.dev',
-  'koyeb.app',
-  'pythonanywhere.com',
-  'ngrok.io',
-  'ngrok-free.app',
-  'loca.lt',
-  'b-cdn.net',
-  'fastly.net',
-  'edgekey.net',
-  'akamaized.net',
-]
+])
 
 const SKIPPED_LOCAL_SUFFIXES = ['.localhost', '.local', '.internal', '.test', '.invalid', '.home.arpa']
+const EXPLICIT_LOCAL_SWEEP_SUFFIXES = ['.local', '.internal', '.test', '.home.arpa']
 const VALID_HOSTNAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/
 const PRIORITY_PREFIXES = ['www', 'api', 'app', 'auth', 'oauth', 'admin', 'billing', 'portal', 'dashboard', 'account', 'accounts', 'login', 'sso', 'staging', 'dev', 'docs', 'blog', 'status']
 
@@ -163,10 +152,25 @@ const DEFAULT_DNS_TIMEOUT_MS = 3_000
 const DEFAULT_DNS_CONCURRENCY = 12
 const DEFAULT_MAX_CANDIDATES = 80
 const DEFAULT_RUN_DISCOVERY_TIMEOUT_MS = 15_000
+const MAX_CNAME_CHAIN_DEPTH = 5
 const DISCOVERY_USER_AGENT = 'KovoHunter/2 passive subdomain discovery'
 
 function normalizeHostname(raw: string): string {
   return raw.trim().toLowerCase().replace(/\.+$/, '')
+}
+
+function isLocalSuffixHost(host: string): boolean {
+  for (const suffix of SKIPPED_LOCAL_SUFFIXES) {
+    if (host.endsWith(suffix)) return true
+  }
+  return false
+}
+
+function isExplicitLocalSweepHost(host: string): boolean {
+  for (const suffix of EXPLICIT_LOCAL_SWEEP_SUFFIXES) {
+    if (host.endsWith(suffix)) return true
+  }
+  return false
 }
 
 function isLocalOrNonPublicHost(hostname: string): boolean {
@@ -174,23 +178,35 @@ function isLocalOrNonPublicHost(hostname: string): boolean {
   if (!host || host === 'localhost' || !host.includes('.')) return true
   if (host.startsWith('[') && host.endsWith(']')) return true
   if (isIP(host) !== 0) return true
-  for (const suffix of SKIPPED_LOCAL_SUFFIXES) {
-    if (host.endsWith(suffix)) return true
+  return isLocalSuffixHost(host)
+}
+
+function extractLocalApex(hostname: string): string | null {
+  const host = normalizeHostname(hostname)
+  if (!host || host === 'localhost' || !host.includes('.')) return null
+  if (host.startsWith('[') && host.endsWith(']')) return null
+  if (isIP(host) !== 0 || !VALID_HOSTNAME_RE.test(host)) return null
+  if (!isExplicitLocalSweepHost(host)) return null
+  if (host.endsWith('.home.arpa')) {
+    const labels = host.split('.')
+    if (labels.length < 3) return null
+    return labels.slice(-3).join('.')
   }
-  return false
+  const labels = host.split('.')
+  if (labels.length < 2) return null
+  return labels.slice(-2).join('.')
 }
 
 /**
- * Returns true when `hostname` is a shared multi-tenant PaaS/hosting domain or tenant subdomain
- * (e.g. `my-app.vercel.app`, `foo.netlify.app`, `bar.github.io`, `app.railway.app`).
+ * Returns true when `hostname` is or resides under a PSL PRIVATE multi-tenant suffix
+ * (e.g. `my-app.vercel.app`, `foo.netlify.app`, `bar.github.io`, `api.fly.dev`,
+ * `bucket.s3.amazonaws.com`, `d111111abcdef8.cloudfront.net`, `acme-svc.a.run.app`).
+ * Backed by the vendored Public Suffix List private-section classifier.
  */
 export function isSharedPaasHost(hostname: string): boolean {
   const host = normalizeHostname(hostname)
   if (!host) return false
-  for (const suffix of SHARED_PAAS_HOST_SUFFIXES) {
-    if (host === suffix || host.endsWith(`.${suffix}`)) return true
-  }
-  return false
+  return isMultiTenantPublicSuffix(host)
 }
 
 export function isSharedPaasOrigin(origin: string): boolean {
@@ -204,50 +220,137 @@ export function isSharedPaasOrigin(origin: string): boolean {
 export function apexDomainOfHost(hostname: string): string | null {
   const host = normalizeHostname(hostname)
   if (isLocalOrNonPublicHost(host) || !VALID_HOSTNAME_RE.test(host)) return null
-  if (isSharedPaasHost(host) || isPublicSuffixHost(host)) return null
+  if (isMultiTenantPublicSuffix(host) || isPublicSuffixHost(host)) return null
   const registrable = registrableDomain(host)
-  if (!registrable || isSharedPaasHost(registrable) || isPublicSuffixHost(registrable)) return null
+  if (!registrable || isMultiTenantPublicSuffix(registrable) || isPublicSuffixHost(registrable)) return null
   return registrable
 }
 
 /**
- * Returns the public apex domain for an HTTPS origin on the default port (443), or `null` when
- * the origin is localhost, an IP literal, `.local`/`.internal`/`.test`/`.invalid`, plain HTTP, or
- * uses a non-standard port (such as local-lab/benchmark containers).
+ * Format a discovered subdomain origin while preserving the seed origin's scheme (`http:`
+ * or `https:`) and explicit non-default port (e.g. `:8443` or `:8080`). Default ports
+ * (`https:` + `443`, `http:` + `80`) are normalized away.
  */
-export function extractDiscoverableApex(origin: string): string | null {
+export function formatSubdomainOrigin(hostname: string, parentOrigin: string): string {
+  const normalizedHost = normalizeHostname(hostname)
+  let protocol = 'https:'
+  let port = ''
+  try {
+    const parsed = new URL(parentOrigin)
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      protocol = parsed.protocol
+      const isDefaultPort =
+        (parsed.protocol === 'https:' && (parsed.port === '' || parsed.port === '443'))
+        || (parsed.protocol === 'http:' && (parsed.port === '' || parsed.port === '80'))
+      port = isDefaultPort ? '' : parsed.port
+    }
+  } catch {
+    // Fallback to https default
+  }
+  return port ? `${protocol}//${normalizedHost}:${port}` : `${protocol}//${normalizedHost}`
+}
+
+/**
+ * Returns the discoverable apex domain for an HTTP or HTTPS origin (preserving explicit
+ * non-default ports such as `:8443` or `:8080`), or `null` when the origin is malformed,
+ * non-HTTP(S), localhost, an IP literal, a shared multi-tenant PSL private suffix, or a
+ * local/internal domain (unless `options.allowLocal` is explicitly set).
+ */
+export function extractDiscoverableApex(
+  origin: string,
+  options: { allowLocal?: boolean } = {},
+): string | null {
   let url: URL
   try {
     url = new URL(origin)
   } catch {
     return null
   }
-  if (url.protocol !== 'https:') return null
-  if (url.port !== '' && url.port !== '443') return null
-  return apexDomainOfHost(url.hostname)
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') return null
+  const publicApex = apexDomainOfHost(url.hostname)
+  if (publicApex) return publicApex
+  if (options.allowLocal) {
+    return extractLocalApex(url.hostname)
+  }
+  return null
 }
 
 export function isPublicDiscoverableOrigin(origin: string): boolean {
   return extractDiscoverableApex(origin) !== null
 }
 
+function isFirstPartyHostingProxy(cnameHost: string, cnameIcannApex: string | null): boolean {
+  if (cnameIcannApex && FIRST_PARTY_HOSTING_PROXY_APEXES.has(cnameIcannApex)) return true
+  const pslReg = registrableDomain(cnameHost)
+  if (pslReg && FIRST_PARTY_HOSTING_PROXY_APEXES.has(pslReg)) return true
+  return false
+}
+
 /**
- * Classify a resolved CNAME chain against conservative managed third-party SaaS vendor suffixes.
- * First-party PaaS/CDN providers remain `thirdParty: false`.
+ * Universal CNAME Apex Ownership Check:
+ * Walks the resolved CNAME chain and compares each CNAME target's PSL registrable apex
+ * against `targetHost`'s PSL registrable apex. Whenever a CNAME points to a different
+ * apex (outside pure CDN / edge / first-party PaaS hosting proxies), it is automatically
+ * classified as external/third-party (`thirdParty: true`, `externalCname: true`) with
+ * `matchedVendor` and `cnameApex` set to the resolved external apex — with zero hardcoded
+ * SaaS vendor blocklist required.
  */
-export function classifyThirdPartyCname(cnames: readonly string[]): ThirdPartyCnameClassification {
+export function classifyThirdPartyCname(
+  cnames: readonly string[],
+  targetHost?: string,
+): ThirdPartyCnameClassification {
+  const normalizedTarget = targetHost ? normalizeHostname(targetHost) : ''
+  const targetPslApex = normalizedTarget ? registrableDomain(normalizedTarget) : null
+  const targetIcannApex = normalizedTarget ? icannRegistrableDomain(normalizedTarget) : null
+
   let firstCname: string | null = null
+  let firstCnameApex: string | null = null
+
   for (const raw of cnames) {
     const target = normalizeHostname(raw)
     if (!target) continue
-    firstCname ??= target
-    for (const suffix of THIRD_PARTY_SAAS_CNAME_SUFFIXES) {
-      if (target === suffix || target.endsWith(`.${suffix}`)) {
-        return { thirdParty: true, matchedVendor: suffix, cnameTarget: target }
-      }
+    const cnamePslApex = registrableDomain(target)
+    const cnameIcannApex = icannRegistrableDomain(target)
+    const effectiveApex = cnameIcannApex ?? cnamePslApex ?? target
+    if (firstCname === null) {
+      firstCname = target
+      firstCnameApex = effectiveApex
+    }
+
+    // Same-apex CNAME hop (e.g. `api.acme.co.uk -> lb.acme.co.uk`) stays first-party.
+    if (
+      normalizedTarget
+      && (
+        target === normalizedTarget
+        || (targetPslApex !== null && cnamePslApex !== null && cnamePslApex === targetPslApex)
+        || (targetIcannApex !== null && cnameIcannApex !== null && cnameIcannApex === targetIcannApex)
+      )
+    ) {
+      continue
+    }
+
+    // Pure CDN / edge / first-party PaaS hosting proxy stays first-party.
+    if (isFirstPartyHostingProxy(target, cnameIcannApex)) {
+      continue
+    }
+
+    // External CNAME apex mismatch -> classify as third-party with the resolved apex.
+    return {
+      thirdParty: true,
+      externalCname: true,
+      matchedVendor: effectiveApex,
+      cnameApex: effectiveApex,
+      cnameTarget: target,
     }
   }
-  return { thirdParty: false, matchedVendor: null, cnameTarget: firstCname }
+
+  return {
+    thirdParty: false,
+    externalCname: false,
+    matchedVendor: null,
+    cnameApex: firstCnameApex,
+    cnameTarget: firstCname,
+  }
 }
 
 function candidateRank(hostname: string, apex: string): [number, number, string] {
@@ -331,6 +434,189 @@ function rankAndCapCandidates(
     : collapseSprawlCandidates(deduped, normalizedApex)
   return filtered.slice(0, Math.max(1, Math.min(Math.floor(maxCandidates), 200)))
 }
+
+export interface ScopeRankableAsset {
+  id?: string
+  origin: string
+  source?: string
+  thirdParty?: boolean
+  includeSubdomains?: boolean
+  dnsSource?: unknown
+}
+
+export interface ScopeRankingOptions {
+  maxAssets?: number
+  includeThirdParty?: boolean
+  includeBulkDns?: boolean
+}
+
+export interface RankedScopeAsset<T extends ScopeRankableAsset = ScopeRankableAsset> {
+  asset: T
+  score: number
+  apex: string | null
+  sameApexAsSeed: boolean
+  depth: number
+  noisy: boolean
+}
+
+const SCOPE_HIGH_VALUE_TIER1: ReadonlySet<string> = new Set([
+  'api', 'app', 'auth', 'admin', 'billing', 'oauth', 'sso', 'login', 'portal',
+  'dashboard', 'console', 'graphql', 'gateway', 'accounts', 'account',
+])
+
+const SCOPE_HIGH_VALUE_TIER2: ReadonlySet<string> = new Set([
+  'www', 'pay', 'payments', 'checkout', 'mcp', 'cloud', 'engine', 'internal',
+  'staging', 'stage', 'dev', 'beta', 'sandbox', 'studio', 'web', 'my', 'id',
+  'identity', 'token', 'webhooks', 'webhook', 'docs', 'blog', 'status',
+])
+
+function extractOriginHostname(origin: string): string {
+  try {
+    return normalizeHostname(new URL(origin).hostname)
+  } catch {
+    return normalizeHostname(origin.replace(/^https?:\/\//i, '').replace(/\/.*$/, '').replace(/:\d+$/, ''))
+  }
+}
+
+function canonicalOriginKey(origin: string): string {
+  try {
+    return new URL(origin).origin.toLowerCase()
+  } catch {
+    return origin.trim().toLowerCase().replace(/\/+$/, '')
+  }
+}
+
+function isDiscoveredSubdomainSource(source?: string): boolean {
+  return (
+    source === 'subdomain_discovery'
+    || source === 'phase0_ct_discovery'
+    || source === 'phase0_subdomain_discovery'
+  )
+}
+
+/**
+ * Canonical PSL-backed scope ranking helper for Scope Review (`consent.tsx`) and
+ * server-side asset prioritization:
+ * - Resolves registrable apex via PSL (correctly handling `.co.uk`, `.com.au`,
+ *   multi-part ccTLDs, nested subdomains, and non-443 origins).
+ * - Refuses to collapse shared multi-tenant PSL private suffixes (`*.vercel.app`,
+ *   `*.github.io`, etc.) across unrelated tenants.
+ * - Computes subdomain depth relative to the PSL registrable apex so multi-part
+ *   ccTLDs (`api.acme.co.uk`) are never penalized relative to `.com` domains.
+ * - Ranks seeds > repo/spec > exact apex > Tier-1 prefixes > Tier-2 prefixes >
+ *   standard subdomains > noisy preview sprawl > foreign apex / third-party CNAMEs.
+ */
+export function rankScopeAssets<T extends ScopeRankableAsset>(
+  assets: readonly T[],
+  seedOrigins: readonly string[],
+  options: ScopeRankingOptions = {},
+): RankedScopeAsset<T>[] {
+  const seedOriginSet = new Set(seedOrigins.map(canonicalOriginKey))
+  const seedHostSet = new Set(seedOrigins.map(extractOriginHostname).filter(Boolean))
+  const seedApexes = new Set<string>()
+  for (const seed of seedOrigins) {
+    const seedHost = extractOriginHostname(seed)
+    if (!seedHost || isMultiTenantPublicSuffix(seedHost)) continue
+    const apex = registrableApex(seed)
+    if (apex && !isMultiTenantPublicSuffix(apex)) {
+      seedApexes.add(apex)
+    }
+  }
+
+  const ranked: Array<RankedScopeAsset<T> & { _idx: number; _hostLen: number }> = []
+
+  for (let idx = 0; idx < assets.length; idx += 1) {
+    const asset = assets[idx]!
+    if (options.includeThirdParty === false && asset.thirdParty) continue
+    const isBulkDns = Boolean(asset.dnsSource) && !isDiscoveredSubdomainSource(asset.source)
+    if (options.includeBulkDns === false && isBulkDns) continue
+
+    const host = extractOriginHostname(asset.origin)
+    const apex = registrableApex(asset.origin)
+    const originKey = canonicalOriginKey(asset.origin)
+    const isExactSeed = seedOriginSet.has(originKey) || (seedHostSet.has(host) && !isDiscoveredSubdomainSource(asset.source))
+    const isSharedTenant = host ? isMultiTenantPublicSuffix(host) : false
+    const sameApexAsSeed = isExactSeed || (
+      !isSharedTenant && apex !== null && seedApexes.has(apex)
+    )
+
+    let relativePrefix = ''
+    let depth = 0
+    if (apex && host === apex) {
+      depth = 0
+    } else if (apex && host.endsWith(`.${apex}`)) {
+      relativePrefix = host.slice(0, -(apex.length + 1))
+      depth = relativePrefix.split('.').filter(Boolean).length
+    } else if (host) {
+      const parts = host.split('.').filter(Boolean)
+      depth = Math.max(0, parts.length - 2)
+      relativePrefix = depth > 0 ? parts.slice(0, depth).join('.') : ''
+    }
+
+    const firstLabel = relativePrefix ? (relativePrefix.split('.')[0] ?? '') : ''
+    const noisy = relativePrefix ? sprawlPatternKey(relativePrefix) !== null : false
+
+    const src = (asset.source ?? '').toLowerCase()
+    let score: number
+    if (isExactSeed || src === 'project seed' || (!asset.dnsSource && !isDiscoveredSubdomainSource(asset.source) && src === '')) {
+      score = 1000
+    } else if (/repo|spec|openapi|swagger|github|graphql/.test(src)) {
+      score = 850
+    } else if (depth === 0 && sameApexAsSeed) {
+      score = 760
+    } else if (noisy) {
+      score = 50
+    } else if (SCOPE_HIGH_VALUE_TIER1.has(firstLabel)) {
+      score = Math.max(300, 700 - Math.max(0, depth - 1) * 40)
+    } else if (SCOPE_HIGH_VALUE_TIER2.has(firstLabel)) {
+      score = Math.max(200, 550 - Math.max(0, depth - 1) * 40)
+    } else {
+      score = Math.max(100, 440 - depth * 40)
+    }
+
+    if (seedOrigins.length > 0 && !sameApexAsSeed) {
+      score -= 200
+    }
+    if (asset.thirdParty) {
+      score -= 500
+    }
+
+    ranked.push({
+      asset,
+      score,
+      apex,
+      sameApexAsSeed,
+      depth,
+      noisy,
+      _idx: idx,
+      _hostLen: host.length,
+    })
+  }
+
+  ranked.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score
+    if (a.depth !== b.depth) return a.depth - b.depth
+    if (a._hostLen !== b._hostLen) return a._hostLen - b._hostLen
+    const cmp = a.asset.origin.localeCompare(b.asset.origin)
+    return cmp !== 0 ? cmp : a._idx - b._idx
+  })
+
+  const limited = options.maxAssets !== undefined
+    ? ranked.slice(0, Math.max(0, Math.floor(options.maxAssets)))
+    : ranked
+
+  return limited.map(({ asset, score, apex, sameApexAsSeed, depth, noisy }) => ({
+    asset,
+    score,
+    apex,
+    sameApexAsSeed,
+    depth,
+    noisy,
+  }))
+}
+
+/** Alias for `rankScopeAssets` for discoverability by UI and planner callers. */
+export const rankDiscoveredAssets = rankScopeAssets
 
 function collectCtHosts(
   entries: readonly { name_value?: unknown; common_name?: unknown }[],
@@ -450,6 +736,30 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: 
   }
 }
 
+async function resolveCnameChain(
+  hostname: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const chain: string[] = []
+  const visited = new Set<string>([normalizeHostname(hostname)])
+  let current = normalizeHostname(hostname)
+  for (let depth = 0; depth < MAX_CNAME_CHAIN_DEPTH; depth += 1) {
+    if (signal?.aborted) break
+    const hops = await withTimeout(
+      resolveCname(current).catch(() => [] as string[]),
+      timeoutMs,
+      [] as string[],
+    )
+    const next = hops.map(normalizeHostname).find(h => h && !visited.has(h))
+    if (!next) break
+    visited.add(next)
+    chain.push(next)
+    current = next
+  }
+  return chain
+}
+
 export async function defaultSubdomainDnsResolver(
   hostname: string,
   signal?: AbortSignal,
@@ -457,12 +767,12 @@ export async function defaultSubdomainDnsResolver(
 ): Promise<DnsLookupResult> {
   if (signal?.aborted) return { cnames: [], addresses: [] }
   const [cnames, ipv4, ipv6] = await Promise.all([
-    withTimeout(resolveCname(hostname).catch(() => [] as string[]), timeoutMs, [] as string[]),
+    resolveCnameChain(hostname, timeoutMs, signal),
     withTimeout(resolve4(hostname).catch(() => [] as string[]), timeoutMs, [] as string[]),
     withTimeout(resolve6(hostname).catch(() => [] as string[]), timeoutMs, [] as string[]),
   ])
   return {
-    cnames: cnames.map(normalizeHostname).filter(Boolean),
+    cnames: cnames.filter(Boolean),
     addresses: [...ipv4, ...ipv6].filter(Boolean),
   }
 }
@@ -486,13 +796,15 @@ async function mapWithConcurrency<T, R>(
 }
 
 /**
- * Multi-source resilient passive + wildcard-safe DNS subdomain discovery for public HTTPS origins:
+ * Multi-source resilient passive + wildcard-safe DNS subdomain discovery:
  * - `crt.sh` (15s timeout, 1 fast retry on 429/502/503/504)
  * - Certspotter public issuances API (10s timeout)
  * - HackerTarget hostsearch API (8s timeout)
  * - Wildcard-safe common-prefix DNS sweep (~60 high-value prefixes, skipped if random label resolves)
- * Skips localhost, IP literals, `.local`/`.internal`/`.test`/`.invalid`, HTTP, and non-standard
- * ports with zero network calls. Gracefully degrades on CT-log errors/rate-limits/offline.
+ * Preserves the seed origin's scheme (`http:` / `https:`) and explicit non-default ports
+ * (e.g. `:8443`, `:8080`). Skips localhost, IP literals, and PSL private multi-tenant PaaS
+ * suffixes with zero network calls; local/internal suffixes run DNS sweep only when
+ * `options.allowLocal` is enabled (never leaking internal names to public CT APIs).
  */
 export async function discoverSubdomainsForOrigins(
   origins: readonly string[],
@@ -506,6 +818,7 @@ export async function discoverSubdomainsForOrigins(
   const dnsTimeoutMs = Math.max(200, Math.min(options.dnsTimeoutMs ?? DEFAULT_DNS_TIMEOUT_MS, 10_000))
   const dnsConcurrency = Math.max(1, Math.min(options.dnsConcurrency ?? DEFAULT_DNS_CONCURRENCY, 24))
   const maxCandidates = Math.max(1, Math.min(options.maxCandidates ?? DEFAULT_MAX_CANDIDATES, 200))
+  const allowLocal = Boolean(options.allowLocal)
   const dnsResolver: SubdomainDnsResolver = options.dnsResolver
     ?? ((host, sig) => defaultSubdomainDnsResolver(host, sig, dnsTimeoutMs))
 
@@ -521,7 +834,7 @@ export async function discoverSubdomainsForOrigins(
       skippedOrigins.push(origin)
       continue
     }
-    const apex = extractDiscoverableApex(origin)
+    const apex = extractDiscoverableApex(origin, { allowLocal })
     if (!apex) {
       skippedOrigins.push(origin)
       continue
@@ -539,11 +852,12 @@ export async function discoverSubdomainsForOrigins(
   const warnings: string[] = []
   const wildcardApexes: string[] = []
   const discovered: DiscoveredSubdomain[] = []
-  const seenOrigins = new Set<string>(origins)
+  const seenOrigins = new Set<string>(origins.map(canonicalOriginKey))
 
   for (const apex of queriedApexes) {
     if (options.signal?.aborted) break
     const parentOrigin = apexToParent.get(apex)!
+    const isLocalApex = isLocalSuffixHost(apex)
     const apexErrors: string[] = []
     const dnsInFlight = new Map<string, Promise<DnsLookupResult>>()
     const resolvedDns = new Map<string, DnsLookupResult>()
@@ -608,17 +922,18 @@ export async function discoverSubdomainsForOrigins(
       const rankedBatch = rankAndCapCandidates(liveForSource, apex, maxCandidates)
       const newlyEmitted: DiscoveredSubdomain[] = []
       for (const hostname of rankedBatch) {
-        const origin = `https://${hostname}`
+        const origin = formatSubdomainOrigin(hostname, parentOrigin)
+        const originKey = canonicalOriginKey(origin)
         const existing = discoveredByOrigin.get(origin)
         if (existing) {
           if (!existing.sources) existing.sources = []
           if (!existing.sources.includes(source)) existing.sources.push(source)
           continue
         }
-        if (seenOrigins.has(origin) || apexEmittedCount >= maxCandidates) continue
+        if (seenOrigins.has(originKey) || apexEmittedCount >= maxCandidates) continue
         const dns = resolvedDns.get(hostname)
         if (!dns) continue
-        const classification = classifyThirdPartyCname(dns.cnames)
+        const classification = classifyThirdPartyCname(dns.cnames, hostname)
         const entry: DiscoveredSubdomain = {
           hostname,
           origin,
@@ -632,7 +947,7 @@ export async function discoverSubdomainsForOrigins(
           sources: [...(sourcesByHost.get(hostname) ?? [source])],
         }
         if (!entry.sources!.includes(source)) entry.sources!.push(source)
-        seenOrigins.add(origin)
+        seenOrigins.add(originKey)
         discoveredByOrigin.set(origin, entry)
         discovered.push(entry)
         apexEmittedCount += 1
@@ -693,8 +1008,8 @@ export async function discoverSubdomainsForOrigins(
       emitLiveBatch(resolvedSweepHosts, 'dns_sweep')
     })()
 
-    // 2. Primary passive CT source: crt.sh (15s timeout, 1 fast retry on 429/502/503/504)
-    const crtTask = (async () => {
+    // 2. Primary passive CT source: crt.sh (skipped for local/internal apexes)
+    const crtTask = isLocalApex ? Promise.resolve() : (async () => {
       if (options.signal?.aborted) return
       const url = `https://crt.sh/?q=%25.${encodeURIComponent(apex)}&output=json&exclude=expired&deduplicate=Y`
       const startedAt = Date.now()
@@ -743,8 +1058,8 @@ export async function discoverSubdomainsForOrigins(
       }
     })()
 
-    // 3. Backup passive CT source: Certspotter public issuances API (10s timeout)
-    const certspotterTask = (async () => {
+    // 3. Backup passive CT source: Certspotter public issuances API (skipped for local/internal apexes)
+    const certspotterTask = isLocalApex ? Promise.resolve() : (async () => {
       if (options.signal?.aborted) return
       const url = `https://api.certspotter.com/v1/issuances?domain=${encodeURIComponent(apex)}&include_subdomains=true&expand=dns_names`
       try {
@@ -778,8 +1093,8 @@ export async function discoverSubdomainsForOrigins(
       }
     })()
 
-    // 4. Backup passive source: HackerTarget hostsearch API (8s timeout)
-    const hackerTargetTask = (async () => {
+    // 4. Backup passive source: HackerTarget hostsearch API (skipped for local/internal apexes)
+    const hackerTargetTask = isLocalApex ? Promise.resolve() : (async () => {
       if (options.signal?.aborted) return
       const url = `https://api.hackertarget.com/hostsearch/?q=${encodeURIComponent(apex)}`
       try {
@@ -826,17 +1141,18 @@ export async function discoverSubdomainsForOrigins(
     const rankedLiveHosts = rankAndCapCandidates(liveHosts, apex, maxCandidates)
     const remainingBatch: DiscoveredSubdomain[] = []
     for (const hostname of rankedLiveHosts) {
-      const origin = `https://${hostname}`
+      const origin = formatSubdomainOrigin(hostname, parentOrigin)
+      const originKey = canonicalOriginKey(origin)
       const existing = discoveredByOrigin.get(origin)
       if (existing) {
         existing.sources = [...(sourcesByHost.get(hostname) ?? existing.sources ?? [])]
         continue
       }
-      if (seenOrigins.has(origin) || apexEmittedCount >= maxCandidates) continue
+      if (seenOrigins.has(originKey) || apexEmittedCount >= maxCandidates) continue
       const dns = resolvedDns.get(hostname)
       if (!dns) continue
-      const classification = classifyThirdPartyCname(dns.cnames)
-      seenOrigins.add(origin)
+      const classification = classifyThirdPartyCname(dns.cnames, hostname)
+      seenOrigins.add(originKey)
       const entry: DiscoveredSubdomain = {
         hostname,
         origin,
@@ -891,7 +1207,7 @@ function buildDnsSource(sub: DiscoveredSubdomain): DnsSource {
 /**
  * Apply Phase-0 discovered subdomains to a run:
  * - When an approved first-party parent asset for the apex has `includeSubdomains: true` AND the
- *   subdomain is NOT a third-party SaaS CNAME (`!sub.thirdParty`), admit `https://<subdomain>`
+ *   subdomain is NOT an external third-party CNAME (`!sub.thirdParty`), admit the discovered origin
  *   into `run.approved` and `project_assets` (`source: 'phase0_ct_discovery'`, `thirdParty: false`)
  *   so Phase-0 crawls and workers test it in the SAME run.
  * - Otherwise (`sub.thirdParty` or strict single-host parent), record as an unapproved candidate
@@ -925,8 +1241,8 @@ export function applyDiscoveredSubdomainsToRun(
 
   for (const sub of result.discovered) {
     if (approvedOrigins.has(sub.origin)) continue
-    // Defense-in-depth: shared-PaaS hosts and bare public suffixes must never auto-admit
-    // sibling tenants even if a caller supplies synthetic discovery entries directly.
+    // Defense-in-depth: PSL private multi-tenant hosts and bare public suffixes must never
+    // auto-admit sibling tenants even if a caller supplies synthetic discovery entries directly.
     const subApex = apexDomainOfHost(sub.hostname)
     const isSharedOrUnsafeTenant =
       isSharedPaasHost(sub.hostname) ||
@@ -1002,8 +1318,9 @@ export interface RunDiscoverySubdomainsResult {
 
 /**
  * Pre-scope-review subdomain discovery for a run:
- * - Skips `local-lab`, `prepared`, non-https, localhost, and private/IP literal seeds with zero network calls.
- * - Discovers live subdomains across multi-source passive CT APIs + wildcard-safe common-prefix DNS sweep.
+ * - Skips `local-lab`, `prepared`, localhost, IP literal, and PSL private PaaS seeds with zero network calls.
+ * - Discovers live subdomains across multi-source passive CT APIs + wildcard-safe common-prefix DNS sweep,
+ *   preserving seed scheme and explicit non-default ports.
  * - Persists discovered hosts into `project_assets` and `run.candidates` (unapproved until scope approval)
  *   so the Scope Review screen displays all live subdomains immediately.
  */
