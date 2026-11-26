@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "maxQuarantinedCases": 197,
+  "maxQuarantinedCases": 191,
   "entries": [
     {
       "file": "tests/arch-a1-engine.test.ts",
@@ -87,14 +87,6 @@
       "testName": "floor: the discriminating baseline confirms on the concatenating twin via wired floor recipe",
       "assertionLocation": "tests/floor-regress.test.ts:398:1",
       "ownerStream": "cq-4-parity-corpus",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/gb-planner-wiring.test.ts",
-      "testName": "ExecWorkerRunner triggers hop-continuation on non-confirmed complete_intent and max_turns exits with sealed handles, and dedup blocks identical handle-set loops",
-      "assertionLocation": "tests/gb-planner-wiring.test.ts:637:1",
-      "ownerStream": "cq-6-agent-contract",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
@@ -1027,14 +1019,6 @@
       "expires": "2026-12-26"
     },
     {
-      "file": "tests/v8-composite-receipt.test.ts",
-      "testName": "combined 5-hop signed DAG exercising all 4 edge bindings + custom terminal oracle + disconnected hop check",
-      "assertionLocation": "tests/v8-composite-receipt.test.ts:910:1",
-      "ownerStream": "triage-kernel-v8-composite-receipt",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
-    },
-    {
       "file": "tests/v8-concurrency-12.test.ts",
       "testName": "Live Execution dispatches 12 unique concurrent specialists on Wave 1 with zero duplicates and raises SQLite busy_timeout >= 10s",
       "assertionLocation": "tests/v8-concurrency-12.test.ts:631:1",
@@ -1499,14 +1483,6 @@
     },
     {
       "file": "tests/v8-seam3-receipt-fuzz.test.ts",
-      "testName": "M05: Replacing terminal response with intermediate job/export/signed-URL/draft/queued stub fails closed",
-      "assertionLocation": "tests/v8-seam3-receipt-fuzz.test.ts:1210:1",
-      "ownerStream": "triage-kernel-v8-seam3-receipt-fuzz",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
-    },
-    {
-      "file": "tests/v8-seam3-receipt-fuzz.test.ts",
       "testName": "M12–M14: Tampered host signatures, TranscriptStore tamper, and Mode-B (one_shot_transcript) abuse fail closed",
       "assertionLocation": "tests/v8-seam3-receipt-fuzz.test.ts:1475:1",
       "ownerStream": "triage-kernel-v8-seam3-receipt-fuzz",
@@ -1520,30 +1496,6 @@
       "ownerStream": "triage-kernel-v8-seam3-receipt-fuzz",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-10"
-    },
-    {
-      "file": "tests/v8-slot-rotation.test.ts",
-      "testName": "Execution rotates a stalled specialist at wallClockMs=150 in < 400ms and dispatches the queued next step immediately",
-      "assertionLocation": "tests/v8-slot-rotation.test.ts:556:1",
-      "ownerStream": "cq-6-agent-contract",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/v8-slot-rotation.test.ts",
-      "testName": "runAgentSession grants bounded grace for an actively running kovo_verify proof call before rotating",
-      "assertionLocation": "tests/v8-slot-rotation.test.ts:499:1",
-      "ownerStream": "cq-6-agent-contract",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/v8-slot-rotation.test.ts",
-      "testName": "runAgentSession hard-aborts a stalled specialist at wallClockMs=150 within < 400ms",
-      "assertionLocation": "tests/v8-slot-rotation.test.ts:457:1",
-      "ownerStream": "cq-6-agent-contract",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-wire-l1.test.ts",

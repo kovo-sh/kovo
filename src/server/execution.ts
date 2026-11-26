@@ -22,8 +22,6 @@ import {
   StateChangeApprovalLedger,
 } from './approval-judge.ts'
 import {
-  AGENTIC_SPECIALIST_MAX_TURNS,
-  AGENTIC_SPECIALIST_WALL_CLOCK_MS,
   codeAuditPrompt,
   resolveSpecialistProfile,
   routeStepToSpecialist,
@@ -34,6 +32,11 @@ import {
   type RequestHttpRaceArgs,
   type WorkerToolHandlers,
 } from './agent-session.ts'
+import {
+  getRunTokenTelemetrySummary,
+  hasRunTokenTelemetry,
+  type RunTokenTelemetrySummary,
+} from './token-telemetry.ts'
 import { createAgentTraceFromEnv, type AgentTrace } from './agent-trace.ts'
 import {
   BrokerApprovalRequired,
@@ -2841,13 +2844,10 @@ export class Execution {
     return this.lastAssignmentMetrics.get(runId) ?? null
   }
 
-  private specialistWallClockMs(maxTurns: number): number {
-    const envMs = Number(process.env.KOVO_AGENTIC_SPECIALIST_WALL_CLOCK_MS)
-    const base = Number.isFinite(envMs) && envMs > 0 ? envMs : AGENTIC_SPECIALIST_WALL_CLOCK_MS
-    // Batched micro-specialists sit at AGENTIC_SPECIALIST_MAX_TURNS; longer legacy assignments
-    // scale linearly up to 2x the base wall clock, always inside the 30-minute intent lease.
-    const turnScale = Math.min(2, Math.max(0.5, maxTurns / Math.max(1, AGENTIC_SPECIALIST_MAX_TURNS)))
-    return Math.max(20_000, Math.min(intentLeaseMs * 0.85, Math.round(base * turnScale)))
+  /** Live structured per-run token, prompt-cache, cost, stall, rotation & tool-bloat telemetry snapshot. */
+  getRunTokenTelemetry(runId: string): RunTokenTelemetrySummary | null {
+    if (!hasRunTokenTelemetry(runId)) return null
+    return getRunTokenTelemetrySummary(runId)
   }
 
   /**
@@ -3651,7 +3651,6 @@ export class Execution {
       },
       {
         baseMaxTurns: stepMaxTurns,
-        baseWallClockMs: this.specialistWallClockMs(stepMaxTurns),
         runDurationMs: effectiveRunDurationMs,
         singleStepWallClockMs: singleStepWallClockMs(),
         ...(this.assignmentWallClockOverrideMs !== undefined

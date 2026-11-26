@@ -56,6 +56,7 @@ import {
 import { makeStore, setupApprovedRun, stopExecution, withEnv } from './v4-tier-helpers.ts'
 
 process.env.KOVO_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_MODEL = '1'
 
 const APP_ORIGIN = 'https://portal.example.invalid'
 const API_ORIGIN = 'https://api.example.invalid'
@@ -740,7 +741,7 @@ test('ExecWorkerRunner triggers hop-continuation on non-confirmed complete_inten
       backend,
       deterministicSweep: false,
     })
-    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_ALLOW_LOCAL_MODEL: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 8_000
@@ -792,11 +793,12 @@ test('ExecWorkerRunner triggers hop-continuation on non-confirmed complete_inten
         allowedOrigins: [targetOrigin],
       })
       assert.equal(sealRes.ok, true, `capability.seal must succeed: ${sealRes.error ?? ''}`)
-      sealedHandleMt = (sealRes.result as { handle: string }).handle
+      const currentHandle = (sealRes.result as { handle: string }).handle
+      if (!sealedHandleMt) sealedHandleMt = currentHandle
       return {
         runtime: req.runtime,
-        result: { sdk: 'kovo_verify.ts', nonce: req.nonce, claims: [], sealedCapabilities: [sealedHandleMt] },
-        stdout: `Sealed ${sealedHandleMt}\n`,
+        result: { sdk: 'kovo_verify.ts', nonce: req.nonce, claims: [], sealedCapabilities: [currentHandle] },
+        stdout: `Sealed ${currentHandle}\n`,
         stderr: '',
         exitCode: 0,
         durationMs: 5,
@@ -880,7 +882,7 @@ test('ExecWorkerRunner triggers hop-continuation on non-confirmed complete_inten
     })
     const planner = internals(engine).reconPlanner
 
-    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_ALLOW_LOCAL_MODEL: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 10_000

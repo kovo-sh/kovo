@@ -48,7 +48,15 @@ import {
   provider,
   providerPool,
 } from "./provider.ts"
-import type { CallRecorder, ProviderConfig, ProviderOptions, SecretSource, UsageCallback } from "./provider.ts"
+import type {
+  CallRecorder,
+  ProviderConfig,
+  ProviderOptions,
+  SecretSource,
+  TelemetryCallback,
+  UsageCallback,
+} from "./provider.ts"
+import { recordToolResultSizeTelemetry, recordWallClockRotationTelemetry } from "./token-telemetry.ts"
 import { redactSecrets } from "./egress-sanitizer.ts"
 import { redact } from "./redact.ts"
 import type { NamedSecret } from "./redact.ts"
@@ -188,8 +196,6 @@ export {
   AGENTIC_DET_LEAD_LIMIT,
   AGENTIC_MAX_MAX_TURNS,
   AGENTIC_MIN_MAX_TURNS,
-  AGENTIC_SPECIALIST_MAX_TURNS,
-  AGENTIC_SPECIALIST_WALL_CLOCK_MS,
   AGENTIC_UPGRADE_MAX_TURNS,
   BASE_INVESTIGATOR_TOOLS,
   EARLY_EXIT_GRACE_TURNS,
@@ -3645,6 +3651,8 @@ export class ProviderStallWaitTracker {
 
 export interface RunAgentSessionOptions {
   directory: string
+  /** Optional run ID for per-run structured token, cache, cost, rotation & tool-bloat telemetry (defaults to `traceContext.runId`). */
+  runId?: string
   sessionId: string
   requestId: string
   /** Provide `profiles` for multi-profile failover pool, or a single `settings` object. */
@@ -3707,6 +3715,8 @@ export interface RunAgentSessionOptions {
   record?: CallRecorder
   beforeCall?: () => void
   onUsage?: UsageCallback
+  /** Optional direct observer for per-call provider token, cache, stall, retry & truncation telemetry. */
+  onTelemetry?: TelemetryCallback
   onTurn?: (turn: number, maxTurns: number, settling: boolean) => void
   /** Executed before each model request; return extra user messages (e.g. a <board_delta> block). */
   onTurnStart?: (turn: number, maxTurns: number) => { messages?: readonly string[] } | void
@@ -3907,11 +3917,14 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     if (wallClockGraceTimer) { wallClockGraceTimer.cancel(); wallClockGraceTimer = undefined }
   }
 
+  const telemetryRunId = (options.runId ?? options.traceContext?.runId ?? '').trim()
+
   const providerOpts: ProviderOptions = {
     signal: sessionController.signal,
     record: options.record,
     secrets: resolveLiveSecrets,
     maxCalls: Math.max(defaultMaxCalls, maxTurns + 40),
+    ...(telemetryRunId ? { runId: telemetryRunId } : {}),
     ...(options.providerMaxTransportRetries !== undefined ? { maxTransportRetries: options.providerMaxTransportRetries } : {}),
     ...(options.providerTransportRetryBaseMs !== undefined ? { transportRetryBaseMs: options.providerTransportRetryBaseMs } : {}),
     ...(options.providerFirstEventTimeoutMs !== undefined ? { firstEventTimeoutMs: options.providerFirstEventTimeoutMs } : {}),
@@ -3941,6 +3954,9 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         || event.outcome === 'aborted'
       ) {
         providerStallTracker.onCallEnd()
+      }
+      if (options.onTelemetry) {
+        try { options.onTelemetry(event) } catch { /* telemetry observer must never throw */ }
       }
     },
     onStreamActivity: () => {
@@ -3985,6 +4001,9 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       ? Math.max(0, activeClock.activeElapsedMs() - wallClockGraceStartedAtMs)
       : 0
     const verifyGraceApplied = wallClockGraceStartedAtMs !== undefined || graceUsedMs > 0
+    if (telemetryRunId) {
+      try { recordWallClockRotationTelemetry(telemetryRunId) } catch { /* telemetry only */ }
+    }
     try {
       options.onWallClockRotate?.({
         elapsedMs,
@@ -4321,11 +4340,22 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
               }
             })()
           : result
+        const rawToolResultText = toolResultText(effectiveResult.output)
+        if (telemetryRunId && !call.parent) {
+          try {
+            recordToolResultSizeTelemetry({
+              runId: telemetryRunId,
+              toolName: call.name,
+              bytes: Buffer.byteLength(rawToolResultText, 'utf8'),
+              spilled: rawToolResultText.includes('full redacted output spilled to '),
+            })
+          } catch { /* telemetry only */ }
+        }
         if (trace && !call.parent) {
           const startedAt = toolStartedAt.get(call.id)
           toolStartedAt.delete(call.id)
           try {
-            const summary = toolResultSummary(toolResultText(effectiveResult.output))
+            const summary = toolResultSummary(rawToolResultText)
             const diagnostic = (effectiveResult.diagnostics ?? []).find(item => item.severity === 'error')
             trace.recordToolResult({
               assignmentId: traceAssignmentId,
@@ -4655,6 +4685,8 @@ export interface AgentTurnJob {
   record?: CallRecorder
   beforeCall?: () => void
   onUsage?: UsageCallback
+  /** Optional direct observer for per-call provider token, cache, stall, retry & truncation telemetry. */
+  onTelemetry?: TelemetryCallback
   onProfileSuccess?: (profileId: string) => void
   onProfileFailure?: (profileId: string, err: string, hard: boolean) => void
 }

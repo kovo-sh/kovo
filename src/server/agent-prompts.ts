@@ -66,15 +66,11 @@ export const maxEmptyTurnNudges = 2
  * Live prompts and `runAgentSession` derive all turn and wall-clock thresholds directly from
  * `AssignmentBudget`.
  */
-export const AGENTIC_SPECIALIST_MAX_TURNS = 9
-/** @deprecated Use `resolveAssignmentBudget` (`AssignmentBudget`) instead. */
 export const AGENTIC_UPGRADE_MAX_TURNS = 7
 /** @deprecated Use `resolveAssignmentBudget` (`AssignmentBudget`) instead. */
 export const AGENTIC_MIN_MAX_TURNS = 6
 /** @deprecated Use `resolveAssignmentBudget` (`AssignmentBudget`) instead. */
 export const AGENTIC_MAX_MAX_TURNS = 10
-/** @deprecated Use `resolveAssignmentBudget` (`AssignmentBudget`) instead. */
-export const AGENTIC_SPECIALIST_WALL_CLOCK_MS = 80_000
 export const AGENTIC_DET_LEAD_LIMIT = 8
 
 /** @deprecated Use `resolveAssignmentBudget` (`AssignmentBudget`) instead. */
@@ -84,7 +80,7 @@ export function resolveAgenticTurnBudget(missionKind?: MissionKind): number {
     case 'chain_step_2':
       return AGENTIC_UPGRADE_MAX_TURNS
     default:
-      return AGENTIC_SPECIALIST_MAX_TURNS
+      return 9
   }
 }
 
