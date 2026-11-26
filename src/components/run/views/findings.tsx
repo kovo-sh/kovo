@@ -7,9 +7,10 @@
 // outlined check; accent means selection only. Long lists are windowed.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, ReactNode, RefObject } from 'react'
+import type { OperatorTriage, OperatorTriageStatus } from '../../../actions-triage.ts'
 import { Dropdown, FilterBox, Tabs } from '../controls.tsx'
 import { useRunModel, useVerdict } from '../data.tsx'
-import { EmptyState, KbdGroup, Seg } from '../display.tsx'
+import { EmptyState, KbdGroup, Seg, Tag } from '../display.tsx'
 import { host } from '../format.ts'
 import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
@@ -38,9 +39,38 @@ const HEAD_H = 32
 
 interface G { key: string; label: string; glyph: ReactNode; items: FindingRow[] }
 
+export type FindingWithTriage = FindingRow & { operatorTriage?: OperatorTriage | null }
+
+export interface TriageStatusOption {
+  value: OperatorTriageStatus
+  label: string
+  short: string
+  tone?: 'accent' | 'warn' | 'solid'
+}
+
+export function getTriageStatusOptions(): readonly TriageStatusOption[] {
+  return [
+    { value: 'open', label: 'Open', short: 'Open' },
+    { value: 'accepted_risk', label: 'Accepted risk', short: 'Accepted risk', tone: 'solid' },
+    { value: 'false_positive', label: 'False positive', short: 'False positive', tone: 'warn' },
+    { value: 'fixed', label: 'Fixed', short: 'Fixed', tone: 'solid' },
+    { value: 'confirmed_by_operator', label: 'Confirmed by operator', short: 'Confirmed (op)', tone: 'accent' },
+  ]
+}
+
+export function getTriageStatusMeta(status: OperatorTriageStatus | string | undefined): TriageStatusOption {
+  const options = getTriageStatusOptions()
+  return options.find(o => o.value === status) ?? options[0]!
+}
+
 function matches(f: FindingRow, q: string) {
   if (!q) return true
-  const text = [f.title, f.origin, f.category, f.cwe, f.status, f.severity, f.id].join(' ').toLowerCase()
+  const triage = (f as FindingWithTriage).operatorTriage
+  const triageMeta = triage ? getTriageStatusMeta(triage.status) : null
+  const text = [
+    f.title, f.origin, f.category, f.cwe, f.status, f.severity, f.id,
+    triage?.status, triageMeta?.label, triage?.severityOverride, triage?.notes,
+  ].join(' ').toLowerCase()
   return q.toLowerCase().split(/\s+/).filter(Boolean).every(t => text.includes(t))
 }
 
@@ -124,6 +154,20 @@ function Toolbar({ tabs, tab, setTab, filter, setFilter, filterRef, onFilterEnte
 
 // ---------------------------------------------------------------- rows
 
+function FindingTriageBadges({ triage }: { triage: OperatorTriage | null | undefined }) {
+  if (!triage) return null
+  const hasStatus = triage.status !== 'open'
+  const hasOverride = Boolean(triage.severityOverride)
+  const hasNotes = Boolean(triage.notes?.trim())
+  if (!hasStatus && !hasOverride && !hasNotes) return null
+  const meta = getTriageStatusMeta(triage.status)
+  return <span className="flex flex-none items-center gap-1" data-slot="finding-triage-badges">
+    {hasStatus && <Tag tone={meta.tone} title={triage.notes || meta.label}>{meta.short}</Tag>}
+    {hasOverride && <Tag title={`Operator severity override: ${SEV_LABEL[triage.severityOverride!] ?? triage.severityOverride}`}>{SEV_LABEL[triage.severityOverride!] ?? triage.severityOverride} (op)</Tag>}
+    {!hasStatus && !hasOverride && hasNotes && <Tag tone="solid" title={triage.notes}>Note</Tag>}
+  </span>
+}
+
 function FindingRowView({ f, group, cur, onClick, style }: {
   f: FindingRow
   group: Group
@@ -132,6 +176,7 @@ function FindingRowView({ f, group, cur, onClick, style }: {
   style?: CSSProperties
 }) {
   const st = normFStatus(f.status)
+  const triage = (f as FindingWithTriage).operatorTriage
   return <div
     className={cn(RW.row, 'cursor-pointer', cur && RW.rowCur)}
     data-id={f.id}
@@ -142,6 +187,7 @@ function FindingRowView({ f, group, cur, onClick, style }: {
     {group !== 'severity' && <span className="inline-flex size-3.5 flex-none items-center justify-center" title={SEV_LABEL[f.severity] ?? f.severity}><SevGlyph sev={f.severity} /></span>}
     <span className="inline-flex size-3.5 flex-none items-center justify-center" title={stLabel(st)}><StatusGlyph status={st} /></span>
     <span className="min-w-0 flex-1 truncate text-fg">{f.title}</span>
+    <FindingTriageBadges triage={triage} />
     {f.category && <span className="max-w-[155px] flex-none truncate text-[12px] text-fg-subtle">{prettyCat(f.category)}</span>}
     {group !== 'origin' && <span className="w-[150px] flex-none truncate text-right font-mono text-[12px] text-fg-subtle max-[1320px]:w-[120px] max-[1180px]:hidden">{host(f.origin)}</span>}
   </div>

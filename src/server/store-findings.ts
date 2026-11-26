@@ -96,6 +96,51 @@ import {
   type SurfaceProbe,
 } from './store-session.ts'
 
+export const operatorTriageStatuses = [
+  'open',
+  'confirmed_by_operator',
+  'accepted_risk',
+  'false_positive',
+  'fixed',
+] as const
+export type OperatorTriageStatus = typeof operatorTriageStatuses[number]
+
+export const operatorSeverityOverrides = [
+  'critical',
+  'high',
+  'medium',
+  'low',
+  'info',
+] as const
+export type OperatorSeverityOverride = typeof operatorSeverityOverrides[number]
+
+export interface OperatorTriage {
+  status: OperatorTriageStatus
+  severityOverride: OperatorSeverityOverride | null
+  notes: string
+  updatedAt: number
+}
+
+export interface TriageFindingInput {
+  status?: OperatorTriageStatus
+  severityOverride?: OperatorSeverityOverride | null
+  notes?: string
+}
+
+export const patchProposalReviewStatuses = ['approved', 'rejected', 'pending'] as const
+export type PatchProposalReviewStatus = typeof patchProposalReviewStatuses[number]
+
+export interface PatchProposalReviewInput {
+  status: PatchProposalReviewStatus
+  reviewNotes?: string
+}
+
+export type TriagedFinding = Finding & { operatorTriage?: OperatorTriage | null }
+
+const operatorTriageStatusSet = new Set<string>(operatorTriageStatuses)
+const operatorSeverityOverrideSet = new Set<string>(operatorSeverityOverrides)
+const patchProposalReviewStatusSet = new Set<string>(patchProposalReviewStatuses)
+
 export class FindingsRepository {
   private readonly session: DbSession
 
@@ -1181,6 +1226,109 @@ export class FindingsRepository {
     return row
   }
 
+  /**
+   * Persist operator approval/rejection and review notes on a patch proposal.
+   * Maps `'pending'` to the domain `'draft'` status so report/UI status labels stay consistent.
+   */
+  updatePatchProposalReview(
+    proposalId: string,
+    input: PatchProposalReviewInput,
+    options: { runId?: string } = {},
+  ): PatchProposal {
+    if (!patchProposalReviewStatusSet.has(input.status)) {
+      throw new Error(`Invalid patch proposal review status "${String(input.status)}".`)
+    }
+    if (options.runId) this.session.requireRun(options.runId)
+    const where = options.runId
+      ? and(eq(tables.patchProposals.runId, options.runId), eq(tables.patchProposals.id, proposalId))
+      : eq(tables.patchProposals.id, proposalId)
+    const existing = this.session.db.select().from(tables.patchProposals).where(where).get()
+    if (!existing) throw new Error('Patch proposal not found.')
+    this.session.requireRun(existing.runId)
+
+    const nextStatus: PatchProposalStatus = input.status === 'pending' ? 'draft' : input.status
+    const nextNotes = input.reviewNotes !== undefined
+      ? redact(input.reviewNotes.trim().slice(0, 4000))
+      : existing.reviewNotes
+    const now = Date.now()
+
+    const updated = this.session.db.update(tables.patchProposals).set({
+      status: nextStatus,
+      reviewNotes: nextNotes,
+      updatedAt: now,
+    }).where(eq(tables.patchProposals.id, existing.id)).returning().get()!
+
+    this.session.event(existing.runId, 'patch.reviewed', `Patch proposal [${updated.status}] reviewed by operator for finding ${updated.findingId}.`, {
+      patchId: updated.id,
+      findingId: updated.findingId,
+      status: updated.status,
+      hasReviewNotes: updated.reviewNotes.length > 0,
+    })
+    return updated
+  }
+
+  /**
+   * Persist operator triage metadata alongside machine-verified finding state without mutating
+   * H-4 / H-18 machine verdict, severity, category, or confirmation receipts.
+   */
+  triageFinding(
+    findingId: string,
+    input: TriageFindingInput,
+    options: { runId?: string } = {},
+  ): TriagedFinding {
+    if (input.status !== undefined && !operatorTriageStatusSet.has(input.status)) {
+      throw new Error(`Invalid operator triage status "${String(input.status)}".`)
+    }
+    if (
+      input.severityOverride !== undefined
+      && input.severityOverride !== null
+      && !operatorSeverityOverrideSet.has(input.severityOverride)
+    ) {
+      throw new Error(`Invalid severity override "${String(input.severityOverride)}".`)
+    }
+    if (options.runId) this.session.requireRun(options.runId)
+
+    const where = options.runId
+      ? and(eq(tables.findings.runId, options.runId), eq(tables.findings.id, findingId))
+      : eq(tables.findings.id, findingId)
+    const existing = this.session.db.select().from(tables.findings).where(where).get()
+    if (!existing) throw new Error('Finding not found.')
+    this.session.requireRun(existing.runId)
+
+    const existingFinding = existing.finding as TriagedFinding
+    const prevTriage = existingFinding.operatorTriage ?? null
+    const nextTriage: OperatorTriage = {
+      status: input.status ?? prevTriage?.status ?? 'open',
+      severityOverride: input.severityOverride !== undefined
+        ? input.severityOverride
+        : (prevTriage?.severityOverride ?? null),
+      notes: input.notes !== undefined
+        ? redact(input.notes.trim().slice(0, 4000))
+        : (prevTriage?.notes ?? ''),
+      updatedAt: Date.now(),
+    }
+
+    const nextFinding: TriagedFinding = {
+      ...existingFinding,
+      operatorTriage: nextTriage,
+    }
+
+    this.session.transaction(() => {
+      this.session.db.update(tables.findings).set({
+        finding: nextFinding,
+      }).where(eq(tables.findings.id, existing.id)).run()
+
+      this.session.event(existing.runId, 'finding.triaged', `Operator triaged "${existing.finding.title}" (${nextTriage.status}).`, {
+        findingId: existing.id,
+        triageStatus: nextTriage.status,
+        severityOverride: nextTriage.severityOverride,
+        hasNotes: nextTriage.notes.length > 0,
+      })
+    }, { behavior: 'immediate' })
+
+    return nextFinding
+  }
+
   listOpenProofGaps(runId: string, goalRevision?: number): CoverageEntry[] {
     const where = goalRevision !== undefined
       ? and(
@@ -1284,8 +1432,10 @@ export class FindingsRepository {
         provenance: existing.provenance,
       })
     }
+    const existingOperatorTriage = (existing.finding as TriagedFinding).operatorTriage
     const persistedFinding = {
       ...mergedFinding,
+      ...(existingOperatorTriage !== undefined ? { operatorTriage: existingOperatorTriage } : {}),
       provenance: existing.provenance,
       ...(parentFindingIds?.length ? { parentFindingIds } : {}),
       verificationStatus: verificationClass,

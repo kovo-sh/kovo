@@ -27,7 +27,7 @@ import { usePaletteCommands } from '../palette.tsx'
 import type { InspectorMap } from '../pane.tsx'
 import { useToast } from '../toast.tsx'
 import { cn, runBtn, runDdItem, runIconBtn, RW } from '../tw.ts'
-import { canGeneratePatch, canVerifyFix } from './findings-inspector.tsx'
+import { canGeneratePatch, canVerifyFix, PatchProposalReview } from './findings-inspector.tsx'
 
 const H2 = 'm-0 mb-2.5 mt-[30px] text-[12px] font-semibold uppercase tracking-[0.02em] text-fg-subtle'
 const DL = 'm-0 mb-2.5 grid grid-cols-[112px_minmax(0,1fr)] gap-x-3 gap-y-1 text-[12.5px] leading-[19px] [&_dt]:text-fg-subtle [&_dd]:m-0 [&_dd]:break-words [&_dd]:text-fg-muted'
@@ -441,14 +441,14 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
       {patches.map(p => <div key={p.id} className="border-b border-line py-2.5">
         <div className="mb-1.5 text-[13px] text-fg"><b className="font-medium">{titleById.get(p.findingId) ?? p.findingId}</b><span className="font-mono text-[12px] text-fg-subtle"> · {p.repo}</span></div>
         <div className="mb-2.5 mt-0.5 flex flex-wrap gap-[5px]">
-          <Tag tone={p.status === 'withheld' || p.status === 'rejected' ? 'warn' : undefined}>{patchStatusLabels[p.status]}</Tag>
+          <Tag tone={p.status === 'withheld' || p.status === 'rejected' ? 'warn' : p.status === 'approved' ? 'accent' : undefined}>{patchStatusLabels[p.status]}</Tag>
           <Tag>{callerCompatibilityLabels[p.callerCompatibility]}</Tag>
           <Tag>{dynamicRetestLabels[p.dynamicRetestVerdict]}</Tag>
         </div>
         {p.codeLocations.length > 0 && <p className={cn(DOC_P, 'font-mono text-[12px] text-fg-subtle')}>{p.codeLocations.map(l => `${l.file}:${l.startLine}-${l.endLine}`).join(', ')}</p>}
-        {p.reviewNotes && <p className={DOC_P}>{p.reviewNotes}</p>}
         {p.status === 'approved' && p.diff.trim() ? <pre className={RW.pre}>{p.diff}</pre>
           : p.status === 'withheld' ? <p className={cn(DOC_P, 'text-fg-subtle')}>Diff withheld automatically because the independent patch reviewer flagged caller compatibility or a gate failure.</p> : null}
+        <PatchProposalReview runId={detail.run.id} proposal={p} onReviewed={refresh} />
       </div>)}
     </>}
 
