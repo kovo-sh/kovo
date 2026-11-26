@@ -377,7 +377,7 @@ test('white-box reposDir reuses warm containers, resets /tmp, bypasses on rpcMou
   assert.equal(existsSync(join(stagedDir1!, '.env')), false, 'sensitive .env excluded from staged /repos')
 
   // First white-box assignment: warm hit (no cold create).
-  const s1 = await backend.openSession('asgn-wb-1', new AbortController().signal, { reposDir })
+  const s1 = await backend.openSession('asgn-wb-1', new AbortController().signal, { reposDir, warmPoolPolicy: 'run-wb:gen1' })
   assert.equal(backend.containerStats().coldSessions, 0, 'first white-box assignment hits warm pool')
   assert.equal(backend.containerStats().created, 1)
   await s1.close()
@@ -388,7 +388,7 @@ test('white-box reposDir reuses warm containers, resets /tmp, bypasses on rpcMou
   )
 
   // Second white-box assignment: reuses the exact same warm container without re-staging or re-creating.
-  const s2 = await backend.openSession('asgn-wb-2', new AbortController().signal, { reposDir })
+  const s2 = await backend.openSession('asgn-wb-2', new AbortController().signal, { reposDir, warmPoolPolicy: 'run-wb:gen1' })
   assert.equal(started[1], started[0], 'second assignment reuses the same container')
   assert.equal(backend.containerStats().reused, 1, 'reuse counter increments on white-box hit')
   assert.equal(backend.containerStats().coldSessions, 0, 'still zero cold creates')
@@ -397,7 +397,7 @@ test('white-box reposDir reuses warm containers, resets /tmp, bypasses on rpcMou
   assert.equal(backend.warmPoolStats?.idle, 1)
 
   // Layer-1 rpcMountDir session MUST cold-bypass the warm pool even when reposDir matches.
-  const sRpc = await backend.openSession('asgn-rpc-1', new AbortController().signal, { reposDir, rpcMountDir: rpcDir })
+  const sRpc = await backend.openSession('asgn-rpc-1', new AbortController().signal, { reposDir, rpcMountDir: rpcDir, warmPoolPolicy: 'run-wb:gen1' })
   assert.equal(backend.containerStats().coldSessions, 1, 'rpcMountDir forces cold container bypass')
   assert.equal(backend.warmPoolStats?.idle, 1, 'warm container remains untouched in idle pool')
   assert.equal(createCalls().length, 2, 'cold create runs for rpcMountDir session')

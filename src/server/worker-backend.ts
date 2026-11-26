@@ -2131,7 +2131,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
   private readonly warmPools = new Map<string, WarmPoolSlot>()
   /** Immutable staged `/repos` snapshots shared across all workers in the same `(runKey, reposDir)`. */
   private readonly runRepoSnapshots = new Map<string, RunRepoSnapshotLease>()
-  /** Most recently installed policy key (used when `openSession` omits `options.warmPoolPolicy`). */
+  /** Most recently installed policy key (diagnostic `warmPoolStats` getter ONLY; NEVER used for run/snapshot/session resolution). */
   private activeWarmPoolPolicy?: string
   /** Hard bound on concurrent per-policy warm pools retained in `this.warmPools` (LRU evicted). */
   private readonly maxWarmPools: number
@@ -2219,12 +2219,10 @@ export class LinuxWorkerBackend implements WorkerBackend {
     if (explicitRunId) return explicitRunId
     const requestedPolicy = options?.warmPoolPolicy?.trim()
     if (requestedPolicy) return policyRunKey(requestedPolicy)
-    if (this.activeWarmPoolPolicy) {
-      const activeSlot = this.warmPools.get(this.activeWarmPoolPolicy)
-      if (activeSlot && !activeSlot.retired && activeSlot.policy !== this.defaultWarmPolicy()) {
-        return activeSlot.runKey
-      }
-    }
+    // R4-H-8: NEVER infer run identity from mutable backend-global `activeWarmPoolPolicy`.
+    // When callers omit both `runId` and `warmPoolPolicy` (and this backend is not scoped to a
+    // single immutable `this.runId`), return undefined so `acquireReposForCall` fails closed by
+    // staging a private single-call snapshot instead of attaching to another run's lease.
     const backendRunId = this.runId?.trim()
     return backendRunId || undefined
   }
@@ -2812,14 +2810,30 @@ export class LinuxWorkerBackend implements WorkerBackend {
     await ensureWorkerImageAvailable(this.image, this.docker, signal)
     await this.reclaimInactive()
     signal.throwIfAborted()
-    // Warm pool first (best-effort): resolve strictly from the caller's `warmPoolPolicy` (or
-    // current active policy when omitted) so concurrent runs never take or evict each other's
-    // containers. Per-call `rpcMountDir` sockets always bypass the pool for strict isolation.
+    // Warm pool first (best-effort): resolve strictly from the caller's explicit `warmPoolPolicy`
+    // or `runId` (NEVER from mutable backend-global `activeWarmPoolPolicy`) so concurrent runs
+    // never take each other's warm containers or bind another run's stale `/repos` snapshot.
+    // Per-call `rpcMountDir` sockets always bypass the pool for strict isolation.
     const requestedPolicy = options?.warmPoolPolicy?.trim()
-    const candidateSlot = requestedPolicy
-      ? this.warmPools.get(requestedPolicy)
-      : (this.activeWarmPoolPolicy ? this.warmPools.get(this.activeWarmPoolPolicy) : undefined)
-    const activeSlot = candidateSlot && !candidateSlot.retired ? candidateSlot : undefined
+    const effectiveRunKey = this.resolveRunKeyForOptions(options)
+    let candidateSlot: WarmPoolSlot | undefined
+    if (requestedPolicy) {
+      const exactSlot = this.warmPools.get(requestedPolicy)
+      if (exactSlot && !exactSlot.retired && Boolean(effectiveRunKey) && exactSlot.runKey === effectiveRunKey) {
+        candidateSlot = exactSlot
+      }
+    } else if (effectiveRunKey) {
+      const defaultPolicy = this.defaultWarmPolicy()
+      for (const slot of this.warmPools.values()) {
+        if (!slot.retired && slot.runKey === effectiveRunKey && slot.policy !== defaultPolicy) {
+          candidateSlot = slot
+          break
+        }
+      }
+    }
+    const activeSlot = candidateSlot && !candidateSlot.retired && Boolean(effectiveRunKey) && candidateSlot.runKey === effectiveRunKey
+      ? candidateSlot
+      : undefined
     let heldSlot: WarmPoolSlot | undefined
     let releasedSlot = false
     const releaseSlot = () => {
@@ -2837,9 +2851,13 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const activePool = activeSlot?.pool
     const warmRepos = activeSlot?.preparedRepos
     const matchesWarmRepos = Boolean(
-      activePool
+      activeSlot
+      && activePool
       && !options?.rpcMountDir
       && warmRepos
+      && effectiveRunKey
+      && activeSlot.runKey === effectiveRunKey
+      && warmRepos.runKey === effectiveRunKey
       && options?.reposDir
       && normalizeReposDirKey(options.reposDir) === warmRepos.sourceDir,
     )

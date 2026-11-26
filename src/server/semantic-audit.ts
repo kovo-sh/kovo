@@ -2399,7 +2399,7 @@ export async function runVariantSweepForFinding(
   const primaryLoc = locs[0]
   const cleanRepo = normalizeRepoIdentifier(primaryLoc.repo)
   const ownedSession = !ctx.session
-  const session = ctx.session ?? await ctx.backend.openSession(ctx.assignment?.id ?? randomUUID(), ctx.signal, { reposDir: ctx.reposDir })
+  const session = ctx.session ?? await ctx.backend.openSession(ctx.assignment?.id ?? randomUUID(), ctx.signal, { reposDir: ctx.reposDir, runId: ctx.run.id })
 
   const warnings: SemanticAuditWarning[] = []
   try {
@@ -2678,7 +2678,7 @@ export async function runThreeStageSemanticAudit(
   let session: WorkerSession | undefined = ctx.session
   const ensureSession = async (): Promise<WorkerSession> => {
     if (!session) {
-      session = await ctx.backend.openSession(ctx.assignment?.id ?? randomUUID(), ctx.signal, { reposDir: ctx.reposDir })
+      session = await ctx.backend.openSession(ctx.assignment?.id ?? randomUUID(), ctx.signal, { reposDir: ctx.reposDir, runId: ctx.run.id })
     }
     return session
   }
