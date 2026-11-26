@@ -6,6 +6,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
 import { parseRoleLabel, routeFamily, stepReadsState } from './oracle-invariants.ts'
+import { augmentCompositeReceiptWithAutoDag, matchesNormalizedCtrlPath } from './composite-autodag.ts'
 import { HostFactLog } from './host-fact-log.ts'
 import { proofReceiptSchema, receiptIdSchema } from './proof-receipt.ts'
 import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
@@ -108,13 +109,9 @@ export interface CompositeReceiptVerification {
 }
 
 // --- Cryptographic, Hashing & Transcript Helpers ----------------------------
-const CONSUMED_STATE_RE =
-  /\b(?:already[_\s-]?(?:consumed|redeemed|used|claimed|applied|settled)|token[_\s-]?(?:consumed|used|redeemed|spent)|one[_\s-]?time|nonce[_\s-]?(?:used|replayed|consumed)|invite[_\s-]?(?:redeemed|consumed|used)|state[_\s-]?(?:consumed|exhausted|finalized))\b/i
-const ABLATION_DENIED_STATUSES = new Set([401, 403, 404, 409, 412, 422])
-const DENIED_CONTROL_STATUSES = new Set([401, 403, 404])
-const SHA256_RE = /^[0-9a-f]{64}$/
-const CROSS_TENANT_CLASS_RE =
-  /^(?:dual_tenant_abac|parser_cache_differential)$|dual[_-]?tenant|cross[_-]?tenant|tenant[_-]?(?:isolation|bleed|leak|export)|abac|cache[_-]?(?:bleed|poison|deception|diff|bypass)|export[_-]?(?:bypass|leak|disclosure)|presign|cwe[-_]?(?:444|639)|\bidor\b|\bbola\b/i
+const CONSUMED_STATE_RE = /\b(?:already[_\s-]?(?:consumed|redeemed|used|claimed|applied|settled)|token[_\s-]?(?:consumed|used|redeemed|spent)|one[_\s-]?time|nonce[_\s-]?(?:used|replayed|consumed)|invite[_\s-]?(?:redeemed|consumed|used)|state[_\s-]?(?:consumed|exhausted|finalized))\b/i
+const ABLATION_DENIED_STATUSES = new Set([401, 403, 404, 409, 412, 422]), DENIED_CONTROL_STATUSES = new Set([401, 403, 404]), SHA256_RE = /^[0-9a-f]{64}$/
+const CROSS_TENANT_CLASS_RE = /^(?:dual_tenant_abac|parser_cache_differential)$|dual[_-]?tenant|cross[_-]?tenant|tenant[_-]?(?:isolation|bleed|leak|export)|abac|cache[_-]?(?:bleed|poison|deception|diff|bypass)|export[_-]?(?:bypass|leak|disclosure)|presign|cwe[-_]?(?:444|639)|\bidor\b|\bbola\b/i
 const TERMINAL_IMPACT_UNPROVEN_HINT =
   "terminal_impact_unproven: obtaining a job/export handle, signed URL, or cache ack is an intermediate capability (seal with ctx.seal_capability), NOT terminal impact — fetch the target resource with the derived URL/handle to prove unauthorized foreign-tenant data exposure or privileged state mutation, or settle with record_coverage(status='ruled_out', proofGapReason='invariant_enforced_hardened') if blocked"
 const ANON_ACTOR_RE = /^(?:anon(?:ymous)?|unauth(?:enticated)?|guest)$/i
@@ -453,7 +450,7 @@ function verifyAttackerProvenance(
   const allowedSet = options.attackerPersonas?.length ? new Set(options.attackerPersonas) : null, forbiddenSet = new Set(options.forbiddenShortcutPersonas ?? [])
   const rootSet = new Set(dag.roots), dagCaps = new Set<string>(), probeTenants = new Set<string>()
   const isForbidden = (a: string | null, r: string | null, rl?: string | null, tt?: string | null) =>
-    (a !== null && forbiddenSet.has(a)) || (allowedSet ? a !== null && !allowedSet.has(a) : isPrivilegedActorOrRole(a, r, rl, tt))
+    (a !== null && forbiddenSet.has(a)) || (allowedSet ? (a !== null && !allowedSet.has(a)) || (Boolean(tt) && isPrivilegedActorOrRole(a, r, rl, tt)) : isPrivilegedActorOrRole(a, r, rl, tt))
   const isAllowed = (a: string | null, r: string | null, rl?: string | null) =>
     !(a !== null && forbiddenSet.has(a)) && (allowedSet ? a !== null && allowedSet.has(a) : !isPrivilegedActorOrRole(a, r, rl))
   const checkExternalCaps = (e: HostTranscriptEntry, label: string): string | null => {
@@ -478,7 +475,7 @@ function verifyAttackerProvenance(
     if (isRoot && (hop.exchangeIds.length > 0 || (hop.oobEventIds.length === 0 && hop.browserTraceIds.length === 0)) && probes.length === 0) return { ok: false, reason: `Root hop "${hopId}" requires an attacker-origin probe.` }
     for (const e of nonControls) {
       const ra = resolveActor(e), usesDag = ra.fromDag || (e.consumedCapabilities ?? []).some(c => dagCaps.has(c)) || (e.cryptoAttestations ?? []).some(x => dagCaps.has(x.derivedFromCapabilityId))
-      const termMarkers = isTermHop && !usesDag ? extractTenantMarkers(e.step.json, e.step.body) : new Set<string>(), tt = termMarkers.size === 1 ? [...termMarkers][0]! : null
+      const termMarkers = isTermHop && !ra.fromDag ? extractTenantMarkers(e.step.json, e.step.body) : new Set<string>(), tt = termMarkers.size === 1 ? [...termMarkers][0]! : null
       if (ra.missingOrigin) return { ok: false, reason: `Attacker-origin violation in "${hopId}" ("${e.exchangeId}"): capability "${ra.a}" has unknown origin.` }
       if (!ra.fromDag && (isForbidden(ra.a, ra.r, ra.rl, tt) || (ra.isCap && !allowedSet && isPrivilegedActorOrRole(null, roleOf(e), e.actorRoleLabel, tt)))) return { ok: false, reason: `Attacker-origin violation in "${hopId}" ("${e.exchangeId}"): pre-seeded persona "${ra.a ?? ra.r}" is forbidden.` }
       const capErr = checkExternalCaps(e, `"${hopId}"`); if (capErr) return { ok: false, reason: capErr }
@@ -489,7 +486,7 @@ function verifyAttackerProvenance(
     }
     recordHopCapabilities(hop, idx, dagCaps, isTermHop)
   }
-  const extraIds = [...receipt.terminalImpact.postChainReadbackExchangeIds, ...(receipt.terminalImpact.modeAFailureExchangeId ? [receipt.terminalImpact.modeAFailureExchangeId] : []), ...(receipt.terminalImpact.proofReceipt?.exchangeIds ?? []), ...receipt.hops.flatMap(h => h.proofReceipt?.exchangeIds ?? [])]
+  const extraIds = [...receipt.terminalImpact.postChainReadbackExchangeIds.filter(id => { const e = idx.entriesById.get(id); return Boolean(e && !stepReadsState(e.step)) }), ...(receipt.terminalImpact.modeAFailureExchangeId ? [receipt.terminalImpact.modeAFailureExchangeId] : []), ...(receipt.terminalImpact.proofReceipt?.exchangeIds ?? []), ...receipt.hops.flatMap(h => h.proofReceipt?.exchangeIds ?? [])]
   for (const id of extraIds) {
     const e = idx.entriesById.get(id); if (!e || e.step.arm === 'control') continue
     const ra = resolveActor(e)
@@ -649,10 +646,13 @@ function verifyTerminalImpactGate(
   const hasPostMutation = Boolean(postMutRb), termHopSet = new Set(termHop.exchangeIds), nonTermExSet = new Set(receipt.hops.filter(h => h.hopId !== termHop.hopId).flatMap(h => h.exchangeIds).filter(id => !termHopSet.has(id)))
   const termRawActor = termEx ? actorOf(termEx) : null, termActor = termEx ? resolvedActorOf(termEx, capIdx) : null, termAuthd = Boolean(termActor && !ANON_ACTOR_RE.test(termActor)), normAct = (a: string | null) => (!a || ANON_ACTOR_RE.test(a.trim())) ? null : a.trim().toLowerCase()
   const termUsesDagCap = Boolean(termEx && ((termEx.consumedCapabilities ?? []).some(c => dagCaps.has(c)) || (termEx.cryptoAttestations ?? []).some(x => dagCaps.has(x.derivedFromCapabilityId)) || (termRawActor && dagCaps.has(termRawActor))))
+  const hasVerifiedTermEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.verified), hasTermDerivedCrypto = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'derived_crypto_binding' && e.verified), allowDynCtrl = receipt.hops.length >= 2 && hasVerifiedTermEdge
   const ctrlCandidates = [...ti.preChainControlExchangeIds, ...termHop.exchangeIds, ...receipt.causalEdges.flatMap(ed => ed.kind === 'state_transition_binding' && ed.toHopId === termHop.hopId ? ed.ablationExchangeIds : [])]
   const matchesCtrlTarget = (c: HostTranscriptEntry, ref: HostTranscriptEntry): boolean => {
     const cRaw = c.step.pathAndQuery ?? c.step.route ?? '', rRaw = ref.step.pathAndQuery ?? ref.step.route ?? '', hostEid = ref.entityId?.trim()
-    if (c.step.method.toUpperCase() !== ref.step.method.toUpperCase() || !cleanExactPath(cRaw) || cleanExactPath(cRaw) !== cleanExactPath(rRaw) || canonicalNonAuthQuery(cRaw) !== canonicalNonAuthQuery(rRaw)) return false
+    if ((c.origin && ref.origin && c.origin.trim().toLowerCase() !== ref.origin.trim().toLowerCase()) || c.step.method.toUpperCase() !== ref.step.method.toUpperCase() || canonicalNonAuthQuery(cRaw) !== canonicalNonAuthQuery(rRaw)) return false
+    const exactPath = Boolean(cleanExactPath(cRaw) && cleanExactPath(cRaw) === cleanExactPath(rRaw))
+    if (!exactPath) return allowDynCtrl && c.step.status !== 404 && matchesNormalizedCtrlPath(cRaw, rRaw)
     return !(hostEid && c.entityId?.trim() && c.entityId.trim().toLowerCase() !== hostEid.toLowerCase()) && (c.step.status !== 404 || !hostEid || entryMatchesEntity(c, hostEid))
   }
   const terminalCtrl = ctrlCandidates.map(id => idx.entriesById.get(id)).find((c): c is HostTranscriptEntry => {
@@ -661,7 +661,7 @@ function verifyTerminalImpactGate(
     if ((c.step.status === 401 && termAuthd && (!ca || ANON_ACTOR_RE.test(ca))) || (!termUsesDagCap && termAuthd && normAct(ca) !== normAct(termActor))) return false
     return Boolean((termEx && matchesCtrlTarget(c, termEx)) || (postMutRb && matchesCtrlTarget(c, postMutRb)))
   })
-  const hasCleanDeniedCtrl = Boolean(terminalCtrl), hasVerifiedTermEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.verified), hasTermDerivedCrypto = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'derived_crypto_binding' && e.verified)
+  const hasCleanDeniedCtrl = Boolean(terminalCtrl)
   const termTenants = termEx ? extractTenantMarkers(termEx.step.json, termEx.step.body) : new Set<string>(), ownTenantOnly = Boolean(termEx && termTenants.size > 0 && attackerTenants.size > 0 && [...termTenants].every(t => attackerTenants.has(t))), hasForeignTenantData = Boolean(termEx && !isStub && hasBody && attackerTenants.size > 0 && [...termTenants].some(t => !attackerTenants.has(t)))
   const v8Default = dispatchDefaultV8Oracle(receipt, dag, idx, factLog, termEx, options, terminalCtrl, postMutRb, { termEndpoint, termFam, hasOob: hasBoundOob, hasBrowser: hasBoundBrowser, hasBody, isStub, ownTenantOnly, hasForeignTenantData, hasVerifiedTermEdge })
   if (v8Default && !v8Default.ok) return { ...v8Default, ...(terminalVerification ? { terminalVerification } : {}) }
@@ -690,7 +690,7 @@ export function verifyCompositeReceipt(rawReceipt: unknown, hostTranscript: Host
     const issue = parsed.error.issues[0]
     return { confirmed: false, chainId: 'invalid', terminalVulnClass: 'invalid', replayMode: 'fresh_clean_replay', modeBVerified: false, hopCount: 0, verifiedEdges: [], failedStage: 'schema', reason: `Schema validation failed: ${issue?.path.join('.') || 'receipt'} ${issue?.message ?? ''}`.slice(0, 400) }
   }
-  const receipt = parsed.data
+  const factLog = options.factLog ?? HostFactLog.fromTranscript(hostTranscript), { receipt, inferredEdges } = augmentCompositeReceiptWithAutoDag(parsed.data, factLog)
   const fail = (failedStage: CompositeFailureStage, reason: string, verifiedEdges: VerifiedEdgeResult[] = [], terminalVerification?: ReceiptVerification, rejectedBy?: string, missingEvidence?: string[]): CompositeReceiptVerification => ({
     confirmed: false, chainId: receipt.chainId, terminalVulnClass: receipt.terminalVulnClass, replayMode: receipt.replayMode,
     modeBVerified: false, hopCount: receipt.hops.length, verifiedEdges, failedStage, reason,
@@ -719,7 +719,6 @@ export function verifyCompositeReceipt(rawReceipt: unknown, hostTranscript: Host
   if (!provRes.ok) return fail('attacker_provenance', provRes.reason, verifiedEdges)
   const replayRes = verifyReplayMode(receipt, dag, idx, options)
   if (!replayRes.ok) return fail('replay_mode', replayRes.reason, verifiedEdges)
-  const factLog = options.factLog ?? HostFactLog.fromTranscript(hostTranscript)
   const termRes = verifyTerminalImpactGate(receipt, dag, idx, factLog, verifiedEdges, hostTranscript, provRes.attackerTenants, new Set(provRes.derivedCapabilities), capIdx, options)
   if (!termRes.ok) return fail('terminal_impact', termRes.reason, verifiedEdges, termRes.terminalVerification, termRes.rejectedBy, termRes.missingEvidence)
   return {
@@ -729,7 +728,7 @@ export function verifyCompositeReceipt(rawReceipt: unknown, hostTranscript: Host
     ...(termRes.terminalOracleFamily ? { terminalOracleFamily: termRes.terminalOracleFamily } : {}),
     ...(termRes.terminalEndpoint ? { terminalEndpoint: termRes.terminalEndpoint } : {}),
     ...(termRes.terminalVerification ? { terminalVerification: termRes.terminalVerification } : {}),
-    evidence: { topoOrder: dag.topoOrder, roots: dag.roots, derivedCapabilities: provRes.derivedCapabilities, ...(termRes.terminalOracleFamily ? { terminalOracleFamily: termRes.terminalOracleFamily } : {}), ...(termRes.terminalEndpoint ? { terminalEndpoint: termRes.terminalEndpoint } : {}) },
+    evidence: { topoOrder: dag.topoOrder, roots: dag.roots, derivedCapabilities: provRes.derivedCapabilities, ...(inferredEdges.length ? { autoInferredEdgeCount: inferredEdges.length } : {}), ...(termRes.terminalOracleFamily ? { terminalOracleFamily: termRes.terminalOracleFamily } : {}), ...(termRes.terminalEndpoint ? { terminalEndpoint: termRes.terminalEndpoint } : {}) },
   }
 }
 

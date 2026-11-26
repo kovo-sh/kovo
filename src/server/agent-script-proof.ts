@@ -24,6 +24,7 @@ import { DerivedCapabilityVault, type DerivedCapabilityMeta } from './derived-cu
 import { createEgressSanitizer, type EgressSanitizer } from './egress-sanitizer.ts'
 import { HostFactLog } from './host-fact-log.ts'
 import { parseRoleLabel } from './oracle-invariants.ts'
+import { isPrivilegedActorOrRole } from './v8-oracle-hydrate.ts'
 import { buildAgentScriptReceipt } from './proof-receipt.ts'
 import type { ProofReceipt, ReceiptVerification, ScriptProofExchange } from './proof-receipt.ts'
 import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
@@ -302,12 +303,12 @@ class CapturingVerifyRpcServer extends VerifyRpcServer {
   }
 }
 
-const PRIVILEGED_PERSONA_TOKEN_RE =
-  /(?:^|[\s:_-])(?:super[\s_-]?admin|org[\s_-]?admin|sys[\s_-]?admin|platform[\s_-]?admin|admin|owner|root|superuser|manager|staff|operator)(?:$|[\s:_-])/i
-
 /**
  * H-11: Derive `CompositeVerifyOptions` attacker/forbidden-shortcut persona lists from the run's
- * `Grant` whenever the caller did not supply explicit options.
+ * `Grant` whenever the caller did not supply explicit options. Routes through tenant-aware
+ * `isPrivilegedActorOrRole` so multi-tenant personas (`dual_tenant_abac`: admin in tenant A +
+ * low-priv in tenant B) are not wrongly blacklisted as `forbiddenShortcutPersonas`, while single-
+ * tenant admins, owners, and global superadmins remain strictly forbidden.
  */
 export function buildCompositeVerifyOptionsFromGrant(
   grant: Pick<Grant, 'personas'>,
@@ -317,10 +318,7 @@ export function buildCompositeVerifyOptionsFromGrant(
   const forbiddenShortcutPersonas: string[] = []
   for (const [handle, persona] of grant.personas.entries()) {
     const parsed = parseRoleLabel(persona.roleLabel)
-    const isPrivileged = parsed.role === 'admin'
-      || parsed.role === 'owner'
-      || PRIVILEGED_PERSONA_TOKEN_RE.test(persona.roleLabel ?? '')
-      || PRIVILEGED_PERSONA_TOKEN_RE.test(handle)
+    const isPrivileged = isPrivilegedActorOrRole(handle, parsed.role, persona.roleLabel)
     if (isPrivileged) {
       forbiddenShortcutPersonas.push(handle)
     } else {
