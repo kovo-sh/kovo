@@ -12,6 +12,7 @@ import { resolve } from 'node:path'
 import { describe, test } from 'node:test'
 
 import { ORIGIN_WIDE_CWE_KEYS, isOriginWideCwe, normalizeCwe } from '../src/finding-keys.ts'
+import { UNCLASSIFIED_TAXONOMY_KEY, cweFamiliesConflict, cweFamiliesIntersect } from '../src/vuln-taxonomy.ts'
 import * as reportSummary from '../src/report-summary.ts'
 import * as dedupe from '../src/server/dedupe.ts'
 import {
@@ -419,6 +420,189 @@ describe('R2-10: LLM semantic dedupe deterministic veto', () => {
     const vetoed = await judgeSemanticDuplicate(postFinding, [getFinding], alwaysDuplicateLlm('f-get'))
     assert.equal(vetoed.isDuplicate, false)
     assert.equal(vetoed.vetoReason, 'method_conflict')
+  })
+
+  test('R3-11 CWE-family veto: two distinct injection classes on the exact same endpoint and parameter NEVER collapse under LLM dedupe', async () => {
+    const existingSqli: ExistingFindingRef = {
+      id: 'f-sqli-q',
+      origin,
+      title: 'SQL injection on /api/v1/diagnostics (host)',
+      status: 'confirmed',
+      cwe: 'CWE-89',
+      category: 'injection-input',
+      severity: 'high',
+      endpoint: '/api/v1/diagnostics',
+      method: 'GET',
+      param: 'host',
+      mutated: mutation('param', 'host', 'query'),
+      handler: '/svc-diag/diagnostics',
+    }
+
+    const distinctInjectionClasses: Array<{ label: string; cwe: string }> = [
+      { label: 'command injection', cwe: 'CWE-78' },
+      { label: 'SSTI', cwe: 'CWE-1336' },
+      { label: 'NoSQL injection', cwe: 'CWE-943' },
+      { label: 'XXE', cwe: 'CWE-611' },
+      { label: 'path traversal', cwe: 'CWE-22' },
+    ]
+
+    for (const tc of distinctInjectionClasses) {
+      const candidate: DedupeCandidate = {
+        origin,
+        title: `${tc.label} on /api/v1/diagnostics (host)`,
+        cwe: tc.cwe,
+        category: 'injection-input',
+        severity: 'critical',
+        endpoint: '/api/v1/diagnostics',
+        method: 'GET',
+        param: 'host',
+        mutated: mutation('param', 'host', 'query'),
+        handler: '/svc-diag/diagnostics',
+      }
+
+      assert.equal(
+        sameFindingPredicate(candidate, existingSqli),
+        false,
+        `sameFindingPredicate must reject ${tc.cwe} vs CWE-89 on the same parameter`,
+      )
+
+      let llmCalls = 0
+      const decision = await evaluateSubmissionDedupe({
+        candidate,
+        existingFindings: [existingSqli],
+        llmCall: async prompt => {
+          llmCalls += 1
+          return alwaysDuplicateLlm('f-sqli-q', true)(prompt)
+        },
+      })
+
+      assert.equal(llmCalls, 1, `LLM judge was invoked because both share category injection-input (${tc.cwe})`)
+      assert.equal(decision.action, 'accept', `${tc.cwe} must proceed to verification`)
+      assert.equal(decision.isDuplicate, false)
+      assert.equal(decision.duplicateOfId, null)
+      assert.equal(decision.siblingOfId, 'f-sqli-q')
+      assert.equal(decision.vetoReason, 'cwe_family_conflict')
+    }
+  })
+
+  test('R3-11 CWE-family veto: cross-family non-injection pairs veto while same-family CWE aliases still dedupe', async () => {
+    // Disjoint families on the exact same route/method/param are vetoed.
+    const disjointPairs: Array<[string, string, string]> = [
+      ['CWE-639', 'CWE-915', 'broken-access-control'], // BOLA vs Mass Assignment
+      ['CWE-79', 'CWE-352', 'cors-client-side'],       // XSS vs CSRF
+      ['CWE-918', 'CWE-601', 'ssrf-redirects'],        // SSRF vs Open Redirect
+      ['CWE-942', 'CWE-693', 'cors-client-side'],      // CORS vs CSP (distinct origin-wide classes)
+    ]
+    for (const [cweA, cweB, category] of disjointPairs) {
+      assert.equal(cweFamiliesIntersect(cweA, cweB), false, `${cweA} and ${cweB} must be disjoint`)
+      const existing: ExistingFindingRef = {
+        id: `f-${cweA}`,
+        origin,
+        title: `Existing ${cweA}`,
+        status: 'confirmed',
+        cwe: cweA,
+        category,
+        severity: 'high',
+        endpoint: '/api/v1/account',
+        method: 'POST',
+        param: 'target',
+      }
+      const candidate: DedupeCandidate = {
+        origin,
+        title: `Candidate ${cweB}`,
+        cwe: cweB,
+        category,
+        severity: 'high',
+        endpoint: '/api/v1/account',
+        method: 'POST',
+        param: 'target',
+      }
+      assert.equal(sameFindingPredicate(candidate, existing), false)
+      const res = await judgeSemanticDuplicate(candidate, [existing], alwaysDuplicateLlm(existing.id))
+      assert.equal(res.isDuplicate, false)
+      assert.equal(res.vetoReason, 'cwe_family_conflict')
+    }
+
+    // Same-family aliases on the exact same surface still pass sameFindingPredicate and dedupe cleanly.
+    const sameFamilyPairs: Array<[string, string, string]> = [
+      ['CWE-639', 'CWE-284', 'broken-access-control'],
+      ['CWE-89', 'CWE-564', 'injection-input'],
+      ['CWE-79', 'CWE-80', 'cors-client-side'],
+      ['CWE-287', 'CWE-347', 'auth-identity'],
+      ['CWE-362', 'CWE-367', 'business-logic-race'],
+      ['CWE-840', 'CWE-472', 'business-logic-race'],
+    ]
+    for (const [cweA, cweB, category] of sameFamilyPairs) {
+      assert.equal(cweFamiliesIntersect(cweA, cweB), true, `${cweA} and ${cweB} must share a family`)
+      const existing: ExistingFindingRef = {
+        id: `f-same-${cweA}`,
+        origin,
+        title: `Existing ${cweA}`,
+        status: 'confirmed',
+        cwe: cweA,
+        category,
+        severity: 'high',
+        endpoint: '/api/v1/orders/1001',
+        method: 'GET',
+        param: 'id',
+      }
+      const candidate: DedupeCandidate = {
+        origin,
+        title: `Candidate ${cweB}`,
+        cwe: cweB,
+        category,
+        severity: 'high',
+        endpoint: '/api/v1/orders/2002',
+        method: 'GET',
+        param: 'id',
+      }
+      assert.equal(sameFindingPredicate(candidate, existing), true)
+      const res = await judgeSemanticDuplicate(candidate, [existing], alwaysDuplicateLlm(existing.id))
+      assert.equal(res.isDuplicate, true)
+      assert.equal(res.duplicateOfId, existing.id)
+    }
+
+    // R3-11 F2: unlisted CWEs (e.g. generic CWE-20) are NOT treated as conflicting singletons.
+    assert.equal(cweFamiliesConflict('CWE-20', 'CWE-89'), false)
+    const unlistedCand: DedupeCandidate = {
+      origin,
+      title: 'Input validation SQLi candidate',
+      cwe: 'CWE-20',
+      category: 'injection-input',
+      severity: 'high',
+      endpoint: '/api/v1/search',
+      method: 'GET',
+      param: 'q',
+    }
+    const sqliExisting: ExistingFindingRef = {
+      id: 'f-sqli-search',
+      origin,
+      title: 'SQL injection on /api/v1/search',
+      status: 'confirmed',
+      cwe: 'CWE-89',
+      category: 'injection-input',
+      severity: 'high',
+      endpoint: '/api/v1/search',
+      method: 'GET',
+      param: 'q',
+    }
+    assert.equal(sameFindingPredicate(unlistedCand, sqliExisting), true)
+
+    // R3-11 N1: unclassified findings must never silently merge into classified findings on the same surface.
+    const unclassifiedCand: DedupeCandidate = {
+      origin,
+      title: 'Unclassified boundary finding',
+      cwe: UNCLASSIFIED_TAXONOMY_KEY,
+      category: UNCLASSIFIED_TAXONOMY_KEY,
+      severity: 'high',
+      endpoint: '/api/v1/search',
+      method: 'GET',
+      param: 'q',
+    }
+    assert.equal(sameFindingPredicate(unclassifiedCand, sqliExisting), false)
+    const unclassifiedVeto = await judgeSemanticDuplicate(unclassifiedCand, [sqliExisting], alwaysDuplicateLlm(sqliExisting.id))
+    assert.equal(unclassifiedVeto.isDuplicate, false)
+    assert.equal(unclassifiedVeto.vetoReason, 'cwe_family_conflict')
   })
 })
 

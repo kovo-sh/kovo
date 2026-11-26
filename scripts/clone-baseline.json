@@ -330,18 +330,5 @@
       ]
     }
   ],
-  "ticketedSafetyPrimitiveDebt": [
-    {
-      "name": "isSensitiveRepoEntry",
-      "file": "src/server/exec-verify.ts",
-      "ticket": "R3-11",
-      "reason": "Kernel-lane file deferred to R3-11 (R3-05 review lane) to retire final duplicate into safety-primitives.ts."
-    },
-    {
-      "name": "isSensitiveRepoRelativePath",
-      "file": "src/server/exec-verify.ts",
-      "ticket": "R3-11",
-      "reason": "Kernel-lane file deferred to R3-11 (R3-05 review lane) to retire final duplicate into safety-primitives.ts."
-    }
-  ]
+  "ticketedSafetyPrimitiveDebt": []
 }
