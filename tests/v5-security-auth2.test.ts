@@ -7,16 +7,18 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { once } from 'node:events'
 import {
+  buildFormChromiumLaunchOptions,
   classifyAddress,
   createPinnedLookup,
   formChromiumLaunchArgs,
   isClerkCredentialHost,
   isHostInScope,
+  launchDefaultChromium,
   PersonaAuthError,
   PersonaAuthManager,
   registrableDomain,
 } from '../src/server/persona-auth.ts'
-import type { PlaywrightFormBrowserLike } from '../src/server/persona-auth.ts'
+import type { PlaywrightChromiumLaunchOptions, PlaywrightFormBrowserLike } from '../src/server/persona-auth.ts'
 import { isCredentialScopeHost, isPublicSuffixHost } from '../src/server/public-suffix.ts'
 import { createProjectPersona } from '../src/server/persona-vault.ts'
 import { Store } from '../src/server/store.ts'
@@ -401,7 +403,7 @@ test('allowlisted localhost login works and resolves to a loopback literal', asy
 test('form browser is sandboxed, blocks service workers, and pins resolved hosts', async t => {
   const storage = makeStorage(t)
   let contextOptions: Record<string, unknown> = {}
-  let launchArgs: string[] = []
+  let launchOptions: PlaywrightChromiumLaunchOptions | undefined
   let pinned: ReadonlyMap<string, readonly string[]> | undefined
   const fake = makeFormBrowser({
     onContext: options => { contextOptions = options },
@@ -409,8 +411,13 @@ test('form browser is sandboxed, blocks service workers, and pins resolved hosts
   const manager = new PersonaAuthManager({
     launchBrowser: async pinnedHosts => {
       pinned = pinnedHosts
-      launchArgs = formChromiumLaunchArgs({ pinnedHosts })
-      return fake.browser
+      return await launchDefaultChromium(pinnedHosts, {
+        env: {},
+        launch: async opts => {
+          launchOptions = opts
+          return fake.browser
+        },
+      })
     },
     resolveHost: async hostname => hostname === 'app.example.com' ? ['93.184.216.34'] : ['93.184.216.35'],
   })
@@ -425,9 +432,14 @@ test('form browser is sandboxed, blocks service workers, and pins resolved hosts
   assert.equal(contextOptions.serviceWorkers, 'block')
   assert.equal(contextOptions.ignoreHTTPSErrors, false)
   assert.equal(pinned?.get('app.example.com')?.[0], '93.184.216.34')
-  assert.ok(launchArgs.some(arg => arg.includes('MAP app.example.com 93.184.216.34')))
-  assert.ok(launchArgs.some(arg => arg.includes('MAP * ~NOTFOUND')))
-  assert.equal(launchArgs.includes('--no-sandbox'), false, 'Sandbox must stay enabled by default')
+  assert.ok(launchOptions, 'Expected launchDefaultChromium to pass options to Playwright')
+  assert.equal(launchOptions.headless, true)
+  assert.equal(launchOptions.chromiumSandbox, true, 'Playwright chromiumSandbox must be explicitly true by default')
+  assert.deepEqual(launchOptions, buildFormChromiumLaunchOptions({ pinnedHosts: pinned, env: {} }))
+  assert.deepEqual(launchOptions.args, formChromiumLaunchArgs({ pinnedHosts: pinned }))
+  assert.ok(launchOptions.args.some(arg => arg.includes('MAP app.example.com 93.184.216.34')))
+  assert.ok(launchOptions.args.some(arg => arg.includes('MAP * ~NOTFOUND')))
+  assert.equal(launchOptions.args.includes('--no-sandbox'), false, 'Sandbox must stay enabled by default')
 })
 
 test('form browser blocks service workers, unknown DNS, rebound pins, and non-http schemes', async t => {

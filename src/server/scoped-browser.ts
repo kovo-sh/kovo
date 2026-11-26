@@ -5,7 +5,17 @@ import { BrokerDenied, RequestBroker } from './broker.ts'
 import type { BrokerExchangeResult, Grant } from './broker.ts'
 import { scanSecondOrderMarkers } from './canary-broker.ts'
 import type { SecondOrderStore } from './canary-broker.ts'
-import { cookieRecordsFromHeader } from './persona-auth.ts'
+import {
+  cookieRecordsFromHeader,
+  formatChromiumSandboxError,
+  isChromiumSandboxFailure,
+  isInsecureNoSandboxEnabled,
+  launchPlaywrightChromium,
+  type ChromiumPlaywrightLauncher,
+  type PlaywrightChromiumLaunchOptions,
+} from './persona-auth.ts'
+export { formatChromiumSandboxError, isChromiumSandboxFailure, isInsecureNoSandboxEnabled }
+export type { PlaywrightChromiumLaunchOptions }
 import { buildPersonaBrowserAttachment, personaSecrets } from './persona-vault.ts'
 import { EgressGateway } from './egress-gateway.ts'
 import type { EgressLoopbackProxy, LoopbackProxyContextBinding } from './egress-gateway.ts'
@@ -473,6 +483,22 @@ export function chromiumLaunchArgs(options: ChromiumLaunchOptions = {}): string[
   return args
 }
 
+/**
+ * Build the authoritative Playwright `chromium.launch(...)` options for `ScopedBrowser`.
+ * Explicitly sets `chromiumSandbox: true` by default because Playwright silently appends
+ * `--no-sandbox` whenever `chromiumSandbox !== true`.
+ */
+export function buildChromiumLaunchOptions(
+  options: ChromiumLaunchOptions & { env?: NodeJS.ProcessEnv } = {},
+): PlaywrightChromiumLaunchOptions {
+  const insecureNoSandbox = options.insecureNoSandbox ?? isInsecureNoSandboxEnabled(options.env)
+  return {
+    headless: true,
+    chromiumSandbox: !insecureNoSandbox,
+    args: chromiumLaunchArgs({ insecureNoSandbox }),
+  }
+}
+
 /** Neutralise WebRTC constructors for target JS even if a platform ignores the launch flags. */
 export const browserWebRtcGuardScript = `(() => {
   const deny = function () { throw new Error('WebRTC is disabled inside Kovo Hunter browser sessions.'); };
@@ -621,23 +647,12 @@ export async function installWebSocketGuard(
   })
 }
 
-async function launchChromium(): Promise<PlaywrightBrowserLike> {
-  const insecureNoSandbox = process.env.KOVO_INSECURE_NO_SANDBOX === '1'
-  if (insecureNoSandbox) {
-    console.warn('WARNING: Chromium sandbox disabled (KOVO_INSECURE_NO_SANDBOX=1). Detection fidelity is reduced.')
-  }
-  const args = chromiumLaunchArgs({ insecureNoSandbox })
-  try {
-    const coreName = 'playwright-core'
-    const coreMod = await import(/* @vite-ignore */ coreName) as { chromium?: { launch: (opts: Record<string, unknown>) => Promise<PlaywrightBrowserLike> } }
-    if (coreMod.chromium) {
-      return await coreMod.chromium.launch({ headless: true, args })
-    }
-  } catch {
-    // Fallback to @playwright/test
-  }
-  const pw = await import('@playwright/test')
-  return await pw.chromium.launch({ headless: true, args }) as unknown as PlaywrightBrowserLike
+export async function launchChromium(deps?: {
+  launch?: ChromiumPlaywrightLauncher<PlaywrightBrowserLike>['launch']
+  env?: NodeJS.ProcessEnv
+}): Promise<PlaywrightBrowserLike> {
+  const launchOptions = buildChromiumLaunchOptions({ env: deps?.env })
+  return await launchPlaywrightChromium(launchOptions, deps?.launch)
 }
 
 const postMessageInstrumentationScript = `
