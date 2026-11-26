@@ -126,6 +126,8 @@ test('verify-rpc.ts preserves 100% public runtime export parity with canonical s
     VERIFY_RESULT_ENV: 'string',
     VERIFY_RPC_HEADER: 'string',
     VERIFY_NONCE_HEADER: 'string',
+    VERIFY_RPC_SDK_VERSION: 'string',
+    VERIFY_SDK_HEADER: 'string',
     VERIFY_RESULT_MARKER: 'string',
     TranscriptStore: 'function',
     normalizeDynamic: 'function',

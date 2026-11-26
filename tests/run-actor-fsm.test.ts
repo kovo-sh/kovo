@@ -387,9 +387,10 @@ test('M-12: blocked circuit-open step transitively taints pending dependents and
     dependsOnStepIds: [],
     sourceOrigins: [APP_ORIGIN],
   })
+  const API_ORIGIN = 'https://api.example.test'
   const s2 = store.addChainStep(run2.run, {
-    title: 'Pending dependent of circuit-open step',
-    hypothesis: 'Must not keep investigation wedged forever',
+    title: 'Pending dependent on same circuit-open origin',
+    hypothesis: 'Transitions directly to blocked via reconcileUnavailableOriginSteps (R4-H-12)',
     category: 'broken-access-control',
     priority: 60,
     targetAssetIds: [asset2.id],
@@ -398,9 +399,20 @@ test('M-12: blocked circuit-open step transitively taints pending dependents and
     dependsOnStepIds: [s1.id],
     sourceOrigins: [APP_ORIGIN],
   })
+  const s3 = store.addChainStep(run2.run, {
+    title: 'Pending dependent on healthy origin',
+    hypothesis: 'Transitively taints from blocked parent and never wedges driveInvestigation',
+    category: 'broken-access-control',
+    priority: 50,
+    targetAssetIds: [asset2.id],
+    skills: [],
+    dependsOnFactIds: [],
+    dependsOnStepIds: [s2.id],
+    sourceOrigins: [API_ORIGIN],
+  })
 
   const broker = makeBroker()
-  ;(broker as unknown as { isCircuitOpen: (origin: string) => boolean }).isCircuitOpen = () => true
+  ;(broker as unknown as { isCircuitOpen: (origin: string) => boolean }).isCircuitOpen = origin => origin === APP_ORIGIN
 
   const execution = new Execution(store, {
     runtime,
@@ -427,7 +439,8 @@ test('M-12: blocked circuit-open step transitively taints pending dependents and
 
   const finalSteps = store.listChainSteps(run2.runId, run2.run.goalRevision)
   assert.equal(finalSteps.find(s => s.id === s1.id)?.status, 'blocked')
-  assert.equal(finalSteps.find(s => s.id === s2.id)?.status, 'tainted')
+  assert.equal(finalSteps.find(s => s.id === s2.id)?.status, 'blocked')
+  assert.equal(finalSteps.find(s => s.id === s3.id)?.status, 'tainted')
 })
 
 // ---------------------------------------------------------------------------

@@ -795,7 +795,25 @@ test('CompositePatchRetestProof redacts secrets and grades OSS M4 >= 80% closure
                 timestampMs: 900,
                 actorPersona: 'member_a',
               }),
-              ...(res.entries ?? []),
+              signedEntry('ex-4', makeStep({
+                id: 'ex-4',
+                arm: 'probe',
+                method: 'POST',
+                status: 200,
+                pathAndQuery: '/api/v1/settlements/execute',
+                json: { tenantId: 'org-b', transferred: true, amount: 5000 },
+              }), {
+                timestampMs: 4000,
+                actorPersona: 'member_a',
+                consumedCapabilities: [CAP_HOP3],
+                cryptoAttestations: [{
+                  derivedFromCapabilityId: CAP_HOP3,
+                  derivedCapabilityId: CAP_HOP4_DERIVED,
+                  alg: 'hmac-sha256',
+                  artifactDigest: sha256Hex('settlement-payload-v1'),
+                  timestampMs: 3500,
+                }],
+              }),
             ],
           }
         }

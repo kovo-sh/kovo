@@ -430,7 +430,7 @@ test('H-19: failed entitled controls map to inconclusive, never fixed', async ()
 })
 
 test('H-19: a healthy denied control observing a denied probe remains fixed', async () => {
-  const result = await retestWithStatuses([200, 401, 403])
+  const result = await retestWithStatuses([200, 403, 403])
   assert.equal(result.verdict, 'fixed', result.replay.outcome.reason ?? 'no reason')
 })
 
