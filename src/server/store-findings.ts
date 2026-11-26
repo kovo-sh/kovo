@@ -9,7 +9,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, rmdirSync, unlinkSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm'
 import type {
   BenchmarkFunnel,
@@ -52,6 +52,7 @@ import {
   DEFAULT_EXCHANGE_RETENTION_DAYS,
   InvariantError,
   artifactBucket,
+  artifactShardFile,
   assertConfirmedVerificationClass,
   boundedArtifactSize,
   capUtf8Bytes,
@@ -65,7 +66,7 @@ import {
   resolvePageOffset,
   safeFileSize,
   sanitizeSecretMatches,
-  uniqueArtifactRunDirs,
+  tenantBlobFile,
   verificationClassForFinding,
   type AgentScriptProofRecord,
   type ApiDependencyRow,
@@ -148,6 +149,12 @@ export class FindingsRepository {
     this.session = session
   }
 
+  private assertTenantRun(runId: string): void {
+    if (this.session.tenantId) {
+      this.session.requireRun(runId)
+    }
+  }
+
   // --- Evidence & Artifacts ---
 
   assignmentEvidence(assignmentId: string, operationId: string) {
@@ -215,6 +222,7 @@ export class FindingsRepository {
     operationId?: string,
     secrets: readonly NamedSecret[] = [],
   ) {
+    this.assertTenantRun(run.id)
     if (operationId) {
       const existing = this.assignmentEvidence(assignment.id, operationId)
       if (existing) return existing
@@ -249,6 +257,7 @@ export class FindingsRepository {
     /** Redacted structural evidence captured pre-scrub by the broker. Fingerprints only. */
     secretMatches?: readonly SecretMatch[]
   }): BrokerExchange {
+    this.assertTenantRun(input.runId)
     const secrets = input.secrets ?? []
     const cleanBody = redact(input.body, secrets)
     const cleanPath = redact(input.pathAndQuery, secrets)
@@ -412,8 +421,20 @@ export class FindingsRepository {
     let runIds: string[]
     if (options.runId) {
       runIds = [this.session.requireRun(options.runId).id]
+    } else if (this.session.tenantId) {
+      const rows = this.session.client.prepare(
+        `SELECT r.id, r.status FROM runs r
+         LEFT JOIN projects p ON p.id = r.project_id
+         WHERE r.workspace_id = ?
+           AND COALESCE(NULLIF(r.tenant_id, 'default'), p.tenant_id, 'default') = ?`,
+      ).all(this.session.workspace.id, this.session.tenantId) as Array<{ id: string; status: string }>
+      runIds = rows
+        .filter(row => !(options.skipActiveRuns ?? true) || row.status !== 'running')
+        .map(row => row.id)
     } else {
-      const rows = this.session.client.prepare('SELECT id, status FROM runs').all() as Array<{ id: string; status: string }>
+      const rows = this.session.client.prepare(
+        'SELECT id, status FROM runs WHERE workspace_id = ?',
+      ).all(this.session.workspace.id) as Array<{ id: string; status: string }>
       runIds = rows
         .filter(row => !(options.skipActiveRuns ?? true) || row.status !== 'running')
         .map(row => row.id)
@@ -522,9 +543,8 @@ export class FindingsRepository {
       for (const id of batch.blobIds) blobIds.add(id)
       if (batch.rows < batchSize) break
     }
-    const runDirs = uniqueArtifactRunDirs(this.session.directory)
     for (const blobId of blobIds) {
-      const removed = this.deleteBlobIfUnreferenced(run.id, blobId, runDirs)
+      const removed = this.deleteBlobIfUnreferenced(run.id, blobId)
       if (removed.deleted) {
         result.blobs += 1
         result.blobBytes += removed.bytes
@@ -579,24 +599,38 @@ export class FindingsRepository {
   }
 
   /**
-   * Remove a content-addressed exchange body blob once no exchange row anywhere references it.
-   * Blobs are shared by hash across runs, so every shard copy is scanned before deletion.
+   * Remove a content-addressed exchange body blob once no exchange row in the run's tenant
+   * references it. Strictly tenant-scoped: never scans other tenants' directories on disk.
    */
   private deleteBlobIfUnreferenced(
     runId: string,
     blobId: string,
-    artifactRunDirs: readonly string[] = uniqueArtifactRunDirs(this.session.directory),
   ): { deleted: boolean; bytes: number } {
-    const referenced = this.session.client.prepare(
+    const tenantId = this.session.effectiveRunTenant(runId) ?? 'default'
+    const tenantReferenced = this.session.client.prepare(
+      `SELECT 1 AS hit
+       FROM broker_exchanges e
+       JOIN runs r ON r.id = e.run_id
+       LEFT JOIN projects p ON p.id = r.project_id
+       WHERE e.body_artifact_id = ?
+         AND r.workspace_id = ?
+         AND COALESCE(NULLIF(r.tenant_id, 'default'), p.tenant_id, 'default') = ?
+       LIMIT 1`,
+    ).get(blobId, this.session.workspace.id, tenantId) as { hit?: number } | undefined
+    if (tenantReferenced?.hit) return { deleted: false, bytes: 0 }
+
+    const bucket = artifactBucket(blobId)
+    const tenantPath = tenantBlobFile(this.session.directory, tenantId, blobId)
+    const runPath = artifactShardFile(this.session.directory, runId, blobId, 'blobs')
+    const candidates = new Set<string>([tenantPath, runPath])
+
+    const globallyReferenced = this.session.client.prepare(
       'SELECT 1 AS hit FROM broker_exchanges WHERE body_artifact_id = ? LIMIT 1',
     ).get(blobId) as { hit?: number } | undefined
-    if (referenced?.hit) return { deleted: false, bytes: 0 }
-    const candidates = new Set<string>([join(this.session.directory, 'artifacts', blobId + '.txt')])
-    const bucket = artifactBucket(blobId)
-    const runDirs = new Set<string>([runId, ...artifactRunDirs])
-    for (const dir of runDirs) {
-      candidates.add(join(this.session.directory, 'artifacts', dir, 'blobs', bucket, blobId + '.txt'))
+    if (!globallyReferenced?.hit) {
+      candidates.add(join(this.session.directory, 'artifacts', blobId + '.txt'))
     }
+
     let bytes = 0
     let deleted = false
     for (const file of candidates) {
@@ -609,6 +643,7 @@ export class FindingsRepository {
       } catch { /* missing or already removed */ }
     }
     if (deleted) {
+      try { rmdirSync(dirname(tenantPath)) } catch { /* non-empty */ }
       try { rmdirSync(join(this.session.directory, 'artifacts', runId, 'blobs', bucket)) } catch { /* non-empty */ }
     }
     return { deleted, bytes }
@@ -626,6 +661,7 @@ export class FindingsRepository {
     sourceOrigins?: string[]
     secrets?: readonly NamedSecret[]
   }): Fact {
+    this.assertTenantRun(run.id)
     const secrets = input.secrets ?? []
     const origins = new Set<string>([input.origin, ...assignment.sourceOrigins, ...(input.sourceOrigins ?? [])])
     const exIds = [...new Set(input.exchangeIds ?? [])]
@@ -688,6 +724,7 @@ export class FindingsRepository {
     limit?: number
     offset?: number
   } = {}): Fact[] {
+    this.assertTenantRun(runId)
     const conditions = [eq(tables.facts.runId, runId)]
     if (!opts.includeTainted) conditions.push(eq(tables.facts.tainted, false))
     if (opts.origin) conditions.push(eq(tables.facts.origin, opts.origin))
@@ -724,6 +761,7 @@ export class FindingsRepository {
   }
 
   listGraphEdges(runId: string): GraphEdge[] {
+    this.assertTenantRun(runId)
     return this.session.db.select().from(tables.graphEdges).where(eq(tables.graphEdges.runId, runId))
       .orderBy(asc(tables.graphEdges.createdAt)).all()
   }
@@ -743,6 +781,7 @@ export class FindingsRepository {
       proof?: AgentScriptProofRecord | null
     },
   ): ReplaySpecRow {
+    this.assertTenantRun(run.id)
     const specSha256 = createHash('sha256').update(JSON.stringify(spec)).digest('hex')
     return this.session.db.insert(tables.replaySpecs).values({
       id: randomUUID(),
@@ -764,6 +803,7 @@ export class FindingsRepository {
 
   /** Persist (or replace) the agent-script proof attached to a replay spec row. */
   setReplaySpecProof(runId: string, replaySpecId: string, proof: AgentScriptProofRecord): ReplaySpecRow {
+    this.assertTenantRun(runId)
     const row = this.session.db.update(tables.replaySpecs)
       .set(proofColumns(proof))
       .where(and(eq(tables.replaySpecs.runId, runId), eq(tables.replaySpecs.id, replaySpecId)))
@@ -774,6 +814,7 @@ export class FindingsRepository {
 
   /** Proof columns for a row (or null when the row is not a script proof). */
   replaySpecProof(runId: string, replaySpecId: string): AgentScriptProofRecord | null {
+    this.assertTenantRun(runId)
     const row = this.session.db.select().from(tables.replaySpecs).where(and(
       eq(tables.replaySpecs.runId, runId), eq(tables.replaySpecs.id, replaySpecId),
     )).get()
@@ -782,6 +823,7 @@ export class FindingsRepository {
 
   /** Latest script proof attached to any spec row of a finding (null when none). */
   agentProofForFinding(runId: string, findingId: string): AgentScriptProofRecord | null {
+    this.assertTenantRun(runId)
     const rows = this.session.db.select().from(tables.replaySpecs).where(and(
       eq(tables.replaySpecs.runId, runId), eq(tables.replaySpecs.findingId, findingId),
     )).orderBy(desc(tables.replaySpecs.createdAt)).all()
@@ -793,6 +835,7 @@ export class FindingsRepository {
   }
 
   getReplaySpec(runId: string, replaySpecId: string): ReplaySpecRow {
+    this.assertTenantRun(runId)
     const row = this.session.db.select().from(tables.replaySpecs).where(and(
       eq(tables.replaySpecs.runId, runId), eq(tables.replaySpecs.id, replaySpecId),
     )).get()
@@ -801,11 +844,13 @@ export class FindingsRepository {
   }
 
   listReplaySpecs(runId: string): ReplaySpecRow[] {
+    this.assertTenantRun(runId)
     return this.session.db.select().from(tables.replaySpecs).where(eq(tables.replaySpecs.runId, runId))
       .orderBy(desc(tables.replaySpecs.createdAt)).all()
   }
 
   listReplaySpecsForFinding(runId: string, findingId: string): ReplaySpecRow[] {
+    this.assertTenantRun(runId)
     return this.session.db.select().from(tables.replaySpecs).where(and(
       eq(tables.replaySpecs.runId, runId), eq(tables.replaySpecs.findingId, findingId),
     )).orderBy(desc(tables.replaySpecs.createdAt)).all()
@@ -925,31 +970,32 @@ export class FindingsRepository {
    * claim whose persisted diff says otherwise.
    */
   enforceConfirmationEvidence(runId: string, findingId: string, cause: string): boolean {
-    const row = this.session.db.select().from(tables.findings).where(and(
-      eq(tables.findings.runId, runId), eq(tables.findings.id, findingId),
-    )).get()
-    if (!row) return false
-    if (row.verificationClass !== 'runtime_confirmed' || row.finding.status !== 'confirmed') return false
-    const evidence = this.confirmationEvidenceFor(runId, {
-      findingId: row.id,
-      replaySpecId: row.replaySpecId,
-      verification: row.finding.verification,
-      findingKind: row.findingKind,
-      verificationTier: row.finding.verificationTier ?? row.verificationTier,
-      provenance: row.provenance,
-    })
-    if (evidence.backed || !evidence.contradicted) return false
-    const conflicts = this.confirmationConflictCount(runId) + 1
-    const demoted: Finding = {
-      ...row.finding,
-      status: 'inconclusive',
-      verificationTier: undefined,
-      confidence: 'low',
-      reason: `Confirmation conflict: ${cause}; the persisted evidence no longer satisfies the `
-        + `${row.finding.category ?? 'claimed'} oracle (${evidence.kind}: ${evidence.verdict ?? 'no verdict'}).`
-        + (row.finding.reason ? ` Prior: ${row.finding.reason}` : ''),
-    }
-    this.session.transaction(() => {
+    this.assertTenantRun(runId)
+    return this.session.transaction(() => {
+      const row = this.session.db.select().from(tables.findings).where(and(
+        eq(tables.findings.runId, runId), eq(tables.findings.id, findingId),
+      )).get()
+      if (!row) return false
+      if (row.verificationClass !== 'runtime_confirmed' || row.finding.status !== 'confirmed') return false
+      const evidence = this.confirmationEvidenceFor(runId, {
+        findingId: row.id,
+        replaySpecId: row.replaySpecId,
+        verification: row.finding.verification,
+        findingKind: row.findingKind,
+        verificationTier: row.finding.verificationTier ?? row.verificationTier,
+        provenance: row.provenance,
+      })
+      if (evidence.backed || !evidence.contradicted) return false
+      const conflicts = this.confirmationConflictCount(runId) + 1
+      const demoted: Finding = {
+        ...row.finding,
+        status: 'inconclusive',
+        verificationTier: undefined,
+        confidence: 'low',
+        reason: `Confirmation conflict: ${cause}; the persisted evidence no longer satisfies the `
+          + `${row.finding.category ?? 'claimed'} oracle (${evidence.kind}: ${evidence.verdict ?? 'no verdict'}).`
+          + (row.finding.reason ? ` Prior: ${row.finding.reason}` : ''),
+      }
       this.session.db.update(tables.findings).set({
         verificationClass: 'open_proof_gap',
         verificationTier: null,
@@ -972,8 +1018,8 @@ export class FindingsRepository {
           conflictsForRun: conflicts,
         },
       )
+      return true
     }, { behavior: 'immediate' })
-    return true
   }
 
   incrementReplaySpecAttempt(
@@ -1158,7 +1204,7 @@ export class FindingsRepository {
     dynamicRetestVerdict?: DynamicRetestVerdict
     secrets?: readonly NamedSecret[]
   }): PatchProposal {
-    const now = Date.now()
+    this.assertTenantRun(input.runId)
     const secrets = input.secrets ?? []
     const cleanDiff = redact(input.diff, secrets)
     const cleanNotes = redact(input.reviewNotes, secrets)
@@ -1168,49 +1214,53 @@ export class FindingsRepository {
       ...(loc.label ? { label: redact(loc.label, secrets) } : {}),
     }))
 
-    const existing = input.id
-      ? this.session.db.select().from(tables.patchProposals).where(and(
-          eq(tables.patchProposals.runId, input.runId), eq(tables.patchProposals.id, input.id),
-        )).get()
-      : undefined
+    return this.session.transaction(() => {
+      const now = Date.now()
+      const existing = input.id
+        ? this.session.db.select().from(tables.patchProposals).where(and(
+            eq(tables.patchProposals.runId, input.runId), eq(tables.patchProposals.id, input.id),
+          )).get()
+        : undefined
 
-    const saved = existing
-      ? this.session.db.update(tables.patchProposals).set({
-          status: input.status,
-          callerCompatibility: input.callerCompatibility,
-          diff: cleanDiff,
-          codeLocations: cleanLocations,
-          reviewNotes: cleanNotes,
-          dynamicRetestVerdict: input.dynamicRetestVerdict ?? existing.dynamicRetestVerdict,
-          updatedAt: now,
-        }).where(eq(tables.patchProposals.id, existing.id)).returning().get()!
-      : this.session.db.insert(tables.patchProposals).values({
-          id: input.id ?? randomUUID(),
-          runId: input.runId,
-          findingId: input.findingId,
-          repo: redact(input.repo.slice(0, 200)),
-          status: input.status,
-          callerCompatibility: input.callerCompatibility,
-          diff: cleanDiff,
-          codeLocations: cleanLocations,
-          reviewNotes: cleanNotes,
-          dynamicRetestVerdict: input.dynamicRetestVerdict ?? 'skipped',
-          createdAt: now,
-          updatedAt: now,
-        }).returning().get()
+      const saved = existing
+        ? this.session.db.update(tables.patchProposals).set({
+            status: input.status,
+            callerCompatibility: input.callerCompatibility,
+            diff: cleanDiff,
+            codeLocations: cleanLocations,
+            reviewNotes: cleanNotes,
+            dynamicRetestVerdict: input.dynamicRetestVerdict ?? existing.dynamicRetestVerdict,
+            updatedAt: now,
+          }).where(eq(tables.patchProposals.id, existing.id)).returning().get()!
+        : this.session.db.insert(tables.patchProposals).values({
+            id: input.id ?? randomUUID(),
+            runId: input.runId,
+            findingId: input.findingId,
+            repo: redact(input.repo.slice(0, 200)),
+            status: input.status,
+            callerCompatibility: input.callerCompatibility,
+            diff: cleanDiff,
+            codeLocations: cleanLocations,
+            reviewNotes: cleanNotes,
+            dynamicRetestVerdict: input.dynamicRetestVerdict ?? 'skipped',
+            createdAt: now,
+            updatedAt: now,
+          }).returning().get()
 
-    this.session.event(input.runId, 'patch.saved', `Patch proposal [${saved.status}] for finding ${saved.findingId} (${saved.callerCompatibility}).`, {
-      patchId: saved.id,
-      findingId: saved.findingId,
-      repo: saved.repo,
-      status: saved.status,
-      callerCompatibility: saved.callerCompatibility,
-      dynamicRetestVerdict: saved.dynamicRetestVerdict,
-    })
-    return saved
+      this.session.event(input.runId, 'patch.saved', `Patch proposal [${saved.status}] for finding ${saved.findingId} (${saved.callerCompatibility}).`, {
+        patchId: saved.id,
+        findingId: saved.findingId,
+        repo: saved.repo,
+        status: saved.status,
+        callerCompatibility: saved.callerCompatibility,
+        dynamicRetestVerdict: saved.dynamicRetestVerdict,
+      })
+      return saved
+    }, { behavior: 'immediate' })
   }
 
   listPatchProposals(runId: string, findingId?: string): PatchProposal[] {
+    this.assertTenantRun(runId)
     const where = findingId
       ? and(eq(tables.patchProposals.runId, runId), eq(tables.patchProposals.findingId, findingId))
       : eq(tables.patchProposals.runId, runId)
@@ -1219,6 +1269,7 @@ export class FindingsRepository {
   }
 
   getPatchProposal(runId: string, patchId: string): PatchProposal {
+    this.assertTenantRun(runId)
     const row = this.session.db.select().from(tables.patchProposals).where(and(
       eq(tables.patchProposals.runId, runId), eq(tables.patchProposals.id, patchId),
     )).get()
@@ -1238,33 +1289,35 @@ export class FindingsRepository {
     if (!patchProposalReviewStatusSet.has(input.status)) {
       throw new Error(`Invalid patch proposal review status "${String(input.status)}".`)
     }
-    if (options.runId) this.session.requireRun(options.runId)
-    const where = options.runId
-      ? and(eq(tables.patchProposals.runId, options.runId), eq(tables.patchProposals.id, proposalId))
-      : eq(tables.patchProposals.id, proposalId)
-    const existing = this.session.db.select().from(tables.patchProposals).where(where).get()
-    if (!existing) throw new Error('Patch proposal not found.')
-    this.session.requireRun(existing.runId)
+    return this.session.transaction(() => {
+      if (options.runId) this.session.requireRun(options.runId)
+      const where = options.runId
+        ? and(eq(tables.patchProposals.runId, options.runId), eq(tables.patchProposals.id, proposalId))
+        : eq(tables.patchProposals.id, proposalId)
+      const existing = this.session.db.select().from(tables.patchProposals).where(where).get()
+      if (!existing) throw new Error('Patch proposal not found.')
+      this.session.requireRun(existing.runId)
 
-    const nextStatus: PatchProposalStatus = input.status === 'pending' ? 'draft' : input.status
-    const nextNotes = input.reviewNotes !== undefined
-      ? redact(input.reviewNotes.trim().slice(0, 4000))
-      : existing.reviewNotes
-    const now = Date.now()
+      const nextStatus: PatchProposalStatus = input.status === 'pending' ? 'draft' : input.status
+      const nextNotes = input.reviewNotes !== undefined
+        ? redact(input.reviewNotes.trim().slice(0, 4000))
+        : existing.reviewNotes
+      const now = Date.now()
 
-    const updated = this.session.db.update(tables.patchProposals).set({
-      status: nextStatus,
-      reviewNotes: nextNotes,
-      updatedAt: now,
-    }).where(eq(tables.patchProposals.id, existing.id)).returning().get()!
+      const updated = this.session.db.update(tables.patchProposals).set({
+        status: nextStatus,
+        reviewNotes: nextNotes,
+        updatedAt: now,
+      }).where(eq(tables.patchProposals.id, existing.id)).returning().get()!
 
-    this.session.event(existing.runId, 'patch.reviewed', `Patch proposal [${updated.status}] reviewed by operator for finding ${updated.findingId}.`, {
-      patchId: updated.id,
-      findingId: updated.findingId,
-      status: updated.status,
-      hasReviewNotes: updated.reviewNotes.length > 0,
-    })
-    return updated
+      this.session.event(existing.runId, 'patch.reviewed', `Patch proposal [${updated.status}] reviewed by operator for finding ${updated.findingId}.`, {
+        patchId: updated.id,
+        findingId: updated.findingId,
+        status: updated.status,
+        hasReviewNotes: updated.reviewNotes.length > 0,
+      })
+      return updated
+    }, { behavior: 'immediate' })
   }
 
   /**
@@ -1286,34 +1339,35 @@ export class FindingsRepository {
     ) {
       throw new Error(`Invalid severity override "${String(input.severityOverride)}".`)
     }
-    if (options.runId) this.session.requireRun(options.runId)
 
-    const where = options.runId
-      ? and(eq(tables.findings.runId, options.runId), eq(tables.findings.id, findingId))
-      : eq(tables.findings.id, findingId)
-    const existing = this.session.db.select().from(tables.findings).where(where).get()
-    if (!existing) throw new Error('Finding not found.')
-    this.session.requireRun(existing.runId)
+    return this.session.transaction(() => {
+      if (options.runId) this.session.requireRun(options.runId)
 
-    const existingFinding = existing.finding as TriagedFinding
-    const prevTriage = existingFinding.operatorTriage ?? null
-    const nextTriage: OperatorTriage = {
-      status: input.status ?? prevTriage?.status ?? 'open',
-      severityOverride: input.severityOverride !== undefined
-        ? input.severityOverride
-        : (prevTriage?.severityOverride ?? null),
-      notes: input.notes !== undefined
-        ? redact(input.notes.trim().slice(0, 4000))
-        : (prevTriage?.notes ?? ''),
-      updatedAt: Date.now(),
-    }
+      const where = options.runId
+        ? and(eq(tables.findings.runId, options.runId), eq(tables.findings.id, findingId))
+        : eq(tables.findings.id, findingId)
+      const existing = this.session.db.select().from(tables.findings).where(where).get()
+      if (!existing) throw new Error('Finding not found.')
+      this.session.requireRun(existing.runId)
 
-    const nextFinding: TriagedFinding = {
-      ...existingFinding,
-      operatorTriage: nextTriage,
-    }
+      const existingFinding = existing.finding as TriagedFinding
+      const prevTriage = existingFinding.operatorTriage ?? null
+      const nextTriage: OperatorTriage = {
+        status: input.status ?? prevTriage?.status ?? 'open',
+        severityOverride: input.severityOverride !== undefined
+          ? input.severityOverride
+          : (prevTriage?.severityOverride ?? null),
+        notes: input.notes !== undefined
+          ? redact(input.notes.trim().slice(0, 4000))
+          : (prevTriage?.notes ?? ''),
+        updatedAt: Date.now(),
+      }
 
-    this.session.transaction(() => {
+      const nextFinding: TriagedFinding = {
+        ...existingFinding,
+        operatorTriage: nextTriage,
+      }
+
       this.session.db.update(tables.findings).set({
         finding: nextFinding,
       }).where(eq(tables.findings.id, existing.id)).run()
@@ -1324,12 +1378,13 @@ export class FindingsRepository {
         severityOverride: nextTriage.severityOverride,
         hasNotes: nextTriage.notes.length > 0,
       })
-    }, { behavior: 'immediate' })
 
-    return nextFinding
+      return nextFinding
+    }, { behavior: 'immediate' })
   }
 
   listOpenProofGaps(runId: string, goalRevision?: number): CoverageEntry[] {
+    this.assertTenantRun(runId)
     const where = goalRevision !== undefined
       ? and(
           eq(tables.coverageEntries.runId, runId),
@@ -1362,118 +1417,125 @@ export class FindingsRepository {
       verificationClass?: FindingVerificationClass
     },
   ): Finding {
-    const existing = this.session.db.select().from(tables.findings).where(and(
-      eq(tables.findings.runId, run.id), eq(tables.findings.id, findingId),
-    )).get()
-    if (!existing) throw new Error('Finding not found.')
+    this.assertTenantRun(run.id)
+    return this.session.transaction(() => {
+      const existing = this.session.db.select().from(tables.findings).where(and(
+        eq(tables.findings.runId, run.id), eq(tables.findings.id, findingId),
+      )).get()
+      if (!existing) throw new Error('Finding not found.')
 
-    // Floor-confirmed rows are immutable: later agent passes may add evidence elsewhere but can
-    // never overwrite, downgrade or reclassify the floor's own confirmation.
-    if (existing.provenance === 'floor') {
-      this.session.event(
-        run.id,
-        'finding.floor_preserved',
-        `Rejected update of floor-confirmed finding "${existing.finding.title}" (${existing.id}); floor rows are immutable.`,
-        { findingId: existing.id, provenance: 'floor' },
-      )
-      return existing.finding
-    }
-
-    const isExistingVerified = existing.finding.status === 'confirmed' || existing.finding.status === 'static_verified'
-    const rawIncomingFinding: Partial<Finding> = patch.finding ? { ...patch.finding } : {}
-    const staysVerified = isExistingVerified
-      && (rawIncomingFinding.status === undefined || rawIncomingFinding.status === existing.finding.status)
-    if (isExistingVerified) {
-      // H-4 / H-18: Never allow post-confirmation updates to mutate confirmed finding identity/severity/category.
-      delete rawIncomingFinding.cwe
-      delete rawIncomingFinding.origin
-      delete rawIncomingFinding.title
-      delete rawIncomingFinding.category
-      delete rawIncomingFinding.severity
-      delete rawIncomingFinding.fingerprintHash
-      if (staysVerified && existing.replaySpecId) {
-        delete rawIncomingFinding.replaySpecId
+      // Floor-confirmed rows are immutable: later agent passes may add evidence elsewhere but can
+      // never overwrite, downgrade or reclassify the floor's own confirmation.
+      if (existing.provenance === 'floor') {
+        this.session.event(
+          run.id,
+          'finding.floor_preserved',
+          `Rejected update of floor-confirmed finding "${existing.finding.title}" (${existing.id}); floor rows are immutable.`,
+          { findingId: existing.id, provenance: 'floor' },
+        )
+        return existing.finding
       }
-    }
-    const effectiveReplaySpecId = staysVerified && existing.replaySpecId
-      ? existing.replaySpecId
-      : (patch.replaySpecId ?? existing.replaySpecId)
-    const mergedFinding: Finding = {
-      ...existing.finding,
-      ...rawIncomingFinding,
-      id: existing.id,
-      ...(effectiveReplaySpecId !== undefined && effectiveReplaySpecId !== null ? { replaySpecId: effectiveReplaySpecId } : {}),
-      ...(patch.verificationTier !== undefined ? { verificationTier: patch.verificationTier ?? undefined } : {}),
-      ...(!isExistingVerified && patch.fingerprintHash !== undefined ? { fingerprintHash: patch.fingerprintHash } : {}),
-      ...(patch.supersededByFindingId !== undefined ? { supersededByFindingId: patch.supersededByFindingId } : {}),
-      ...(patch.counterevidence !== undefined ? { counterevidence: patch.counterevidence } : {}),
-      ...(patch.confidenceRationale !== undefined ? { confidenceRationale: patch.confidenceRationale } : {}),
-      ...(patch.severityChangeConditions !== undefined ? { severityChangeConditions: patch.severityChangeConditions } : {}),
-      ...(patch.codeLocations !== undefined ? { codeLocations: patch.codeLocations ?? undefined } : {}),
-      evidenceIds: [...new Set([...existing.finding.evidenceIds, ...(patch.finding?.evidenceIds ?? [])])],
-      exchangeIds: [...new Set([...(existing.finding.exchangeIds ?? []), ...(patch.finding?.exchangeIds ?? [])])],
-      chainFactIds: [...new Set([...(existing.finding.chainFactIds ?? []), ...(patch.finding?.chainFactIds ?? [])])],
-      scopeRevision: Math.max(existing.finding.scopeRevision, run.scopeRevision),
-    }
 
-    const cleanOrigins = [...new Set([
-      ...existing.sourceOrigins,
-      ...(patch.sourceOrigins ?? []),
-      ...(mergedFinding.origin ? [mergedFinding.origin] : []),
-    ])]
+      const freshRun = this.session.db.select({ scopeRevision: tables.runs.scopeRevision })
+        .from(tables.runs).where(eq(tables.runs.id, run.id)).get()
+      const currentScopeRevision = Math.max(run.scopeRevision, freshRun?.scopeRevision ?? run.scopeRevision)
 
-    const parentFindingIds = patch.parentFindingIds !== undefined
-      ? (patch.parentFindingIds ? [...new Set(patch.parentFindingIds)] : null)
-      : existing.parentFindingIds
-    if (mergedFinding.status === 'confirmed' && mergedFinding.verificationTier === 'static_verified') {
-      mergedFinding.verificationTier = 'runtime_confirmed'
-    }
-    const verificationClass = verificationClassForFinding(mergedFinding, patch.verificationClass)
-    assertConfirmedVerificationClass(mergedFinding.status, verificationClass)
-    if (mergedFinding.status === 'confirmed') {
-      this.assertConfirmationEvidence(run.id, {
-        findingId: existing.id,
-        replaySpecId: effectiveReplaySpecId,
-        verification: mergedFinding.verification,
-        findingKind: existing.findingKind,
-        verificationTier: mergedFinding.verificationTier ?? existing.verificationTier,
+      const isExistingVerified = existing.finding.status === 'confirmed' || existing.finding.status === 'static_verified'
+      const rawIncomingFinding: Partial<Finding> = patch.finding ? { ...patch.finding } : {}
+      const staysVerified = isExistingVerified
+        && (rawIncomingFinding.status === undefined || rawIncomingFinding.status === existing.finding.status)
+      if (isExistingVerified) {
+        // H-4 / H-18: Never allow post-confirmation updates to mutate confirmed finding identity/severity/category.
+        delete rawIncomingFinding.cwe
+        delete rawIncomingFinding.origin
+        delete rawIncomingFinding.title
+        delete rawIncomingFinding.category
+        delete rawIncomingFinding.severity
+        delete rawIncomingFinding.fingerprintHash
+        if (staysVerified && existing.replaySpecId) {
+          delete rawIncomingFinding.replaySpecId
+        }
+      }
+      const effectiveReplaySpecId = staysVerified && existing.replaySpecId
+        ? existing.replaySpecId
+        : (patch.replaySpecId ?? existing.replaySpecId)
+      const mergedFinding: Finding = {
+        ...existing.finding,
+        ...rawIncomingFinding,
+        id: existing.id,
+        ...(effectiveReplaySpecId !== undefined && effectiveReplaySpecId !== null ? { replaySpecId: effectiveReplaySpecId } : {}),
+        ...(patch.verificationTier !== undefined ? { verificationTier: patch.verificationTier ?? undefined } : {}),
+        ...(!isExistingVerified && patch.fingerprintHash !== undefined ? { fingerprintHash: patch.fingerprintHash } : {}),
+        ...(patch.supersededByFindingId !== undefined ? { supersededByFindingId: patch.supersededByFindingId } : {}),
+        ...(patch.counterevidence !== undefined ? { counterevidence: patch.counterevidence } : {}),
+        ...(patch.confidenceRationale !== undefined ? { confidenceRationale: patch.confidenceRationale } : {}),
+        ...(patch.severityChangeConditions !== undefined ? { severityChangeConditions: patch.severityChangeConditions } : {}),
+        ...(patch.codeLocations !== undefined ? { codeLocations: patch.codeLocations ?? undefined } : {}),
+        evidenceIds: [...new Set([...existing.finding.evidenceIds, ...(patch.finding?.evidenceIds ?? [])])],
+        exchangeIds: [...new Set([...(existing.finding.exchangeIds ?? []), ...(patch.finding?.exchangeIds ?? [])])],
+        chainFactIds: [...new Set([...(existing.finding.chainFactIds ?? []), ...(patch.finding?.chainFactIds ?? [])])],
+        scopeRevision: Math.max(existing.finding.scopeRevision, currentScopeRevision),
+      }
+
+      const cleanOrigins = [...new Set([
+        ...existing.sourceOrigins,
+        ...(patch.sourceOrigins ?? []),
+        ...(mergedFinding.origin ? [mergedFinding.origin] : []),
+      ])]
+
+      const parentFindingIds = patch.parentFindingIds !== undefined
+        ? (patch.parentFindingIds ? [...new Set(patch.parentFindingIds)] : null)
+        : existing.parentFindingIds
+      if (mergedFinding.status === 'confirmed' && mergedFinding.verificationTier === 'static_verified') {
+        mergedFinding.verificationTier = 'runtime_confirmed'
+      }
+      const verificationClass = verificationClassForFinding(mergedFinding, patch.verificationClass)
+      assertConfirmedVerificationClass(mergedFinding.status, verificationClass)
+      if (mergedFinding.status === 'confirmed') {
+        this.assertConfirmationEvidence(run.id, {
+          findingId: existing.id,
+          replaySpecId: effectiveReplaySpecId,
+          verification: mergedFinding.verification,
+          findingKind: existing.findingKind,
+          verificationTier: mergedFinding.verificationTier ?? existing.verificationTier,
+          provenance: existing.provenance,
+        })
+      }
+      const existingOperatorTriage = (existing.finding as TriagedFinding).operatorTriage
+      const persistedFinding = {
+        ...mergedFinding,
+        ...(existingOperatorTriage !== undefined ? { operatorTriage: existingOperatorTriage } : {}),
         provenance: existing.provenance,
+        ...(parentFindingIds?.length ? { parentFindingIds } : {}),
+        verificationStatus: verificationClass,
+      } as Finding
+
+      this.session.db.update(tables.findings).set({
+        replaySpecId: effectiveReplaySpecId ?? null,
+        sourceOrigins: cleanOrigins,
+        verificationTier: patch.verificationTier !== undefined ? patch.verificationTier : (mergedFinding.verificationTier ?? existing.verificationTier),
+        fingerprintHash: !isExistingVerified && patch.fingerprintHash !== undefined
+          ? patch.fingerprintHash
+          : (mergedFinding.fingerprintHash ?? existing.fingerprintHash),
+        supersededByFindingId: patch.supersededByFindingId !== undefined ? patch.supersededByFindingId : (mergedFinding.supersededByFindingId ?? existing.supersededByFindingId),
+        counterevidence: patch.counterevidence !== undefined ? patch.counterevidence : (mergedFinding.counterevidence ?? existing.counterevidence),
+        confidenceRationale: patch.confidenceRationale !== undefined ? patch.confidenceRationale : (mergedFinding.confidenceRationale ?? existing.confidenceRationale),
+        severityChangeConditions: patch.severityChangeConditions !== undefined ? patch.severityChangeConditions : (mergedFinding.severityChangeConditions ?? existing.severityChangeConditions),
+        codeLocations: patch.codeLocations !== undefined ? patch.codeLocations : (mergedFinding.codeLocations ?? existing.codeLocations),
+        parentFindingIds: parentFindingIds?.length ? parentFindingIds : null,
+        verificationClass,
+        finding: persistedFinding,
+      }).where(eq(tables.findings.id, existing.id)).run()
+
+      this.session.event(run.id, 'finding.updated', `Updated finding "${mergedFinding.title}" (${mergedFinding.status}).`, {
+        findingId: mergedFinding.id,
+        status: mergedFinding.status,
+        severity: mergedFinding.severity,
+        verificationTier: mergedFinding.verificationTier ?? null,
+        verificationClass,
       })
-    }
-    const existingOperatorTriage = (existing.finding as TriagedFinding).operatorTriage
-    const persistedFinding = {
-      ...mergedFinding,
-      ...(existingOperatorTriage !== undefined ? { operatorTriage: existingOperatorTriage } : {}),
-      provenance: existing.provenance,
-      ...(parentFindingIds?.length ? { parentFindingIds } : {}),
-      verificationStatus: verificationClass,
-    } as Finding
-
-    this.session.db.update(tables.findings).set({
-      replaySpecId: effectiveReplaySpecId ?? null,
-      sourceOrigins: cleanOrigins,
-      verificationTier: patch.verificationTier !== undefined ? patch.verificationTier : (mergedFinding.verificationTier ?? existing.verificationTier),
-      fingerprintHash: !isExistingVerified && patch.fingerprintHash !== undefined
-        ? patch.fingerprintHash
-        : (mergedFinding.fingerprintHash ?? existing.fingerprintHash),
-      supersededByFindingId: patch.supersededByFindingId !== undefined ? patch.supersededByFindingId : (mergedFinding.supersededByFindingId ?? existing.supersededByFindingId),
-      counterevidence: patch.counterevidence !== undefined ? patch.counterevidence : (mergedFinding.counterevidence ?? existing.counterevidence),
-      confidenceRationale: patch.confidenceRationale !== undefined ? patch.confidenceRationale : (mergedFinding.confidenceRationale ?? existing.confidenceRationale),
-      severityChangeConditions: patch.severityChangeConditions !== undefined ? patch.severityChangeConditions : (mergedFinding.severityChangeConditions ?? existing.severityChangeConditions),
-      codeLocations: patch.codeLocations !== undefined ? patch.codeLocations : (mergedFinding.codeLocations ?? existing.codeLocations),
-      parentFindingIds: parentFindingIds?.length ? parentFindingIds : null,
-      verificationClass,
-      finding: persistedFinding,
-    }).where(eq(tables.findings.id, existing.id)).run()
-
-    this.session.event(run.id, 'finding.updated', `Updated finding "${mergedFinding.title}" (${mergedFinding.status}).`, {
-      findingId: mergedFinding.id,
-      status: mergedFinding.status,
-      severity: mergedFinding.severity,
-      verificationTier: mergedFinding.verificationTier ?? null,
-      verificationClass,
-    })
-    return persistedFinding
+      return persistedFinding
+    }, { behavior: 'immediate' })
   }
 
   upsertCoverageEntry(run: Run, assignmentId: string, input: {
@@ -1485,46 +1547,51 @@ export class FindingsRepository {
     proofGapReason?: string | null
     linkedFindingId?: string | null
   }): CoverageEntry {
-    const now = Date.now()
+    this.assertTenantRun(run.id)
     const cleanControl = input.enforcingControl?.trim() ? redact(input.enforcingControl.trim().slice(0, 600)) : null
     const cleanGapReason = input.proofGapReason?.trim() ? redact(input.proofGapReason.trim().slice(0, 600)) : null
     const linkedFindingId = input.linkedFindingId?.trim() || null
-    const existing = this.session.db.select().from(tables.coverageEntries).where(and(
-      eq(tables.coverageEntries.runId, run.id),
-      eq(tables.coverageEntries.goalRevision, run.goalRevision),
-      eq(tables.coverageEntries.origin, input.origin),
-      eq(tables.coverageEntries.category, input.category),
-    )).get()
-    if (existing) {
-      return this.session.db.update(tables.coverageEntries).set({
+    const cleanSummary = redact(input.summary.slice(0, 600))
+    return this.session.transaction(() => {
+      const now = Date.now()
+      const existing = this.session.db.select().from(tables.coverageEntries).where(and(
+        eq(tables.coverageEntries.runId, run.id),
+        eq(tables.coverageEntries.goalRevision, run.goalRevision),
+        eq(tables.coverageEntries.origin, input.origin),
+        eq(tables.coverageEntries.category, input.category),
+      )).get()
+      if (existing) {
+        return this.session.db.update(tables.coverageEntries).set({
+          scopeRevision: run.scopeRevision,
+          status: input.status,
+          summary: cleanSummary,
+          enforcingControl: cleanControl ?? (input.status === 'ruled_out' ? existing.enforcingControl : null),
+          proofGapReason: cleanGapReason ?? (input.status === 'needs_follow_up' ? existing.proofGapReason : null),
+          linkedFindingId: linkedFindingId ?? (input.status === 'reported' ? existing.linkedFindingId : null),
+          assignmentId,
+          updatedAt: now,
+        }).where(eq(tables.coverageEntries.id, existing.id)).returning().get()!
+      }
+      return this.session.db.insert(tables.coverageEntries).values({
+        id: randomUUID(),
+        runId: run.id,
         scopeRevision: run.scopeRevision,
+        goalRevision: run.goalRevision,
+        origin: input.origin,
+        category: input.category,
         status: input.status,
-        summary: redact(input.summary.slice(0, 600)),
-        enforcingControl: cleanControl ?? (input.status === 'ruled_out' ? existing.enforcingControl : null),
-        proofGapReason: cleanGapReason ?? (input.status === 'needs_follow_up' ? existing.proofGapReason : null),
-        linkedFindingId: linkedFindingId ?? (input.status === 'reported' ? existing.linkedFindingId : null),
+        summary: cleanSummary,
+        enforcingControl: cleanControl,
+        proofGapReason: cleanGapReason,
+        linkedFindingId,
         assignmentId,
         updatedAt: now,
-      }).where(eq(tables.coverageEntries.id, existing.id)).returning().get()!
-    }
-    return this.session.db.insert(tables.coverageEntries).values({
-      id: randomUUID(),
-      runId: run.id,
-      scopeRevision: run.scopeRevision,
-      goalRevision: run.goalRevision,
-      origin: input.origin,
-      category: input.category,
-      status: input.status,
-      summary: redact(input.summary.slice(0, 600)),
-      enforcingControl: cleanControl,
-      proofGapReason: cleanGapReason,
-      linkedFindingId,
-      assignmentId,
-      updatedAt: now,
-    }).returning().get()
+      }).returning().get()
+    }, { behavior: 'immediate' })
   }
 
   listCoverageEntries(runId: string, goalRevision?: number): CoverageEntry[] {
+    this.assertTenantRun(runId)
     const where = goalRevision !== undefined
       ? and(eq(tables.coverageEntries.runId, runId), eq(tables.coverageEntries.goalRevision, goalRevision))
       : eq(tables.coverageEntries.runId, runId)
@@ -1641,116 +1708,120 @@ export class FindingsRepository {
     sourceOrigins: string[],
     options: FindingProvenanceOptions = {},
   ) {
-    const byId = this.session.db.select().from(tables.findings).where(eq(tables.findings.id, finding.id)).get()
-    const dupRow = this.findDuplicateChainFinding(run.id, run.goalRevision, finding, byId?.id)
+    this.assertTenantRun(run.id)
+    return this.session.transaction(() => {
+      const byId = this.session.db.select().from(tables.findings).where(eq(tables.findings.id, finding.id)).get()
+      const dupRow = this.findDuplicateChainFinding(run.id, run.goalRevision, finding, byId?.id)
 
-    // When a finding updates by ID and a separate duplicate row already exists for the same (origin, cwe),
-    // merge into the canonical duplicate row (especially if confirmed) and remove the redundant row.
-    const incoming: Finding = {
-      ...finding,
-      findingKind: 'multi_step_chain',
-      replaySpecId,
-    }
-
-    const targetRow = (() => {
-      if (byId && dupRow) {
-        // Keep whichever row is confirmed first, otherwise keep dupRow as the canonical earlier record
-        return byId.finding.status === 'confirmed' && dupRow.finding.status !== 'confirmed' ? byId : dupRow
+      // When a finding updates by ID and a separate duplicate row already exists for the same (origin, cwe),
+      // merge into the canonical duplicate row (especially if confirmed) and remove the redundant row.
+      const incoming: Finding = {
+        ...finding,
+        findingKind: 'multi_step_chain',
+        replaySpecId,
       }
-      return byId ?? dupRow
-    })()
 
-    const redundantRow = byId && dupRow
-      ? (targetRow?.id === byId.id ? dupRow : byId)
-      : undefined
-
-    // Monotonicity: a floor-confirmed row is immutable. An agent re-discovery of the same
-    // canonical dedupe key is suppressed as a no-op — never overwritten, never duplicated.
-    const targetIsFloor = targetRow?.provenance === 'floor'
-    if (targetIsFloor && options.provenance !== 'floor') {
-      this.session.event(
-        run.id,
-        'finding.floor_preserved',
-        `Ignored agent re-discovery of floor-confirmed finding "${targetRow.finding.title}" (${targetRow.id}); floor rows are immutable.`,
-        { findingId: targetRow.id, suppressedFindingId: finding.id, provenance: 'floor' },
-      )
-      return targetRow.finding
-    }
-
-    const rawStoredFinding: Finding = targetRow
-      ? mergeChainFindings(targetRow.finding, incoming)
-      : incoming
-    const targetIsVerified = Boolean(
-      targetRow && (targetRow.finding.status === 'confirmed' || targetRow.finding.status === 'static_verified'),
-    )
-    const preservesVerifiedIdentity = targetIsVerified && targetRow!.finding.status === rawStoredFinding.status
-    const storedFinding: Finding = preservesVerifiedIdentity && targetRow
-      ? {
-          ...rawStoredFinding,
-          cwe: targetRow.finding.cwe,
-          origin: targetRow.finding.origin,
-          title: targetRow.finding.title,
-          category: targetRow.finding.category,
-          severity: targetRow.finding.severity,
-          ...(targetRow.finding.fingerprintHash !== undefined ? { fingerprintHash: targetRow.finding.fingerprintHash } : {}),
+      const targetRow = (() => {
+        if (byId && dupRow) {
+          // Keep whichever row is confirmed first, otherwise keep dupRow as the canonical earlier record
+          return byId.finding.status === 'confirmed' && dupRow.finding.status !== 'confirmed' ? byId : dupRow
         }
-      : rawStoredFinding
+        return byId ?? dupRow
+      })()
 
-    const parentFindingIds = options.parentFindingIds
-      ? [...new Set(options.parentFindingIds.filter(id => typeof id === 'string' && id.length > 0))]
-      : (targetRow?.parentFindingIds ?? null)
-    const provenance = this.resolveFindingProvenance(
-      run.id, storedFinding, targetRow, options.provenance, parentFindingIds,
-    )
-    const canonicalSpecId = storedFinding.replaySpecId ?? replaySpecId
-    const verificationClass = verificationClassForFinding(storedFinding, options.verificationClass)
-    assertConfirmedVerificationClass(storedFinding.status, verificationClass)
-    // Hard gate: never persist a confirmed claim whose own evidence is not confirming. This is the
-    // chokepoint for every chain finding write (inline replay, floor, receipt promotion). It throws
-    // a typed InvariantError so an inconclusive result structurally cannot become confirmed.
-    if (storedFinding.status === 'confirmed') {
-      this.assertConfirmationEvidence(run.id, {
-        findingId: storedFinding.id,
-        replaySpecId: canonicalSpecId,
-        verification: storedFinding.verification,
-        findingKind: storedFinding.findingKind,
-        verificationTier: storedFinding.verificationTier,
-        provenance: options.provenance ?? targetRow?.provenance ?? null,
-      })
-    }
-    const persistedFinding = {
-      ...storedFinding,
-      provenance,
-      ...(parentFindingIds?.length ? { parentFindingIds } : {}),
-      verificationStatus: verificationClass,
-    } as Finding
+      const redundantRow = byId && dupRow
+        ? (targetRow?.id === byId.id ? dupRow : byId)
+        : undefined
 
-    const cleanOrigins = [...new Set([
-      storedFinding.origin,
-      ...(targetRow?.sourceOrigins ?? []),
-      ...(redundantRow?.sourceOrigins ?? []),
-      ...sourceOrigins,
-    ])]
+      // Monotonicity: a floor-confirmed row is immutable. An agent re-discovery of the same
+      // canonical dedupe key is suppressed as a no-op — never overwritten, never duplicated.
+      const targetIsFloor = targetRow?.provenance === 'floor'
+      if (targetIsFloor && options.provenance !== 'floor') {
+        this.session.event(
+          run.id,
+          'finding.floor_preserved',
+          `Ignored agent re-discovery of floor-confirmed finding "${targetRow.finding.title}" (${targetRow.id}); floor rows are immutable.`,
+          { findingId: targetRow.id, suppressedFindingId: finding.id, provenance: 'floor' },
+        )
+        return targetRow.finding
+      }
 
-    const verificationTier: VerificationTier | null = storedFinding.verificationTier ??
-        (storedFinding.status === 'static_verified'
-          ? 'static_verified'
-          : storedFinding.status === 'confirmed'
-            ? 'runtime_confirmed'
-            : targetRow?.verificationTier ?? null)
+      const rawStoredFinding: Finding = targetRow
+        ? mergeChainFindings(targetRow.finding, incoming)
+        : incoming
+      const targetIsVerified = Boolean(
+        targetRow && (targetRow.finding.status === 'confirmed' || targetRow.finding.status === 'static_verified'),
+      )
+      const preservesVerifiedIdentity = targetIsVerified && targetRow!.finding.status === rawStoredFinding.status
+      const storedFinding: Finding = preservesVerifiedIdentity && targetRow
+        ? {
+            ...rawStoredFinding,
+            cwe: targetRow.finding.cwe,
+            origin: targetRow.finding.origin,
+            title: targetRow.finding.title,
+            category: targetRow.finding.category,
+            severity: targetRow.finding.severity,
+            ...(targetRow.finding.fingerprintHash !== undefined ? { fingerprintHash: targetRow.finding.fingerprintHash } : {}),
+          }
+        : rawStoredFinding
 
-    if (verificationTier) storedFinding.verificationTier = verificationTier
-    // A finding promoted to runtime-confirmed must not retain the static tier marker.
-    if (storedFinding.status === 'confirmed' && storedFinding.verificationTier === 'static_verified') {
-      storedFinding.verificationTier = 'runtime_confirmed'
-    }
+      const parentFindingIds = options.parentFindingIds
+        ? [...new Set(options.parentFindingIds.filter(id => typeof id === 'string' && id.length > 0))]
+        : (targetRow?.parentFindingIds ?? null)
+      const provenance = this.resolveFindingProvenance(
+        run.id, storedFinding, targetRow, options.provenance, parentFindingIds,
+      )
+      const canonicalSpecId = storedFinding.replaySpecId ?? replaySpecId
+      const verificationClass = verificationClassForFinding(storedFinding, options.verificationClass)
+      assertConfirmedVerificationClass(storedFinding.status, verificationClass)
+      // Hard gate: never persist a confirmed claim whose own evidence is not confirming. This is the
+      // chokepoint for every chain finding write (inline replay, floor, receipt promotion). It throws
+      // a typed InvariantError so an inconclusive result structurally cannot become confirmed.
+      if (storedFinding.status === 'confirmed') {
+        this.assertConfirmationEvidence(run.id, {
+          findingId: storedFinding.id,
+          replaySpecId: canonicalSpecId,
+          verification: storedFinding.verification,
+          findingKind: storedFinding.findingKind,
+          verificationTier: storedFinding.verificationTier,
+          provenance: options.provenance ?? targetRow?.provenance ?? null,
+        })
+      }
 
-    this.session.transaction(() => {
+      const verificationTier: VerificationTier | null = storedFinding.verificationTier ??
+          (storedFinding.status === 'static_verified'
+            ? 'static_verified'
+            : storedFinding.status === 'confirmed'
+              ? 'runtime_confirmed'
+              : targetRow?.verificationTier ?? null)
+
+      if (verificationTier) storedFinding.verificationTier = verificationTier
+      // A finding promoted to runtime-confirmed must not retain the static tier marker.
+      if (storedFinding.status === 'confirmed' && storedFinding.verificationTier === 'static_verified') {
+        storedFinding.verificationTier = 'runtime_confirmed'
+      }
+
+      const existingOperatorTriage = targetRow ? (targetRow.finding as TriagedFinding).operatorTriage : undefined
+      const persistedFinding = {
+        ...storedFinding,
+        ...(existingOperatorTriage !== undefined ? { operatorTriage: existingOperatorTriage } : {}),
+        provenance,
+        ...(parentFindingIds?.length ? { parentFindingIds } : {}),
+        verificationStatus: verificationClass,
+      } as Finding
+
+      const cleanOrigins = [...new Set([
+        storedFinding.origin,
+        ...(targetRow?.sourceOrigins ?? []),
+        ...(redundantRow?.sourceOrigins ?? []),
+        ...sourceOrigins,
+      ])]
+
       if (targetRow) {
         this.session.db.update(tables.findings).set({
           replaySpecId: canonicalSpecId,
           sourceOrigins: cleanOrigins,
-          verificationTier,
+          verificationTier: storedFinding.verificationTier ?? verificationTier,
           fingerprintHash: storedFinding.fingerprintHash ?? targetRow.fingerprintHash ?? null,
           supersededByFindingId: storedFinding.supersededByFindingId ?? targetRow.supersededByFindingId ?? null,
           counterevidence: storedFinding.counterevidence ?? targetRow.counterevidence ?? null,
@@ -1773,7 +1844,7 @@ export class FindingsRepository {
           findingKind: 'multi_step_chain',
           replaySpecId: canonicalSpecId,
           sourceOrigins: cleanOrigins,
-          verificationTier,
+          verificationTier: storedFinding.verificationTier ?? verificationTier,
           fingerprintHash: storedFinding.fingerprintHash ?? null,
           supersededByFindingId: storedFinding.supersededByFindingId ?? null,
           counterevidence: storedFinding.counterevidence ?? null,
@@ -1799,20 +1870,20 @@ export class FindingsRepository {
       if (redundantRow && redundantRow.id !== targetRow?.id) {
         this.session.db.delete(tables.findings).where(eq(tables.findings.id, redundantRow.id)).run()
       }
-    }, { behavior: 'immediate' })
 
-    this.session.event(run.id, storedFinding.status === 'pending' ? 'finding.proposed' : 'finding.verified',
-      `[${storedFinding.status}] ${storedFinding.severity.toUpperCase()} ${storedFinding.title} (${storedFinding.origin})`, {
-        findingId: storedFinding.id,
-        status: storedFinding.status,
-        severity: storedFinding.severity,
-        origin: storedFinding.origin,
-        replaySpecId: canonicalSpecId,
-        deduplicated: Boolean(dupRow),
-        provenance,
-        verificationClass,
-      })
-    return persistedFinding
+      this.session.event(run.id, storedFinding.status === 'pending' ? 'finding.proposed' : 'finding.verified',
+        `[${storedFinding.status}] ${storedFinding.severity.toUpperCase()} ${storedFinding.title} (${storedFinding.origin})`, {
+          findingId: storedFinding.id,
+          status: storedFinding.status,
+          severity: storedFinding.severity,
+          origin: storedFinding.origin,
+          replaySpecId: canonicalSpecId,
+          deduplicated: Boolean(dupRow),
+          provenance,
+          verificationClass,
+        })
+      return persistedFinding
+    }, { behavior: 'immediate' })
   }
 
   // --- v4 Application State Graph, Second-Order Canaries, Lab Telemetry & Benchmarks ---
@@ -1833,6 +1904,7 @@ export class FindingsRepository {
     riskScore?: number
     codeLocation?: CodeLocation | null
   }): EndpointRow {
+    this.assertTenantRun(input.runId)
     const method = input.method.trim().toUpperCase()
     const pathTemplate = input.pathTemplate.trim()
     const now = Date.now()
@@ -1904,6 +1976,7 @@ export class FindingsRepository {
     limit?: number
     offset?: number
   }): EndpointRow[] {
+    this.assertTenantRun(runId)
     const conditions = [eq(tables.endpoints.runId, runId)]
     if (filter?.origin) conditions.push(eq(tables.endpoints.origin, filter.origin))
     if (filter?.method) conditions.push(eq(tables.endpoints.method, filter.method.trim().toUpperCase()))
@@ -1938,19 +2011,22 @@ export class FindingsRepository {
     coveragePct: number | null,
     testedClasses?: readonly string[],
   ): EndpointRow {
-    const existing = this.session.db.select().from(tables.endpoints).where(eq(tables.endpoints.id, endpointId)).get()
-    if (!existing) throw new Error('Endpoint not found.')
-    const nextCov = typeof coveragePct === 'number' && Number.isFinite(coveragePct)
-      ? Math.max(0, Math.min(100, coveragePct))
-      : coveragePct === null ? null : existing.coveragePct
-    const nextTested = testedClasses
-      ? [...new Set([...existing.testedClasses, ...testedClasses])]
-      : existing.testedClasses
-    return this.session.db.update(tables.endpoints).set({
-      coveragePct: nextCov,
-      testedClasses: nextTested,
-      updatedAt: Date.now(),
-    }).where(eq(tables.endpoints.id, endpointId)).returning().get()!
+    return this.session.transaction(() => {
+      const existing = this.session.db.select().from(tables.endpoints).where(eq(tables.endpoints.id, endpointId)).get()
+      if (!existing) throw new Error('Endpoint not found.')
+      this.session.requireRun(existing.runId)
+      const nextCov = typeof coveragePct === 'number' && Number.isFinite(coveragePct)
+        ? Math.max(0, Math.min(100, coveragePct))
+        : coveragePct === null ? null : existing.coveragePct
+      const nextTested = testedClasses
+        ? [...new Set([...existing.testedClasses, ...testedClasses])]
+        : existing.testedClasses
+      return this.session.db.update(tables.endpoints).set({
+        coveragePct: nextCov,
+        testedClasses: nextTested,
+        updatedAt: Date.now(),
+      }).where(eq(tables.endpoints.id, endpointId)).returning().get()!
+    }, { behavior: 'immediate' })
   }
 
   upsertEndpointParam(input: {
@@ -2050,10 +2126,13 @@ export class FindingsRepository {
   }
 
   markApiDependencyTestedBola(id: string): ApiDependencyRow {
-    const updated = this.session.db.update(tables.apiDependencies).set({ testedBola: true })
-      .where(eq(tables.apiDependencies.id, id)).returning().get()
-    if (!updated) throw new Error('API dependency not found.')
-    return updated
+    return this.session.transaction(() => {
+      const existing = this.session.db.select().from(tables.apiDependencies).where(eq(tables.apiDependencies.id, id)).get()
+      if (!existing) throw new Error('API dependency not found.')
+      this.session.requireRun(existing.runId)
+      return this.session.db.update(tables.apiDependencies).set({ testedBola: true })
+        .where(eq(tables.apiDependencies.id, id)).returning().get()!
+    }, { behavior: 'immediate' })
   }
 
   recordResourceSample(input: {
@@ -2292,30 +2371,33 @@ export class FindingsRepository {
     injectedParam: string
     injectedPersona?: string | null
   }): SecondOrderCanaryRow {
-    const existing = this.session.db.select().from(tables.secondOrderCanaries).where(
-      eq(tables.secondOrderCanaries.marker, input.marker),
-    ).get()
-    if (existing) {
-      if (existing.runId === input.runId) return existing
-      throw new Error('Second-order canary marker collision across runs.')
-    }
-    return this.session.db.insert(tables.secondOrderCanaries).values({
-      id: randomUUID(),
-      runId: input.runId,
-      assignmentId: input.assignmentId,
-      marker: input.marker,
-      injectedOrigin: input.injectedOrigin,
-      injectedEndpoint: redact(input.injectedEndpoint),
-      injectedParam: redact(input.injectedParam),
-      injectedPersona: input.injectedPersona ?? null,
-      surfacedOrigin: null,
-      surfacedEndpoint: null,
-      surfacedPersona: null,
-      surfacedExchangeId: null,
-      status: 'planted',
-      createdAt: Date.now(),
-      surfacedAt: null,
-    }).returning().get()
+    this.assertTenantRun(input.runId)
+    return this.session.transaction(() => {
+      const existing = this.session.db.select().from(tables.secondOrderCanaries).where(
+        eq(tables.secondOrderCanaries.marker, input.marker),
+      ).get()
+      if (existing) {
+        if (existing.runId === input.runId) return existing
+        throw new Error('Second-order canary marker collision across runs.')
+      }
+      return this.session.db.insert(tables.secondOrderCanaries).values({
+        id: randomUUID(),
+        runId: input.runId,
+        assignmentId: input.assignmentId,
+        marker: input.marker,
+        injectedOrigin: input.injectedOrigin,
+        injectedEndpoint: redact(input.injectedEndpoint),
+        injectedParam: redact(input.injectedParam),
+        injectedPersona: input.injectedPersona ?? null,
+        surfacedOrigin: null,
+        surfacedEndpoint: null,
+        surfacedPersona: null,
+        surfacedExchangeId: null,
+        status: 'planted',
+        createdAt: Date.now(),
+        surfacedAt: null,
+      }).returning().get()
+    }, { behavior: 'immediate' })
   }
 
   markSecondOrderCanarySurfaced(
@@ -2328,30 +2410,36 @@ export class FindingsRepository {
       status?: 'surfaced' | 'verified'
     },
   ): SecondOrderCanaryRow {
-    const updated = this.session.db.update(tables.secondOrderCanaries).set({
-      surfacedOrigin: details.surfacedOrigin,
-      surfacedEndpoint: redact(details.surfacedEndpoint),
-      surfacedPersona: details.surfacedPersona ?? null,
-      surfacedExchangeId: details.surfacedExchangeId ?? null,
-      status: details.status ?? 'surfaced',
-      surfacedAt: Date.now(),
-    }).where(eq(tables.secondOrderCanaries.id, id)).returning().get()
-    if (!updated) throw new Error('Second-order canary not found.')
-    this.session.event(updated.runId, 'second_order_canary.surfaced',
-      `Second-order canary surfaced on ${updated.surfacedOrigin}${updated.surfacedEndpoint ?? ''}.`, {
-        canaryId: updated.id,
-        marker: updated.marker,
-        injectedOrigin: updated.injectedOrigin,
-        injectedEndpoint: updated.injectedEndpoint,
-        surfacedOrigin: updated.surfacedOrigin,
-        surfacedEndpoint: updated.surfacedEndpoint,
-        surfacedPersona: updated.surfacedPersona,
-        status: updated.status,
-      })
-    return updated
+    return this.session.transaction(() => {
+      const existing = this.session.db.select().from(tables.secondOrderCanaries)
+        .where(eq(tables.secondOrderCanaries.id, id)).get()
+      if (!existing) throw new Error('Second-order canary not found.')
+      this.session.requireRun(existing.runId)
+      const updated = this.session.db.update(tables.secondOrderCanaries).set({
+        surfacedOrigin: details.surfacedOrigin,
+        surfacedEndpoint: redact(details.surfacedEndpoint),
+        surfacedPersona: details.surfacedPersona ?? null,
+        surfacedExchangeId: details.surfacedExchangeId ?? null,
+        status: details.status ?? 'surfaced',
+        surfacedAt: Date.now(),
+      }).where(eq(tables.secondOrderCanaries.id, id)).returning().get()!
+      this.session.event(updated.runId, 'second_order_canary.surfaced',
+        `Second-order canary surfaced on ${updated.surfacedOrigin}${updated.surfacedEndpoint ?? ''}.`, {
+          canaryId: updated.id,
+          marker: updated.marker,
+          injectedOrigin: updated.injectedOrigin,
+          injectedEndpoint: updated.injectedEndpoint,
+          surfacedOrigin: updated.surfacedOrigin,
+          surfacedEndpoint: updated.surfacedEndpoint,
+          surfacedPersona: updated.surfacedPersona,
+          status: updated.status,
+        })
+      return updated
+    }, { behavior: 'immediate' })
   }
 
   listSecondOrderCanaries(runId: string, status?: SecondOrderCanaryStatus): SecondOrderCanaryRow[] {
+    this.assertTenantRun(runId)
     const where = status
       ? and(eq(tables.secondOrderCanaries.runId, runId), eq(tables.secondOrderCanaries.status, status))
       : eq(tables.secondOrderCanaries.runId, runId)

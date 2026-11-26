@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { drizzle } from 'drizzle-orm/node-sqlite'
@@ -26,13 +26,17 @@ import {
   InvariantError,
   MAX_FTS_MAX_BODY_BYTES,
   MIN_FTS_MAX_BODY_BYTES,
+  SQLITE_DEFAULT_BUSY_TIMEOUT_MS,
+  SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
   STORE_SCHEMA_VERSION,
   StoreSession,
   TenantIsolationError,
+  TenantScopedSession,
   assertConfirmedVerificationClass,
   assessmentAssignments,
   dataDirectory,
   ftsModes,
+  openSqliteDatabase,
   replayVerdictConfirmsRuntime,
   resolvePageLimit,
   resolvePageOffset,
@@ -183,20 +187,14 @@ export class Store {
     let rawClient: DatabaseSync | null = null
     try {
       const path = join(directory, 'kovo.sqlite')
-      if (!existsSync(path)) {
-        try {
-          writeFileSync(path, '', { flag: 'wx', mode: 0o600 })
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-        }
-      }
-      rawClient = new DatabaseSync(path, { timeout: 5000 })
-      // v6 scale pragmas: WAL keeps readers non-blocking under the batched writer; NORMAL skips the
-      // per-commit fsync (WAL still guarantees a consistent DB across process crashes), and the
-      // busy timeout lets concurrent readers/snapshot copies wait instead of failing fast.
-      rawClient.exec(
-        'PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;',
-      )
+      // Unified SQLite connection hygiene: WAL keeps readers non-blocking under the batched writer;
+      // NORMAL skips per-commit fsync; busy_timeout = 5000 lets concurrent readers wait cleanly;
+      // journal_size_limit = 64 MiB bounds WAL file size after checkpoints; foreign_keys = ON.
+      rawClient = openSqliteDatabase(path, {
+        busyTimeoutMs: SQLITE_DEFAULT_BUSY_TIMEOUT_MS,
+        journalSizeLimitBytes: SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
+        foreignKeys: true,
+      })
       // Transparent read-after-write safety: any direct `client.prepare/exec` (including engine code
       // and tests that bypass Store helpers) flushes queued exchanges first. Flush/transaction
       // internals are guarded, so this never recurses.
@@ -244,6 +242,7 @@ export class Store {
       this.session = new StoreSession({
         db: this.db,
         client: this.client,
+        rawClient,
         workspace: this.workspace,
         directory: this.directory,
         emitter: this.emitter,
@@ -449,6 +448,7 @@ export class Store {
         updated_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS chain_steps_run ON chain_steps (run_id, status);
+      CREATE UNIQUE INDEX IF NOT EXISTS chain_steps_run_seq ON chain_steps (run_id, seq);
 
       CREATE TABLE IF NOT EXISTS assignments (
         id TEXT PRIMARY KEY NOT NULL,
@@ -1219,6 +1219,20 @@ export class Store {
           SELECT RAISE(ABORT, 'invariant.audit_log_append_only');
         END;
     `)
+    try {
+      this.client.exec(
+        'CREATE UNIQUE INDEX IF NOT EXISTS tenant_audit_log_chain_unique ON tenant_audit_log (tenant_id, prev_hash);',
+      )
+    } catch (error) {
+      if (!/UNIQUE constraint failed/i.test((error as Error).message)) throw error
+    }
+    try {
+      this.client.exec(
+        'CREATE UNIQUE INDEX IF NOT EXISTS chain_steps_run_seq ON chain_steps (run_id, seq);',
+      )
+    } catch (error) {
+      if (!/UNIQUE constraint failed/i.test((error as Error).message)) throw error
+    }
     this.client.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`)
   }
 
@@ -1637,12 +1651,130 @@ export class Store {
   listBenchmarkRuns(...args: Parameters<FindingsRepository['listBenchmarkRuns']>) { return this.findingsRepo.listBenchmarkRuns(...args) }
   getLatestBenchmarkRun(...args: Parameters<FindingsRepository['getLatestBenchmarkRun']>) { return this.findingsRepo.getLatestBenchmarkRun(...args) }
 
+  /**
+   * Return a tenant-scoped repository boundary enforcing strict tenant isolation on every
+   * project, run, child-entity, and content-addressed blob read/write. Single-tenant CLI/desktop
+   * callers can continue using `Store` directly (defaulting to `'default'`) or call
+   * `store.forTenant('default')`.
+   */
+  forTenant(tenantId: string) {
+    const scopedSession = new TenantScopedSession(this.session, tenantId)
+    const projectsRepo = new ProjectsRepository(scopedSession)
+    const findingsRepo = new FindingsRepository(scopedSession)
+    const runsRepo = new RunsRepository(scopedSession, projectsRepo, findingsRepo)
+    return {
+      tenantId: scopedSession.tenantId,
+      workspace: scopedSession.workspace,
+      directory: scopedSession.directory,
+      session: scopedSession as DbSession,
+      projectsRepo,
+      findingsRepo,
+      runsRepo,
+      flushNow: () => scopedSession.flushNow(),
+      transaction: <T>(fn: () => T, options?: { behavior?: 'deferred' | 'immediate' | 'exclusive' }) =>
+        scopedSession.transaction(fn, options),
+      writeBlob: (content: string, secrets?: Parameters<DbSession['writeBlob']>[1], runId?: string, durable?: boolean) =>
+        scopedSession.writeBlob(content, secrets, runId, durable, scopedSession.tenantId),
+      readBlob: (blobId: string, runId?: string) =>
+        scopedSession.readBlob(blobId, runId, scopedSession.tenantId),
+      // Projects
+      project: (...args: Parameters<ProjectsRepository['project']>) => projectsRepo.project(...args),
+      listWorkspace: () => projectsRepo.listWorkspace(),
+      workspaceSummary: (...args: Parameters<ProjectsRepository['workspaceSummary']>) => projectsRepo.workspaceSummary(...args),
+      projectDetail: (...args: Parameters<ProjectsRepository['projectDetail']>) => projectsRepo.projectDetail(...args),
+      createProject: (...args: Parameters<ProjectsRepository['createProject']>) => projectsRepo.createProject(...args),
+      updateProject: (...args: Parameters<ProjectsRepository['updateProject']>) => projectsRepo.updateProject(...args),
+      deleteProject: (...args: Parameters<ProjectsRepository['deleteProject']>) => projectsRepo.deleteProject(...args),
+      listProjectSpecs: (...args: Parameters<ProjectsRepository['listProjectSpecs']>) => projectsRepo.listProjectSpecs(...args),
+      listProjectSpecsFull: (...args: Parameters<ProjectsRepository['listProjectSpecsFull']>) => projectsRepo.listProjectSpecsFull(...args),
+      getProjectSpec: (...args: Parameters<ProjectsRepository['getProjectSpec']>) => projectsRepo.getProjectSpec(...args),
+      importProjectSpec: (...args: Parameters<ProjectsRepository['importProjectSpec']>) => projectsRepo.importProjectSpec(...args),
+      upsertProjectSpecRaw: (...args: Parameters<ProjectsRepository['upsertProjectSpecRaw']>) => projectsRepo.upsertProjectSpecRaw(...args),
+      deleteProjectSpec: (...args: Parameters<ProjectsRepository['deleteProjectSpec']>) => projectsRepo.deleteProjectSpec(...args),
+      addProjectAsset: (...args: Parameters<ProjectsRepository['addProjectAsset']>) => projectsRepo.addProjectAsset(...args),
+      updateProjectAsset: (...args: Parameters<ProjectsRepository['updateProjectAsset']>) => projectsRepo.updateProjectAsset(...args),
+      updateProjectAssetScope: (...args: Parameters<ProjectsRepository['updateProjectAssetScope']>) => projectsRepo.updateProjectAssetScope(...args),
+      deleteProjectAsset: (...args: Parameters<ProjectsRepository['deleteProjectAsset']>) => projectsRepo.deleteProjectAsset(...args),
+      getProjectTenant: (...args: Parameters<ProjectsRepository['getProjectTenant']>) => projectsRepo.getProjectTenant(...args),
+      listProjectsForTenant: () => projectsRepo.listProjectsForTenant(scopedSession.tenantId),
+      // Runs
+      run: (...args: Parameters<RunsRepository['run']>) => runsRepo.run(...args),
+      runDetail: (...args: Parameters<RunsRepository['runDetail']>) => runsRepo.runDetail(...args),
+      runShellSummary: (...args: Parameters<RunsRepository['runShellSummary']>) => runsRepo.runShellSummary(...args),
+      createRun: (...args: Parameters<RunsRepository['createRun']>) => runsRepo.createRun(...args),
+      updateRun: (...args: Parameters<RunsRepository['updateRun']>) => runsRepo.updateRun(...args),
+      deleteRun: (...args: Parameters<RunsRepository['deleteRun']>) => {
+        cancelOobDrainForRun(args[0])
+        return runsRepo.deleteRun(...args)
+      },
+      command: (...args: Parameters<RunsRepository['command']>) => runsRepo.command(...args),
+      listRunsForTenant: () => runsRepo.listRunsForTenant(scopedSession.tenantId),
+      getRunTenant: (...args: Parameters<RunsRepository['getRunTenant']>) => runsRepo.getRunTenant(...args),
+      assertRunTenantAccess: (runId: string, actor?: string) => runsRepo.assertRunTenantAccess(runId, scopedSession.tenantId, actor),
+      appendTenantAuditLog: (input: Omit<Parameters<RunsRepository['appendTenantAuditLog']>[0], 'tenantId'> & { tenantId?: string }) =>
+        runsRepo.appendTenantAuditLog({ ...input, tenantId: input.tenantId ?? scopedSession.tenantId }),
+      listTenantAuditLog: (options?: Parameters<RunsRepository['listTenantAuditLog']>[1]) =>
+        runsRepo.listTenantAuditLog(scopedSession.tenantId, options),
+      verifyTenantAuditLogChain: () => runsRepo.verifyTenantAuditLogChain(scopedSession.tenantId),
+      workerList: (...args: Parameters<RunsRepository['workerList']>) => runsRepo.workerList(...args),
+      worker: (...args: Parameters<RunsRepository['worker']>) => runsRepo.worker(...args),
+      makeWorker: (...args: Parameters<RunsRepository['makeWorker']>) => runsRepo.makeWorker(...args),
+      updateWorker: (...args: Parameters<RunsRepository['updateWorker']>) => runsRepo.updateWorker(...args),
+      listChainSteps: (...args: Parameters<RunsRepository['listChainSteps']>) => runsRepo.listChainSteps(...args),
+      addChainStep: (...args: Parameters<RunsRepository['addChainStep']>) => runsRepo.addChainStep(...args),
+      updateChainStep: (...args: Parameters<RunsRepository['updateChainStep']>) => runsRepo.updateChainStep(...args),
+      suggestCandidateHost: (...args: Parameters<RunsRepository['suggestCandidateHost']>) => runsRepo.suggestCandidateHost(...args),
+      admitDynamicOrigin: (...args: Parameters<RunsRepository['admitDynamicOrigin']>) => runsRepo.admitDynamicOrigin(...args),
+      boardMember: (...args: Parameters<RunsRepository['boardMember']>) => runsRepo.boardMember(...args),
+      listBoardMembers: (...args: Parameters<RunsRepository['listBoardMembers']>) => runsRepo.listBoardMembers(...args),
+      upsertBoardMember: (...args: Parameters<RunsRepository['upsertBoardMember']>) => runsRepo.upsertBoardMember(...args),
+      postBoardMessage: (...args: Parameters<RunsRepository['postBoardMessage']>) => runsRepo.postBoardMessage(...args),
+      listBoardMessages: (...args: Parameters<RunsRepository['listBoardMessages']>) => runsRepo.listBoardMessages(...args),
+      getApprovalRequest: (...args: Parameters<RunsRepository['getApprovalRequest']>) => runsRepo.getApprovalRequest(...args),
+      listApprovalRequests: (...args: Parameters<RunsRepository['listApprovalRequests']>) => runsRepo.listApprovalRequests(...args),
+      createApprovalRequest: (...args: Parameters<RunsRepository['createApprovalRequest']>) => runsRepo.createApprovalRequest(...args),
+      decideApproval: (...args: Parameters<RunsRepository['decideApproval']>) => runsRepo.decideApproval(...args),
+      grantApprovalLease: (...args: Parameters<RunsRepository['grantApprovalLease']>) => runsRepo.grantApprovalLease(...args),
+      listApprovalLeases: (...args: Parameters<RunsRepository['listApprovalLeases']>) => runsRepo.listApprovalLeases(...args),
+      leaseAuthorizes: (...args: Parameters<RunsRepository['leaseAuthorizes']>) => runsRepo.leaseAuthorizes(...args),
+      writeReport: (...args: Parameters<RunsRepository['writeReport']>) => runsRepo.writeReport(...args),
+      eventsAfter: (...args: Parameters<RunsRepository['eventsAfter']>) => runsRepo.eventsAfter(...args),
+      isRunActive: (...args: Parameters<RunsRepository['isRunActive']>) => runsRepo.isRunActive(...args),
+      // Findings & Exchanges
+      artifact: (...args: Parameters<FindingsRepository['artifact']>) => findingsRepo.artifact(...args),
+      addArtifact: (...args: Parameters<FindingsRepository['addArtifact']>) => findingsRepo.addArtifact(...args),
+      recordExchange: (...args: Parameters<FindingsRepository['recordExchange']>) => findingsRepo.recordExchange(...args),
+      getExchange: (...args: Parameters<FindingsRepository['getExchange']>) => findingsRepo.getExchange(...args),
+      searchExchanges: (...args: Parameters<FindingsRepository['searchExchanges']>) => findingsRepo.searchExchanges(...args),
+      pruneExchanges: (...args: Parameters<FindingsRepository['pruneExchanges']>) => findingsRepo.pruneExchanges(...args),
+      prune: (...args: Parameters<FindingsRepository['prune']>) => findingsRepo.prune(...args),
+      addFact: (...args: Parameters<FindingsRepository['addFact']>) => findingsRepo.addFact(...args),
+      listFacts: (...args: Parameters<FindingsRepository['listFacts']>) => findingsRepo.listFacts(...args),
+      createReplaySpec: (...args: Parameters<FindingsRepository['createReplaySpec']>) => findingsRepo.createReplaySpec(...args),
+      getReplaySpec: (...args: Parameters<FindingsRepository['getReplaySpec']>) => findingsRepo.getReplaySpec(...args),
+      listReplaySpecs: (...args: Parameters<FindingsRepository['listReplaySpecs']>) => findingsRepo.listReplaySpecs(...args),
+      upsertChainFinding: (...args: Parameters<FindingsRepository['upsertChainFinding']>) => findingsRepo.upsertChainFinding(...args),
+      updateProposedFinding: (...args: Parameters<FindingsRepository['updateProposedFinding']>) => findingsRepo.updateProposedFinding(...args),
+      triageFinding: (...args: Parameters<FindingsRepository['triageFinding']>) => findingsRepo.triageFinding(...args),
+      enforceConfirmationEvidence: (...args: Parameters<FindingsRepository['enforceConfirmationEvidence']>) => findingsRepo.enforceConfirmationEvidence(...args),
+      upsertCoverageEntry: (...args: Parameters<FindingsRepository['upsertCoverageEntry']>) => findingsRepo.upsertCoverageEntry(...args),
+      listCoverageEntries: (...args: Parameters<FindingsRepository['listCoverageEntries']>) => findingsRepo.listCoverageEntries(...args),
+      upsertEndpoint: (...args: Parameters<FindingsRepository['upsertEndpoint']>) => findingsRepo.upsertEndpoint(...args),
+      listEndpoints: (...args: Parameters<FindingsRepository['listEndpoints']>) => findingsRepo.listEndpoints(...args),
+      updateEndpointCoverage: (...args: Parameters<FindingsRepository['updateEndpointCoverage']>) => findingsRepo.updateEndpointCoverage(...args),
+      listPatchProposals: (...args: Parameters<FindingsRepository['listPatchProposals']>) => findingsRepo.listPatchProposals(...args),
+      getPatchProposal: (...args: Parameters<FindingsRepository['getPatchProposal']>) => findingsRepo.getPatchProposal(...args),
+      updatePatchProposalReview: (...args: Parameters<FindingsRepository['updatePatchProposalReview']>) => findingsRepo.updatePatchProposalReview(...args),
+    }
+  }
+
   /** Deterministically purge expired exchanges, artifacts, and temp files according to `policy`. */
   purgeArtifactsByTtl(policy: ArtifactTtlPolicy): ArtifactTtlPurgeResult {
     return purgeExpiredArtifacts(this, policy)
   }
 }
 
+export type TenantScopedStore = ReturnType<Store['forTenant']>
 export type StoreRunDetail = ReturnType<Store['runDetail']>
 
 export class RunDeleteBusyError extends Error {

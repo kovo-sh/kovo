@@ -20,11 +20,16 @@
  * `canary-broker.ts` behind `startPublicProfile()`.
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { chmodSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
+import type { DatabaseSync } from 'node:sqlite'
 import { cancelOobDrainForRun } from './oob-drain.ts'
 import { assertValidRunId } from './run-context.ts'
+import {
+  SQLITE_DEFAULT_BUSY_TIMEOUT_MS,
+  SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
+  openSqliteDatabase,
+  withBusyRetry,
+} from './store-session.ts'
 
 export type OobProtocol = 'http' | 'dns' | 'smtp'
 
@@ -297,6 +302,8 @@ export const defaultOobWindowMs = 15 * 60_000
 const defaultDnsDomain = 'canary.kovo.invalid'
 const callbackTokenPattern = /^(kovo-canary-[a-f0-9]{24}|gn2o_[a-f0-9]{8,16})$/
 const maxStoredCallbacks = 20_000
+/** Bounded ring-cap for `oob_rejections` so external OOB spam cannot fill host disk. */
+export const MAX_STORED_OOB_REJECTIONS = 5_000
 
 interface SubscriptionRow {
   id: string
@@ -609,6 +616,8 @@ export interface OobRelayOptions {
   immediateMs?: number
   windowMs?: number
   allowlist?: string[]
+  /** Bounded cap for persisted `oob_rejections` rows (defaults to `MAX_STORED_OOB_REJECTIONS = 5000`). */
+  maxRejections?: number
   logger?: (rejection: OobRejection) => void
 }
 
@@ -622,6 +631,7 @@ export class OobRelay {
   private readonly defaultImmediateMs: number
   private readonly defaultWindowMs: number
   private readonly defaultAllowlist: string[]
+  private readonly maxStoredRejections: number
   private closed = false
 
   constructor(options: OobRelayOptions = {}) {
@@ -632,19 +642,16 @@ export class OobRelay {
     this.defaultImmediateMs = Math.max(0, options.immediateMs ?? defaultImmediateMs)
     this.defaultWindowMs = Math.min(Math.max(1_000, options.windowMs ?? defaultOobWindowMs), maxWindowMs)
     this.defaultAllowlist = [...(options.allowlist ?? [])]
+    this.maxStoredRejections = Math.max(1, Math.trunc(options.maxRejections ?? MAX_STORED_OOB_REJECTIONS))
 
     const path = this.directory ? join(this.directory, 'oob-relay.sqlite') : ':memory:'
-    if (this.directory) mkdirSync(this.directory, { recursive: true, mode: 0o700 })
-    this.client = new DatabaseSync(path, { timeout: 5_000 })
+    this.client = openSqliteDatabase(path, {
+      busyTimeoutMs: SQLITE_DEFAULT_BUSY_TIMEOUT_MS,
+      journalSizeLimitBytes: SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
+      foreignKeys: true,
+    })
     this.ownsClient = true
-    if (this.directory) {
-      try {
-        chmodSync(path, 0o600)
-      } catch { /* best-effort owner-only permissions */ }
-    }
     this.client.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA synchronous = NORMAL;
       CREATE TABLE IF NOT EXISTS pending_oob (
         id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL,
@@ -733,32 +740,34 @@ export class OobRelay {
     const immediateMs = Math.max(0, input.immediateMs ?? this.defaultImmediateMs)
     const windowMs = Math.min(Math.max(immediateMs, input.windowMs ?? this.defaultWindowMs), maxWindowMs)
     const allowlist = input.allowlist ?? (this.defaultAllowlist.length ? this.defaultAllowlist : this.profile.allowlist)
-    const existing = this.client.prepare(
-      'SELECT * FROM pending_oob WHERE run_id = ? AND canary_id = ? AND artifact = ?',
-    ).get(runId, input.canaryId, input.artifact) as unknown as SubscriptionRow | undefined
-    if (existing) {
-      if (existing.status === 'pending') {
-        const expiresAt = now + windowMs
-        this.client.prepare(
-          'UPDATE pending_oob SET expires_at = ?, window_ms = ?, immediate_ms = ? WHERE id = ?',
-        ).run(expiresAt, windowMs, immediateMs, existing.id)
-        return this.subscription(existing.id)
+    return this.inImmediateTx(() => {
+      const existing = this.client.prepare(
+        'SELECT * FROM pending_oob WHERE run_id = ? AND canary_id = ? AND artifact = ?',
+      ).get(runId, input.canaryId, input.artifact) as unknown as SubscriptionRow | undefined
+      if (existing) {
+        if (existing.status === 'pending') {
+          const expiresAt = now + windowMs
+          this.client.prepare(
+            'UPDATE pending_oob SET expires_at = ?, window_ms = ?, immediate_ms = ? WHERE id = ?',
+          ).run(expiresAt, windowMs, immediateMs, existing.id)
+          return this.subscription(existing.id)
+        }
+        return subscriptionFromRow(existing)
       }
-      return subscriptionFromRow(existing)
-    }
 
-    const id = input.id?.trim() || `oob_${randomUUID()}`
-    this.client.prepare(`
-      INSERT INTO pending_oob (
-        id, run_id, assignment_id, canary_id, token, artifact, protocol,
-        created_at, immediate_ms, window_ms, expires_at, status, allowlist
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-    `).run(
-      id, runId, input.assignmentId, input.canaryId, token, input.artifact,
-      input.protocol ?? 'http', now, immediateMs, windowMs, now + windowMs,
-      allowlist.length ? JSON.stringify(allowlist) : null,
-    )
-    return this.subscription(id)
+      const id = input.id?.trim() || `oob_${randomUUID()}`
+      this.client.prepare(`
+        INSERT INTO pending_oob (
+          id, run_id, assignment_id, canary_id, token, artifact, protocol,
+          created_at, immediate_ms, window_ms, expires_at, status, allowlist
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+      `).run(
+        id, runId, input.assignmentId, input.canaryId, token, input.artifact,
+        input.protocol ?? 'http', now, immediateMs, windowMs, now + windowMs,
+        allowlist.length ? JSON.stringify(allowlist) : null,
+      )
+      return this.subscription(id)
+    })
   }
 
   /**
@@ -771,17 +780,19 @@ export class OobRelay {
     if (this.closed) {
       return { runId: validRunId, expiredSubscriptions: 0, removedBindings: 0 }
     }
-    const expired = this.client.prepare(
-      "UPDATE pending_oob SET status = 'expired' WHERE run_id = ? AND status = 'pending'",
-    ).run(validRunId) as { changes?: number | bigint }
-    const removed = this.client.prepare(
-      'DELETE FROM oob_bindings WHERE run_id = ?',
-    ).run(validRunId) as { changes?: number | bigint }
-    return {
-      runId: validRunId,
-      expiredSubscriptions: Number(expired?.changes ?? 0),
-      removedBindings: Number(removed?.changes ?? 0),
-    }
+    return this.inImmediateTx(() => {
+      const expired = this.client.prepare(
+        "UPDATE pending_oob SET status = 'expired' WHERE run_id = ? AND status = 'pending'",
+      ).run(validRunId) as { changes?: number | bigint }
+      const removed = this.client.prepare(
+        'DELETE FROM oob_bindings WHERE run_id = ?',
+      ).run(validRunId) as { changes?: number | bigint }
+      return {
+        runId: validRunId,
+        expiredSubscriptions: Number(expired?.changes ?? 0),
+        removedBindings: Number(removed?.changes ?? 0),
+      }
+    })
   }
 
   subscription(id: string): OobSubscription {
@@ -811,9 +822,12 @@ export class OobRelay {
         at: now,
       }
       try {
-        this.client.prepare(
-          'INSERT INTO oob_rejections (callback_id, token, reason, detail, created_at) VALUES (?, ?, ?, ?, ?)',
-        ).run(callbackId, token || null, reason, detail ? JSON.stringify(detail) : null, now)
+        this.inImmediateTx(() => {
+          this.client.prepare(
+            'INSERT INTO oob_rejections (callback_id, token, reason, detail, created_at) VALUES (?, ?, ?, ?, ?)',
+          ).run(callbackId, token || null, reason, detail ? JSON.stringify(detail) : null, now)
+          this.pruneRejections()
+        })
       } catch { /* rejection logging is best-effort */ }
       this.options.logger?.(rejection)
       return { accepted: false, duplicate: false, rejection }
@@ -1081,7 +1095,7 @@ export class OobRelay {
   }
 
   private claim(subscription: OobSubscription, callback: OobCallback, now: number): OobPromotion {
-    this.client.exec('BEGIN IMMEDIATE')
+    withBusyRetry(() => this.client.exec('BEGIN IMMEDIATE'))
     try {
       const subUpdated = this.client.prepare(
         "UPDATE pending_oob SET status = 'promoted', callback_id = ?, promoted_at = ? WHERE id = ? AND status = 'pending'",
@@ -1102,7 +1116,7 @@ export class OobRelay {
           }
         }
       }
-      this.client.exec('COMMIT')
+      withBusyRetry(() => this.client.exec('COMMIT'))
     } catch (err) {
       try { this.client.exec('ROLLBACK') } catch { /* ignore */ }
       throw err
@@ -1173,6 +1187,27 @@ export class OobRelay {
 
   private assertOpen(): void {
     if (this.closed) throw new Error('OOB relay is closed.')
+  }
+
+  private inImmediateTx<T>(fn: () => T): T {
+    withBusyRetry(() => this.client.exec('BEGIN IMMEDIATE'))
+    try {
+      const result = fn()
+      withBusyRetry(() => this.client.exec('COMMIT'))
+      return result
+    } catch (error) {
+      try { this.client.exec('ROLLBACK') } catch { /* ignore */ }
+      throw error
+    }
+  }
+
+  private pruneRejections(): void {
+    this.client.prepare(`
+      DELETE FROM oob_rejections
+      WHERE id <= (
+        SELECT id FROM oob_rejections ORDER BY id DESC LIMIT 1 OFFSET ?
+      )
+    `).run(this.maxStoredRejections)
   }
 
   private pruneCallbacks(): void {
