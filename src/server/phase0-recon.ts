@@ -40,6 +40,7 @@ import {
   extractHtmlLinksAndScriptsInWorker,
   extractProgramGraphInWorker,
   jsHarvestInWorker,
+  mapServicesToOriginsInWorker,
   parseJsonOrYaml,
   parseJsonOrYamlInWorker,
   parseYamlLikeDocument,
@@ -533,24 +534,104 @@ export function extractStaticFrameworkRoutes(
   const seen = new Set<string>()
   const seenServerActions = new Set<string>()
 
-  // Index Next.js App Router pages so "use server" functions can link to their importing page route
-  // without minting fake POST /_actions/<fn> HTTP endpoints.
-  const nextAppPages: Array<{ rel: string; pageRoute: string; code: string }> = []
+  // Index Next.js App Router pages ONCE in O(pageBytes) so "use server" functions can link to their
+  // importing page route in O(1) average lookup without O(actions * pageBytes) `.includes()` scans (R4-H-16).
+  interface IndexedNextAppPage {
+    readonly rel: string
+    readonly pageRoute: string
+    readonly repoRoot: string
+    readonly tokens: Set<string>
+  }
+  const indexPageTokens = (code: string): Set<string> => {
+    const tokens = new Set<string>()
+    const len = code.length
+    let i = 0
+    while (i < len) {
+      const c = code.charCodeAt(i)
+      const isTok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 45 || c === 46
+      if (!isTok) {
+        i += 1
+        continue
+      }
+      const start = i
+      let hasPunct = false
+      while (i < len) {
+        const ch = code.charCodeAt(i)
+        if ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || (ch >= 48 && ch <= 57) || ch === 95) {
+          i += 1
+        } else if (ch === 45 || ch === 46) {
+          hasPunct = true
+          i += 1
+        } else {
+          break
+        }
+      }
+      const raw = code.slice(start, i)
+      const trimmed = raw.replace(/^\.+|\.+$/g, '')
+      if (!trimmed || trimmed.length > 128) continue
+      tokens.add(trimmed)
+      if (hasPunct) {
+        const stem = trimmed.replace(/\.(?:ts|tsx|js|jsx|mjs|cjs)$/i, '')
+        if (stem && stem !== trimmed) tokens.add(stem)
+        // Also index identifier sub-tokens so `actions.createOrder` or `order-actions` matches both
+        // identifier action names and hyphen/dot-delimited file stems.
+        let subStart = -1
+        for (let k = 0; k <= trimmed.length; k += 1) {
+          const sc = k < trimmed.length ? trimmed.charCodeAt(k) : 0
+          const isIdent = (sc >= 65 && sc <= 90) || (sc >= 97 && sc <= 122) || (sc >= 48 && sc <= 57) || sc === 95
+          if (isIdent) {
+            if (subStart === -1) subStart = k
+          } else if (subStart !== -1) {
+            const sub = trimmed.slice(subStart, k)
+            if (sub.length >= 2) tokens.add(sub)
+            subStart = -1
+          }
+        }
+      }
+    }
+    return tokens
+  }
+  const nextAppPages: IndexedNextAppPage[] = []
+  const pagesByToken = new Map<string, number[]>()
   for (const entry of sourceEntries) {
     const pageMatch = /(?:^|\/)(?:src\/)?app((?:\/[^?#]*)?)\/page\.(?:ts|tsx|js|jsx|mjs)$/i.exec(entry.rel)
     if (!pageMatch) continue
     const rawPageRoute = (pageMatch[1] || '/').replace(/\/\([^)]+\)/g, '') || '/'
-    nextAppPages.push({ rel: entry.rel, pageRoute: normalizeRouteTemplate(rawPageRoute), code: entry.code })
+    const tokens = indexPageTokens(entry.code)
+    const pageIdx = nextAppPages.length
+    nextAppPages.push({
+      rel: entry.rel,
+      pageRoute: normalizeRouteTemplate(rawPageRoute),
+      repoRoot: entry.rel.split('/')[0] ?? '',
+      tokens,
+    })
+    for (const tok of tokens) {
+      const list = pagesByToken.get(tok)
+      if (list) list.push(pageIdx)
+      else pagesByToken.set(tok, [pageIdx])
+    }
   }
   const inferServerActionPageRoute = (actionRel: string, actionName: string): string | undefined => {
     const fileStem = (actionRel.split('/').pop() ?? '').replace(/\.(?:ts|tsx|js|jsx|mjs|cjs)$/i, '')
     const repoPrefix = actionRel.split('/').slice(0, 2).join('/')
-    const importedPage = nextAppPages.find(p =>
-      (p.rel.startsWith(`${repoPrefix}/`) || actionRel.split('/')[0] === p.rel.split('/')[0])
-      && p.code.includes(actionName)
-      && (!fileStem || p.code.includes(fileStem)),
-    )
-    if (importedPage) return importedPage.pageRoute
+    const actionRepoRoot = actionRel.split('/')[0] ?? ''
+    const actionPages = pagesByToken.get(actionName)
+    if (actionPages && actionPages.length > 0) {
+      const stemPages = fileStem ? pagesByToken.get(fileStem) : undefined
+      if (!fileStem || (stemPages && stemPages.length > 0)) {
+        const candidates = stemPages && stemPages.length < actionPages.length ? stemPages : actionPages
+        const checkAction = candidates === stemPages
+        for (const idx of candidates) {
+          const p = nextAppPages[idx]!
+          if (
+            (p.rel.startsWith(`${repoPrefix}/`) || actionRepoRoot === p.repoRoot)
+            && (checkAction ? p.tokens.has(actionName) : (!fileStem || p.tokens.has(fileStem)))
+          ) {
+            return p.pageRoute
+          }
+        }
+      }
+    }
     const appDirMatch = /(?:^|\/)(?:src\/)?app((?:\/[^?#]*)?)\/[^/]+\.(?:ts|tsx|js|jsx|mjs)$/i.exec(actionRel)
     if (appDirMatch) {
       const rawRoute = (appDirMatch[1] || '/').replace(/\/\([^)]+\)/g, '') || '/'
@@ -1198,20 +1279,22 @@ function finalizeRepoProgramGraphExtraction(
   graph: ProgramGraph,
   origins: readonly string[],
   recentDiffSignals?: readonly CommitDiffSignal[],
+  precomputedOriginMappings?: ServiceOriginMapping[],
 ): RepoProgramGraphExtraction {
   const services = discoverGraphServices(inputs)
-  const originMappings = services.length
-    ? mapServicesToOrigins({
-        services,
-        origins,
-        ...(inputs.compose ? { compose: inputs.compose } : {}),
-        ...(inputs.composeFiles.length ? { composeFiles: inputs.composeFiles } : {}),
-        ...(inputs.ingress ? { ingress: inputs.ingress } : {}),
-        ...(inputs.ingressFiles.length ? { ingressFiles: inputs.ingressFiles } : {}),
-        dockerfiles: inputs.dockerfiles,
-        manifests: inputs.manifests,
-      })
-    : []
+  const originMappings = precomputedOriginMappings
+    ?? (services.length
+      ? mapServicesToOrigins({
+          services,
+          origins,
+          ...(inputs.compose ? { compose: inputs.compose } : {}),
+          ...(inputs.composeFiles.length ? { composeFiles: inputs.composeFiles } : {}),
+          ...(inputs.ingress ? { ingress: inputs.ingress } : {}),
+          ...(inputs.ingressFiles.length ? { ingressFiles: inputs.ingressFiles } : {}),
+          dockerfiles: inputs.dockerfiles,
+          manifests: inputs.manifests,
+        })
+      : [])
   const filesByPath = new Map(inputs.sourceFiles.map(file => [file.path, file.content]))
   const globalGuards = graph.globalMiddleware.filter(name => ADMIN_CHAIN_RE.test(name) || TENANT_CHAIN_RE.test(name) || /\b(?:auth|session|jwt|guard|login|authorize)/i.test(name))
   const routeOrigins: Record<string, RouteOriginResolution> = {}
@@ -1505,7 +1588,23 @@ export async function extractRepoProgramGraphInWorker(input: {
       throw new Error(combinedError ?? 'ProgramGraph worker extraction failed')
     }
   }
-  return finalizeRepoProgramGraphExtraction(prepared.inputs, graph, input.origins, input.recentDiffSignals)
+  const services = discoverGraphServices(prepared.inputs)
+  const originMappings = services.length
+    ? await mapServicesToOriginsInWorker(
+        {
+          services,
+          origins: input.origins,
+          ...(prepared.inputs.compose ? { compose: prepared.inputs.compose } : {}),
+          ...(prepared.inputs.composeFiles.length ? { composeFiles: prepared.inputs.composeFiles } : {}),
+          ...(prepared.inputs.ingress ? { ingress: prepared.inputs.ingress } : {}),
+          ...(prepared.inputs.ingressFiles.length ? { ingressFiles: prepared.inputs.ingressFiles } : {}),
+          dockerfiles: prepared.inputs.dockerfiles,
+          manifests: prepared.inputs.manifests,
+        },
+        { timeoutMs: MULTI_REPO_GRAPH_WORKER_TIMEOUT_MS, signal: input.signal },
+      )
+    : []
+  return finalizeRepoProgramGraphExtraction(prepared.inputs, graph, input.origins, input.recentDiffSignals, originMappings)
 }
 
 /**

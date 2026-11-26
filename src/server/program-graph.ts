@@ -169,26 +169,71 @@ function lineNumberAt(text: string, index: number): number {
   return line
 }
 
-function buildNewlineOffsets(text: string): number[] {
-  const offsets: number[] = []
-  let idx = text.indexOf('\n')
-  while (idx !== -1) {
-    offsets.push(idx)
-    idx = text.indexOf('\n', idx + 1)
-  }
-  return offsets
+export interface LineIndex {
+  readonly newlineOffsets: readonly number[]
+  readonly length: number
 }
 
-function lineAtFromOffsets(offsets: readonly number[], index: number, textLength: number): number {
-  const end = Math.min(Math.max(0, index), textLength)
+/** Single-pass O(n) newline-offset index for O(log L) offset-to-line lookup and O(window) slicing. */
+export function buildLineIndex(text: string): LineIndex {
+  const newlineOffsets: number[] = []
+  let idx = text.indexOf('\n')
+  while (idx !== -1) {
+    newlineOffsets.push(idx)
+    idx = text.indexOf('\n', idx + 1)
+  }
+  return { newlineOffsets, length: text.length }
+}
+
+/** O(log L) binary-search 1-based line number lookup for a character offset using a prebuilt `LineIndex`. */
+export function lineAtOffset(index: LineIndex, offset: number): number {
+  const end = Math.min(Math.max(0, offset), index.length)
+  const offsets = index.newlineOffsets
   let lo = 0
   let hi = offsets.length
   while (lo < hi) {
     const mid = (lo + hi) >>> 1
-    if (offsets[mid] < end) lo = mid + 1
+    if (offsets[mid]! < end) lo = mid + 1
     else hi = mid
   }
   return lo + 1
+}
+
+/**
+ * O(window) slice of 1-based lines `[startLine, endLineExclusive)` using a prebuilt `LineIndex`,
+ * bounded to `maxChars` so adversarial single-line/minified files cannot trigger quadratic slicing.
+ */
+export function extractLineRange(
+  text: string,
+  index: LineIndex,
+  startLine: number,
+  endLineExclusive: number,
+  maxChars = 4_096,
+  anchorOffset?: number,
+): string {
+  const totalLines = index.newlineOffsets.length + 1
+  const clampedStart = Math.max(1, Math.min(Math.trunc(startLine), totalLines + 1))
+  const clampedEnd = Math.max(clampedStart, Math.min(Math.trunc(endLineExclusive), totalLines + 1))
+  if (clampedStart >= clampedEnd || text.length === 0) return ''
+  const startChar = clampedStart <= 1 ? 0 : index.newlineOffsets[clampedStart - 2]! + 1
+  const endChar = clampedEnd > totalLines ? text.length : index.newlineOffsets[clampedEnd - 2]!
+  if (endChar <= startChar) return ''
+  const safeMax = Math.max(64, Math.trunc(maxChars))
+  if (endChar - startChar <= safeMax) return text.slice(startChar, endChar)
+  if (anchorOffset !== undefined && anchorOffset >= startChar && anchorOffset <= endChar) {
+    const halfBefore = Math.floor(safeMax / 4)
+    const winStart = Math.max(startChar, Math.min(anchorOffset - halfBefore, endChar - safeMax))
+    return text.slice(winStart, Math.min(endChar, winStart + safeMax))
+  }
+  return text.slice(startChar, startChar + safeMax)
+}
+
+function buildNewlineOffsets(text: string): number[] {
+  return buildLineIndex(text).newlineOffsets as number[]
+}
+
+function lineAtFromOffsets(offsets: readonly number[], index: number, textLength: number): number {
+  return lineAtOffset({ newlineOffsets: offsets, length: textLength }, index)
 }
 
 interface DelimiterIndex {
@@ -4767,6 +4812,58 @@ function parseIngressRulesFromFiles(
  * backends, and manifest names. Genuinely unmapped services are marked `unmapped` instead of
  * silently misattributing their routes to `origins[0]`.
  */
+/**
+ * Strictly linear O(n) line-wise Dockerfile `EXPOSE` port scanner (R4-H-16).
+ * Uses only horizontal `[ \t]*` whitespace skipping per line so multiline whitespace
+ * Dockerfiles can never trigger regex backtracking.
+ */
+function extractDockerfileExposePorts(content: string): number[] {
+  const ports: number[] = []
+  const len = content.length
+  let pos = 0
+  while (pos < len) {
+    let nl = content.indexOf('\n', pos)
+    if (nl === -1) nl = len
+    const lineEnd = nl > pos && content.charCodeAt(nl - 1) === 13 ? nl - 1 : nl
+    let i = pos
+    while (i < lineEnd && (content.charCodeAt(i) === 32 || content.charCodeAt(i) === 9)) i += 1
+    if (lineEnd - i >= 8) {
+      const kw = content.slice(i, i + 6)
+      if (kw === 'EXPOSE' || kw.toUpperCase() === 'EXPOSE') {
+        let j = i + 6
+        if (j < lineEnd && (content.charCodeAt(j) === 32 || content.charCodeAt(j) === 9)) {
+          let linePorts = 0
+          while (j < lineEnd && linePorts < 16) {
+            while (j < lineEnd && (content.charCodeAt(j) === 32 || content.charCodeAt(j) === 9)) j += 1
+            if (j >= lineEnd || content.charCodeAt(j) === 35 /* '#' */) break
+            const tokenStart = j
+            while (j < lineEnd && content.charCodeAt(j) !== 32 && content.charCodeAt(j) !== 9) j += 1
+            let digitEnd = tokenStart
+            while (
+              digitEnd < j
+              && content.charCodeAt(digitEnd) >= 48
+              && content.charCodeAt(digitEnd) <= 57
+              && digitEnd - tokenStart < 5
+            ) {
+              digitEnd += 1
+            }
+            const digitCount = digitEnd - tokenStart
+            if (digitCount >= 2 && (digitEnd === j || content.charCodeAt(digitEnd) === 47 /* '/' */)) {
+              const port = Number(content.slice(tokenStart, digitEnd))
+              if (Number.isInteger(port) && port >= 1 && port <= 65535) {
+                ports.push(port)
+                linePorts += 1
+              }
+            }
+          }
+        }
+      }
+    }
+    pos = nl + 1
+  }
+  return ports
+}
+
 export function mapServicesToOrigins(input: MonorepoOriginInput): ServiceOriginMapping[] {
   const composeFileList: Array<{ path: string; content: string }> = [
     ...(input.composeFiles ?? []),
@@ -4786,7 +4883,7 @@ export function mapServicesToOrigins(input: MonorepoOriginInput): ServiceOriginM
   const dockerPorts = new Map<string, number[]>()
   for (const dockerfile of input.dockerfiles ?? []) {
     const root = dockerfile.path.replace(/(?:\/)?Dockerfile(?:\..*)?$/i, '').replace(/\/$/, '')
-    const ports = [...dockerfile.content.matchAll(/^\s*EXPOSE\s+(\d{2,5})/gim)].map(m => Number(m[1]))
+    const ports = extractDockerfileExposePorts(dockerfile.content)
     if (ports.length) dockerPorts.set(root || '/', ports)
   }
   const manifestNames = new Map<string, string>()

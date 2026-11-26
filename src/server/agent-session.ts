@@ -52,7 +52,14 @@ import type { CallRecorder, ProviderConfig, ProviderOptions, SecretSource, Usage
 import { redactSecrets } from "./egress-sanitizer.ts"
 import { redact } from "./redact.ts"
 import type { NamedSecret } from "./redact.ts"
+import { resolveRunSafetyBudgets } from "./run-safety-budgets.ts"
 import { MAX_CLAIM_REGEX_HAYSTACK, compileSafeClaimRegex } from "./safe-regex.ts"
+import {
+  executeSearchRepoScan,
+  searchRepoInWorker,
+  type SearchRepoWorkerRequest,
+  type SearchRepoWorkerResult,
+} from "./untrusted-compute-pool.ts"
 import { listSkills, listSkillTags, loadSkill, searchSkills, selectPreInjectionSkills, skillsByTag } from "./skills.ts"
 import {
   ALL_SPEC_PROOF_GAP_CODES,
@@ -1215,7 +1222,6 @@ const DEFAULT_SEARCH_MATCHES = 50
 const MAX_SEARCH_MATCHES = 200
 const MAX_SEARCH_FILES = 4_000
 const MAX_SEARCH_FILE_BYTES = 512 * 1024
-const MAX_SEARCH_TOTAL_BYTES = 32 * 1024 * 1024
 const MAX_SEARCH_LINE_CHARS = 240
 
 const DEFAULT_EVIDENCE_SLICE_LIMIT = 8_192
@@ -1400,17 +1406,19 @@ export function readRepoFileHost(reposDir: string, args: ReadRepoFileArgs): Host
   }
 }
 
-export interface HostSearchRepoResult {
-  query: string
-  mode: 'literal' | 'regex'
-  pathPrefix: string
-  filesScanned: number
-  matchCount: number
-  truncated: boolean
-  matches: Array<{ path: string; line: number; text: string }>
+export type HostSearchRepoResult = SearchRepoWorkerResult
+
+export interface SearchRepoHostOptions {
+  deadlineMs?: number
+  maxBytes?: number
+  signal?: AbortSignal
 }
 
-export function searchRepoHost(reposDir: string, args: SearchRepoArgs): HostSearchRepoResult {
+function prepareSearchRepoWorkerRequest(
+  reposDir: string,
+  args: SearchRepoArgs,
+  opts: SearchRepoHostOptions = {},
+): SearchRepoWorkerRequest {
   const query = typeof args.query === 'string' ? args.query : ''
   if (!query || query.length > 256) {
     throw new Error('search_repo query must be a non-empty string up to 256 characters.')
@@ -1419,123 +1427,64 @@ export function searchRepoHost(reposDir: string, args: SearchRepoArgs): HostSear
   const useRegex = args.regex === true
   const caseSensitive = args.caseSensitive === true
 
-  let regexMatcher: RegExp | null = null
-  const literalNeedle = caseSensitive ? query : query.toLowerCase()
   if (useRegex) {
     // Compile without `i`/`u` flags so V8's linear-time fallback engine engages (R3-H-11).
     const compiled = compileSafeClaimRegex(query, { flags: '', maxLength: 256 })
     if (!compiled.ok) {
       throw new Error(`Unsafe or invalid search_repo regex rejected: ${compiled.reason} Use literal search (regex: false) or a simpler linear pattern.`)
     }
-    regexMatcher = compiled.regex
   }
 
+  const budgets = resolveRunSafetyBudgets({
+    overrides: {
+      ...(opts.deadlineMs !== undefined ? { searchRepoDeadlineMs: opts.deadlineMs } : {}),
+      ...(opts.maxBytes !== undefined ? { searchRepoMaxBytes: opts.maxBytes } : {}),
+    },
+  })
   const resolved = resolveJailedHostPath(reposDir, args.pathPrefix ?? '', 'repo', { allowRoot: true })
-  const startStat = lstatSync(resolved.realTarget)
-  const matches: Array<{ path: string; line: number; text: string }> = []
-  let filesScanned = 0
-  let totalBytesScanned = 0
-  let truncated = false
-
-  const scanFile = (absPath: string, relPosix: string): void => {
-    if (matches.length >= maxMatches) {
-      truncated = true
-      return
-    }
-    if (filesScanned >= MAX_SEARCH_FILES || totalBytesScanned >= MAX_SEARCH_TOTAL_BYTES) {
-      truncated = true
-      return
-    }
-    let st
-    try {
-      st = lstatSync(absPath)
-    } catch {
-      return
-    }
-    if (!st.isFile() || st.isSymbolicLink() || st.size === 0 || st.size > MAX_SEARCH_FILE_BYTES) return
-    let buf: Buffer
-    try {
-      buf = readFileSync(absPath)
-    } catch {
-      return
-    }
-    if (isBinaryBuffer(buf)) return
-    filesScanned += 1
-    totalBytesScanned += buf.length
-    const lines = buf.toString('utf8').split(/\r?\n/)
-    for (let i = 0; i < lines.length; i += 1) {
-      const line = lines[i]!
-      let matched = false
-      if (regexMatcher) {
-        const haystack = line.length > MAX_CLAIM_REGEX_HAYSTACK ? line.slice(0, MAX_CLAIM_REGEX_HAYSTACK) : line
-        matched = regexMatcher.test(haystack)
-      } else {
-        matched = (caseSensitive ? line : line.toLowerCase()).includes(literalNeedle)
-      }
-      if (!matched) continue
-      if (matches.length >= maxMatches) {
-        truncated = true
-        return
-      }
-      matches.push({
-        path: `/repos/${relPosix}`,
-        line: i + 1,
-        text: line.trimEnd().slice(0, MAX_SEARCH_LINE_CHARS),
-      })
-    }
-  }
-
-  if (startStat.isFile()) {
-    scanFile(resolved.realTarget, resolved.relPosix)
-  } else if (startStat.isDirectory()) {
-    const stack: Array<{ absDir: string; relPrefix: string; parents: string[] }> = [{
-      absDir: resolved.realTarget,
-      relPrefix: resolved.relPosix,
-      parents: resolved.relPosix ? resolved.relPosix.split('/') : [],
-    }]
-    while (stack.length > 0 && !truncated) {
-      const cur = stack.pop()!
-      let entries
-      try {
-        entries = readdirSync(cur.absDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))
-      } catch {
-        continue
-      }
-      const subdirs: Array<{ absDir: string; relPrefix: string; parents: string[] }> = []
-      for (const entry of entries) {
-        if (entry.isSymbolicLink()) continue
-        const isDir = entry.isDirectory()
-        const isFile = entry.isFile()
-        if (!isDir && !isFile) continue
-        if (isSensitiveHostRepoSegment(entry.name, isDir, cur.parents)) continue
-        const childAbs = join(cur.absDir, entry.name)
-        const childRel = cur.relPrefix ? `${cur.relPrefix}/${entry.name}` : entry.name
-        if (isDir) {
-          subdirs.push({ absDir: childAbs, relPrefix: childRel, parents: [...cur.parents, entry.name] })
-        } else {
-          scanFile(childAbs, childRel)
-          if (matches.length >= maxMatches || filesScanned >= MAX_SEARCH_FILES || totalBytesScanned >= MAX_SEARCH_TOTAL_BYTES) {
-            truncated = true
-            break
-          }
-        }
-      }
-      for (let i = subdirs.length - 1; i >= 0; i -= 1) {
-        stack.push(subdirs[i]!)
-      }
-    }
-  }
-
   return {
+    realTarget: resolved.realTarget,
+    relPosix: resolved.relPosix,
     query,
-    mode: useRegex ? 'regex' : 'literal',
-    pathPrefix: resolved.relPosix ? `/repos/${resolved.relPosix}` : '/repos',
-    filesScanned,
-    matchCount: matches.length,
-    truncated,
-    matches,
+    regex: useRegex,
+    caseSensitive,
+    maxMatches,
+    maxFiles: MAX_SEARCH_FILES,
+    maxFileBytes: MAX_SEARCH_FILE_BYTES,
+    maxBytes: budgets.searchRepoMaxBytes,
+    maxLineChars: MAX_SEARCH_LINE_CHARS,
+    deadlineMs: budgets.searchRepoDeadlineMs,
   }
 }
+
+export function searchRepoHost(
+  reposDir: string,
+  args: SearchRepoArgs,
+  opts?: Omit<SearchRepoHostOptions, 'signal'>,
+): HostSearchRepoResult {
+  const req = prepareSearchRepoWorkerRequest(reposDir, args, opts)
+  return executeSearchRepoScan(req)
+}
+
+/**
+ * Off-host worker-thread `search_repo` execution (`R4-H-15`): validates query/regex/path-jail on
+ * the host, then delegates repo walking and regex matching to `UntrustedComputePool` with a hard
+ * wall-clock `searchRepoDeadlineMs` timeout enforced via `worker.terminate()`.
+ */
+export async function searchRepoHostInWorker(
+  reposDir: string,
+  args: SearchRepoArgs,
+  opts: SearchRepoHostOptions = {},
+): Promise<HostSearchRepoResult> {
+  const req = prepareSearchRepoWorkerRequest(reposDir, args, opts)
+  return searchRepoInWorker(req, { timeoutMs: req.deadlineMs, signal: opts.signal })
+}
+
+/** Registry preserving sync test-compat `searchRepoHost` alongside authoritative off-host `searchRepoHostInWorker`. */
+const HOST_REPO_SEARCH_RUNNERS = {
+  syncCompat: searchRepoHost,
+  worker: searchRepoHostInWorker,
+} as const
 
 interface HostSpillRecord {
   artifactId: string
@@ -2534,7 +2483,7 @@ export function buildWorkerTools(
         const signal = combineSignal(ctx.abortSignal)
         return wrapExec(
           'search_repo',
-          async () => customFn ? customFn(args, signal) : searchRepoHost(reposDir!, args),
+          async () => customFn ? customFn(args, signal) : HOST_REPO_SEARCH_RUNNERS.worker(reposDir!, args, { signal }),
           signal,
         )
       },

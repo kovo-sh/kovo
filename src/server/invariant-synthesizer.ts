@@ -1,6 +1,17 @@
 /** General Invariant Synthesizer (v8 Layer 2 — White-Box + Runtime Parity). All capabilities stay quarantined as `capability_only`. */
 import { createHash } from 'node:crypto'
-import type { MonorepoService, ProgramGraph, ProgramNode, ProgramRoute, ProgramSinkKind, ServiceOriginMapping } from './program-graph.ts'
+import {
+  buildLineIndex,
+  extractLineRange,
+  lineAtOffset,
+  type LineIndex,
+  type MonorepoService,
+  type ProgramGraph,
+  type ProgramNode,
+  type ProgramRoute,
+  type ProgramSinkKind,
+  type ServiceOriginMapping,
+} from './program-graph.ts'
 import { snapshotSourceFiles, type StaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
 
 export const ENTITY_LIFECYCLE_SLICE_MAX_BYTES = 1600
@@ -101,7 +112,7 @@ function isAuthenticatedWcdObservation(obs: PersonaSurfaceObservation): boolean 
     && WCD_SENSITIVE_PATH_RE.test(normalized)
 }
 const AUTH_GUARD_RE = /\b(?:auth(?:enticate|orize|Required|Middleware)?|requireAuth|ensureAuth|verify(?:Jwt|Token|Session|Bearer|Pat|Cookie)|jwtAuth|sessionAuth|passport|loginRequired|isAuthenticated|getSession|currentUser|req\.user|ctx\.user)\b/i
-const TENANT_GUARD_RE = /\b(?:tenant|org(?:anization)?|workspace|account|team|project)(?:Scope|Guard|Check|Isolation|Access|Match|Member|Filter|Context)|require(?:Tenant|Org|Workspace|Account)|enforceTenant|scopeBy(?:Tenant|Org|Workspace)|assert(?:Tenant|Org|Workspace)Access|where.*(?:tenantId|orgId|workspaceId)\b/i
+const TENANT_GUARD_RE = /\b(?:tenant|org(?:anization)?|workspace|account|team|project)(?:Scope|Guard|Check|Isolation|Access|Match|Member|Filter|Context)|require(?:Tenant|Org|Workspace|Account)|enforceTenant|scopeBy(?:Tenant|Org|Workspace)|assert(?:Tenant|Org|Workspace)Access|where[^\n]{0,120}(?:tenantId|orgId|workspaceId)\b/i
 const ROLE_GUARD_RE = /\b(?:require(?:Admin|Owner|Role|Permission|Scope|Privilege|Approver|Finance)|check(?:Role|Permission|Scope|Rbac|Abac|Policy)|has(?:Role|Permission|Scope)|is(?:Admin|Owner|Staff|Superuser)|authorize(?:Role|Action|Policy)|rbac|abac|allowRoles|guardRole|minRole)\b/i
 const REVOCATION_GUARD_RE = /\b(?:revok(?:e|ed|ation)|checkRevok|isRevok|verifyActive(?:Token|Session|Pat|Key|Invite|Grant)?|tokenVersion|sessionVersion|introspect(?:Token)?|notRevoked|ensureActive|checkDemot|liveRoleCheck|validateGrantStatus|blacklist|denylist)\b/i
 const BATCH_HINT_RE = /(?:\/(?:batch|bulk|multi)(?:\/|$)|batch[A-Z_]|bulk[A-Z_]|arrayOfIds|\bids\b)/i
@@ -203,20 +214,62 @@ function classifyGuardDimensions(guards: readonly string[], bodySnippet = ''): R
   return out
 }
 
-function extractFunctionBodyWindow(content: string, line: number, maxLines = 26): string {
-  const lines = content.split('\n'), start = Math.max(0, line - 1), end = Math.min(lines.length, start + maxLines), out: string[] = []
+const MAX_WINDOW_EXTRACT_CHARS = 4_096
+const MAX_AUX_HANDLERS_PER_FILE = 256
+const MAX_OUTBOUND_MATCHES_PER_FILE = 256
+
+interface IndexedSourceFile {
+  readonly content: string
+  readonly lineIndex: LineIndex
+}
+
+function createIndexedSourceLookup(sourceFiles?: readonly SourceFileInput[]): Map<string, IndexedSourceFile> {
+  const map = new Map<string, IndexedSourceFile>()
+  for (const sf of sourceFiles ?? []) {
+    if (!map.has(sf.path)) {
+      map.set(sf.path, { content: sf.content, lineIndex: buildLineIndex(sf.content) })
+    }
+  }
+  return map
+}
+
+function extractFunctionBodyWindow(
+  content: string,
+  line: number,
+  maxLines = 26,
+  lineIndex?: LineIndex,
+  anchorOffset?: number,
+): string {
+  const idx = lineIndex ?? buildLineIndex(content)
+  const slice = extractLineRange(content, idx, Math.max(1, line), Math.max(1, line) + maxLines, MAX_WINDOW_EXTRACT_CHARS, anchorOffset)
+  if (!slice) return ''
+  const lines = slice.split('\n')
+  const out: string[] = []
   let depth = 0, sawOpen = false
-  for (let i = start; i < end; i += 1) {
-    const l = lines[i]
-    if (i > start && !sawOpen && /^\s*(?:export\s+)?(?:async\s+)?(?:function\b|const\s+\w+\s*=|router\.|app\.)/.test(l)) break
+  for (let i = 0; i < lines.length; i += 1) {
+    const l = lines[i]!
+    if (i > 0 && !sawOpen && /^[ \t]{0,32}(?:export[ \t]+)?(?:async[ \t]+)?(?:function\b|const[ \t]+\w+[ \t]*=|router\.|app\.)/.test(l)) break
     out.push(l)
-    for (const ch of l) { if (ch === '{') { depth += 1; sawOpen = true } else if (ch === '}') depth -= 1 }
+    for (let j = 0; j < l.length; j += 1) {
+      const ch = l.charCodeAt(j)
+      if (ch === 123 /* '{' */) { depth += 1; sawOpen = true }
+      else if (ch === 125 /* '}' */) depth -= 1
+    }
     if (sawOpen && depth <= 0) break
   }
   return out.join('\n')
 }
-const extractLineWindow = (content: string, line: number, before = 6, after = 14): string =>
-  content.split('\n').slice(Math.max(0, line - 1 - before), Math.min(content.split('\n').length, line - 1 + after)).join('\n')
+const extractLineWindow = (
+  content: string,
+  line: number,
+  before = 6,
+  after = 14,
+  lineIndex?: LineIndex,
+  anchorOffset?: number,
+): string => {
+  const idx = lineIndex ?? buildLineIndex(content)
+  return extractLineRange(content, idx, Math.max(1, line - before), Math.max(1, line + after), MAX_WINDOW_EXTRACT_CHARS, anchorOffset)
+}
 function resolveServiceOriginForFile(file: string, mappings?: readonly ServiceOriginMapping[]): string | undefined {
   if (!mappings?.length) return undefined
   const norm = file.replace(/\\/g, '/')
@@ -227,40 +280,65 @@ function resolveServiceOriginForFile(file: string, mappings?: readonly ServiceOr
   }
   return best?.origin ?? best?.service
 }
-function collectReachableNodes(graph: ProgramGraph, startId: string, maxDepth = 3): ProgramNode[] {
-  const nodeById = new Map(graph.nodes.map(n => [n.id, n])), adj = new Map<string, string[]>()
-  for (const e of graph.edges) adj.set(e.fromId, [...(adj.get(e.fromId) ?? []), e.toId])
+interface GraphReachabilityIndex {
+  readonly nodeById: Map<string, ProgramNode>
+  readonly adj: Map<string, string[]>
+}
+function buildGraphReachabilityIndex(graph: ProgramGraph): GraphReachabilityIndex {
+  const nodeById = new Map<string, ProgramNode>()
+  for (const n of graph.nodes) nodeById.set(n.id, n)
+  const adj = new Map<string, string[]>()
+  for (const e of graph.edges) {
+    const list = adj.get(e.fromId)
+    if (list) list.push(e.toId)
+    else adj.set(e.fromId, [e.toId])
+  }
+  return { nodeById, adj }
+}
+function collectReachableNodes(index: GraphReachabilityIndex, startId: string, maxDepth = 3): ProgramNode[] {
   const visited = new Set([startId]), queue: Array<{ id: string; depth: number }> = [{ id: startId, depth: 0 }], result: ProgramNode[] = []
-  while (queue.length > 0) {
-    const cur = queue.shift()!
+  let head = 0
+  while (head < queue.length) {
+    const cur = queue[head++]!
     if (cur.depth >= maxDepth) continue
-    for (const nextId of adj.get(cur.id) ?? []) {
+    for (const nextId of index.adj.get(cur.id) ?? []) {
       if (visited.has(nextId)) continue
       visited.add(nextId)
-      const node = nodeById.get(nextId); if (node) result.push(node)
+      const node = index.nodeById.get(nextId); if (node) result.push(node)
       queue.push({ id: nextId, depth: cur.depth + 1 })
     }
   }
   return result
 }
 // Analyzer 1 — Entity x Surface Guard-Asymmetry Matrix
-function discoverAuxiliarySurfaceHandlers(sourceFiles: readonly SourceFileInput[], serviceOrigins?: readonly ServiceOriginMapping[]): SurfaceHandlerRecord[] {
+function discoverAuxiliarySurfaceHandlers(
+  sourceFiles: readonly SourceFileInput[],
+  serviceOrigins?: readonly ServiceOriginMapping[],
+  indexedFiles?: Map<string, IndexedSourceFile>,
+): SurfaceHandlerRecord[] {
   const discovered: SurfaceHandlerRecord[] = []
   const patterns: Array<{ surface: CapabilitySurface; method: string; re: RegExp; nameGroup: number }> = [
-    { surface: 'graphql', method: 'RESOLVER', re: /\b(?:(Query|Mutation|Subscription)\s*:\s*\{[\s\S]{0,120}?)?([a-z][A-Za-z0-9_]{2,48})\s*:\s*(?:async\s*)?\([^)]*(?:args|ctx|context|parent)[^)]*\)\s*(?:=>|\{)/g, nameGroup: 2 },
-    { surface: 'async_job', method: 'WORKER', re: /\b(?:registerWorker|processJob|onJob|queue\.process|worker\.on|subscribeTopic|consumeQueue)\s*\(\s*['"`]([a-zA-Z0-9._:/-]{2,64})['"`]/g, nameGroup: 1 },
-    { surface: 'ws', method: 'WS', re: /\b(?:ws|wss|socket|io)\.on\s*\(\s*['"`]([a-zA-Z0-9._:/-]{2,64})['"`]/g, nameGroup: 1 },
+    { surface: 'graphql', method: 'RESOLVER', re: /\b(?:(Query|Mutation|Subscription)[ \t]{0,8}:[ \t]{0,8}\{[\s\S]{0,120}?)?([a-z][A-Za-z0-9_]{2,48})[ \t]{0,8}:[ \t]{0,8}(?:async[ \t]{1,8})?\([^)]{0,160}(?:args|ctx|context|parent)[^)]{0,160}\)[ \t]{0,8}(?:=>|\{)/g, nameGroup: 2 },
+    { surface: 'async_job', method: 'WORKER', re: /\b(?:registerWorker|processJob|onJob|queue\.process|worker\.on|subscribeTopic|consumeQueue)[ \t]{0,8}\([ \t\r\n]{0,16}['"`]([a-zA-Z0-9._:/-]{2,64})['"`]/g, nameGroup: 1 },
+    { surface: 'ws', method: 'WS', re: /\b(?:ws|wss|socket|io)\.on[ \t]{0,8}\([ \t\r\n]{0,16}['"`]([a-zA-Z0-9._:/-]{2,64})['"`]/g, nameGroup: 1 },
   ]
   for (const sf of sourceFiles) {
+    const indexed = indexedFiles?.get(sf.path)
+    let lineIndex: LineIndex | undefined = indexed?.lineIndex
+    let fileMatches = 0
     for (const pat of patterns) {
+      if (fileMatches >= MAX_AUX_HANDLERS_PER_FILE) break
       pat.re.lastIndex = 0
       let match: RegExpExecArray | null
       while ((match = pat.re.exec(sf.content)) !== null) {
+        if (fileMatches >= MAX_AUX_HANDLERS_PER_FILE) break
         const rawName = match[pat.nameGroup]
         if (!rawName || /^(?:connection|close|error|open|disconnect|ping|pong|end|data|finish)$/.test(rawName)) continue
-        const line = sf.content.slice(0, match.index).split('\n').length
-        const snippet = extractFunctionBodyWindow(sf.content, line, 24)
+        if (!lineIndex) lineIndex = buildLineIndex(sf.content)
+        const line = lineAtOffset(lineIndex, match.index)
+        const snippet = extractFunctionBodyWindow(sf.content, line, 24, lineIndex, match.index)
         const path = `${pat.surface}:${rawName}`
+        fileMatches += 1
         discovered.push({
           id: stableId('aux', `${sf.path}:${line}:${path}`),
           entity: inferEntityName(`/${rawName.replace(/[:.]/g, '/')}`, rawName, snippet),
@@ -288,7 +366,8 @@ export function buildGuardAsymmetryMatrix(
   graph: ProgramGraph,
   options: GuardAsymmetryMatrixOptions = {},
 ): GuardAsymmetryMatrixResult {
-  const fileMap = new Map((options.sourceFiles ?? []).map(sf => [sf.path, sf.content]))
+  const indexedFiles = createIndexedSourceLookup(options.sourceFiles)
+  const reachability = buildGraphReachabilityIndex(graph)
   const handlers: SurfaceHandlerRecord[] = []
   const seenKeys = new Set<string>()
   const addHandler = (h: SurfaceHandlerRecord) => {
@@ -303,9 +382,9 @@ export function buildGuardAsymmetryMatrix(
     if (isPublicOrStaticAssetPath(route.path)) continue
     const handlerFile = route.handlerFile ?? route.file
     const handlerLine = route.handlerLine ?? route.line
-    const src = fileMap.get(handlerFile) ?? fileMap.get(route.file)
-    const snippet = src ? extractFunctionBodyWindow(src, handlerLine, 26) : ''
-    const reachable = collectReachableNodes(graph, route.id, 3)
+    const src = indexedFiles.get(handlerFile) ?? indexedFiles.get(route.file)
+    const snippet = src ? extractFunctionBodyWindow(src.content, handlerLine, 26, src.lineIndex) : ''
+    const reachable = collectReachableNodes(reachability, route.id, 3)
     addHandler({
       id: route.id,
       entity: inferEntityName(route.path, route.handler, `${snippet}\n${reachable.map(n => n.symbol).join(' ')}`),
@@ -319,7 +398,7 @@ export function buildGuardAsymmetryMatrix(
       sinks: [...new Set(reachable.map(n => n.sinkKind).filter((s): s is ProgramSinkKind => Boolean(s)))],
     })
   }
-  for (const aux of [...discoverAuxiliarySurfaceHandlers(options.sourceFiles ?? [], options.serviceOrigins), ...(options.extraHandlers ?? [])]) addHandler(aux)
+  for (const aux of [...discoverAuxiliarySurfaceHandlers(options.sourceFiles ?? [], options.serviceOrigins, indexedFiles), ...(options.extraHandlers ?? [])]) addHandler(aux)
 
   const byEntity = new Map<string, SurfaceHandlerRecord[]>()
   for (const h of handlers) pushMap(byEntity, h.entity, h)
@@ -335,9 +414,22 @@ export function buildGuardAsymmetryMatrix(
     const diffs: GuardAsymmetryDiff[] = []
     if (group.length >= 2) {
       const guardedCount = Object.fromEntries(dims.map(d => [d, group.filter(h => h.guards[d].length > 0).length])) as Record<GuardDimension, number>
+      // Deduplicate stronger-handler candidates by `(surface, isBatch, isMutating, guardMask)` so
+      // comparison stays O(group.length * uniqueProfiles) instead of O(group.length^2) on huge groups.
+      const candidateReps: SurfaceHandlerRecord[] = []
+      const seenProfile = new Set<string>()
+      for (const h of group) {
+        const mask = (h.guards.auth.length ? 1 : 0) | (h.guards.tenant_scope.length ? 2 : 0) | (h.guards.role.length ? 4 : 0) | (h.guards.revocation.length ? 8 : 0)
+        if (mask === 0) continue
+        const prof = `${h.surface}|${h.isBatch ? 1 : 0}|${h.isMutating ? 1 : 0}|${mask}`
+        if (!seenProfile.has(prof)) {
+          seenProfile.add(prof)
+          candidateReps.push(h)
+        }
+      }
       for (const weaker of group) {
         let bestStronger: SurfaceHandlerRecord | undefined, bestMissing: GuardDimension[] = [], bestStrength = -1
-        for (const cand of group) {
+        for (const cand of candidateReps) {
           if (cand.id === weaker.id) continue
           const missing = dims.filter(d => cand.guards[d].length > 0 && weaker.guards[d].length === 0)
           if (!missing.length) continue
@@ -384,7 +476,7 @@ const PATH_PREFIX_RE = /\b(?:rewrite|stripPrefix|pathRewrite|startsWith\s*\(|red
 const BODY_REPARSE_RE = /\b(?:JSON\.parse|rawBody|bodyParser|text\(\)|Buffer\.concat|forwardBody|streamBody|parseJson)\b/i
 const CACHE_SURFACE_RE = /\b(?:cache-control|x-cache|cache\.set|cache\.get|cacheKey|cdnCache|vary\b|max-age|s-maxage|stale-while-revalidate)\b/i
 const SIGNING_SURFACE_RE = /\b(?:createHmac|hmac|jwt\.sign|jwt\.verify|signPayload|verifySignature|x-signature|webhookSignature|crypto\.sign)\b/i
-const OUTBOUND_CALL_RE = /\b(?:fetch|axios(?:\.(?:get|post|put|patch|delete|request))?|http\.request|https\.request|proxyRequest|forwardTo|upstreamFetch|dispatchWebhook|enqueueJob|publishEvent|sendToWorker|res\.redirect)\s*\(\s*([^\n;]{1,180})/g
+const OUTBOUND_CALL_RE = /\b(?:fetch|axios(?:\.(?:get|post|put|patch|delete|request))?|http\.request|https\.request|proxyRequest|forwardTo|upstreamFetch|dispatchWebhook|enqueueJob|publishEvent|sendToWorker|res\.redirect)[ \t]{0,8}\([ \t]{0,8}([^\n;]{1,180})/g
 
 function classifyServiceTier(name: string, routes: readonly ProgramRoute[], sourceText: string): ServiceTier {
   const lower = name.toLowerCase()
@@ -418,7 +510,7 @@ function detectRiskClassesInWindow(windowText: string, mechanism: BoundaryMechan
   if (BODY_REPARSE_RE.test(windowText) && (mechanism === 'reverse_proxy' || fromTier === 'edge_cdn')) { artifacts.add('raw_body_forward'); risks.add('body_reparse_differential') }
   if (CACHE_SURFACE_RE.test(windowText)) {
     artifacts.add('cache_layer')
-    if (!/vary[^;\n]*(?:authorization|cookie)/i.test(windowText) && !/cacheKey[^\n]*(?:tenantId|orgId|userId)[^\n]*(?:tenantId|orgId|userId)/i.test(windowText)) risks.add('cache_key_divergence')
+    if (!/vary[^;\n]{0,200}(?:authorization|cookie)/i.test(windowText) && !/cacheKey[^\n]{0,200}(?:tenantId|orgId|userId)[^\n]{0,200}(?:tenantId|orgId|userId)/i.test(windowText)) risks.add('cache_key_divergence')
   }
   if (SIGNING_SURFACE_RE.test(windowText)) {
     artifacts.add('crypto_signature')
@@ -514,11 +606,15 @@ export function buildTrustBoundaryGraph(
   for (const sf of options.sourceFiles ?? []) {
     const fromSvc = inferServiceIdForPath(sf.path, services, options.serviceOrigins)
     const fromTier = nodesMap.get(fromSvc)?.tier ?? 'app_api'
+    let lineIndex: LineIndex | undefined
+    let outboundMatches = 0
     OUTBOUND_CALL_RE.lastIndex = 0
     let match: RegExpExecArray | null
     while ((match = OUTBOUND_CALL_RE.exec(sf.content)) !== null) {
+      if (outboundMatches >= MAX_OUTBOUND_MATCHES_PER_FILE) break
       const callExpr = match[0], argExpr = match[1] ?? ''
-      const line = sf.content.slice(0, match.index).split('\n').length
+      if (!lineIndex) lineIndex = buildLineIndex(sf.content)
+      const line = lineAtOffset(lineIndex, match.index)
       const mechanism: BoundaryMechanism = /proxy|forwardTo|upstream/i.test(callExpr) || fromTier === 'edge_cdn' ? 'reverse_proxy'
         : /redirect/i.test(callExpr) ? 'oauth_redirect'
         : /webhook/i.test(callExpr) ? 'webhook_dispatch'
@@ -526,8 +622,9 @@ export function buildTrustBoundaryGraph(
       const resolved = resolveTarget(argExpr, fromSvc)
       const toService = resolved?.target ?? (mechanism === 'oauth_redirect' ? 'client_redirect_target' : mechanism === 'async_queue' ? 'async_worker_pool' : '')
       if (!toService) continue
+      outboundMatches += 1
       const toTier: ServiceTier = resolved?.tier ?? (mechanism === 'async_queue' ? 'async_worker' : 'app_api')
-      const { risks, artifacts } = detectRiskClassesInWindow(extractLineWindow(sf.content, line, 10, 14), mechanism, fromTier, toTier)
+      const { risks, artifacts } = detectRiskClassesInWindow(extractLineWindow(sf.content, line, 10, 14, lineIndex, match.index), mechanism, fromTier, toTier)
       addEdge({
         id: stableId('edge', `${fromSvc}->${toService}|${mechanism}|${sf.path}:${line}`),
         fromService: fromSvc, toService, fromTier, toTier, mechanism,
@@ -535,10 +632,11 @@ export function buildTrustBoundaryGraph(
         targetPattern: scrubLiteralValues(argExpr.trim().slice(0, 96)),
       })
     }
-    if (CACHE_SURFACE_RE.test(sf.content)) {
-      const m = CACHE_SURFACE_RE.exec(sf.content)!
-      const line = sf.content.slice(0, m.index).split('\n').length
-      const { risks, artifacts } = detectRiskClassesInWindow(extractLineWindow(sf.content, line, 8, 12), 'cache_layer', fromTier, 'app_api')
+    const cacheMatch = CACHE_SURFACE_RE.exec(sf.content)
+    if (cacheMatch) {
+      if (!lineIndex) lineIndex = buildLineIndex(sf.content)
+      const line = lineAtOffset(lineIndex, cacheMatch.index)
+      const { risks, artifacts } = detectRiskClassesInWindow(extractLineWindow(sf.content, line, 8, 12, lineIndex, cacheMatch.index), 'cache_layer', fromTier, 'app_api')
       if (risks.includes('cache_key_divergence')) {
         addEdge({ id: stableId('edge_cache', `${fromSvc}|${sf.path}:${line}`), fromService: fromSvc, toService: `${fromSvc}:cache`, fromTier, toTier: fromTier, mechanism: 'cache_layer', propagatedArtifacts: artifacts, riskClasses: risks, file: sf.path, line })
       }
@@ -615,10 +713,11 @@ function detectLifecyclePatterns(text: string): LifecyclePatternKind[] {
   if (NUMERIC_BALANCE_RE.test(text)) out.push('numeric_balance_billing')
   return out
 }
-const compactCodeExcerpt = (content: string, line: number, maxLines = 12): string =>
-  scrubLiteralValues(extractFunctionBodyWindow(content, line, maxLines).split('\n').map(l => l.trimEnd()).filter(l => l.trim().length > 0 && !/^\s*\/\//.test(l)).slice(0, maxLines).join('\n'))
+const compactCodeExcerpt = (content: string, line: number, maxLines = 12, lineIndex?: LineIndex): string =>
+  scrubLiteralValues(extractFunctionBodyWindow(content, line, maxLines, lineIndex).split('\n').map(l => l.trimEnd()).filter(l => l.trim().length > 0 && !/^\s*\/\//.test(l)).slice(0, maxLines).join('\n'))
 export function buildEntityLifecycleSlices(graph: ProgramGraph, options: EntityLifecycleSliceOptions = {}): EntityLifecycleSlicesResult {
-  const fileMap = new Map((options.sourceFiles ?? []).map(sf => [sf.path, sf.content]))
+  const indexedFiles = createIndexedSourceLookup(options.sourceFiles)
+  const reachability = buildGraphReachabilityIndex(graph)
   const maxSliceBytes = Math.min(Math.max(128, Math.floor(options.maxSliceBytes ?? ENTITY_LIFECYCLE_SLICE_MAX_BYTES)), ENTITY_LIFECYCLE_SLICE_MAX_BYTES)
   const totalRunBudgetUsd = Math.max(0, options.totalRunBudgetUsd ?? 5.0), requestedBudgetFraction = Math.max(0, options.maxBudgetFraction ?? DEFAULT_SEMANTIC_BUDGET_FRACTION)
   const enforcedBudgetFraction = Math.min(requestedBudgetFraction, MAX_SEMANTIC_BUDGET_FRACTION), allocatedBudgetUsd = Number((totalRunBudgetUsd * enforcedBudgetFraction).toFixed(6))
@@ -630,11 +729,14 @@ export function buildEntityLifecycleSlices(graph: ProgramGraph, options: EntityL
   for (const route of orderedRoutes) {
     if (isPublicOrStaticAssetPath(route.path)) continue
     const handlerFile = route.handlerFile ?? route.file, handlerLine = route.handlerLine ?? route.line
-    const src = fileMap.get(handlerFile) ?? fileMap.get(route.file)
-    const excerpt = src ? compactCodeExcerpt(src, handlerLine, 10) : `${route.method} ${route.path} -> ${route.handler}`
-    const depExcerpts = collectReachableNodes(graph, route.id, 3)
+    const src = indexedFiles.get(handlerFile) ?? indexedFiles.get(route.file)
+    const excerpt = src ? compactCodeExcerpt(src.content, handlerLine, 10, src.lineIndex) : `${route.method} ${route.path} -> ${route.handler}`
+    const depExcerpts = collectReachableNodes(reachability, route.id, 3)
       .filter(d => d.kind === 'function' || d.kind === 'sink')
-      .map(d => ({ symbol: d.symbol, file: d.file, line: d.line, excerpt: fileMap.has(d.file) ? compactCodeExcerpt(fileMap.get(d.file)!, d.line, 7) : `${d.kind}:${d.symbol}` }))
+      .map(d => {
+        const depSrc = indexedFiles.get(d.file)
+        return { symbol: d.symbol, file: d.file, line: d.line, excerpt: depSrc ? compactCodeExcerpt(depSrc.content, d.line, 7, depSrc.lineIndex) : `${d.kind}:${d.symbol}` }
+      })
     const combined = [route.path, route.handler, route.input.body.join(' '), excerpt, ...depExcerpts.map(d => `${d.symbol} ${d.excerpt}`)].join('\n')
     const patterns = detectLifecyclePatterns(combined)
     if (!patterns.length) continue
