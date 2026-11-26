@@ -123,7 +123,7 @@ export const BASELINE_SOURCE_TEXT_REGEX_ASSERTS: Readonly<Record<string, number>
   'tests/r4-orchestration-lifecycle.test.ts': 4,
   'tests/r4-repo-isolation.test.ts': 2,
   'tests/step-status-agreement.test.ts': 2,
-  'tests/sys-contract-canary.test.ts': 37,
+  'tests/sys-contract-canary.test.ts': 13,
   'tests/sys-q2-repo-tools.test.ts': 15,
   'tests/sys-q7-ui-reports.test.ts': 21,
   'tests/sys-q8-patch-retest.test.ts': 3,
