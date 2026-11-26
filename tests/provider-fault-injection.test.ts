@@ -43,7 +43,6 @@ import {
 import {
   ProviderFailureError,
   QuotaExhaustedError,
-  classifyFailoverError,
   classifyProviderFailure,
   evaluateRoleProviderCircuit,
   providerPool,
@@ -409,7 +408,7 @@ test('R2-13.3: mid-stream drop and stream silence/stall produce typed ProviderFa
 // 3. Single classifier parity across provider.ts and exec-dispatch.ts
 // ============================================================================
 
-test('R2-13.4: single typed classifier drives classifyWorkerErrorToStepStatus and classifyFailoverError', () => {
+test('R2-13.4: single typed classifier drives classifyWorkerErrorToStepStatus and classifyProviderFailure', () => {
   assert.equal(classifyWorkerErrorToStepStatus(new QuotaExhaustedError('quota gone')), 'model_failure')
   assert.equal(classifyWorkerErrorToStepStatus(new ProviderFailureError('429', { kind: 'rate_limited', status: 429 })), 'model_failure')
   assert.equal(classifyWorkerErrorToStepStatus(new ProviderFailureError('drop', { kind: 'stream_drop', emitted: true })), 'model_failure')
@@ -418,11 +417,29 @@ test('R2-13.4: single typed classifier drives classifyWorkerErrorToStepStatus an
   assert.equal(classifyWorkerErrorToStepStatus(new Error('Docker daemon container start ECONNREFUSED')), 'infra_failed')
   assert.equal(classifyWorkerErrorToStepStatus(new Error('Container sandbox exec EPIPE')), 'infra_failed')
 
-  assert.deepEqual(classifyFailoverError('The provider quota or credit balance was exhausted.'), { failover: true, hard: true })
-  assert.deepEqual(classifyFailoverError('The provider rejected the API key.'), { failover: true, hard: true })
-  assert.deepEqual(classifyFailoverError('The provider rate limit was reached.'), { failover: true, hard: false })
-  assert.deepEqual(classifyFailoverError('The model provider returned HTTP 503.'), { failover: true, hard: false })
-  assert.deepEqual(classifyFailoverError('The operation was aborted by user'), { failover: false, hard: false })
+  const quotaClassified = classifyProviderFailure('The provider quota or credit balance was exhausted.')
+  assert.ok(quotaClassified instanceof QuotaExhaustedError)
+  assert.equal(quotaClassified.kind, 'quota')
+  assert.equal(quotaClassified.hard, true)
+
+  const authClassified = classifyProviderFailure('The provider rejected the API key.')
+  assert.ok(authClassified instanceof ProviderFailureError)
+  assert.equal(authClassified.kind, 'auth')
+  assert.equal(authClassified.hard, true)
+
+  const rateLimitClassified = classifyProviderFailure('The provider rate limit was reached.')
+  assert.ok(rateLimitClassified instanceof ProviderFailureError)
+  assert.equal(rateLimitClassified.kind, 'rate_limited')
+  assert.equal(rateLimitClassified.hard, false)
+  assert.equal(rateLimitClassified.retryable, true)
+
+  const server503Classified = classifyProviderFailure('The model provider returned HTTP 503.')
+  assert.ok(server503Classified instanceof ProviderFailureError)
+  assert.equal(server503Classified.kind, 'server')
+  assert.equal(server503Classified.hard, false)
+  assert.equal(server503Classified.retryable, true)
+
+  assert.equal(classifyProviderFailure('The operation was aborted by user'), null)
   assert.equal(normalizeDispatchStopReason('provider_paused'), 'provider_paused')
 })
 

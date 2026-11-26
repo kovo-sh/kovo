@@ -121,7 +121,6 @@
     "src/server/program-graph.ts::renderCodeDataflowSliceText",
     "src/server/proof-tools.ts::proofToolNames",
     "src/server/provider-stream.ts::scrubExactSecretsValue",
-    "src/server/provider.ts::QuotaExhaustedError",
     "src/server/provider.ts::estimateTranscriptTokens",
     "src/server/provider.ts::extractUsageFromSse",
     "src/server/public-suffix.ts::publicSuffix",
