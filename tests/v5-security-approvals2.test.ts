@@ -286,6 +286,7 @@ test('C: hard-escalated requests still escalate even with a matching pattern', a
     method: 'POST',
     pathAndQuery: '/api/items/123',
     approvedPatterns: patterns,
+    leaseAuthorizes: () => true,
     offline: true,
     ...overrides,
   })
@@ -318,6 +319,7 @@ test('C: hard-escalated requests still escalate even with a matching pattern', a
     method: 'DELETE',
     pathAndQuery: '/api/items/123',
     approvedPatterns: [{ origin: PUBLIC_ORIGIN, method: 'DELETE', pathPattern: '/api/items/*' }],
+    leaseAuthorizes: () => true,
     offline: true,
   })
   assert.equal(approvedDelete.decision, 'approve')
@@ -368,6 +370,7 @@ test('C: patterns never authorize an RCE proof or malformed multipart, including
     pathAndQuery: '/api/items/123',
     context: { personaHandle: null, hasMultipart: true },
     approvedPatterns: patterns,
+    leaseAuthorizes: () => true,
   })
   assert.equal(withWellFormedMultipart.approved, true, 'explicit operator pattern authorizes well-formed multipart on that route')
   assert.equal(withWellFormedMultipart.via, 'operator_pattern')

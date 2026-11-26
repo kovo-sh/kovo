@@ -984,6 +984,12 @@ export const runCommand = z.discriminatedUnion('action', [
   commandBase.extend({ action: z.literal('approve_all_pending') }),
   commandBase.extend({ action: z.literal('revoke_approval_lease'), leaseId: id }),
   commandBase.extend({
+    action: z.literal('extend_approval_lease'),
+    leaseId: id,
+    extendMs: z.number().int().min(MIN_APPROVAL_LEASE_TTL_MS).max(MAX_APPROVAL_LEASE_TTL_MS).optional(),
+    addUses: z.number().int().min(0).max(MAX_APPROVAL_LEASE_USES).optional(),
+  }),
+  commandBase.extend({
     action: z.literal('remove_approved_pattern'),
     origin: z.string().trim().min(1).max(253),
     method: z.string().trim().min(1).max(16),

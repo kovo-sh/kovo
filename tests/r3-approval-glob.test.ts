@@ -294,6 +294,7 @@ test('R3-H-9: approveSimilarEndpoint on /api/**, /**, and /api/*/users flags car
       scopeRevision: updatedRun.scopeRevision,
       context: { personaHandle: 'user_a', hasMultipart: false, isRceProof: false },
       approvedPatterns: updatedRun.approvedEndpointPatterns,
+      leaseAuthorizes: store.approvalLeaseAuthorizer(runId),
     })
     assert.equal(authUnrelated.approved, false, `stored pattern for ${globPath} must not authorize /api/admin/users/delete`)
 
@@ -303,8 +304,9 @@ test('R3-H-9: approveSimilarEndpoint on /api/**, /**, and /api/*/users flags car
       method: 'POST',
       pathAndQuery: globPath,
       scopeRevision: updatedRun.scopeRevision,
-      context: { personaHandle: 'user_a', hasMultipart: false, isRceProof: false },
+      context: { personaHandle: null, hasMultipart: false, isRceProof: false },
       approvedPatterns: updatedRun.approvedEndpointPatterns,
+      leaseAuthorizes: store.approvalLeaseAuthorizer(runId),
     })
     assert.equal(authExact.approved, true)
     assert.equal(authExact.via, 'operator_pattern')
