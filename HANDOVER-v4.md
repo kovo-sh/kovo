@@ -1,7 +1,7 @@
 # Guardian v4 — Engineering Handover (`HANDOVER-v4.md`)
 
 **Date:** 2026-11-22  
-**Branch:** `main` (`origin`: `https://github.com/wwwillchen/guardian.git`)  
+**Branch:** `main` (`origin`: `https://github.com/kovo-sh/kovo.git`)  
 **Spec Reference:** [SPEC-v4.md](SPEC-v4.md)
 
 > **Status (2026-11-22): historical planning document, superseded by M7.**

@@ -8,7 +8,7 @@ import { startHeldOutSaasServer, loadHeldOutSaasManifest, heldOutSaasPatchIds } 
 const manifest = loadHeldOutSaasManifest()
 const mk = id => manifest.challenges.find(c => c.id === id)?.flagMarker
 
-// ---- loopback canary listener (stand-in for Kovo Hunter's CanaryBroker) --------------------------------------------
+// ---- loopback canary listener (stand-in for Kovo's CanaryBroker) --------------------------------------------
 const hits = []
 const canary = createServer((req, res) => {
   hits.push(req.url)

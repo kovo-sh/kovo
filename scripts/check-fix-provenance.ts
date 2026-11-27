@@ -20,6 +20,10 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import {
+  parseKernelCosmeticTrailer,
+  verifyCosmeticKernelDiff,
+} from './lib/kernel-cosmetic-ast.ts'
 
 /** Canonical 20-file confirmation-kernel fallback set used when `scripts/kernel-manifest.json` is absent. */
 export const FALLBACK_CONFIRMATION_KERNEL_FILES: readonly string[] = [
@@ -59,6 +63,8 @@ export interface CommitProvenanceInput {
   subject: string
   message: string
   files: string[]
+  parentSha?: string | null
+  filePairs?: ReadonlyMap<string, { base: string | null; head: string | null }>
 }
 
 export interface CommitProvenanceResult {
@@ -67,6 +73,8 @@ export interface CommitProvenanceResult {
   kernelFilesTouched: string[]
   subjectAuditIds: string[]
   requiresFixes: boolean
+  cosmeticVerified?: boolean
+  cosmeticReason?: string | null
   fixesIds: string[]
   resolvedIds: Record<string, string[]>
   unresolvedIds: string[]
@@ -230,13 +238,13 @@ export function evaluateCommitProvenance(
   commit: CommitProvenanceInput,
   kernelFiles: ReadonlySet<string>,
   plans: ReadonlyArray<{ file: string; content: string }>,
+  rootDir?: string,
 ): CommitProvenanceResult {
   const kernelFilesTouched = commit.files
     .map(normalizeRepoPath)
     .filter(f => kernelFiles.has(f))
     .sort()
   const subjectAuditIds = extractSubjectAuditIds(commit.subject)
-  const requiresFixes = kernelFilesTouched.length > 0 || subjectAuditIds.length > 0
   const fixesIds = extractFixesTrailerIds(commit.message)
 
   const resolvedIds: Record<string, string[]> = {}
@@ -251,9 +259,39 @@ export function evaluateCommitProvenance(
   }
 
   const violations: string[] = []
+  let cosmeticVerified = false
+  let cosmeticReason: string | null = null
+  const cosmetic = parseKernelCosmeticTrailer(commit.message)
+  if (kernelFilesTouched.length > 0 && cosmetic.present) {
+    if (cosmetic.malformed) {
+      violations.push(
+        `malformed_kernel_cosmetic_trailer: commit ${commit.sha.slice(0, 8)} has malformed Kernel-cosmetic trailer ("${cosmetic.malformed}"); expected "Kernel-cosmetic: <reason (min 6 chars)>"`,
+      )
+    } else {
+      const astRes = verifyCosmeticKernelDiff({
+        rootDir: rootDir ?? resolve(join(fileURLToPath(import.meta.url), '../..')),
+        baseRef: commit.parentSha ?? null,
+        headRef: commit.sha,
+        kernelFiles: kernelFilesTouched,
+        filePairs: commit.filePairs,
+      })
+      if (astRes.ok) {
+        cosmeticVerified = true
+        cosmeticReason = cosmetic.reason
+      } else {
+        const detail = astRes.failedFiles.map(f => `${f.file}: ${f.reason}`).join('; ')
+        violations.push(
+          `invalid_kernel_cosmetic: commit ${commit.sha.slice(0, 8)} failed AST cosmetic verification: ${detail}`,
+        )
+      }
+    }
+  }
+
+  const requiresFixes = (kernelFilesTouched.length > 0 && !cosmeticVerified) || subjectAuditIds.length > 0
+
   if (requiresFixes && fixesIds.length === 0) {
     const reasons: string[] = []
-    if (kernelFilesTouched.length > 0) {
+    if (kernelFilesTouched.length > 0 && !cosmeticVerified) {
       reasons.push(`touches ${kernelFilesTouched.length} confirmation-kernel file(s): ${kernelFilesTouched.join(', ')}`)
     }
     if (subjectAuditIds.length > 0) {
@@ -273,6 +311,7 @@ export function evaluateCommitProvenance(
     kernelFilesTouched,
     subjectAuditIds,
     requiresFixes,
+    ...(cosmeticVerified ? { cosmeticVerified: true, cosmeticReason } : {}),
     fixesIds,
     resolvedIds,
     unresolvedIds,
@@ -311,7 +350,17 @@ function readGitCommits(rootDir: string, baseRef: string | null, headOnly: boole
       .split(/\r?\n/)
       .map(s => s.trim())
       .filter(Boolean)
-    commits.push({ sha, subject, message, files })
+    let parentSha: string | null = null
+    try {
+      const p = execFileSync('git', ['-C', rootDir, 'rev-parse', '--verify', `${sha}^`], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim()
+      if (p) parentSha = p
+    } catch {
+      parentSha = null
+    }
+    commits.push({ sha, subject, message, files, parentSha })
   }
   return commits
 }
@@ -349,7 +398,7 @@ export function runFixProvenanceCheck(options: FixProvenanceOptions = {}): FixPr
     }
   }
 
-  const results = commits.map(c => evaluateCommitProvenance(c, kernel.files, plans))
+  const results = commits.map(c => evaluateCommitProvenance(c, kernel.files, plans, rootDir))
   const failedCommits = results.filter(r => !r.ok).length
 
   return {
@@ -399,6 +448,10 @@ function main(): void {
         for (const v of c.violations) {
           console.error(`  FAIL  ${v}`)
         }
+      } else if (c.cosmeticVerified) {
+        console.log(
+          `  OK    ${c.sha.slice(0, 8)} ${c.subject} (Kernel-cosmetic verified by AST: ${c.cosmeticReason})`,
+        )
       } else if (c.requiresFixes) {
         const resolved = Object.entries(c.resolvedIds)
           .map(([id, files]) => `${id} -> ${files[0]}`)

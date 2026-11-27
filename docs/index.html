@@ -3,25 +3,25 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Kovo Hunter: Open-source AI pentester that won’t break prod.</title>
+  <title>Kovo: Open-source AI pentester that won’t break prod.</title>
   <meta name="description" content="Open-source, self-hosted AI pentester that won’t break prod. Catch the real-world vulnerabilities attackers find with ARTEX—backed by host-enforced guardrails, not prompts." />
   <meta name="theme-color" content="#fbfbfa" media="(prefers-color-scheme: light)" />
   <meta name="theme-color" content="#161616" media="(prefers-color-scheme: dark)" />
   <meta name="color-scheme" content="light dark" />
 
   <meta property="og:type" content="website" />
-  <meta property="og:site_name" content="Kovo Hunter" />
-  <meta property="og:title" content="Kovo Hunter: Open-source AI pentester that won’t break prod." />
+  <meta property="og:site_name" content="Kovo" />
+  <meta property="og:title" content="Kovo: Open-source AI pentester that won’t break prod." />
   <meta property="og:description" content="Catch the real-world vulnerabilities attackers find with ARTEX—backed by host-enforced guardrails, not prompts. Air-gapped workers, sealed credentials, and zero-LLM Verify Fix." />
   <!-- TODO: make og:image/twitter:image absolute (https://<pages-domain>/og.png) once the public URL is known; most crawlers ignore relative URLs -->
   <meta property="og:image" content="og.png" />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
-  <meta property="og:image:alt" content="Kovo Hunter: Open-source AI pentester that won’t break prod." />
+  <meta property="og:image:alt" content="Kovo: Open-source AI pentester that won’t break prod." />
 
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:image" content="og.png" />
-  <meta name="twitter:title" content="Kovo Hunter: Open-source AI pentester that won’t break prod." />
+  <meta name="twitter:title" content="Kovo: Open-source AI pentester that won’t break prod." />
   <meta name="twitter:description" content="Open-source Apache 2.0 AI pentester with air-gapped workers, host-enforced guardrails, an opaque persona vault, and zero-LLM Verify Fix." />
 
   <link rel="icon" type="image/svg+xml" href="favicon.svg" />
@@ -47,7 +47,7 @@
 <!-- ================================================================ top bar -->
 <header class="nav" id="nav">
   <div class="nav-in">
-    <a href="#overview" class="brand" aria-label="Kovo Hunter, back to top"><i class="mk" aria-hidden="true"></i><b>Kovo Hunter</b></a>
+    <a href="#overview" class="brand" aria-label="Kovo, back to top"><i class="mk" aria-hidden="true"></i><b>Kovo</b></a>
     <nav class="nav-links" aria-label="Sections">
       <a href="#proof" data-nav="proof">Proof</a>
       <a href="#architecture" data-nav="architecture">Architecture</a>
@@ -57,7 +57,7 @@
     </nav>
     <div class="nav-acts">
       <button type="button" class="btn ghost icon hide-md" data-act="theme" aria-label="Switch to dark theme"><i class="ico" data-i="moon"></i></button>
-      <a class="btn ghost nav-gh hide-md" href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer"><i class="ico" data-i="github"></i>GitHub</a>
+      <a class="btn ghost nav-gh hide-md" href="https://github.com/kovo-sh/kovo" target="_blank" rel="noopener noreferrer"><i class="ico" data-i="github"></i>GitHub</a>
       <a class="btn primary" href="#install">Get started</a>
       <button type="button" class="btn ghost icon nav-menu" id="nav-menu" aria-expanded="false" aria-controls="nav-sheet" aria-label="Open menu"><i class="ico" data-i="menu"></i></button>
     </div>
@@ -71,7 +71,7 @@
       <a href="#faq" data-nav="faq">FAQ</a>
     </nav>
     <div class="sheet-acts">
-      <a class="btn" href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer"><i class="ico" data-i="github"></i>GitHub</a>
+      <a class="btn" href="https://github.com/kovo-sh/kovo" target="_blank" rel="noopener noreferrer"><i class="ico" data-i="github"></i>GitHub</a>
       <button type="button" class="btn" data-act="theme"><i class="ico" data-i="moon"></i><span class="theme-lbl">Dark theme</span></button>
     </div>
   </div>
@@ -86,7 +86,7 @@
       <p class="lede">Catch the real-world vulnerabilities attackers find with ARTEX—backed by host-enforced guardrails, not prompts.</p>
       <div class="ctas">
         <a class="btn primary lg" href="#install">Get started<i class="ico sm" data-i="arrowR"></i></a>
-        <a class="btn lg" href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer"><i class="ico" data-i="github"></i>GitHub</a>
+        <a class="btn lg" href="https://github.com/kovo-sh/kovo" target="_blank" rel="noopener noreferrer"><i class="ico" data-i="github"></i>GitHub</a>
       </div>
 
       <figure class="player" id="player">
@@ -99,10 +99,10 @@
           <span class="ph-d num">0:51</span>
         </div>
         <div class="player-b">
-          <iframe id="replay" title="Kovo Hunter replay, 51 seconds, simulated data: from scope approval to a fix re-verified by replay" data-src="replay/?embed=1&amp;paused=1" allow="clipboard-write"></iframe>
+          <iframe id="replay" title="Kovo replay, 51 seconds, simulated data: from scope approval to a fix re-verified by replay" data-src="replay/?embed=1&amp;paused=1" allow="clipboard-write"></iframe>
           <noscript><p class="noscript">The replay needs JavaScript. <a href="replay/">Open it on its own page.</a></p></noscript>
         </div>
-        <figcaption class="sr-only">A scripted replay of the Kovo Hunter run workspace: you approve the scope, the broker blocks an out-of-scope host, a confirmed finding shows its control vs. variant replay, and after the fix ships, Verify Fix re-runs the stored replay with no LLM.</figcaption>
+        <figcaption class="sr-only">A scripted replay of the Kovo run workspace: you approve the scope, the broker blocks an out-of-scope host, a confirmed finding shows its control vs. variant replay, and after the fix ships, Verify Fix re-runs the stored replay with no LLM.</figcaption>
       </figure>
     </div>
   </section>
@@ -110,9 +110,9 @@
   <!-- ============================================================ WHY -->
   <section class="view why" aria-labelledby="why-h">
     <div class="wrap">
-      <p class="eyebrow">Why Kovo Hunter</p>
+      <p class="eyebrow">Why Kovo</p>
       <h2 id="why-h">Red-team depth. <span class="mute">Built for your own stack.</span></h2>
-      <p class="lede sm">ARTEX proved autonomous AI agents can run real pentests end to end—but red-team tools are easy to misuse on your own software. Kovo Hunter brings that same autonomous depth with host-enforced guardrails, so you never probe third-party hosts, wreck production data, or leak test credentials.</p>
+      <p class="lede sm">ARTEX proved autonomous AI agents can run real pentests end to end—but red-team tools are easy to misuse on your own software. Kovo brings that same autonomous depth with host-enforced guardrails, so you never probe third-party hosts, wreck production data, or leak test credentials.</p>
 
       <ul class="cards" aria-label="Safety guarantees">
         <li class="card">
@@ -329,15 +329,15 @@
             <div class="ipane" id="pane-docker" role="tabpanel" aria-labelledby="tab-docker">
               <div class="code">
                 <div class="code-h"><span class="dotname">Terminal</span><span class="sp"></span><button type="button" class="btn ghost sm" data-copy="docker" aria-label="Copy Docker install command"><i class="ico" data-i="copy"></i>Copy</button></div>
-                <pre><span class="pr" aria-hidden="true">$ </span>docker run -p 8000:8000 -v kovo-data:/data ghcr.io/kovo-sh/kovo-hunter</pre>
+                <pre><span class="pr" aria-hidden="true">$ </span>docker run -p 8000:8000 -v kovo-data:/data ghcr.io/kovo-sh/kovo</pre>
               </div>
               <p class="note">Keeps run state in the <code>kovo-data</code> volume and opens the self-hosted UI at <code>http://localhost:8000</code>.</p>
             </div>
             <div class="ipane" id="pane-source" role="tabpanel" aria-labelledby="tab-source" hidden>
               <div class="code">
                 <div class="code-h"><span class="dotname">Terminal</span><span class="sp"></span><button type="button" class="btn ghost sm" data-copy="source" aria-label="Copy build from source commands"><i class="ico" data-i="copy"></i>Copy</button></div>
-                <pre><span class="pr" aria-hidden="true">$ </span>git clone https://github.com/kovo-sh/kovo-hunter.git
-<span class="pr" aria-hidden="true">$ </span>cd kovo-hunter &amp;&amp; npm ci &amp;&amp; npm run worker:build &amp;&amp; npm run build &amp;&amp; npm start</pre>
+                <pre><span class="pr" aria-hidden="true">$ </span>git clone https://github.com/kovo-sh/kovo.git
+<span class="pr" aria-hidden="true">$ </span>cd kovo &amp;&amp; npm ci &amp;&amp; npm run worker:build &amp;&amp; npm run build &amp;&amp; npm start</pre>
               </div>
               <p class="note">Requires Node.js 24+ and a local Docker daemon for isolated <code>--network=none</code> workers.</p>
             </div>
@@ -384,7 +384,7 @@
           <thead>
             <tr>
               <th scope="col">Dimension</th>
-              <th scope="col" class="me"><span class="me-h"><i class="mk sm" aria-hidden="true"></i>Kovo Hunter</span></th>
+              <th scope="col" class="me"><span class="me-h"><i class="mk sm" aria-hidden="true"></i>Kovo</span></th>
               <th scope="col">ARTEX</th>
               <th scope="col">Strix</th>
               <th scope="col">Classic DAST <span class="s">(ZAP / Nuclei)</span></th>
@@ -393,35 +393,35 @@
           <tbody>
             <tr>
               <th scope="row">Safety &amp; guardrails</th>
-              <td class="me" data-l="Kovo Hunter">Air-gapped worker, host broker, Tiers 0–3, opaque vault</td>
+              <td class="me" data-l="Kovo">Air-gapped worker, host broker, Tiers 0–3, opaque vault</td>
               <td data-l="ARTEX">Built for red-teaming; easy to misuse on your own apps</td>
               <td data-l="Strix">Containerized; operator-managed safety</td>
               <td data-l="Classic DAST">Rule/template driven; manual auth and scope tuning</td>
             </tr>
             <tr>
               <th scope="row">Finding proof</th>
-              <td class="me" data-l="Kovo Hunter">Zero-LLM replay proof + Verify Fix</td>
+              <td class="me" data-l="Kovo">Zero-LLM replay proof + Verify Fix</td>
               <td data-l="ARTEX">Agent-generated PoCs and reports</td>
               <td data-l="Strix">Agent exploit scripts and PoCs</td>
               <td data-l="Classic DAST">Signature match; manual false-positive triage</td>
             </tr>
             <tr>
               <th scope="row">Code context</th>
-              <td class="me" data-l="Kovo Hunter">Full read-only <code>/repos</code> mounts</td>
+              <td class="me" data-l="Kovo">Full read-only <code>/repos</code> mounts</td>
               <td data-l="ARTEX">Primarily external / black-box</td>
               <td data-l="Strix">Source + dynamic hybrid</td>
               <td data-l="Classic DAST">Black-box HTTP only</td>
             </tr>
             <tr>
               <th scope="row">Interface</th>
-              <td class="me" data-l="Kovo Hunter">Self-hosted end-to-end management UI</td>
+              <td class="me" data-l="Kovo">Self-hosted end-to-end management UI</td>
               <td data-l="ARTEX">Self-hosted web UI</td>
               <td data-l="Strix">CLI-first</td>
               <td data-l="Classic DAST">Desktop GUI (ZAP) / CLI (Nuclei)</td>
             </tr>
             <tr>
               <th scope="row">License</th>
-              <td class="me" data-l="Kovo Hunter">Apache 2.0</td>
+              <td class="me" data-l="Kovo">Apache 2.0</td>
               <td data-l="ARTEX">Open-source / source-available</td>
               <td data-l="Strix">Apache 2.0</td>
               <td data-l="Classic DAST">Apache 2.0 / MIT</td>
@@ -439,9 +439,9 @@
       <p class="eyebrow">Built by</p>
       <h2 id="about-h">Built in the open, <span class="mute">by a builder you can verify.</span></h2>
       <div class="sheet founder">
-        <img class="founder-pic" src="will-chen.jpeg" alt="Will Chen, creator of Kovo Hunter" width="84" height="84" loading="lazy" />
+        <img class="founder-pic" src="will-chen.jpeg" alt="Will Chen, creator of Kovo" width="84" height="84" loading="lazy" />
         <div class="founder-b">
-          <p class="founder-q">“I built Kovo Hunter because autonomous AI pentesting is too important to leave only to red-team tools—or locked behind closed SaaS. You shouldn’t have to choose between catching real vulnerabilities and knowing your security agent won’t go rogue on your own software.”</p>
+          <p class="founder-q">“I built Kovo because autonomous AI pentesting is too important to leave only to red-team tools—or locked behind closed SaaS. You shouldn’t have to choose between catching real vulnerabilities and knowing your security agent won’t go rogue on your own software.”</p>
           <div class="founder-meta">
             <div class="founder-who"><b>Will Chen</b> · Ex-Google Staff Software Engineer</div>
             <div class="founder-links">
@@ -461,7 +461,7 @@
       <h2 id="faq-h">Questions.</h2>
       <div class="sheet faq">
         <details open>
-          <summary><i class="ico chev" data-i="chev"></i><span>Is Kovo Hunter free? What are the restrictions?</span></summary>
+          <summary><i class="ico chev" data-i="chev"></i><span>Is Kovo free? What are the restrictions?</span></summary>
           <div class="ans">
             <p>100% free and open source under <b>Apache 2.0</b>. Unlimited runs across all your apps—you only pay your own LLM provider.</p>
           </div>
@@ -475,7 +475,7 @@
         <details>
           <summary><i class="ico chev" data-i="chev"></i><span>How does it compare to ARTEX, Strix and traditional scanners?</span></summary>
           <div class="ans">
-            <p>See <a href="#compare">Compare</a> above. Kovo Hunter pairs autonomous, end-to-end AI pentesting (like ARTEX) with host-enforced guardrails built for your own software: air-gapped workers, broker-enforced scope tiers, an opaque persona vault, and deterministic zero-LLM replay verification.</p>
+            <p>See <a href="#compare">Compare</a> above. Kovo pairs autonomous, end-to-end AI pentesting (like ARTEX) with host-enforced guardrails built for your own software: air-gapped workers, broker-enforced scope tiers, an opaque persona vault, and deterministic zero-LLM replay verification.</p>
           </div>
         </details>
       </div>
@@ -492,10 +492,10 @@
 <footer class="foot">
   <div class="wrap">
     <div class="foot-top">
-      <span class="foot-brand"><i class="mk" aria-hidden="true"></i><b>Kovo Hunter</b></span>
+      <span class="foot-brand"><i class="mk" aria-hidden="true"></i><b>Kovo</b></span>
       <nav aria-label="Footer">
-        <a href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer">GitHub</a>
-        <a href="https://github.com/kovo-sh/kovo-hunter/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">Apache 2.0 license</a>
+        <a href="https://github.com/kovo-sh/kovo" target="_blank" rel="noopener noreferrer">GitHub</a>
+        <a href="https://github.com/kovo-sh/kovo/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">Apache 2.0 license</a>
         <a href="mailto:will@kovo.sh?subject=Kovo%20Hunter%20Enterprise">Enterprise contact</a>
       </nav>
     </div>

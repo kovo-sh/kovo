@@ -7,7 +7,7 @@ This document defines how the four `benchmarks/realism-suite` fixtures become me
 serves `truth.json` to `Execution`.
 
 > Defensive QA context: the fixtures are loopback-only authorized lab targets. They
-> measure whether Kovo Hunter's discovery, auth, replay and evidence pipeline works under
+> measure whether Kovo's discovery, auth, replay and evidence pipeline works under
 > realistic enterprise, WAN, staging and monorepo conditions — not an attack tool.
 
 ## Safety and evidence rules

@@ -1,4 +1,4 @@
-# Kovo Hunter LabRunner compose file: single hardened service, no ports / privileged / cap_add / host mounts.
+# Kovo LabRunner compose file: single hardened service, no ports / privileged / cap_add / host mounts.
 # LabRunner re-emits its own sanitized `docker run` (--internal network, --cap-drop ALL, --read-only).
 services:
   app:

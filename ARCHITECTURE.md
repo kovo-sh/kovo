@@ -1,4 +1,4 @@
-# Kovo Hunter — Architecture
+# Kovo — Architecture
 
 > Principal-to-principal guide. Real paths, real symbols, real invariants, honest debt.
 > Interactive companion: [`docs/architecture-walkthrough.html`](docs/architecture-walkthrough.html) (standalone, open locally).
@@ -10,7 +10,7 @@
 
 ## 1. Executive architecture & design thesis
 
-Kovo Hunter is a defensive web-application security verifier. It finds vulnerabilities in
+Kovo is a defensive web-application security verifier. It finds vulnerabilities in
 authorized targets, **proves** them with host-verified evidence, and re-tests patches. v8's scope
 is deep multi-hop causal chains (3–6 hops) across multi-service SaaS apps, where each endpoint
 looks fine on its own and the impact only shows up when identities, state transitions and

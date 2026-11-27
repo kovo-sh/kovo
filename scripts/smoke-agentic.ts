@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Kovo Hunter v7 — three-tier smoke battery.
+// Kovo v7 — three-tier smoke battery.
 //
 // Tier 0 (<90 s, $0): worker gate + deterministic replay of past false-positive
 // archetypes through the shared Oracle invariants.
@@ -202,7 +202,7 @@ export interface SmokeArgs {
   help: boolean
 }
 
-const usage = `Kovo Hunter smoke battery (three tiers, defensive QA)
+const usage = `Kovo smoke battery (three tiers, defensive QA)
 
 Usage:
   npm run smoke:agentic -- [flags]
@@ -244,7 +244,7 @@ Flags:
                             bounded cold fallback for monorepo-whitebox when no
                             resumable post-recon snapshot exists (default 420)
   --out-dir <path>          artifacts (default .kovo/smoke-battery)
-  --data-dir <path>         Kovo Hunter data dir (default $KOVO_DATA_DIR or
+  --data-dir <path>         Kovo data dir (default $KOVO_DATA_DIR or
                             $HOME/guardian-data)
   --snapshot-root <path>    post-floor checkpoints (default <out-dir>/snapshots)
   --floor-scorecard <path>  pinned baseline floor scorecard used for net-new/preservation

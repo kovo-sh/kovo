@@ -1,6 +1,6 @@
-// Integration layer between realistic-bench (pane 3) and Kovo Hunter's live engines.
+// Integration layer between realistic-bench (pane 3) and Kovo's live engines.
 //
-// realistic-bench owns materialization, the impact oracle and grading. Kovo Hunter owns discovery,
+// realistic-bench owns materialization, the impact oracle and grading. Kovo owns discovery,
 // hypothesis probing and Zero-LLM replay verification. This adapter joins them without either
 // side reading the other's answer key:
 //   * input:  a materialized app tree + its live origin (per-seed variant.json routes only)
@@ -10,7 +10,7 @@
 // type below deliberately omits them, so truth is not even reachable from this module. Routes,
 // params, personas and the login flow all come from variant.json / the briefing.
 //
-// Kovo Hunter's engine is loaded from ../../scripts/*.ts through non-literal dynamic imports: the
+// Kovo's engine is loaded from ../../scripts/*.ts through non-literal dynamic imports: the
 // benchmark tsconfig stays self-contained (no tsc coupling to scripts/ + src/), while runtime
 // still executes the real engine modules.
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
@@ -103,7 +103,7 @@ export interface BriefingLike {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Kovo Hunter engine surface (loaded dynamically; structural so tsc never follows scripts/)
+// Kovo engine surface (loaded dynamically; structural so tsc never follows scripts/)
 // ---------------------------------------------------------------------------------------------
 export interface DiscoveredParamLike { name: string; location: string; isObjectId: boolean; isCsrf: boolean }
 export interface DiscoveredEndpointLike { method: string; path: string; params: DiscoveredParamLike[]; source: string }
@@ -161,7 +161,7 @@ export interface EngineEnvCreateOptionsLike {
 }
 
 /**
- * A Kovo Hunter-operated loopback canary listener, started *before* the materialized app so its exact
+ * A Kovo-operated loopback canary listener, started *before* the materialized app so its exact
  * port can be handed to the app's contained egress allowlist. The broker is passed unchanged into
  * createEngineEnv, so SSRF/XXE probes, replay verification and the app all share one callback port.
  */
@@ -188,7 +188,7 @@ export async function startOobCanaryBroker(opts: { repoRootDir?: string } = {}):
   const repoRootDir = opts.repoRootDir ?? DEFAULT_REPO_ROOT
   const mod = await importRepoModule(repoRootDir, 'src/server/canary-broker.ts')
   const Broker = mod.CanaryBroker as (new (options?: { storage?: unknown; dnsDomain?: string }) => CanaryBrokerLike) | undefined
-  if (!Broker) throw new Error('src/server/canary-broker.ts does not export CanaryBroker (Kovo Hunter engine API drift)')
+  if (!Broker) throw new Error('src/server/canary-broker.ts does not export CanaryBroker (Kovo engine API drift)')
   const broker = new Broker()
   const info = await broker.startListener({ host: '127.0.0.1', port: 0 })
   if (!info.running || !info.port || info.host !== '127.0.0.1') {
@@ -208,7 +208,7 @@ export async function startOobCanaryBroker(opts: { repoRootDir?: string } = {}):
 
 async function importRepoModule(repoRootDir: string, rel: string): Promise<Record<string, unknown>> {
   const file = resolve(repoRootDir, rel)
-  if (!existsSync(file)) throw new Error(`Kovo Hunter engine module missing: ${file}`)
+  if (!existsSync(file)) throw new Error(`Kovo engine module missing: ${file}`)
   // Non-literal specifier: deliberately opaque to tsc so this tsconfig stays standalone.
   return await import(pathToFileURL(file).href) as Record<string, unknown>
 }
@@ -224,7 +224,7 @@ export async function loadKovoEngine(repoRootDir = DEFAULT_REPO_ROOT): Promise<E
   ])
   const need = (mod: Record<string, unknown>, name: string, where: string): unknown => {
     const fn = mod[name]
-    if (!fn) throw new Error(`${where} does not export ${name} (Kovo Hunter engine API drift)`)
+    if (!fn) throw new Error(`${where} does not export ${name} (Kovo engine API drift)`)
     return fn
   }
   return {

@@ -3,8 +3,8 @@
 #
 # Boots an isolated temporary Compose project (`kovo-smoke`), verifies:
 #   1. Host-accessible `/health` returns `200 ok` and unauthenticated `/` returns `401` (fail-closed)
-#   2. `kovo-hunter` runs as non-root UID 10001
-#   3. `kovo-hunter` connects to `docker-proxy` (`DOCKER_HOST=tcp://docker-proxy:2375`)
+#   2. `kovo` runs as non-root UID 10001
+#   3. `kovo` connects to `docker-proxy` (`DOCKER_HOST=tcp://docker-proxy:2375`)
 #   4. `LinuxWorkerBackend` spawns a sibling `kovo-worker:v4` container with per-session
 #      isolated `volume-subpath` mounts (no root `/scratch` exposure) and cleans up
 #   5. Unconditional `docker compose -p kovo-smoke down -v` leaves zero containers/volumes
@@ -18,7 +18,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT="${KOVO_SMOKE_PROJECT:-kovo-smoke}"
 PORT="${KOVO_PORT:-18000}"
 KOVO_VERSION="${KOVO_VERSION:-local}"
-HUNTER_IMAGE="${KOVO_HUNTER_IMAGE:-kovo-hunter:${KOVO_VERSION}}"
+KOVO_IMAGE="${KOVO_IMAGE:-kovo:${KOVO_VERSION}}"
 WORKER_IMAGE="${KOVO_WORKER_IMAGE:-kovo-worker:v4}"
 AUTO_PULL="${KOVO_WORKER_AUTO_PULL:-0}"
 SCRATCH_VOLUME="${KOVO_WORKER_SCRATCH_VOLUME:-${PROJECT}_kovo_scratch}"
@@ -40,8 +40,8 @@ if ! docker compose version >/dev/null 2>&1; then
   fail "'docker compose' plugin is not available."
 fi
 
-if ! docker image inspect "$HUNTER_IMAGE" >/dev/null 2>&1; then
-  fail "Image '$HUNTER_IMAGE' not found locally. Build it with: docker build -t $HUNTER_IMAGE --build-arg KOVO_WORKER_IMAGE=$WORKER_IMAGE ."
+if ! docker image inspect "$KOVO_IMAGE" >/dev/null 2>&1; then
+  fail "Image '$KOVO_IMAGE' not found locally. Build it with: docker build -t $KOVO_IMAGE --build-arg KOVO_WORKER_IMAGE=$WORKER_IMAGE ."
 fi
 
 if ! docker image inspect "$WORKER_IMAGE" >/dev/null 2>&1; then
@@ -51,8 +51,8 @@ fi
 OVERRIDE_FILE="$(mktemp "${TMPDIR:-/tmp}/kovo-compose-smoke.XXXXXX.yml")"
 cat > "$OVERRIDE_FILE" <<EOF
 services:
-  kovo-hunter:
-    image: ${HUNTER_IMAGE}
+  kovo:
+    image: ${KOVO_IMAGE}
     environment:
       KOVO_WORKER_IMAGE: ${WORKER_IMAGE}
       KOVO_WORKER_AUTO_PULL: "${AUTO_PULL}"
@@ -74,7 +74,7 @@ export KOVO_PORT="$PORT"
 export KOVO_VERSION
 export KOVO_WORKER_SCRATCH_VOLUME="$SCRATCH_VOLUME"
 
-echo "docker-compose-smoke: starting project '$PROJECT' on 127.0.0.1:${PORT} (hunter=${HUNTER_IMAGE}, worker=${WORKER_IMAGE})..."
+echo "docker-compose-smoke: starting project '$PROJECT' on 127.0.0.1:${PORT} (kovo=${KOVO_IMAGE}, worker=${WORKER_IMAGE})..."
 docker compose "${COMPOSE_ARGS[@]}" up -d --no-build --wait-timeout 30
 
 echo "docker-compose-smoke: waiting for http://127.0.0.1:${PORT}/health -> 200 ok..."
@@ -101,17 +101,17 @@ if [[ "$ROOT_STATUS" != "401" ]]; then
   fail "Expected unauthenticated GET / to return 401, got HTTP $ROOT_STATUS."
 fi
 
-# Verify UID 10001 and proxy connectivity inside kovo-hunter.
-UID_OUT="$(docker compose "${COMPOSE_ARGS[@]}" exec -T kovo-hunter id -u)"
+# Verify UID 10001 and proxy connectivity inside kovo.
+UID_OUT="$(docker compose "${COMPOSE_ARGS[@]}" exec -T kovo id -u)"
 if [[ "$UID_OUT" != "10001" ]]; then
-  fail "Expected kovo-hunter UID 10001, got '$UID_OUT'."
+  fail "Expected kovo UID 10001, got '$UID_OUT'."
 fi
 
-docker compose "${COMPOSE_ARGS[@]}" exec -T kovo-hunter docker version >/dev/null \
-  || fail "kovo-hunter failed to query Docker daemon via DOCKER_HOST=tcp://docker-proxy:2375."
+docker compose "${COMPOSE_ARGS[@]}" exec -T kovo docker version >/dev/null \
+  || fail "kovo failed to query Docker daemon via DOCKER_HOST=tcp://docker-proxy:2375."
 
 echo "docker-compose-smoke: spawning sibling worker (${WORKER_IMAGE}) via docker-proxy + volume-subpath..."
-docker compose "${COMPOSE_ARGS[@]}" exec -T -e KOVO_WARM_WORKERS=0 kovo-hunter node -e '
+docker compose "${COMPOSE_ARGS[@]}" exec -T -e KOVO_WARM_WORKERS=0 kovo node -e '
   import("./src/server/worker-backend.ts").then(async m => {
     const { mkdirSync, readdirSync, rmSync, writeFileSync } = await import("node:fs");
     const { randomUUID } = await import("node:crypto");

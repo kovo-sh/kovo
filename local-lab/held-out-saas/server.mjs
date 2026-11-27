@@ -23,7 +23,7 @@ export const heldOutSaasPatchIds = [...PATCH_IDS]
 export async function startHeldOutSaasServer(opts = {}) {
   const host = opts.host ?? '127.0.0.1'
   if (!LOOPBACK.has(host) && process.env.KOVO_LAB !== '1') {
-    throw new Error(`Held-out SaaS lab refuses to bind ${host}: only loopback is allowed outside a Kovo Hunter lab container.`)
+    throw new Error(`Held-out SaaS lab refuses to bind ${host}: only loopback is allowed outside a Kovo lab container.`)
   }
   for (const id of opts.patchedIds ?? []) {
     if (!PATCH_IDS.includes(id)) throw new Error(`Unknown held-out SaaS patch id "${id}".`)

@@ -424,7 +424,7 @@ export function formatRunScopedStateReport(result: RunScopedStateScanResult): st
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
 
-const usage = `Kovo Hunter Per-Run Module-State Ratchet Lint (R2-08)
+const usage = `Kovo Per-Run Module-State Ratchet Lint (R2-08)
 
 Usage:
   node scripts/check-run-scoped-state.ts [--root <dir>] [--json] [--help]

@@ -1,7 +1,7 @@
 {
   "schemaVersion": "1.0",
   "bundleKind": "sealed_anchors",
-  "description": "Kovo Hunter v8 M4 Sealed OSS Multi-Hop Anchor Specs (4 targets: Keycloak, Woodpecker, Metabase, Saleor). Evaluated ONLY at M4 certification via --manifest; kept strictly outside dev hill-climbing. Defensive QA manifests, external impact oracles, and paired patch-retest contracts only — zero exploit payloads.",
+  "description": "Kovo v8 M4 Sealed OSS Multi-Hop Anchor Specs (4 targets: Keycloak, Woodpecker, Metabase, Saleor). Evaluated ONLY at M4 certification via --manifest; kept strictly outside dev hill-climbing. Defensive QA manifests, external impact oracles, and paired patch-retest contracts only — zero exploit payloads.",
   "anchors": [
     {
       "schemaVersion": "1.0",

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Kovo Hunter v6 Phase-1 certification runner.
+ * Kovo v6 Phase-1 certification runner.
  *
  * Turns the reviewer's Phase-1 matrix (ROADMAP check-in #4) into one reproducible
  * certificate. It does not grade anything itself: every number comes from the real
@@ -2208,7 +2208,7 @@ function artifactSecrets(env: NodeJS.ProcessEnv): string[] {
 
 export function renderCertificateMarkdown(cert: Certificate): string {
   const lines: string[] = []
-  lines.push('# Kovo Hunter v6 Phase-1 certification')
+  lines.push('# Kovo v6 Phase-1 certification')
   lines.push('')
   lines.push(`**Verdict: ${cert.verdict}** (status: \`${cert.status}\`, failedCells: ${cert.failedCells})`)
   lines.push('')
@@ -2666,7 +2666,7 @@ export interface CliOptions {
   help: boolean
 }
 
-const usage = `Kovo Hunter v6 Phase-1 certification
+const usage = `Kovo v6 Phase-1 certification
 
 Usage:
   npm run certify:phase1 -- --run [flags]        execute the matrix
@@ -2690,7 +2690,7 @@ Flags:
   --concurrency <n>         concurrent harness processes (default 3) — cell scheduling only
   --worker-concurrency <n>  in-run worker slots per agentic cell (default: harness default:
                             6 agentic / 1 deterministic). Independent of --concurrency.
-  --data-dir <path>         Kovo Hunter data dir with an enabled model profile
+  --data-dir <path>         Kovo data dir with an enabled model profile
                             (default $KOVO_DATA_DIR); required for --run agentic
   --verifier <kind>         auto | docker | local-jq (default docker for --run)
   --use-newgrp              wrap harnesses in 'newgrp docker -c' (Docker socket group)
@@ -2705,7 +2705,7 @@ Flags:
 Environment:
   KOVO_ALLOW_LOCAL_LAB=1   required by the harnesses (set automatically for children)
   KOVO_RB_HELDOUT_SALT     required for --run held-out cells; never written to artifacts
-  KOVO_DATA_DIR            default Kovo Hunter data dir
+  KOVO_DATA_DIR            default Kovo data dir
 
 Verdict thresholds:
   floor spread <= ${DEFAULT_THRESHOLDS.floorSpreadMax} target; preservation >= ${DEFAULT_THRESHOLDS.preservationMin};

@@ -1,4 +1,4 @@
-/* Kovo Hunter landing (lab). Tokens are copied 1:1 from src/styles/tokens.css;
+/* Kovo landing (lab). Tokens are copied 1:1 from src/styles/tokens.css;
    buttons, tags, cards and the finding pane follow src/components/run/{tw.ts,
    display.tsx,toast.tsx,pane.tsx,glyphs.tsx}. The page layout itself is a plain
    landing page (top bar + centred column), not the app shell. */

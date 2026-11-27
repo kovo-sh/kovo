@@ -376,7 +376,7 @@ test('WS-2: hardened Node flags pass serve/cli startup self-check, seal Object.p
     encoding: 'utf8',
     timeout: 15_000,
   })
-  assert.match(cliHelp, /Kovo Hunter Headless Security Scanner CLI/)
+  assert.match(cliHelp, /Kovo Headless Security Scanner CLI/)
 
   // Verify Dockerfile enables Node hardening flags and enforces startup self-check.
   const dockerfile = readFileSync(resolve(REPO_ROOT, 'Dockerfile'), 'utf8')

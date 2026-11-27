@@ -41,7 +41,7 @@ jobs:
           owner="$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
           echo "owner=${owner}" >> "$GITHUB_OUTPUT"
           echo "worker_image=ghcr.io/${owner}/kovo-worker:pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
-          echo "hunter_image=ghcr.io/${owner}/kovo-hunter:pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+          echo "kovo_image=ghcr.io/${owner}/kovo:pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -65,7 +65,7 @@ jobs:
           KOVO_WORKER_IMAGE: ${{ steps.prep.outputs.worker_image }}
         run: bash scripts/docker-smoke.sh
 
-      - name: Build kovo-hunter (linux/amd64)
+      - name: Build kovo (linux/amd64)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -75,25 +75,25 @@ jobs:
           load: true
           build-args: |
             KOVO_WORKER_IMAGE=${{ steps.prep.outputs.worker_image }}
-          tags: ${{ steps.prep.outputs.hunter_image }}
-          cache-from: type=gha,scope=kovo-hunter-amd64
-          cache-to: type=gha,mode=max,scope=kovo-hunter-amd64
+          tags: ${{ steps.prep.outputs.kovo_image }}
+          cache-from: type=gha,scope=kovo-amd64
+          cache-to: type=gha,mode=max,scope=kovo-amd64
           sbom: false
           provenance: false
 
-      - name: Smoke-test kovo-hunter startup health check
+      - name: Smoke-test kovo startup health check
         env:
-          KOVO_HUNTER_IMAGE: ${{ steps.prep.outputs.hunter_image }}
+          KOVO_IMAGE: ${{ steps.prep.outputs.kovo_image }}
         run: |
           set -euo pipefail
-          cid="$(docker run -d --rm -p 18000:8000 "$KOVO_HUNTER_IMAGE")"
+          cid="$(docker run -d --rm -p 18000:8000 "$KOVO_IMAGE")"
           trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
           uid="$(docker exec "$cid" id -u)"
           test "$uid" != "0"
           docker exec "$cid" docker --version
           for i in $(seq 1 30); do
             if docker exec "$cid" node -e "fetch('http://127.0.0.1:8000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"; then
-              echo "kovo-hunter /health OK"
+              echo "kovo /health OK"
               exit 0
             fi
             sleep 1
@@ -187,7 +187,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  build-hunter:
+  build-kovo:
     if: github.event_name != 'pull_request'
     strategy:
       fail-fast: false
@@ -237,11 +237,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata for kovo-hunter
+      - name: Extract metadata for kovo
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-hunter
+          images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo
           tags: |
             type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
@@ -249,7 +249,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
 
-      - name: Build and push kovo-hunter (${{ matrix.platform }}) by digest
+      - name: Build and push kovo (${{ matrix.platform }}) by digest
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -259,13 +259,13 @@ jobs:
           build-args: |
             KOVO_WORKER_IMAGE=${{ steps.prep.outputs.worker_image }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-hunter,push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=kovo-hunter-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=kovo-hunter-${{ matrix.arch }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=kovo-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=kovo-${{ matrix.arch }}
           sbom: true
           provenance: mode=max
 
-      - name: Export kovo-hunter digest
+      - name: Export kovo digest
         run: |
           set -euo pipefail
           mkdir -p /tmp/digests
@@ -273,17 +273,17 @@ jobs:
           test -n "$digest"
           touch "/tmp/digests/${digest#sha256:}"
 
-      - name: Upload kovo-hunter digest
+      - name: Upload kovo digest
         uses: actions/upload-artifact@v4
         with:
-          name: digests-hunter-${{ matrix.arch }}
+          name: digests-kovo-${{ matrix.arch }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
   merge-manifests:
     if: github.event_name != 'pull_request'
-    needs: [build-worker, build-hunter]
+    needs: [build-worker, build-kovo]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -301,12 +301,12 @@ jobs:
           merge-multiple: true
           path: /tmp/digests-worker
 
-      - name: Download kovo-hunter digests
+      - name: Download kovo digests
         uses: actions/download-artifact@v4
         with:
-          pattern: digests-hunter-*
+          pattern: digests-kovo-*
           merge-multiple: true
-          path: /tmp/digests-hunter
+          path: /tmp/digests-kovo
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -362,11 +362,11 @@ jobs:
           subject-digest: ${{ steps.merge-worker.outputs.digest }}
           push-to-registry: true
 
-      - name: Extract metadata for kovo-hunter
-        id: meta-hunter
+      - name: Extract metadata for kovo
+        id: meta-kovo
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-hunter
+          images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo
           tags: |
             type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
@@ -374,11 +374,11 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
 
-      - name: Create and push kovo-hunter multi-arch manifest
-        id: merge-hunter
+      - name: Create and push kovo multi-arch manifest
+        id: merge-kovo
         run: |
           set -euo pipefail
-          image="${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-hunter"
+          image="${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo"
           TAG_ARGS=()
           first_tag=""
           while IFS= read -r tag; do
@@ -386,10 +386,10 @@ jobs:
               TAG_ARGS+=(--tag "$tag")
               [[ -z "$first_tag" ]] && first_tag="$tag"
             fi
-          done <<< "${{ steps.meta-hunter.outputs.tags }}"
+          done <<< "${{ steps.meta-kovo.outputs.tags }}"
           test -n "$first_tag"
           SOURCES=()
-          for f in /tmp/digests-hunter/*; do
+          for f in /tmp/digests-kovo/*; do
             SOURCES+=("${image}@sha256:$(basename "$f")")
           done
           test "${#SOURCES[@]}" -ge 2
@@ -398,10 +398,10 @@ jobs:
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
           docker buildx imagetools inspect "$first_tag"
 
-      - name: Attest kovo-hunter provenance
+      - name: Attest kovo provenance
         if: github.event.repository.private == false
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-hunter
-          subject-digest: ${{ steps.merge-hunter.outputs.digest }}
+          subject-name: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo
+          subject-digest: ${{ steps.merge-kovo.outputs.digest }}
           push-to-registry: true

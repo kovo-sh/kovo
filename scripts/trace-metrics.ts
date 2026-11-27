@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v5.1 — trace metrics CLI.
+ * Kovo v5.1 — trace metrics CLI.
  *
  * Reads `.kovo/traces/<id>/` (manifest + events) and computes the nine fast-loop metrics
  * accepted in plans/ROADMAP-v5.md. Prints a compact table (or `--json`) and never dumps raw

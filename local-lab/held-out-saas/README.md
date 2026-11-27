@@ -1,6 +1,6 @@
 # Held-Out Modern SaaS Lab ("Orbit Workspace")
 
-Kovo Hunter v4 Suite C: 20 planted High/Critical vulnerabilities + 6 hard decoys in a multi-tenant SaaS.
+Kovo v4 Suite C: 20 planted High/Critical vulnerabilities + 6 hard decoys in a multi-tenant SaaS.
 Pure Node.js stdlib (`node:http`, `node:crypto`, `node:sqlite`), synthetic data only, no npm install, no disk writes.
 
 | File | Purpose |

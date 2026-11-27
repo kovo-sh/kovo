@@ -1,6 +1,6 @@
-# Kovo Hunter — Option B Sibling-Container (Docker-outside-of-Docker) Deployment
+# Kovo — Option B Sibling-Container (Docker-outside-of-Docker) Deployment
 #
-# Runs Kovo Hunter without Docker-in-Docker or privileged mode. A restricted
+# Runs Kovo without Docker-in-Docker or privileged mode. A restricted
 # socket proxy on an internal-only bridge network mediates Docker API calls for
 # spawning isolated, `--network none`, UID-10001 sibling worker containers.
 #
@@ -45,8 +45,8 @@ services:
     networks:
       - docker_socket_net
 
-  kovo-hunter:
-    image: ghcr.io/wwwillchen/kovo-hunter:${KOVO_VERSION:-latest}
+  kovo:
+    image: ghcr.io/kovo-sh/kovo:${KOVO_VERSION:-latest}
     build:
       context: .
     restart: unless-stopped

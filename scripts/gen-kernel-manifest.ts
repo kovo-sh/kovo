@@ -432,7 +432,7 @@ export function checkKernelManifestFreshness(
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
 
-const usage = `Kovo Hunter Confirmation-Kernel Manifest Generator (R3-04)
+const usage = `Kovo Confirmation-Kernel Manifest Generator (R3-04)
 
 Usage:
   node scripts/gen-kernel-manifest.ts --check [--root <dir>]

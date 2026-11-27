@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// realistic-bench x Kovo Hunter CLI: materialize one variant, run the real Kovo Hunter engines
+// realistic-bench x Kovo CLI: materialize one variant, run the real Kovo engines
 // against it, grade with grader/score.ts, and print recall/precision by vuln class.
 //
 // Usage:

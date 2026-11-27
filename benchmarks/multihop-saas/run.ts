@@ -1,4 +1,4 @@
-// multihop-saas entrypoint: programmatic API + CLI + Kovo Hunter v8 product-runner bridge.
+// multihop-saas entrypoint: programmatic API + CLI + Kovo v8 product-runner bridge.
 //   startPaygrid({ seed, mode, twin?, asyncLatencyMs? }) -> StartedPaygrid
 //   startMultihopApp({ app, seed, mode?, variant?, fastLab?, heldOutSalt? }) -> StartedMultihopApp
 //   briefingFor(started, mode?) -> MultihopProductBriefing
@@ -318,7 +318,7 @@ export function gradeLab(lab: StartedPaygrid | StartedLabBase, findings: Finding
 }
 
 // ---------------------------------------------------------------------------------------------
-// Kovo Hunter v8 product-runner bridge (`scripts/benchmark-multihop.ts`)
+// Kovo v8 product-runner bridge (`scripts/benchmark-multihop.ts`)
 // ---------------------------------------------------------------------------------------------
 
 export interface StartMultihopAppOptions {
@@ -1148,7 +1148,7 @@ function resolveReceiptChainId(
     return receipt.chainId
   }
 
-  // Step B: endpoint + causal-topology matching for real Kovo Hunter runs (anti-contamination generic chainIds).
+  // Step B: endpoint + causal-topology matching for real Kovo runs (anti-contamination generic chainIds).
   if (!chainSpecs.length || candidateChainIds.size === 0) return null
   const hops = receipt.receipt?.hops
   if (receipt.hopCount < 2 || (hops !== undefined && hops.length < 2)) {

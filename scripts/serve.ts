@@ -171,9 +171,9 @@ export function sessionCookie(token: string, origin: string): string {
 }
 
 function bootstrapNotice(): string {
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Kovo Hunter local session</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"></head>
-<body><h1>Kovo Hunter needs a local session</h1>
-<p>Open the one-time bootstrap URL printed by the Kovo Hunter server in your terminal, or read
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Kovo local session</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"></head>
+<body><h1>Kovo needs a local session</h1>
+<p>Open the one-time bootstrap URL printed by the Kovo server in your terminal, or read
 <code>&lt;data-dir&gt;/bootstrap</code> (mode 0600) and open <code>/?bootstrap=&lt;secret&gt;</code>.</p>
 <p>A plain request to this server no longer receives an owner session cookie.</p></body></html>`
 }
@@ -470,7 +470,7 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
 
     const session = isSessionAuthorized(req.headers.cookie, token)
     if (!isAllowedSecFetchSite(req.headers['sec-fetch-site'], readOnly)) {
-      return reject(res, 403, 'Open Kovo Hunter directly.')
+      return reject(res, 403, 'Open Kovo directly.')
     }
     if (!session) {
       if (shouldReturnJsonAuthError(path.pathname)) {
@@ -1184,7 +1184,7 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
         })
       }
       if (res.destroyed) return
-      if (!res.headersSent) reject(res, 500, 'Kovo Hunter could not complete the request.')
+      if (!res.headersSent) reject(res, 500, 'Kovo could not complete the request.')
       else res.end()
     })
   })
@@ -1466,8 +1466,8 @@ async function main() {
     const bootstrapFile = join(directory, 'bootstrap-url')
     writeFileSync(bootstrapFile, `${local.bootstrapUrl(`http://127.0.0.1:${externalPort}`)}\n`, { mode: 0o600 })
     chmodSync(bootstrapFile, 0o600)
-    console.log(`Kovo Hunter listening on http://${listenHost}:${port}`)
-    console.log(`Open Kovo Hunter with the one-time bootstrap URL: ${local.bootstrapUrl(origin)}`)
+    console.log(`Kovo listening on http://${listenHost}:${port}`)
+    console.log(`Open Kovo with the one-time bootstrap URL: ${local.bootstrapUrl(origin)}`)
   })
 }
 

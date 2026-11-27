@@ -523,5 +523,5 @@ test('R3-H-11: package.json and Dockerfile enforce hardened Node flags and start
     timeout: 15_000,
   })
   assert.strictEqual(cliWithFlags.status, 0)
-  assert.match(cliWithFlags.stdout, /Kovo Hunter Headless Security Scanner CLI/)
+  assert.match(cliWithFlags.stdout, /Kovo Headless Security Scanner CLI/)
 })
