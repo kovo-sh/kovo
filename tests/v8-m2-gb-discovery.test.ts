@@ -15,10 +15,9 @@
  */
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
-import { readFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
@@ -405,11 +404,14 @@ test('2c. createCheckpointOnlySessionGuard hard-blocks non-proof scripts after >
     assert.equal(guard.shouldBlockCheckpointOnlyScript(proofScript), false, `proof script must not be blocked: ${proofScript}`)
   }
 
-  // Verify live wiring in exec-worker-runner.ts invokes shouldBlockCheckpointOnlyScript BEFORE runAgentScriptProof.
-  const runnerSrc = readFileSync(join(REPO_ROOT, 'src/server/exec-worker-runner.ts'), 'utf8')
-  const blockIdx = runnerSrc.indexOf('checkpointOnlyGuard.shouldBlockCheckpointOnlyScript(script)')
-  const dockerIdx = runnerSrc.indexOf('this.host.verifier.runAgentScriptProof(')
-  assert.ok(blockIdx > 0 && dockerIdx > blockIdx, 'shouldBlockCheckpointOnlyScript must short-circuit before runAgentScriptProof')
+  // After a real proof attempt resets the streak, non-proof scripts are no longer blocked until 2 consecutive checkpoint_only calls again.
+  guard.summarizeOutcome({
+    verdict: { confirmed: false, reason: 'oracle_failed', detail: 'Composite receipt failed terminal stage.', exitCode: 0 },
+    sealedCapabilities: [],
+    verifiedHops: [],
+  })
+  assert.equal(guard.consecutiveCount(), 0)
+  assert.equal(guard.shouldBlockCheckpointOnlyScript(sealOnlyScript), false)
 })
 
 test('1d. Multi-origin 4KB brief reduction preserves >= 1 route per approved publicOrigin and avoids high-risk origin starvation', async t => {

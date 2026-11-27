@@ -1734,4 +1734,10 @@ test('Check 8: All terminalVulnClass/vulnClass examples in assignment-brief, age
     checkedClasses.size >= 8,
     `Expected >= 8 distinct canonical terminal classes validated, got ${checkedClasses.size}: ${[...checkedClasses].join(', ')}`,
   )
+
+  // Also verify live checkpoint_only pre-Docker hard-block wiring in exec-worker-runner.ts.
+  const runnerSrc = readFileSync(join(REPO_ROOT, 'src/server/exec-worker-runner.ts'), 'utf8')
+  const blockIdx = runnerSrc.indexOf('checkpointOnlyGuard.shouldBlockCheckpointOnlyScript(script)')
+  const dockerIdx = runnerSrc.indexOf('this.host.verifier.runAgentScriptProof(')
+  assert.ok(blockIdx > 0 && dockerIdx > blockIdx, 'shouldBlockCheckpointOnlyScript must short-circuit before runAgentScriptProof')
 })
