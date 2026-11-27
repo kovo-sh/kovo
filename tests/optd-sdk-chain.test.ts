@@ -123,7 +123,7 @@ async function startFixture(t: TestContext, runId: string): Promise<{ origin: st
     }
     if (u.pathname === '/api/v1/permissions/prime' && req.method === 'POST') {
       cachePrimed = true
-      return sendJson(res, 200, { ok: true, tenantId: 'tenant-a', primed: true })
+      return sendJson(res, 200, { ok: true, tenantId: 'tenant-a', primed: true, sessionTok: 'dual_bleed_tok_001122334455' })
     }
     if (u.pathname === '/api/v1/reports/export' && req.method === 'GET') {
       if (cachePrimed) {
@@ -493,4 +493,74 @@ test('live VerifyRpcServer: dual_tenant_abac synthOracleInput auto-populates ora
     singleForeignControlDeniedExchangeId: ctrl.exchangeId,
     batchRequestExchangeId: s2.exchangeId,
   })
+})
+
+test('live VerifyRpcServer: dual_tenant_abac multi-hop value_binding chains synthesize oracleInput when oracleFamily is omitted without contaminating broken_access_control', async t => {
+  const { ctx } = await startFixture(t, 'run-optd-sdk-dual-tenant-vb')
+
+  // 1) dual_tenant_abac + value_binding edge + omitted oracleFamily -> synthesizes dual_org_cache_bleed & confirms live
+  const chBleed = ctx.chain('chain-optd-dual-vb-bleed', 'dual_tenant_abac')
+  const ctrl = await chBleed.control('GET /api/v1/reports/export', { as: 'dual_member' })
+  assert.equal(ctrl.status, 403)
+  const s1 = await chBleed.step('POST /api/v1/permissions/prime', { hopId: 'vb_1', as: 'dual_member', claimedDelta: 'Prime tenant-a session.' })
+  assert.equal(s1.status, 200)
+  const tokCap = await chBleed.seal(s1, { jsonPath: '$.sessionTok', kind: 'header_secret' })
+  const s2 = await chBleed.step('GET /api/v1/reports/export', {
+    hopId: 'vb_2',
+    as: 'dual_member',
+    capability: { handle: tokCap, target: 'header', headerName: 'x-session-tok' },
+    claimedDelta: 'Read tenant-b report with value_binding after cache bleed.',
+  })
+  assert.equal(s2.status, 200)
+
+  const builtBleed = chBleed.build({ terminalHopId: 'vb_2', terminalExchange: s2, claimedImpact: 'Dual-tenant cache bleed on multi-hop value_binding chain.' })
+  assert.ok((builtBleed.causalEdges ?? []).some(e => e.kind === 'value_binding' && e.fromHopId === 'vb_1' && e.toHopId === 'vb_2'))
+  assert.deepEqual(builtBleed.terminalImpact.oracleInput, {
+    mode: 'dual_org_cache_bleed',
+    baselineDeniedControlExchangeId: ctrl.exchangeId,
+    primeActionExchangeId: s1.exchangeId,
+    bledAccessExchangeId: s2.exchangeId,
+  })
+  const provedBleed = await chBleed.prove({ terminalHopId: 'vb_2', terminalExchange: s2, claimedImpact: 'Dual-tenant cache bleed on multi-hop value_binding chain.' })
+  assert.equal(provedBleed.confirmed, true, `Expected live dual_tenant_abac value_binding chain to confirm: ${JSON.stringify(provedBleed)}`)
+
+  // 2) dual_tenant_abac + value_binding edge + post-transfer readback + entityId -> picks cross_org_transfer
+  const chXfer = ctx.chain('chain-optd-dual-vb-xfer', 'dual_tenant_abac')
+  const xCtrl = await chXfer.control('GET /api/v1/items/item-77/export', { as: 'dual_member', entityId: 'item-77' })
+  assert.equal(xCtrl.status, 403)
+  const x1 = await chXfer.step('POST /api/v1/permissions/prime', { hopId: 'xv_1', as: 'dual_member', claimedDelta: 'Mint session.' })
+  const xCap = await chXfer.seal(x1, { jsonPath: '$.sessionTok', kind: 'header_secret' })
+  const x2 = await chXfer.step('POST /api/v1/items/item-77/transfer', {
+    hopId: 'xv_2',
+    as: 'dual_member',
+    entityId: 'item-77',
+    capability: { handle: xCap, target: 'header', headerName: 'x-session-tok' },
+    claimedDelta: 'Transfer item-77 to tenant-a.',
+  })
+  assert.equal(x2.status, 200)
+  const xRb = await chXfer.readback('GET /api/v1/items/item-77/export', { as: 'dual_member', entityId: 'item-77' })
+  assert.equal(xRb.status, 200)
+  const builtXfer = chXfer.build({ claimedImpact: 'Cross-org transfer on value_binding chain.' })
+  assert.ok((builtXfer.causalEdges ?? []).some(e => e.kind === 'value_binding'))
+  assert.deepEqual(builtXfer.terminalImpact.oracleInput, {
+    mode: 'cross_org_transfer',
+    sourceControlDeniedExchangeId: xCtrl.exchangeId,
+    transferRecordExchangeId: x2.exchangeId,
+    postTransferReadbackExchangeId: xRb.exchangeId,
+    entityId: 'item-77',
+  })
+
+  // 3) broken_access_control (non-dual_tenant_abac) MUST NOT synthesize dual_tenant_abac oracleInput when oracleFamily is omitted
+  const chBac = ctx.chain('chain-optd-bac-no-dual', 'broken_access_control')
+  chBac.control(ctrl)
+  chBac.recordHop({ hopId: 'b_1', target: 'POST /api/v1/permissions/prime', exchangeIds: [s1.exchangeId], producedCapabilities: [tokCap], claimedDelta: 'Mint.' })
+  chBac.recordHop({ hopId: 'b_2', target: 'GET /api/v1/reports/export', exchangeIds: [s2.exchangeId], consumedCapabilities: [tokCap], claimedDelta: 'Read.' })
+  assert.equal(chBac.build({ terminalHopId: 'b_2', terminalExchange: s2 }).terminalImpact.oracleInput, undefined)
+
+  // 4) cross_tenant_read with value_binding edge + omitted oracleFamily MUST NOT force dual_org_cache_bleed (preserves single-tenant multiHopDualDag)
+  const chRead = ctx.chain('chain-optd-ctr-vb-no-bleed', 'cross_tenant_read')
+  chRead.control(ctrl)
+  chRead.recordHop({ hopId: 'r_1', target: 'POST /api/v1/permissions/prime', exchangeIds: [s1.exchangeId], producedCapabilities: [tokCap], claimedDelta: 'Mint.' })
+  chRead.recordHop({ hopId: 'r_2', target: 'GET /api/v1/reports/export', exchangeIds: [s2.exchangeId], consumedCapabilities: [tokCap], claimedDelta: 'Read.' })
+  assert.equal(chRead.build({ terminalHopId: 'r_2', terminalExchange: s2 }).terminalImpact.oracleInput, undefined)
 })

@@ -507,7 +507,7 @@ export class ChainBuilder {
     const lastExIds = lastHop.exchangeIds ?? [], resolvedTermEx = terminalExchangeId ?? lastExIds[lastExIds.length - 1]
     const normCls = this.terminalVulnClass.trim().toLowerCase().replace(/[\s-]+/g, '_')
     const effFamily: OracleFamily | undefined = opts.oracleFamily ?? (/^(?:economic_conservation|conserved_balance|ledger_overcredit|over_refund|double_spend|race_condition)$/.test(normCls) ? 'economic_conservation' : /^(?:dual_tenant_abac|cross_tenant_(?:export|read|write|idor))$/.test(normCls) ? 'dual_tenant_abac' : undefined)
-    const oracleInput = effFamily ? this.synthOracleInput(effFamily, opts.oracleInput, activeHops, edges, preControl, postReadback, resolvedTermEx, Boolean(opts.oracleFamily)) : (opts.oracleInput ? { ...opts.oracleInput } : undefined)
+    const oracleInput = effFamily ? this.synthOracleInput(effFamily, opts.oracleInput, activeHops, edges, preControl, postReadback, resolvedTermEx, Boolean(opts.oracleFamily) || normCls === 'dual_tenant_abac') : (opts.oracleInput ? { ...opts.oracleInput } : undefined)
     return {
       chainId: this.chainId, terminalVulnClass: this.terminalVulnClass, replayMode: opts.replayMode ?? this.replayMode,
       ...(opts.benchmarkMode ?? this.benchmarkMode !== undefined ? { benchmarkMode: opts.benchmarkMode ?? this.benchmarkMode } : {}),
