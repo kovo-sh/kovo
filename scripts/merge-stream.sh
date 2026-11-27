@@ -30,6 +30,7 @@
 #   KOVO_MERGE_SKIP_CI_CHECK Set to 1 to skip GitHub Actions verify.yml check
 #   KOVO_MERGE_SKIP_KERNEL_REVIEW Set to 1 to skip kernel review lane check (unit tests only)
 #   KOVO_GH_BIN              Override gh CLI binary (default: gh)
+#   KOVO_TMPDIR              Preferred temp root when TMPDIR is unset/empty (default: $HOME/guardian-bench-tmp if writable)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -236,16 +237,33 @@ if [[ -f "$LOCK_FILE" && "$CLEAR_RED_LOCK" -eq 0 ]]; then
   exit 1
 fi
 
-# 2. Create temporary detached worktree at BASE_SHA and ensure guaranteed cleanup.
-WORKTREE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kovo-merge-stream-XXXXXX")"
+# 2. Protect /tmp tmpfs by defaulting TMPDIR to a per-run subdir under
+#    ${KOVO_TMPDIR:-$HOME/guardian-bench-tmp} when TMPDIR is unset/empty,
+#    then create the temporary detached worktree under ${TMPDIR:-/tmp} with guaranteed cleanup.
+RUN_TMPDIR=""
+WORKTREE_DIR=""
 cleanup() {
   if [[ -n "${WORKTREE_DIR:-}" && -e "$WORKTREE_DIR" ]]; then
     git -C "$REPO_ROOT" worktree remove --force "$WORKTREE_DIR" >/dev/null 2>&1 || true
     rm -rf "$WORKTREE_DIR" >/dev/null 2>&1 || true
     git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
   fi
+  if [[ -n "${RUN_TMPDIR:-}" && -e "$RUN_TMPDIR" ]]; then
+    rm -rf "$RUN_TMPDIR" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
+
+if [[ -z "${TMPDIR:-}" ]]; then
+  _kovo_tmp_base="${KOVO_TMPDIR:-${HOME:+${HOME}/guardian-bench-tmp}}"
+  if [[ -n "$_kovo_tmp_base" && -d "$_kovo_tmp_base" && -w "$_kovo_tmp_base" ]]; then
+    RUN_TMPDIR="$(mktemp -d "${_kovo_tmp_base}/kovo-gate-XXXXXX")"
+    export TMPDIR="$RUN_TMPDIR"
+  fi
+  unset _kovo_tmp_base
+fi
+
+WORKTREE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kovo-merge-stream-XXXXXX")"
 
 git -C "$REPO_ROOT" worktree add --quiet --detach "$WORKTREE_DIR" "$BASE_SHA"
 
