@@ -1089,7 +1089,7 @@ test('enforces rce_proof cryptographic nonces (dynamic_math, split_echo, oob_can
     transport: async (_url, _addr, _sig, opts) => {
       const parsed = JSON.parse(opts?.body ?? '{}') as { mode?: string; url?: string }
       if (triggerProbe && parsed.mode === 'exec' && parsed.url) {
-        // Simulate asynchronous server-side callback to Kovo Hunter's local canary listener
+        // Simulate asynchronous server-side callback to Kovo's local canary listener
         void fetch(parsed.url, { signal: AbortSignal.timeout(3_000) }).catch(() => undefined)
       }
       return { status: 202, headers: { 'content-type': 'application/json' }, body: '{"queued":true}' }
@@ -1297,7 +1297,7 @@ test('clones full repos without .git/credentials, extracts deep lockfiles, and m
 
   await exec('git', ['init', '-b', 'main', srcRepo])
   await exec('git', ['-C', srcRepo, 'config', 'user.email', 'test@kovo.local'])
-  await exec('git', ['-C', srcRepo, 'config', 'user.name', 'Kovo Hunter Test'])
+  await exec('git', ['-C', srcRepo, 'config', 'user.name', 'Kovo Test'])
 
   // Create >45 filler files so we prove no 40-file cap applies to full clone / dependency walk
   mkdirSync(join(srcRepo, 'src', 'routes'), { recursive: true })

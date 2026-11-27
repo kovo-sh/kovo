@@ -53,39 +53,39 @@ test('resolveGithubAppSlug & githubAppInstallUrl: env precedence, validation, gi
     mkdirSync(credDir, { recursive: true, mode: 0o700 })
     writeFileSync(
       join(credDir, 'github-app.json'),
-      `${JSON.stringify({ appSlug: 'kovo-hunter' }, null, 2)}\n`,
+      `${JSON.stringify({ appSlug: 'kovo' }, null, 2)}\n`,
       { mode: 0o600 },
     )
-    assert.equal(resolveGithubAppSlug(dataDir), 'kovo-hunter')
+    assert.equal(resolveGithubAppSlug(dataDir), 'kovo')
     assert.equal(
-      githubAppInstallUrl('kovo-hunter'),
-      'https://github.com/apps/kovo-hunter/installations/new',
+      githubAppInstallUrl('kovo'),
+      'https://github.com/apps/kovo/installations/new',
     )
     assert.equal(
-      githubAppInstallUrl('kovo-hunter', 'https://github.enterprise.local///'),
-      'https://github.enterprise.local/apps/kovo-hunter/installations/new',
+      githubAppInstallUrl('kovo', 'https://github.enterprise.local///'),
+      'https://github.enterprise.local/apps/kovo/installations/new',
     )
 
     // saveGithubClientId preserves existing appSlug in github-app.json
     saveGithubClientId(dataDir, 'Iv23liKEEPAPPSLUG99')
     const persisted = JSON.parse(readFileSync(join(credDir, 'github-app.json'), 'utf8')) as Record<string, unknown>
     assert.equal(persisted.clientId, 'Iv23liKEEPAPPSLUG99')
-    assert.equal(persisted.appSlug, 'kovo-hunter')
-    assert.equal(resolveGithubAppSlug(dataDir), 'kovo-hunter')
+    assert.equal(persisted.appSlug, 'kovo')
+    assert.equal(resolveGithubAppSlug(dataDir), 'kovo')
 
     // Env var takes precedence over github-app.json and trims whitespace
-    process.env.KOVO_GITHUB_APP_SLUG = '  kovo-hunter-staging  '
-    assert.equal(resolveGithubAppSlug(dataDir), 'kovo-hunter-staging')
+    process.env.KOVO_GITHUB_APP_SLUG = '  kovo-staging  '
+    assert.equal(resolveGithubAppSlug(dataDir), 'kovo-staging')
 
     // Invalid env slug is rejected (returns null)
     process.env.KOVO_GITHUB_APP_SLUG = 'Bad Slug/Path'
     assert.equal(resolveGithubAppSlug(dataDir), null)
 
     // getGithubAuthStatus exposes appSlug and installUrl
-    process.env.KOVO_GITHUB_APP_SLUG = 'kovo-hunter'
+    process.env.KOVO_GITHUB_APP_SLUG = 'kovo'
     const status = getGithubAuthStatus(dataDir)
-    assert.equal(status.appSlug, 'kovo-hunter')
-    assert.equal(status.installUrl, 'https://github.com/apps/kovo-hunter/installations/new')
+    assert.equal(status.appSlug, 'kovo')
+    assert.equal(status.installUrl, 'https://github.com/apps/kovo/installations/new')
   } finally {
     if (prevSlug === undefined) delete process.env.KOVO_GITHUB_APP_SLUG
     else process.env.KOVO_GITHUB_APP_SLUG = prevSlug
@@ -96,7 +96,7 @@ test('resolveGithubAppSlug & githubAppInstallUrl: env precedence, validation, gi
 test('listAccessibleGithubRepos queries /user/installations FIRST, puts installed private/org repos ahead of public repos, and deduplicates keeping richer/private entry', async () => {
   const dataDir = tempDataDir('kovo-gh-inst-first-')
   const prevSlug = process.env.KOVO_GITHUB_APP_SLUG
-  process.env.KOVO_GITHUB_APP_SLUG = 'kovo-hunter'
+  process.env.KOVO_GITHUB_APP_SLUG = 'kovo'
 
   const accessToken = 'ghu_11INSTALLATIONS_FIRST_TEST_TOKEN_12345'
   const callOrder: string[] = []
@@ -250,7 +250,7 @@ test('listAccessibleGithubRepos queries /user/installations FIRST, puts installe
     // Structured installation metadata
     assert.equal(listed.needsAppInstall, false)
     assert.equal(listed.privateRepoCount, 3)
-    assert.equal(listed.installUrl, `${server.baseUrl}/apps/kovo-hunter/installations/new`)
+    assert.equal(listed.installUrl, `${server.baseUrl}/apps/kovo/installations/new`)
     assert.deepEqual(listed.installations, [
       {
         id: 101,
@@ -273,7 +273,7 @@ test('listAccessibleGithubRepos queries /user/installations FIRST, puts installe
     assert.equal(statusAfter.needsAppInstall, false)
     assert.equal(statusAfter.privateRepoCount, 3)
     assert.equal(statusAfter.installations?.length, 2)
-    assert.equal(statusAfter.installUrl, `${server.baseUrl}/apps/kovo-hunter/installations/new`)
+    assert.equal(statusAfter.installUrl, `${server.baseUrl}/apps/kovo/installations/new`)
   } finally {
     await server.close()
     if (prevSlug === undefined) delete process.env.KOVO_GITHUB_APP_SLUG
@@ -285,7 +285,7 @@ test('listAccessibleGithubRepos queries /user/installations FIRST, puts installe
 test('listAccessibleGithubRepos sets needsAppInstall=true when GitHub App token has 0 installations, and false for PATs', async () => {
   const dataDir = tempDataDir('kovo-gh-needs-inst-')
   const prevSlug = process.env.KOVO_GITHUB_APP_SLUG
-  process.env.KOVO_GITHUB_APP_SLUG = 'kovo-hunter'
+  process.env.KOVO_GITHUB_APP_SLUG = 'kovo'
 
   const server = await startMockGithubServer((req, res) => {
     const url = req.url ?? '/'
@@ -329,7 +329,7 @@ test('listAccessibleGithubRepos sets needsAppInstall=true when GitHub App token 
     assert.equal(appListed.installations.length, 0)
     assert.equal(appListed.needsAppInstall, true)
     assert.equal(appListed.privateRepoCount, 0)
-    assert.equal(appListed.installUrl, `${server.baseUrl}/apps/kovo-hunter/installations/new`)
+    assert.equal(appListed.installUrl, `${server.baseUrl}/apps/kovo/installations/new`)
     assert.deepEqual(appListed.repos.map(r => r.fullName), ['octo-dev/public-demo'])
 
     const appStatus = getGithubAuthStatus(dataDir, undefined, server.baseUrl)

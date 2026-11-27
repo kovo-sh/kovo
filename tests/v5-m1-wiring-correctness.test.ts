@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v5 M1-core: P0 wiring, canary correlation, dedupe, routing & feedback correctness.
+ * Kovo v5 M1-core: P0 wiring, canary correlation, dedupe, routing & feedback correctness.
  *
  * Covers plans/v5.md M1.1–M1.5 as owned by the m1-core stream:
  *   1.1 storage/session/csrfBind/authMutation/traceId/runId/assignmentId wiring in Execution

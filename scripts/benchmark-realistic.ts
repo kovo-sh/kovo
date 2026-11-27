@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Kovo Hunter v5 M0 — true end-to-end `realistic-bench` harness.
+// Kovo v5 M0 — true end-to-end `realistic-bench` harness.
 //
-// Drives Kovo Hunter's REAL `Execution` orchestrator (Phase-0 recon → threat model →
+// Drives Kovo's REAL `Execution` orchestrator (Phase-0 recon → threat model →
 // investigation → Zero-LLM replay verification) against a materialized
 // `benchmarks/realistic-bench` app, then grades the persisted findings with the
 // benchmark's immutable grader.
@@ -22,7 +22,7 @@
 //
 // Model usage: a fresh per-cell data directory has no provider profile, so the
 // run is deterministic/Zero-LLM (`Execution` stops after threat model because it
-// has no investigator). Point `--data-dir` at a Kovo Hunter data directory that has
+// has no investigator). Point `--data-dir` at a Kovo data directory that has
 // an enabled model profile to run the full agentic loop. `--no-llm` refuses to
 // run when such a profile is present. The selected model mode is always recorded
 // in the artifact metadata; results are never simulated.
@@ -211,7 +211,7 @@ export interface RealisticArgs {
   help: boolean
 }
 
-const usage = `Kovo Hunter realistic-bench (real Execution loop)
+const usage = `Kovo realistic-bench (real Execution loop)
 
 Usage:
   KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:realistic -- [flags]
@@ -245,7 +245,7 @@ Flags:
                           (default: 6 agentic, 1 with --no-llm). Independent of
                           --concurrency: it changes how many assignments one cell
                           runs at once, never how many cells run at once.
-  --data-dir <path>       Kovo Hunter data dir (single cell: used verbatim, so an
+  --data-dir <path>       Kovo data dir (single cell: used verbatim, so an
                           existing model profile is picked up; multi-cell: base
                           directory, one isolated child dir per cell)
                           (default: $KOVO_DATA_DIR or <out-dir>/data/<cell>)
@@ -300,7 +300,7 @@ Flags:
 Environment:
   KOVO_ALLOW_LOCAL_LAB=1   required to boot loopback lab origins
   KOVO_RB_HELDOUT_SALT     required for --held-out (never logged/committed)
-  KOVO_DATA_DIR            default Kovo Hunter data dir (model profile source)
+  KOVO_DATA_DIR            default Kovo data dir (model profile source)
   KOVO_FLOOR_REQUEST_BUDGET / KOVO_AGENT_REQUEST_BUDGET / KOVO_TOTAL_REQUEST_BUDGET
                                defaults for the split request budgets
   KOVO_MAX_RPS             hard per-origin rate cap (default 50)
@@ -1268,7 +1268,7 @@ export function specMutatedParams(spec: unknown): string[] {
 }
 
 /**
- * Translate persisted Kovo Hunter findings into the benchmark grader schema.
+ * Translate persisted Kovo findings into the benchmark grader schema.
  * Confirmed -> runtime_confirmed, static_verified -> static_verified; pending /
  * inconclusive claims are preserved as proposed/open_proof_gap so the precision
  * denominator reflects what was actually submitted. Dismissed and superseded
@@ -1369,7 +1369,7 @@ export function buildTelemetry(input: {
   budgetUsd: number
   budgetExhausted: boolean
 }): RunTelemetry {
-  // Kovo Hunter does not persist a chain-step -> concrete path mapping, so the harness
+  // Kovo does not persist a chain-step -> concrete path mapping, so the harness
   // deliberately reports no synthesized hypotheses rather than guessing paths. The
   // grader still derives hypothesis formation from the recorded request log.
   return {
@@ -1773,7 +1773,7 @@ export function openCellStore(directory: string): Store {
     return new Store(directory)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    if (/Another Kovo Hunter server is using this data directory/.test(message)) {
+    if (/Another Kovo server is using this data directory/.test(message)) {
       throw new PreflightError(
         `${message} Parallel cells need isolated stores: add --isolate-data-dir `
         + '(it is on by default when --concurrency > 1) or use a distinct --data-dir per cell.',
@@ -1908,7 +1908,7 @@ function assertValidCredentialFile(credentialPath: string, profileLabel: string,
 }
 
 /**
- * Create a per-cell Kovo Hunter Store from a source data dir without copying or symlinking keys:
+ * Create a per-cell Kovo Store from a source data dir without copying or symlinking keys:
  * only enabled model_profiles rows + the workspace identity are copied into the isolated SQLite DB;
  * callers reference the real host `credentialsDir` via `KOVO_CREDENTIALS_DIR` (read-only),
  * keeping M-15 anti-symlink hardening intact and giving each cell its own `credentials/` for

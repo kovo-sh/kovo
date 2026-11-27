@@ -226,7 +226,7 @@ test('auto_review Stage 2 independent Safety Judge handles approve, escalate_hum
     method: 'POST',
     pathAndQuery: '/api/profile/update',
     personaHandle: 'user_a',
-    bodyPreview: '{"displayName":"Kovo Hunter Probe"}',
+    bodyPreview: '{"displayName":"Kovo Probe"}',
     rationale: 'Verify CSRF protection on profile update.',
     offline: false,
     llmCall: async ({ userPrompt }) => {

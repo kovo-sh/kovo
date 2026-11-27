@@ -1074,7 +1074,7 @@ function synthXxe(hyp: EngineHypothesis, result: DifferentialResult): Synthesize
       kind: 'http_chain',
       steps: [
         stepOf(hyp.endpoint.origin, 'c1', 'control', 'Benign XML document', { method, pathAndQuery: hyp.pathAndQuery, headers, textBody: xmlBenign }, hyp.ownerPersona),
-        stepOf(hyp.endpoint.origin, 'p1', 'probe', `XML document with external entity to Kovo Hunter canary${canaryOobStepTag(result)}`, { method, pathAndQuery: hyp.pathAndQuery, headers, textBody: body }, hyp.ownerPersona),
+        stepOf(hyp.endpoint.origin, 'p1', 'probe', `XML document with external entity to Kovo canary${canaryOobStepTag(result)}`, { method, pathAndQuery: hyp.pathAndQuery, headers, textBody: body }, hyp.ownerPersona),
       ],
     },
   }]
@@ -1127,7 +1127,7 @@ function synthSsrf(hyp: EngineHypothesis, result: DifferentialResult): Synthesiz
       kind: 'http_chain',
       steps: [
         stepOf(hyp.endpoint.origin, 'c1', 'control', 'Benign URL value (no callback expected)', control, hyp.ownerPersona),
-        stepOf(hyp.endpoint.origin, 'p1', 'probe', `Kovo Hunter canary URL value${tag}`, probe, hyp.ownerPersona),
+        stepOf(hyp.endpoint.origin, 'p1', 'probe', `Kovo canary URL value${tag}`, probe, hyp.ownerPersona),
       ],
     },
   }]

@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v6 — Phase-0 planning reads must page past the store's default 500-row page.
+ * Kovo v6 — Phase-0 planning reads must page past the store's default 500-row page.
  *
  * Regression for the monorepo fixture finding: `runPhase0Recon` ingested the declared surface
  * losslessly, but the discovery planning phases (nav targets, GraphQL argument pass, XML surface,

@@ -1,5 +1,5 @@
 /**
- * Unit tests for Kovo Hunter v8 M2/M3/M4 Scaling & Certification Scorecard CLI (`scripts/certify-v8.ts`).
+ * Unit tests for Kovo v8 M2/M3/M4 Scaling & Certification Scorecard CLI (`scripts/certify-v8.ts`).
  *
  * Covers:
  *  - M2 PASS & FAIL cases (WB lift < +15 pp, 1 twin FP in 1 of 3 repeats fails worst-run precision,

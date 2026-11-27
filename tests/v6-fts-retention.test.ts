@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v6.2 — bounded opt-in FTS + exchange retention GC + footprint guard.
+ * Kovo v6.2 — bounded opt-in FTS + exchange retention GC + footprint guard.
  *
  * Covers: `ftsMode: 'off' | 'preview' | 'full'` write/search semantics with a hard per-exchange
  * body cap; `pruneExchanges()` deleting rows + FTS rows + unreferenced sharded blobs in bounded

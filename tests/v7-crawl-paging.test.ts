@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v7 — `crawlStateGraph` route lookups must page past the store's default 500-row view.
+ * Kovo v7 — `crawlStateGraph` route lookups must page past the store's default 500-row view.
  *
  * Regression for the state-graph crawl finding: `runPhase0Recon` planning reads were paged, but
  * the crawl still resolved intercepted-query, Next-Action and persona-union routes through

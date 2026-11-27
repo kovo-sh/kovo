@@ -1344,7 +1344,7 @@ export class RequestAdmissionEngine {
     }
     if (hasDestructiveContent(canonical)) {
       return fail('destructive_payload', 'denylist:destructive_payload',
-        'Redirect destination is blocked by Kovo Hunter destructive-payload denylist.')
+        'Redirect destination is blocked by Kovo destructive-payload denylist.')
     }
     return {
       outcome: 'allow',
@@ -1519,8 +1519,8 @@ export class RequestAdmissionEngine {
         'malformed_path',
         'path_syntax',
         kind === 'websocket'
-          ? 'WebSocket path is invalid or exceeds Kovo Hunter 8 KiB limit.'
-          : 'Request path is invalid or exceeds Kovo Hunter 8 KiB limit.',
+          ? 'WebSocket path is invalid or exceeds Kovo 8 KiB limit.'
+          : 'Request path is invalid or exceeds Kovo 8 KiB limit.',
         { normalizedOrigin: initialOrigin, normalizedPath: rawPath, localLab },
       )
     }
@@ -1616,7 +1616,7 @@ export class RequestAdmissionEngine {
       const wsText = [canonical, request.wsOriginHeader ?? '', serializedHeaders, ...wsMessages].join('\n')
       if (hasDestructiveContent(wsText)) {
         return build('deny', 'destructive_payload', 'denylist:destructive_payload',
-          'WebSocket probe blocked by Kovo Hunter destructive-payload denylist.',
+          'WebSocket probe blocked by Kovo destructive-payload denylist.',
           { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
       }
       if (request.personaHandle && capabilityTier < 2) {
@@ -1636,19 +1636,19 @@ export class RequestAdmissionEngine {
       (request.body !== undefined && hasDestructiveContent(request.body))
     ) {
       return build('deny', 'destructive_payload', 'denylist:destructive_payload',
-        'Request blocked by Kovo Hunter destructive-payload denylist.',
+        'Request blocked by Kovo destructive-payload denylist.',
         { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
     }
     if (request.authMutation?.kind === 'kid_inject' && hasDestructiveContent(request.authMutation.value)) {
       return build('deny', 'destructive_payload', 'denylist:auth_mutation_kid',
-        'authMutation kid_inject blocked by Kovo Hunter destructive-payload denylist.',
+        'authMutation kid_inject blocked by Kovo destructive-payload denylist.',
         { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
     }
     if (request.authMutation?.kind === 'jku_x5u_canary') {
       const candidateUrl = request.authMutation.url ?? request.authMutation.value
       if (candidateUrl && (hasDestructiveContent(candidateUrl) || /[\r\n\0]/.test(candidateUrl))) {
         return build('deny', 'destructive_payload', 'denylist:auth_mutation_jku',
-          'authMutation jku_x5u_canary blocked by Kovo Hunter destructive-payload denylist.',
+          'authMutation jku_x5u_canary blocked by Kovo destructive-payload denylist.',
           { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
       }
     }
@@ -1664,12 +1664,12 @@ export class RequestAdmissionEngine {
         const serialized = `${part.name}\n${part.filename ?? ''}\n${part.contentType ?? ''}\n${part.content}`
         if (hasDestructiveContent(serialized)) {
           return build('deny', 'destructive_payload', 'denylist:multipart_destructive',
-            'Multipart upload blocked by Kovo Hunter destructive-payload denylist.',
+            'Multipart upload blocked by Kovo destructive-payload denylist.',
             { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
         }
         if (containsWebshellSignature(serialized)) {
           return build('deny', 'webshell_signature', 'denylist:multipart_webshell',
-            'Multipart upload blocked by Kovo Hunter webshell signature filter.',
+            'Multipart upload blocked by Kovo webshell signature filter.',
             { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
         }
       }

@@ -1,6 +1,6 @@
 # NoSQL Query Type-Confusion & Operator Filtering Audit
 Tags: nosql, mongodb, mongoose, type-confusion, input-validation, query-builder, api
-Summary: Audit MongoDB/Mongoose/document-store query handlers for missing primitive type validation on JSON bodies and bracket-encoded query strings using offline SAST and Kovo Hunter’s nosqli_type differential engine.
+Summary: Audit MongoDB/Mongoose/document-store query handlers for missing primitive type validation on JSON bodies and bracket-encoded query strings using offline SAST and Kovo’s nosqli_type differential engine.
 
 ## 1. Root Cause & Source Audit (`/repos`)
 Document-store query confusion occurs when an application passes raw parsed objects from `req.body` or Express/qs bracket-parsed `req.query` directly into a database filter (`collection.findOne({ email: req.body.email })`) without asserting that the value is a primitive string/number. If an attacker supplies an object containing query operators instead of a string, the driver interprets the object as a filter expression.
@@ -12,7 +12,7 @@ Inspect `/repos` via `run_sast_scan` (`opengrep`, `ast-grep`) and `derive_eviden
 4. **Query Parser Settings:** Check Express `app.set('query parser', ...)` (`extended` / `qs` parses nested bracket notation into objects by default!).
 
 ## 2. Safe Non-Destructive Verification (`probe_differential`)
-Use Kovo Hunter’s host-side `probe_differential` (`probeClass: "nosqli_type"`), which executes bounded, non-destructive type-comparison controls through `RequestBroker`:
+Use Kovo’s host-side `probe_differential` (`probeClass: "nosqli_type"`), which executes bounded, non-destructive type-comparison controls through `RequestBroker`:
 - Compares a valid baseline primitive value against benign operator-typed controls on read-only filter/search/lookup endpoints.
 - Checks for deterministic status, body-length, or record-count divergence while verifying negative controls and SPA-catchall exclusion.
 - Keep Tier 1/2 checks strictly read-only; never probe mutating auth/account endpoints without Tier 3 HITL approval or `local-lab` isolation.

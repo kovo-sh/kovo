@@ -15,7 +15,7 @@
             "content": [
               {
                 "type": "text",
-                "text": "Check the Kovo Hunter connection.",
+                "text": "Check the Kovo connection.",
                 "cache_control": {
                   "type": "ephemeral"
                 }
@@ -28,7 +28,7 @@
         "system": [
           {
             "type": "text",
-            "text": "Kovo Hunter connection test. Call kovo_connection with status ready. Do not add prose.",
+            "text": "Kovo connection test. Call kovo_connection with status ready. Do not add prose.",
             "cache_control": {
               "type": "ephemeral"
             }

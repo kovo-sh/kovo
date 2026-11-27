@@ -62,7 +62,7 @@ export async function createApp(env: NodeJS.ProcessEnv = {}, existingDirectory?:
         }
         await delay(70)
       }
-      throw new Error('Kovo Hunter startup failed.\n' + output)
+      throw new Error('Kovo startup failed.\n' + output)
     },
     /** Open the app through the single-use local bootstrap (sets the session cookie). */
     async open(page: Page) {

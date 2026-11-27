@@ -315,7 +315,7 @@ export function resolveTransportConfig(
   }
 }
 
-export const defaultUserAgent = 'KovoHunter/2 defensive evidence review'
+export const defaultUserAgent = 'Kovo/2 defensive evidence review'
 
 // ---------------------------------------------------------------------------
 // TLS metadata (shared with the broker)
@@ -1487,7 +1487,7 @@ export class WebSocketSession {
       connection: 'Upgrade',
       'sec-websocket-key': key,
       'sec-websocket-version': '13',
-      'user-agent': options.userAgent ?? 'KovoHunter/3 defensive websocket probe',
+      'user-agent': options.userAgent ?? 'Kovo/3 defensive websocket probe',
     }, 'WebSocket headers')
     if (subprotocols.length) headers['sec-websocket-protocol'] = subprotocols.join(', ')
     const callerHeaders = canonicalizeUniqueHeaders(options.headers ?? {}, 'WebSocket headers')

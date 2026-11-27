@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * Kovo Hunter v8 Multi-Hop SaaS Product Benchmark Runner (plans/v8.md §Evaluation).
+ * Kovo v8 Multi-Hop SaaS Product Benchmark Runner (plans/v8.md §Evaluation).
  *
  * Drives the *real* `Execution` loop (deterministic `--no-llm` floor OR agentic `--verifier docker`)
  * against `benchmarks/multihop-saas/` multi-service loopback SaaS archetypes and computes:
  *
  *   - Two-Side Confirmation: `ChainOracle v2` (ordered causal DAG from an attacker persona, zero
- *     shortcut violations) AND host-verified Kovo Hunter `CompositeProofReceipt` (Mode A clean replay)
+ *     shortcut violations) AND host-verified Kovo `CompositeProofReceipt` (Mode A clean replay)
  *   - Hop-Depth Funnel: `H1 -> H2 -> H3 -> H4+ -> FinalOracle -> CompositeReceiptConfirmed`
  *     plus per-hop drop reasons and 3–4 hop vs 5–6 hop depth-tier recall
  *   - Efficiency metrics: `TP/$` and `TP/10m`
@@ -141,7 +141,7 @@ export interface MultihopPersona {
   rolesByTenant?: Record<string, string>
 }
 
-/** Mode-scoped briefing exposed to Kovo Hunter (never ground truth, never victim bot creds). */
+/** Mode-scoped briefing exposed to Kovo (never ground truth, never victim bot creds). */
 export interface MultihopBriefing {
   app: MultihopAppName | string
   mode: MultihopMode
@@ -218,11 +218,11 @@ export interface MultihopChainVerdict {
   oracleObserved: boolean
   /** Side 1 anti-shortcut invariant: true if any forbidden privileged persona was used. */
   forbiddenShortcutViolation?: boolean
-  /** Side 2: Kovo Hunter emitted a host-verified Mode-A CompositeProofReceipt for this chain. */
+  /** Side 2: Kovo emitted a host-verified Mode-A CompositeProofReceipt for this chain. */
   compositeReceiptConfirmed: boolean
   /** True iff Side 1 (no shortcut) AND Side 2 both pass. */
   twoSideConfirmed: boolean
-  /** Optional replay mode recorded by Kovo Hunter's receipt. */
+  /** Optional replay mode recorded by Kovo's receipt. */
   replayMode?: 'fresh_clean_replay' | 'one_shot_transcript'
   /** Diagnostic reason when the chain did not reach two-side confirmation. */
   dropReason?: HopDropReason | null
@@ -379,7 +379,7 @@ export interface MultihopArgs {
   help: boolean
 }
 
-export const usage = `Kovo Hunter v8 multihop-saas Product Benchmark Runner (real Execution loop, plans/v8.md §Evaluation)
+export const usage = `Kovo v8 multihop-saas Product Benchmark Runner (real Execution loop, plans/v8.md §Evaluation)
 
 Usage:
   KOVO_ALLOW_LOCAL_LAB=1 node scripts/benchmark-multihop.ts [flags]
@@ -401,7 +401,7 @@ Flags:
   --duration-min <n>        alias for --max-duration-ms <n * 60000> (minutes, 1..360)
   --concurrency <n>         parallel app/seed cells (default: ${DEFAULT_CONCURRENCY})
   --worker-concurrency <n>  override in-run Execution worker slots (1..${maxWorkerConcurrency}; omitted = dynamic AIMD)
-  --data-dir <path>         Kovo Hunter data dir (default: $KOVO_DATA_DIR)
+  --data-dir <path>         Kovo data dir (default: $KOVO_DATA_DIR)
   --isolate-data-dir        per-cell isolated data dir (default ON for --verifier docker;
                             host credentials read via KOVO_CREDENTIALS_DIR, no symlink, key never copied)
   --no-isolate-data-dir     disable default per-cell data-dir isolation for --verifier docker
@@ -793,7 +793,7 @@ export function normalizeDropReason(raw: unknown): HopDropReason | null {
 /**
  * Computes strict Two-Side Confirmation per plans/v8.md §ChainOracle v2:
  *   TP iff BOTH ChainOracle v2 observed the full ordered DAG from an attacker-eligible persona
- *   (no forbiddenShortcutViolation) AND Kovo Hunter emitted a host-verified Mode-A
+ *   (no forbiddenShortcutViolation) AND Kovo emitted a host-verified Mode-A
  *   `CompositeProofReceipt` (`replayMode === 'fresh_clean_replay'`).
  */
 export function evaluateTwoSideConfirmation(
@@ -1024,7 +1024,7 @@ export interface MultihopCellPlan {
 }
 
 /**
- * Format a briefing persona's role/tenant/orgSlug into the Kovo Hunter `roleLabel` contract
+ * Format a briefing persona's role/tenant/orgSlug into the Kovo `roleLabel` contract
  * (`<role> [slug=<orgSlug>; memberships=<role>:<tenant>,...] (<tenantId>)`) so Execution's
  * tenant-scope parsers (`/\(([^()]+)\)\s*$/` and `parseRoleLabel`) extract both privilege and
  * primary tenantId cleanly while preserving orgSlug and secondary memberships for agentic reasoning.
@@ -1401,7 +1401,7 @@ export interface ExtractMultihopRunTelemetryOptions {
   runStartedAtMs?: number
   /** Override run wall-clock end timestamp (epoch ms). */
   runEndedAtMs?: number
-  /** Optional Kovo Hunter data dir containing read-only `agent-sessions/*.sqlite` for SDK call counts. */
+  /** Optional Kovo data dir containing read-only `agent-sessions/*.sqlite` for SDK call counts. */
   dataDir?: string
   /** Optional live FrontierWaveController telemetry snapshot from Execution. */
   frontierTelemetry?: {
@@ -1623,7 +1623,7 @@ function roundPct(rate: number): number {
 
 /**
  * Extract structured Phase-timing, Scheduler/Dead-End-Waste, CapabilityLedger, and v8-SDK-Adoption
- * telemetry from a Kovo Hunter run's SQLite database.
+ * telemetry from a Kovo run's SQLite database.
  *
  * Strictly queries structured metadata columns only (`runs`, `events`, `assignments`/`workers`,
  * `chain_steps`, `capability_nodes`, `capability_causal_edges`/`capability_edges`,
@@ -3976,7 +3976,7 @@ export function renderMultihopReport(report: MultihopReport, format: 'json' | 'm
   if (format === 'json') return JSON.stringify(report, null, 2)
 
   const lines: string[] = []
-  lines.push('# Kovo Hunter v8 multihop-saas scorecard')
+  lines.push('# Kovo v8 multihop-saas scorecard')
   lines.push('')
   lines.push(`Generated ${report.generatedAt} · git ${report.gitSha}`)
   lines.push('')

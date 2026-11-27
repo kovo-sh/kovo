@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v3 protocol & interactive browser loopback unit tests:
+ * Kovo v3 protocol & interactive browser loopback unit tests:
  *   1. RequestBroker.probeWebsocket + verifyReplaySpec (ws_chain)
  *   2. RequestBroker benign multipartParts upload + verifyReplaySpec (upload_probe)
  *   3. ScopedBrowser.visitPage interactive actions (fill, click, wait_for_selector, dom_xss_sink_hook)

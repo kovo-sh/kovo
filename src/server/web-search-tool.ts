@@ -121,7 +121,7 @@ export async function executeWebSearch(args: WebSearchArgs, opts: WebSearchOptio
   try {
     const reqInit: RequestInit = {
       method: 'GET', redirect: 'follow', credentials: 'omit', signal: controller.signal,
-      headers: { Accept: 'application/json, text/html;q=0.9', 'User-Agent': 'KovoHunter-Research/1.0' },
+      headers: { Accept: 'application/json, text/html;q=0.9', 'User-Agent': 'Kovo-Research/1.0' },
     }
     const res = opts.fetchImpl
       ? await opts.fetchImpl(requestUrl, reqInit)

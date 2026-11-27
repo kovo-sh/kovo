@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v5 M5 Phase 1 — Swarm Message Board security boundary suite.
+ * Kovo v5 M5 Phase 1 — Swarm Message Board security boundary suite.
  *
  * Mandatory invariants (plans/message-board.md §6):
  *   B1 write-time secret redaction (DB + SSE)

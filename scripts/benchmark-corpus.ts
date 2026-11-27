@@ -1,5 +1,5 @@
 /**
- * Generic, target-agnostic "observation corpus": the bodies Kovo Hunter can fetch from a target's own
+ * Generic, target-agnostic "observation corpus": the bodies Kovo can fetch from a target's own
  * public surface (landing HTML, linked pages, OpenAPI documents, linked JS bundles). Hypothesis
  * formation mines it for realistic baseline values, XML/GraphQL request shapes and seed query
  * strings. Nothing here knows about any benchmark route, challenge id or flag.

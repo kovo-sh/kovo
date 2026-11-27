@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v3 — Suite B deterministic Full-Stack Lab fixture server (SPEC-v3 §8 Suite B).
+ * Kovo v3 — Suite B deterministic Full-Stack Lab fixture server (SPEC-v3 §8 Suite B).
  *
  * A single in-process Node HTTP + WebSocket server emulating a modern Next.js + Express +
  * GraphQL-ish + WebSocket SaaS app with 12 planted High/Critical vulnerability classes and

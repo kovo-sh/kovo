@@ -1901,7 +1901,7 @@ async function checkGithubPreflightRepoSize(input: {
         Authorization: `Bearer ${input.pat}`,
         Accept: 'application/vnd.github+json',
         'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'KovoHunter/2 read-only repo connector',
+        'User-Agent': 'Kovo/2 read-only repo connector',
       },
       signal: reqSignal,
     })
@@ -3038,7 +3038,7 @@ export async function syncGithubRepos(
       Authorization: `Bearer ${pat}`,
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent': 'KovoHunter/2 read-only repo connector',
+      'User-Agent': 'Kovo/2 read-only repo connector',
     }
 
     const githubGetJson = async <T>(path: string): Promise<T> => {

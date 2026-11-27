@@ -1,7 +1,7 @@
 id: nextjs-image-optimizer-ssrf-canary
 name: "Next.js image optimizer fetches attacker-chosen remote URLs (canary callback)"
 severity: medium
-description: "The /_next/image endpoint requested a Kovo Hunter-minted canary URL, proving server-side fetching of arbitrary remote image URLs (SSRF lead)."
+description: "The /_next/image endpoint requested a Kovo-minted canary URL, proving server-side fetching of arbitrary remote image URLs (SSRF lead)."
 tech: [nextjs]
 tags: [ssrf, oob]
 cwe: CWE-918

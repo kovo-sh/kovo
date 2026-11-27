@@ -715,7 +715,7 @@ export async function resolveFreshGithubCredential(options: {
         headers: {
           Accept: 'application/json',
           'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent': 'KovoHunter/2 read-only repo connector',
+          'User-Agent': 'Kovo/2 read-only repo connector',
         },
         body: new URLSearchParams({
           client_id: clientId,
@@ -822,7 +822,7 @@ export async function startGithubDeviceFlow(
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': 'KovoHunter/2 read-only repo connector',
+      'User-Agent': 'Kovo/2 read-only repo connector',
     },
     body: new URLSearchParams({ client_id: clientId }).toString(),
     signal: reqSignal,
@@ -915,7 +915,7 @@ export async function pollGithubDeviceFlow(
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': 'KovoHunter/2 read-only repo connector',
+      'User-Agent': 'Kovo/2 read-only repo connector',
     },
     body: new URLSearchParams({
       client_id: flow.clientId,
@@ -1009,7 +1009,7 @@ export async function pollGithubDeviceFlow(
         Authorization: `Bearer ${accessToken}`,
         Accept: 'application/vnd.github+json',
         'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'KovoHunter/2 read-only repo connector',
+        'User-Agent': 'Kovo/2 read-only repo connector',
       },
       signal: options.signal
         ? AbortSignal.any([options.signal, AbortSignal.timeout(10_000)])
@@ -1137,7 +1137,7 @@ export async function listAccessibleGithubRepos(
     Authorization: `Bearer ${pat}`,
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
-    'User-Agent': 'KovoHunter/2 read-only repo connector',
+    'User-Agent': 'Kovo/2 read-only repo connector',
   }
 
   const repos: AccessibleGithubRepo[] = []

@@ -1,5 +1,5 @@
 /**
- * Zero-dependency PTC client SDK for Kovo Hunter sandboxed code execution.
+ * Zero-dependency PTC client SDK for Kovo sandboxed code execution.
  * Speaks JSON-over-HTTP across `/kovo-ptc/ptc.sock` using `node:http` & `node:fs` only.
  */
 import { readFileSync } from 'node:fs'

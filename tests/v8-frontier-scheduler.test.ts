@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v8 M3 — Frontier / Beam Multi-Wave Scheduler deterministic simulation tests.
+ * Kovo v8 M3 — Frontier / Beam Multi-Wave Scheduler deterministic simulation tests.
  *
  * Covers:
  *  1. Exact EVI scoring formula, deterministic ordering, and beam-width cap (B = 8..16).

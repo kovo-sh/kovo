@@ -1024,7 +1024,7 @@ export class SpecSubmissionTracker {
   }
 
   /**
-   * Record a host-side denial (tier/scope/auth/runtime) that reached Kovo Hunter but never the app.
+   * Record a host-side denial (tier/scope/auth/runtime) that reached Kovo but never the app.
    * This is the transcript evidence that can substantiate a `tier_blocked`/`out_of_scope` gap;
    * it never increments probe attempts.
    */
@@ -2019,7 +2019,7 @@ export function buildWorkerTools(
     }
     tools.push(defineTool({
       name: 'request_http',
-      description: 'Send a scoped HTTP request through Kovo Hunter’s RequestBroker. Responses are redacted and auto-staged into /evidence/exchanges/<id>.json.',
+      description: 'Send a scoped HTTP request through Kovo’s RequestBroker. Responses are redacted and auto-staged into /evidence/exchanges/<id>.json.',
       parameters: httpRequestSchema,
       replay: 'unsafe',
       outputLimits,
@@ -2152,7 +2152,7 @@ export function buildWorkerTools(
     const fn = handlers.browser_visit
     tools.push(defineTool({
       name: 'browser_visit',
-      description: 'Load an approved URL in Kovo Hunter’s 100% broker-proxied Playwright browser (zero direct egress) and optionally execute safe interactive actions (fill, click, select_option, wait_for_selector, wait_for_xhr, evaluate_builtin, dom_xss_sink_hook). Captures rendered DOM, live XHR/fetch URLs, DOM sink taint traces, console logs, postMessage listeners, and safe storage keys.',
+      description: 'Load an approved URL in Kovo’s 100% broker-proxied Playwright browser (zero direct egress) and optionally execute safe interactive actions (fill, click, select_option, wait_for_selector, wait_for_xhr, evaluate_builtin, dom_xss_sink_hook). Captures rendered DOM, live XHR/fetch URLs, DOM sink taint traces, console logs, postMessage listeners, and safe storage keys.',
       parameters: obj({
         origin: str({ maxLength: 256 }),
         pathAndQuery: str({ maxLength: 4096 }),
@@ -2213,7 +2213,7 @@ export function buildWorkerTools(
     })
     tools.push(defineTool({
       name: 'browser_session',
-      description: 'Execute a multi-step stateful browser session in Kovo Hunter’s 100%-brokered Playwright browser, preserving DOM, cookies, and localStorage across contiguous steps of the same role/persona and isolating control vs probe groups automatically.',
+      description: 'Execute a multi-step stateful browser session in Kovo’s 100%-brokered Playwright browser, preserving DOM, cookies, and localStorage across contiguous steps of the same role/persona and isolating control vs probe groups automatically.',
       parameters: obj({
         steps: arr(browserSessionStepSchema, { minItems: 1, maxItems: 16 }),
       }),
@@ -2260,7 +2260,7 @@ export function buildWorkerTools(
     const fn = handlers.crawl_state_graph
     tools.push(defineTool({
       name: 'crawl_state_graph',
-      description: 'Run a bounded multi-persona SPA state-graph crawl through Kovo Hunter’s 100%-brokered ScopedBrowser, discovering routes, HTML forms/CSRF fields, XHR/fetch/GraphQL/Next-Action endpoints, postMessage listeners, and storage key names into SQLite.',
+      description: 'Run a bounded multi-persona SPA state-graph crawl through Kovo’s 100%-brokered ScopedBrowser, discovering routes, HTML forms/CSRF fields, XHR/fetch/GraphQL/Next-Action endpoints, postMessage listeners, and storage key names into SQLite.',
       parameters: obj({
         origin: str({ description: 'Approved origin to crawl.', maxLength: 256 }),
         personas: opt(arr(str({ maxLength: 64 }), { maxItems: 6, description: 'Optional approved persona handles to crawl alongside anonymous.' })),
@@ -2411,7 +2411,7 @@ export function buildWorkerTools(
     const fn = handlers.run_safe_templates
     tools.push(defineTool({
       name: 'run_safe_templates',
-      description: 'Run Kovo Hunter’s vetted, non-destructive YAML template pack filtered by techTags or templateIds, executed 100% through RequestBroker with SPA-catchall exclusion. Matches produce candidate leads/hypotheses (still require Zero-LLM Replay Verification).',
+      description: 'Run Kovo’s vetted, non-destructive YAML template pack filtered by techTags or templateIds, executed 100% through RequestBroker with SPA-catchall exclusion. Matches produce candidate leads/hypotheses (still require Zero-LLM Replay Verification).',
       parameters: obj({
         origin: str({ description: 'Approved origin.', maxLength: 256 }),
         techTags: opt(arr(str({ maxLength: 64 }), { maxItems: 24, description: 'Fingerprinted tech tags (e.g. nextjs, django, fastapi, springboot, graphql, clerk, supabase).' })),
@@ -2580,7 +2580,7 @@ export function buildWorkerTools(
     const fn = handlers.query_cves
     tools.push(defineTool({
       name: 'query_cves',
-      description: 'Query OSV.dev and Kovo Hunter’s curated web CVE registry for a fingerprinted (ecosystem, package, version?). Returns advisories and safe verification hints; never confirms a finding on version alone.',
+      description: 'Query OSV.dev and Kovo’s curated web CVE registry for a fingerprinted (ecosystem, package, version?). Returns advisories and safe verification hints; never confirms a finding on version alone.',
       parameters: obj({
         ecosystem: str({ description: 'Package ecosystem (e.g. npm, PyPI, Go, Debian, infra).', maxLength: 64 }),
         package: str({ description: 'Package or framework name (e.g. next, react, vite, express).', maxLength: 160 }),
@@ -2614,7 +2614,7 @@ export function buildWorkerTools(
     const fn = handlers.mint_canary
     tools.push(defineTool({
       name: 'mint_canary',
-      description: 'Mint a signed, single-use benign Kovo Hunter canary token/URL for blind reflection or OOB callback validation.',
+      description: 'Mint a signed, single-use benign Kovo canary token/URL for blind reflection or OOB callback validation.',
       parameters: obj({ purpose: str({ maxLength: 200 }) }),
       replay: 'unsafe',
       outputLimits,
@@ -2629,7 +2629,7 @@ export function buildWorkerTools(
     const fn = handlers.check_canary
     tools.push(defineTool({
       name: 'check_canary',
-      description: 'Check whether a previously minted Kovo Hunter canary token has received a benign callback.',
+      description: 'Check whether a previously minted Kovo canary token has received a benign callback.',
       parameters: obj({ token: str({ maxLength: 128 }) }),
       replay: 'safe',
       outputLimits,
@@ -3259,7 +3259,7 @@ export function buildWorkerTools(
     const fn = handlers.verify_replay_spec
     tools.push(defineTool({
       name: 'verify_replay_spec',
-      description: `${hasKovoVerify ? '[LEGACY FALLBACK — `kovo_verify` is active in this session. Prefer `kovo_verify(script="<inline TS using ctx.prove_*>", runtime="ts")` for all runtime proofs so findings persist ProofReceipt (`proof_kind="agent_script"`). Use `verify_replay_spec` ONLY for `static_ast_proof` or when `kovo_verify` is unavailable.] ' : ''}Execute a DeclarativeReplaySpec synchronously through Kovo Hunter’s Zero-LLM ReplayVerifier and return sanitized InlineVerifyFeedback (jqError, failedStepId, spaCatchallMatched, canaryTriggered, stepStatuses, retriesRemaining). Maximum 2 repair retries (3 attempts total) per hypothesis. ${KOVO_VERIFY_SPEC_SHAPE}`,
+      description: `${hasKovoVerify ? '[LEGACY FALLBACK — `kovo_verify` is active in this session. Prefer `kovo_verify(script="<inline TS using ctx.prove_*>", runtime="ts")` for all runtime proofs so findings persist ProofReceipt (`proof_kind="agent_script"`). Use `verify_replay_spec` ONLY for `static_ast_proof` or when `kovo_verify` is unavailable.] ' : ''}Execute a DeclarativeReplaySpec synchronously through Kovo’s Zero-LLM ReplayVerifier and return sanitized InlineVerifyFeedback (jqError, failedStepId, spaCatchallMatched, canaryTriggered, stepStatuses, retriesRemaining). Maximum 2 repair retries (3 attempts total) per hypothesis. ${KOVO_VERIFY_SPEC_SHAPE}`,
       parameters: obj({
         spec: opt(unsafe<Record<string, unknown>>({
           type: 'object',
@@ -4561,7 +4561,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           options.signal,
         )
         return finish({
-          answer: 'The model did not provide a usable evidence command. Kovo Hunter recorded the standard observation extraction.',
+          answer: 'The model did not provide a usable evidence command. Kovo recorded the standard observation extraction.',
           turnsUsed,
           settled,
           nudgesUsed,

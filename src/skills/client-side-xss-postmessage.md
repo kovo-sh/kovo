@@ -1,6 +1,6 @@
 # Client-Side XSS, DOM Sinks & postMessage Security
 Tags: xss, dom-xss, postmessage, csp, browser, client-side, sandbox
-Summary: Identify and deterministically verify reflected/DOM XSS, unsafe postMessage handlers, sandboxed iframe escapes, and CSP bypasses using Kovo Hunter’s broker-proxied Playwright browser.
+Summary: Identify and deterministically verify reflected/DOM XSS, unsafe postMessage handlers, sandboxed iframe escapes, and CSP bypasses using Kovo’s broker-proxied Playwright browser.
 
 ## 1. Static Sink Discovery First
 1. Use `analyze_artifact` (`tool: "js-harvest"`) and `derive_evidence` (`rg`) over harvested JS bundles to locate:

@@ -43,7 +43,7 @@ export async function diffXxeCanary(
     validateXxeCustomPayload(req.customPayload)
   }
   if (!canaryBroker) {
-    return { verdict: 'inconclusive', summary: 'CanaryBroker is unavailable; XXE OOB probing needs a Kovo Hunter-operated listener.', details: {} }
+    return { verdict: 'inconclusive', summary: 'CanaryBroker is unavailable; XXE OOB probing needs a Kovo-operated listener.', details: {} }
   }
   let info = canaryBroker.listenerInfo()
   if (!info.running) info = await canaryBroker.startListener()

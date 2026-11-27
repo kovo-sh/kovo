@@ -731,7 +731,7 @@ test('booting scripts/serve.ts against built build/server/server.js succeeds wit
   }
 
   assert.equal(
-    output.includes('Another Kovo Hunter server is using this data directory'),
+    output.includes('Another Kovo server is using this data directory'),
     false,
     `serve.ts hit process-lock self-collision:\n${output}`,
   )

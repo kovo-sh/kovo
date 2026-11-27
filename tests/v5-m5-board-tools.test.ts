@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v5 M5 (board-tools stream) — specialist board tools & warm-specialist lifecycle.
+ * Kovo v5 M5 (board-tools stream) — specialist board tools & warm-specialist lifecycle.
  *
  * Covers plans/message-board.md §5–6 and plans/v5.md §5.2:
  *   - board_post/board_read availability across all 7 specialist profiles;

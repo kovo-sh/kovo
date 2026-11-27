@@ -576,7 +576,7 @@ export function dockerHost(env: NodeJS.ProcessEnv = process.env): string {
   if (isAllowedDockerTcpHost(host, env)) {
     return host
   }
-  throw new Error('Kovo Hunter requires a local Docker Unix socket.')
+  throw new Error('Kovo requires a local Docker Unix socket.')
 }
 
 export function dockerEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
@@ -967,7 +967,7 @@ const verifySdkFiles = ['kovo_verify.ts'] as const
 export interface PreparedReadableMount {
   /** Host directory guaranteed readable/traversable by container UID 10001 (`0o755` dirs / `0o644` files). */
   mountDir: string
-  /** True when Kovo Hunter staged a clean container-readable copy in `tmpdir()` instead of binding directly. */
+  /** True when Kovo staged a clean container-readable copy in `tmpdir()` instead of binding directly. */
   staged: boolean
   /** Remove any temporary staged directory (idempotent no-op when `staged === false`). */
   cleanup(): void
@@ -1235,7 +1235,7 @@ interface ContainerArgsInput {
 export interface PreparedReposMount {
   /** Host directory bind-mounted read-only at `/repos`. */
   mountDir: string
-  /** True when Kovo Hunter staged a clean container-readable copy instead of binding `reposDir` directly. */
+  /** True when Kovo staged a clean container-readable copy instead of binding `reposDir` directly. */
   staged: boolean
   /** Number of secret/sensitive or unsafe entries excluded while staging. */
   excludedCount: number

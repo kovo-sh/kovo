@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v4 recall benchmark core: pure, dependency-light helpers shared by the
+ * Kovo v4 recall benchmark core: pure, dependency-light helpers shared by the
  * live pipeline (`benchmark-live.ts`) and the CLI/orchestrator (`benchmark-recall.ts`).
  *
  * Nothing in this file talks to the network. It owns the funnel arithmetic, the
@@ -883,7 +883,7 @@ const usd = (v: number | null): string => (v === null ? 'n/a' : `$${v.toFixed(4)
 export function formatBenchmarkMarkdown(result: BenchmarkSuiteResult): string {
   if (result.children?.length && result.suite === 'all') {
     return [
-      `# Kovo Hunter v4 Recall Benchmark: all suites`,
+      `# Kovo v4 Recall Benchmark: all suites`,
       '',
       `- Git SHA: \`${result.gitSha}\``,
       `- Baseline SHA: \`${result.baselineSha ?? 'none'}\``,
@@ -893,7 +893,7 @@ export function formatBenchmarkMarkdown(result: BenchmarkSuiteResult): string {
   }
   const diff = result.diff
   const lines: string[] = []
-  lines.push(`# Kovo Hunter v4 Recall Benchmark: ${result.suite}`)
+  lines.push(`# Kovo v4 Recall Benchmark: ${result.suite}`)
   lines.push('')
   lines.push(`- Git SHA: \`${result.gitSha}\``)
   lines.push(`- Baseline SHA: \`${result.baselineSha ?? 'none'}\`${diff && !diff.hasBaseline ? ' (no matching baseline run found)' : ''}`)

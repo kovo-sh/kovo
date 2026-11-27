@@ -680,7 +680,7 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
       fixes.push({
         description: {
           text: redact(
-            `Kovo Hunter verified patch (${patch.id.slice(0, 8)})${patch.dynamicRetestVerdict === 'fixed' ? ' [dynamically retested: reproduced -> fixed]' : ''}: ${patch.reviewNotes?.split('\n')[0] || finding.remediation}`,
+            `Kovo verified patch (${patch.id.slice(0, 8)})${patch.dynamicRetestVerdict === 'fixed' ? ' [dynamically retested: reproduced -> fixed]' : ''}: ${patch.reviewNotes?.split('\n')[0] || finding.remediation}`,
             secrets,
           ),
         },
@@ -797,7 +797,7 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
     const ruleIndex = ensureRule(covRuleId, () => ({
       id: covRuleId,
       name: `Coverage: ${catTitle}`,
-      shortDescription: { text: `Kovo Hunter coverage ledger for ${catTitle}` },
+      shortDescription: { text: `Kovo coverage ledger for ${catTitle}` },
       fullDescription: { text: `Tracks defensive review coverage, ruled-out controls, and open proof gaps for ${catTitle}.` },
       help: {
         text: 'Non-failing coverage record documenting verified controls or open follow-up proof gaps.',
@@ -861,8 +861,8 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
       {
         tool: {
           driver: {
-            name: 'Kovo Hunter',
-            fullName: 'Kovo Hunter v3 Defensive Security Platform',
+            name: 'Kovo',
+            fullName: 'Kovo v3 Defensive Security Platform',
             semanticVersion: '3.0.0',
             informationUri: 'https://github.com/kovo-sec/kovo',
             rules,

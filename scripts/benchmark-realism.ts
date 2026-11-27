@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Kovo Hunter v6 — realism exit-gate harness.
+// Kovo v6 — realism exit-gate harness.
 //
 // Boots one `benchmarks/realism-suite` fixture, hands its briefing to the REAL
 // `Execution` product pipeline (black/grey/white-box, `--no-llm` and agentic), then
@@ -13,7 +13,7 @@
 //   KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- \
 //     --fixture all --mode grey-box --no-llm --json --md
 //
-// Agentic runs additionally need a Kovo Hunter data dir with an enabled model profile
+// Agentic runs additionally need a Kovo data dir with an enabled model profile
 // (`--data-dir` or KOVO_DATA_DIR) and a worker-session-capable verifier (docker):
 //   KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR=/path/to/data \
 //     newgrp docker -c 'node scripts/benchmark-realism.ts --fixture all --verifier docker'
@@ -111,7 +111,7 @@ export interface RealismArgs {
   help: boolean
 }
 
-const usage = `Kovo Hunter realism exit gates (real Execution loop)
+const usage = `Kovo realism exit gates (real Execution loop)
 
 Usage:
   KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- [flags]
@@ -126,7 +126,7 @@ Flags:
   --budget-usd <n>          per-run USD budget (default: ${DEFAULT_BUDGET_USD})
   --max-duration-ms <n>     wall-clock cap per fixture (default: ${DEFAULT_MAX_DURATION_MS})
   --out-dir <path>          artifact directory (default: .kovo/realism-bench)
-  --data-dir <path>         Kovo Hunter data dir with an enabled model profile
+  --data-dir <path>         Kovo data dir with an enabled model profile
                             (default: $KOVO_DATA_DIR). Agentic cells always run
                             from an isolated copy under <out-dir>/data/<cell>.
   --isolate-data-dir        accepted for parity; agentic cells are always isolated
@@ -146,7 +146,7 @@ Flags:
 
 Environment:
   KOVO_ALLOW_LOCAL_LAB=1   required to boot loopback fixtures
-  KOVO_DATA_DIR            default Kovo Hunter data dir (model profile source)
+  KOVO_DATA_DIR            default Kovo data dir (model profile source)
   KOVO_RB_HELDOUT_SALT     scanned in artifacts when set (never printed)
 
 Artifacts per fixture:
@@ -590,7 +590,7 @@ export function declaredEndpointsFromReplaySpec(spec: unknown): DeclaredEndpoint
   }
 }
 
-/** Translate persisted Kovo Hunter findings into the realism-suite grading schema. */
+/** Translate persisted Kovo findings into the realism-suite grading schema. */
 export function translateFindings(input: {
   findings: Finding[]
   replaySpecs: ReplaySpecLike[]

@@ -1,4 +1,4 @@
-# Kovo Hunter v4 Hardened Air-Gapped Worker Image (kovo-worker:v4 / kovo-worker:local)
+# Kovo v4 Hardened Air-Gapped Worker Image (kovo-worker:v4 / kovo-worker:local)
 # Runs strictly with --network none --read-only --cap-drop ALL --security-opt no-new-privileges --user 10001:10001
 
 FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS tools-downloader

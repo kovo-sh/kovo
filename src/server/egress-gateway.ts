@@ -572,7 +572,7 @@ export function warnIfEnvProxyEnabled(): void {
   warnedEnvProxy = true
   console.warn(
     'WARNING: NODE_USE_ENV_PROXY is set. Outbound pinned-IP flows are unsupported behind an environment proxy: ' +
-    'the proxy re-resolves on Kovo Hunter\'s behalf, so pinned addresses cannot be guaranteed.',
+    'the proxy re-resolves on Kovo\'s behalf, so pinned addresses cannot be guaranteed.',
   )
 }
 

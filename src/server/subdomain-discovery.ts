@@ -213,7 +213,7 @@ const DEFAULT_DNS_CONCURRENCY = 12
 const DEFAULT_MAX_CANDIDATES = 80
 const DEFAULT_RUN_DISCOVERY_TIMEOUT_MS = 15_000
 const MAX_CNAME_CHAIN_DEPTH = 5
-const DISCOVERY_USER_AGENT = 'KovoHunter/2 passive subdomain discovery'
+const DISCOVERY_USER_AGENT = 'Kovo/2 passive subdomain discovery'
 
 function normalizeHostname(raw: string): string {
   return raw.trim().toLowerCase().replace(/\.+$/, '')

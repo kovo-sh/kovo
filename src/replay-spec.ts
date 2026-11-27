@@ -95,7 +95,7 @@ export const authMutationSchema = z.discriminatedUnion('kind', [
           return false
         }
       },
-      'jku_x5u_canary url must be a safe http/https Kovo Hunter CanaryBroker URL.',
+      'jku_x5u_canary url must be a safe http/https Kovo CanaryBroker URL.',
     ).optional(),
     value: z.string().max(512).refine(
       v => {
@@ -111,7 +111,7 @@ export const authMutationSchema = z.discriminatedUnion('kind', [
           return false
         }
       },
-      'jku_x5u_canary value must be a safe http/https Kovo Hunter CanaryBroker URL.',
+      'jku_x5u_canary value must be a safe http/https Kovo CanaryBroker URL.',
     ).optional(),
   }),
   z.object({

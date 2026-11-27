@@ -1,5 +1,5 @@
 /**
- * Live recall benchmark pipeline. Boots the lab server on loopback, then drives Kovo Hunter's
+ * Live recall benchmark pipeline. Boots the lab server on loopback, then drives Kovo's
  * real engines generically: recon -> hypothesis formation -> probes -> replay-spec synthesis ->
  * Zero-LLM verification. Manifest answer keys are used only afterwards, for scoring.
  */

@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v6 — product-side paging (lossless ingestion view + probe-candidate selection).
+ * Kovo v6 — product-side paging (lossless ingestion view + probe-candidate selection).
  *
  * Regression for the monorepo fixture finding: Phase-0 declared-surface ingestion read only the
  * store's default 500-row page (reporting ~246 of 2,565 declared ops), and probe selection was

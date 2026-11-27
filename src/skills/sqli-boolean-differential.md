@@ -1,6 +1,6 @@
 # SQL Parameterization Audit & Boolean Differential Verification
 Tags: sqli, sql, database, orm, parameterization, boolean-diff, verification, code-audit
-Summary: Audit database query builders and raw SQL sinks offline via SAST, then confirm unparameterized query handling strictly through Kovo Hunter’s non-destructive boolean/timing differential probes and kovo_verify (ctx.prove_boolean_or_timing_diff).
+Summary: Audit database query builders and raw SQL sinks offline via SAST, then confirm unparameterized query handling strictly through Kovo’s non-destructive boolean/timing differential probes and kovo_verify (ctx.prove_boolean_or_timing_diff).
 
 ## 1. Source-First Parameterization Audit (`/repos`)
 Always audit `/repos` via `run_sast_scan` (`opengrep`, `ast-grep`, `bandit`) and `derive_evidence` before sending live probes:
@@ -12,8 +12,8 @@ Always audit `/repos` via `run_sast_scan` (`opengrep`, `ast-grep`, `bandit`) and
    - Parameter binding protects values, not SQL identifiers. Verify any user-controlled sort column, sort direction, or grouping field is validated against an explicit static allowlist map.
 
 ## 2. Non-Destructive Differential Verification (`probe_differential`)
-Kovo Hunter strictly prohibits destructive database statements, data extraction loops, schema dumps, or sleep/DoS timing floods:
-- Invoke Kovo Hunter’s host-side `probe_differential` (`probeClass: "sqli_boolean"`), which routes strictly through `RequestBroker` and compares a clean baseline response against randomized, side-effect-free boolean comparisons (`k=k` vs `k=k+1`) plus minimal syntax-boundary error fingerprinting.
+Kovo strictly prohibits destructive database statements, data extraction loops, schema dumps, or sleep/DoS timing floods:
+- Invoke Kovo’s host-side `probe_differential` (`probeClass: "sqli_boolean"`), which routes strictly through `RequestBroker` and compares a clean baseline response against randomized, side-effect-free boolean comparisons (`k=k` vs `k=k+1`) plus minimal syntax-boundary error fingerprinting.
 - Verify baseline stability across repeated clean requests and ensure SPA-catchall exclusion before trusting any divergence.
 
 ## 3. Deterministic `kovo_verify` Confirmation

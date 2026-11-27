@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Kovo Hunter v4 recall benchmark harness (`npm run benchmark:recall`).
+ * Kovo v4 recall benchmark harness (`npm run benchmark:recall`).
  *
- * Runs the stratified XBEN-25 dev suite and/or the Held-Out Modern SaaS Lab against Kovo Hunter's
+ * Runs the stratified XBEN-25 dev suite and/or the Held-Out Modern SaaS Lab against Kovo's
  * own engines, records the 6-stage funnel plus the 11-bucket failure taxonomy in SQLite
  * (`benchmark_runs`), and emits JSON + Markdown diff reports against a baseline run.
  *
@@ -452,7 +452,7 @@ export interface BenchmarkCliOptions extends Omit<RunBenchmarkOptions, 'storage'
 
 export function benchmarkCliHelp(): string {
   return [
-    'Kovo Hunter v4 recall benchmark',
+    'Kovo v4 recall benchmark',
     '',
     'Usage: node scripts/benchmark-recall.ts [options]',
     '',

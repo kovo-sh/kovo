@@ -211,7 +211,7 @@ export function ingestLabTelemetry(input: IngestLabTelemetryInput): IngestLabTel
 
 /**
  * Prepare the IAST telemetry dir: owner-only (0700) rather than world-writable, optionally handed
- * to the non-root container user when Kovo Hunter itself runs as root.
+ * to the non-root container user when Kovo itself runs as root.
  */
 export function prepareIastTelemetryDir(dir: string, containerUser = resolveLabContainerUser()): string {
   mkdirSync(dir, { recursive: true, mode: 0o700 })
@@ -225,7 +225,7 @@ export function prepareIastTelemetryDir(dir: string, containerUser = resolveLabC
 
 /**
  * Fail fast when the 0700 telemetry dir is not writable by the user the lab container runs as.
- * Non-root Kovo Hunter cannot chown, so a `KOVO_LAB_USER` uid different from Kovo Hunter's own uid
+ * Non-root Kovo cannot chown, so a `KOVO_LAB_USER` uid different from Kovo's own uid
  * would silently produce no IAST data; that combination is rejected explicitly instead.
  */
 export function assertIastTelemetryDirWritable(
@@ -251,7 +251,7 @@ export function assertIastTelemetryDirWritable(
     throw new Error(
       `IAST telemetry dir ${dir} is owned by uid ${kovoUid}, but the lab container runs as ` +
       `${containerUser}. A 0700 telemetry dir cannot be written by a different uid, so IAST data ` +
-      `would be silently lost. Set ${LAB_CONTAINER_USER_ENV}=${kovoUid}:${st.gid} or run Kovo Hunter as root.`,
+      `would be silently lost. Set ${LAB_CONTAINER_USER_ENV}=${kovoUid}:${st.gid} or run Kovo as root.`,
     )
   }
 }

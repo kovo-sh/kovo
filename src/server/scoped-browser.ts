@@ -492,7 +492,7 @@ export function buildChromiumLaunchOptions(
 
 /** Neutralise WebRTC constructors for target JS even if a platform ignores the launch flags. */
 export const browserWebRtcGuardScript = `(() => {
-  const deny = function () { throw new Error('WebRTC is disabled inside Kovo Hunter browser sessions.'); };
+  const deny = function () { throw new Error('WebRTC is disabled inside Kovo browser sessions.'); };
   for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel', 'WebTransport']) {
     try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
   }
@@ -503,7 +503,7 @@ export const browserWebRtcGuardScript = `(() => {
  * socket constructors entirely instead of being allowed to open an unchecked connection.
  */
 export const browserSocketDenyScript = `(() => {
-  const deny = function () { throw new Error('WebSocket/WebTransport are disabled inside Kovo Hunter browser sessions.'); };
+  const deny = function () { throw new Error('WebSocket/WebTransport are disabled inside Kovo browser sessions.'); };
   for (const name of ['WebSocket', 'WebTransport', 'RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel']) {
     try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
   }
@@ -588,24 +588,24 @@ export async function installWebSocketGuard(
       const secure = parsedUrl.protocol === 'wss:'
       if (!secure && !(allowLocalLab && parsedUrl.protocol === 'ws:')) {
         options.audit?.('denied', parsedUrl.origin)
-        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
         return
       }
       port = parsedUrl.port ? Number(parsedUrl.port) : (secure ? 443 : 80)
       origin = `${secure ? 'https:' : 'http:'}//${parsedUrl.host}`
     } catch {
-      await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+      await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
       return
     }
     const allowedPorts = typeof options.allowedPorts === 'function' ? options.allowedPorts() : options.allowedPorts
     if (allowedPorts && allowedPorts.length > 0 && !allowedPorts.includes(port)) {
       options.audit?.('denied', origin)
-      await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+      await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
       return
     }
     if (options.allowConnectPort && !options.allowConnectPort(port, parsedUrl.hostname)) {
       options.audit?.('denied', origin)
-      await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+      await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
       return
     }
     const scopePolicy = typeof options.scopePolicy === 'function' ? options.scopePolicy() : options.scopePolicy
@@ -621,17 +621,17 @@ export async function installWebSocketGuard(
       // and never allow upgrades to `asset`/`auth` origins or denylisted routes.
       if (!decision.allowed || decision.role !== 'target' || isRouteDenylisted(scopePolicy, wsPath)) {
         options.audit?.('denied', origin)
-        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
         return
       }
     }
     if (!options.canRead(origin)) {
       options.audit?.('denied', origin)
-      await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+      await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
       return
     }
     if (typeof ws.connectToServer !== 'function') {
-      await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+      await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
       return
     }
     await ws.connectToServer()
@@ -2837,7 +2837,7 @@ export class ScopedBrowser {
           bypassCSP: false,
           serviceWorkers: 'block',
           proxy: proxyBinding.proxyConfig,
-          userAgent: 'KovoHunter/6 pooled scoped inspector',
+          userAgent: 'Kovo/6 pooled scoped inspector',
         })
       } catch (err) {
         proxyBinding.unregister()
@@ -3476,7 +3476,7 @@ export class ScopedBrowser {
         bypassCSP: false,
         serviceWorkers: 'block',
         proxy: loopbackProxy.proxyConfig,
-        userAgent: 'KovoHunter/3 scoped headless inspector',
+        userAgent: 'Kovo/3 scoped headless inspector',
       })
       await context.addInitScript(postMessageInstrumentationScript)
       await context.addInitScript(browserWebRtcGuardScript)
@@ -3745,7 +3745,7 @@ export class ScopedBrowser {
               })
             }
           } else if (action.type === 'evaluate_builtin') {
-            // Strictly Kovo Hunter-authored read-only DOM/sink inspectors (never arbitrary JS!)
+            // Strictly Kovo-authored read-only DOM/sink inspectors (never arbitrary JS!)
             const data = await page.evaluate((opts: { check: BrowserBuiltinCheck; canaryToken: string | null }) => {
               const probe = (window as unknown as {
                 __kovoBrowserProbe?: {
@@ -4343,7 +4343,7 @@ export class ScopedBrowser {
             bypassCSP: false,
             serviceWorkers: 'block',
             proxy: loopbackProxy.proxyConfig,
-            userAgent: 'KovoHunter/4 scoped headless session inspector',
+            userAgent: 'Kovo/4 scoped headless session inspector',
           })
           await context.addInitScript(postMessageInstrumentationScript)
           await context.addInitScript(browserWebRtcGuardScript)

@@ -441,7 +441,7 @@ describe('github connector: preserved history and diff mining', () => {
     mkdirSync(join(origin, 'acme'), { recursive: true })
     execFileSync('git', ['init', '-b', 'main', source], { stdio: 'ignore' })
     git(source, ['config', 'user.email', 'test@kovo.local'])
-    git(source, ['config', 'user.name', 'Kovo Hunter Test'])
+    git(source, ['config', 'user.name', 'Kovo Test'])
     writeTree(source, {
       'package.json': JSON.stringify({ name: 'app', dependencies: { express: '^4.19.0' } }),
       'routes/users.ts': "router.get('/users/:id', requireAuth, getUser)\n",

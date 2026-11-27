@@ -19,7 +19,7 @@ function withCanaryCorrelation(req: InjectedRequest, token: string): InjectedReq
 
 export async function diffCanaryCallback(ctx: DiffContext, canaryBroker: CanaryBroker | undefined, grant: Grant, signal: AbortSignal): Promise<DiffOutcome> {
   const { req, send, anomalies, notes } = ctx
-  if (!canaryBroker) return { verdict: 'inconclusive', summary: 'CanaryBroker is unavailable; callback probing needs a Kovo Hunter-operated listener.', details: {} }
+  if (!canaryBroker) return { verdict: 'inconclusive', summary: 'CanaryBroker is unavailable; callback probing needs a Kovo-operated listener.', details: {} }
   const params = (req.ssrfParams?.length ? req.ssrfParams : req.param ? [req.param] : []).filter(p => /^[A-Za-z0-9_.\-[\]]{1,64}$/.test(p)).slice(0, 10)
   if (params.length === 0) return { verdict: 'inconclusive', summary: 'ssrfParams (candidate URL parameters) are required.', details: {} }
 
@@ -116,7 +116,7 @@ export async function diffCanaryCallback(ctx: DiffContext, canaryBroker: CanaryB
   return {
     verdict: hitCount > 0 || inbandHit ? 'signal' : 'no_signal',
     summary: hitCount > 0
-      ? `${hitCount} correlated out-of-band callback(s) received from the target for Kovo Hunter-minted canary tokens.`
+      ? `${hitCount} correlated out-of-band callback(s) received from the target for Kovo-minted canary tokens.`
       : inbandHit
         ? 'The sink fetched a loopback service origin published by the target itself (response differential, no OOB callback).'
         : 'No out-of-band callback was observed within the wait window.',

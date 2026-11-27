@@ -322,7 +322,7 @@ describe('structured collection and fail-closed classification', () => {
     writeArtifacts(args, target, null, null)
     const locked = collectCellResult(target, args, {
       exitCode: 2, runtimeMs: 500,
-      output: 'error: Kovo Hunter data dir is locked by another process (process-lock.sqlite)\nstack trace with raw paths',
+      output: 'error: Kovo data dir is locked by another process (process-lock.sqlite)\nstack trace with raw paths',
     })
     assert.equal(locked.ok, false)
     assert.equal(locked.lockError, true)

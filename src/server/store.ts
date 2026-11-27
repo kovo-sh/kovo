@@ -1574,7 +1574,7 @@ export class Store {
       this.processLock.exec('BEGIN EXCLUSIVE')
     } catch {
       this.processLock.close()
-      throw new Error('Another Kovo Hunter server is using this data directory.')
+      throw new Error('Another Kovo server is using this data directory.')
     }
     let rawClient: DatabaseSync | null = null
     try {

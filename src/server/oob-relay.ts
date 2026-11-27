@@ -82,7 +82,7 @@ export interface OobAcmeHttpChallenge {
 }
 
 /**
- * ACME hook points. Kovo Hunter deliberately does not embed a CA: operators plug in
+ * ACME hook points. Kovo deliberately does not embed a CA: operators plug in
  * certbot/acme.sh/Caddy/their existing ACME client and provide a loader (plus an optional
  * renewal hook). Without one, the public HTTPS profile refuses to start.
  */

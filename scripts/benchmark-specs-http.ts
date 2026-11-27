@@ -616,7 +616,7 @@ export function synthSsrf(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[
     kind: 'http_chain',
     steps: [
       stepOf(env, 'c1', 'control', 'Benign URL value (no callback expected)', control),
-      stepOf(env, 'p1', 'probe', 'Kovo Hunter canary URL value', probe),
+      stepOf(env, 'p1', 'probe', 'Kovo canary URL value', probe),
     ],
   }
   return [{ kind: 'http_chain', spec }]
@@ -641,7 +641,7 @@ export function synthXxe(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[]
     kind: 'http_chain',
     steps: [
       stepOf(env, 'c1', 'control', 'Benign XML document', { method, pathAndQuery: path, headers, textBody: xmlBenign }),
-      stepOf(env, 'p1', 'probe', 'XML document with external entity to Kovo Hunter canary', { method, pathAndQuery: path, headers, textBody: body }),
+      stepOf(env, 'p1', 'probe', 'XML document with external entity to Kovo canary', { method, pathAndQuery: path, headers, textBody: body }),
     ],
   }
   return [{ kind: 'http_chain', spec }]

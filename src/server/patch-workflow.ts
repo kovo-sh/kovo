@@ -755,7 +755,7 @@ export async function runPatchAuthor(params: PatchWorkflowParams): Promise<Patch
     }
     const fileExcerpts = [...locsByFile.entries()].map(([file, ranges]) => extractFocusedFileContext(repoRoot, file, ranges))
     const systemPrompt = [
-      'You are Kovo Hunter’s air-gapped Patch Author (Stage 1).',
+      'You are Kovo’s air-gapped Patch Author (Stage 1).',
       'Produce a minimal, repository-native security patch that closes the confirmed vulnerability WITHOUT breaking legitimate callers.',
       '1. Build a Coverage Inventory listing the primary vulnerable sink and any sibling routes/handlers/writers sharing the broken invariant.',
       '2. Provide exact verbatim `fixBefore` and `fixAfter`, plus a valid unified `diff` (`--- a/<file>`, `+++ b/<file>`, `@@ ... @@`).',
@@ -1010,7 +1010,7 @@ export async function runPatchReviewer(params: {
   const siblingHints = collectSiblingHints(repoRoot, new Set(rangesByFile.keys()), [...params.authorOutput.coverageInventory.map(c => c.symbol), ...params.authorOutput.codeLocations.map(l => l.label ?? '')])
 
   const systemPrompt = [
-    'You are Kovo Hunter’s independent air-gapped Patch Reviewer (Stage 2).',
+    'You are Kovo’s independent air-gapped Patch Reviewer (Stage 2).',
     'You have ZERO shared context with the patch author. Independently verify the proposed diff against 5 static gates (Gate 6 dynamic retest runs separately):',
     '1. applicability: Does fixBefore match verbatim, does the diff apply cleanly, and does offline syntax/typecheck pass?',
     '2. security_closure: Does the patch close the vulnerability? Quote the EXACT enforcing file:line.',

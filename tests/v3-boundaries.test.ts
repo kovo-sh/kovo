@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v3 boundary suite (SPEC-v3 §2 invariants, §7 threat model, §9 exit gates).
+ * Kovo v3 boundary suite (SPEC-v3 §2 invariants, §7 threat model, §9 exit gates).
  *
  * Part A — subsystems that do not depend on RequestBroker v3:
  *   A1 hardened air-gapped worker (real Docker): flags, UID, SAST masking, offline scripts, static AST re-verification

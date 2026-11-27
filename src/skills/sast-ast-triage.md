@@ -1,9 +1,9 @@
 # SAST & AST Triage: Reducing Noise with Deterministic Code Analysis
 Tags: sast, ast, opengrep, ast-grep, bandit, gitleaks, trivy, triage, static-analysis
-Summary: Combine offline SAST (Opengrep, Bandit), structural AST queries (ast-grep), secret scanning (Gitleaks/TruffleHog), and SCA (Trivy) inside Kovo Hunter’s air-gapped worker to separate real source-to-sink flaws from false positives.
+Summary: Combine offline SAST (Opengrep, Bandit), structural AST queries (ast-grep), secret scanning (Gitleaks/TruffleHog), and SCA (Trivy) inside Kovo’s air-gapped worker to separate real source-to-sink flaws from false positives.
 
 ## 1. Offline Toolchain Strategy
-All static analysis executes strictly inside Kovo Hunter’s `--network none` container over the read-only `/repos/<owner>/<repo>` mount via `run_sast_scan` and `derive_evidence`:
+All static analysis executes strictly inside Kovo’s `--network none` container over the read-only `/repos/<owner>/<repo>` mount via `run_sast_scan` and `derive_evidence`:
 1. **Run Targeted Scans First:** Invoke `run_sast_scan` with the engines matching the repo stack (`opengrep` + `ast-grep` for JS/TS/Python/Go/Java/Ruby; `bandit` for Python; `gitleaks`/`trufflehog` for secrets; `trivy-fs` for lockfiles & IaC).
 2. **Focus on Crown-Jewel Paths:** Prioritize changed files (`--diff-base`), auth middleware, API routes, Server Actions, webhooks, database layers, upload handlers, and IaC manifests.
 3. **Never Print Raw Secrets:** `worker/bridge.ts` automatically masks matched secret values. Report secret hits strictly by `file:line`, detector rule ID, and masked fingerprint.

@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v5.1 — agentic trace capture + metrics contract suite.
+ * Kovo v5.1 — agentic trace capture + metrics contract suite.
  *
  * Covers the trace store layout, content-addressed blob dedupe, deterministic redaction,
  * event schema round-trip, 4 KiB preview bounds, best-effort failure, and the nine metrics

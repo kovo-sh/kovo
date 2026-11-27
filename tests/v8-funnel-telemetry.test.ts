@@ -1,5 +1,5 @@
 /**
- * Unit tests for Kovo Hunter v8 structured multi-hop funnel & telemetry extraction
+ * Unit tests for Kovo v8 structured multi-hop funnel & telemetry extraction
  * (`scripts/benchmark-multihop.ts`) and end-to-end compatibility with
  * `scripts/certify-v8.ts` (`evaluateV8Certification`, `loadMultihopInputs`).
  *

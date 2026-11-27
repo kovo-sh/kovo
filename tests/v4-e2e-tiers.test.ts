@@ -1,8 +1,8 @@
 /**
- * Kovo Hunter v4 Opaque-Box 4-Tier E2E Test Suite
+ * Kovo v4 Opaque-Box 4-Tier E2E Test Suite
  *
  * Implements the full 4-tier Category-Partition + BVA + Pairwise + Workload matrix
- * covering 100% of the 28 Kovo Hunter v4 Feature Inventory items in PROJECT.md:
+ * covering 100% of the 28 Kovo v4 Feature Inventory items in PROJECT.md:
  *   - Tier 1 (T1-01a..e .. T1-28a..e): 140 Category-Partition & BVA tests
  *   - Tier 2 (T2-01a..e .. T2-28a..e): 140 Pairwise Component Integration tests
  *   - Tier 3 (T3-01 .. T3-28):         28 Cross-Feature Full E2E Workflows
@@ -6977,7 +6977,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     assert.ok(storage.listChainSteps(runId).some(s => /payments\.ts/i.test(JSON.stringify(s))))
   })
 
-  test('T3-14: kovo-hunter scan --local-lab boots app+sidecar, seeds personas, confirms vuln, rebuilds & verifies fix', async (t) => {
+  test('T3-14: kovo scan --local-lab boots app+sidecar, seeds personas, confirms vuln, rebuilds & verifies fix', async (t) => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon required for T3-14')
     const runner = new LabRunner()
     t.after(() => runner.stopAll())
@@ -7884,7 +7884,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     assert.ok(errRes && typeof errRes === 'object')
   })
 
-  test('T4-08: Full CLI kovo-hunter scan --local-lab --sarif lifecycle produces valid SARIF 2.1.0, Markdown, summary.json & exit code 2', async (t) => {
+  test('T4-08: Full CLI kovo scan --local-lab --sarif lifecycle produces valid SARIF 2.1.0, Markdown, summary.json & exit code 2', async (t) => {
     const fx = await startHttpFixture(t, (req, _b, res) => {
       res.setHeader('Content-Type', 'application/json')
       const u = new URL(req.url ?? '/', fx.origin)

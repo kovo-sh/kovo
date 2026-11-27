@@ -106,14 +106,14 @@ const OBSERVABLE_AUTH_HEADER_RE = /^(?:authorization|x-api-key|x-auth-token|x-ac
 const JWT_SHAPE_RE = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*$/
 
 const WEBRTC_GUARD_SCRIPT = `(() => {
-  const deny = function () { throw new Error('WebRTC/WebTransport disabled inside Kovo Hunter browser sessions.'); };
+  const deny = function () { throw new Error('WebRTC/WebTransport disabled inside Kovo browser sessions.'); };
   for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel', 'WebTransport']) {
     try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
   }
 })();`
 
 const SOCKET_DENY_SCRIPT = `(() => {
-  const deny = function () { throw new Error('WebSocket/WebTransport/WebRTC disabled inside Kovo Hunter browser sessions.'); };
+  const deny = function () { throw new Error('WebSocket/WebTransport/WebRTC disabled inside Kovo browser sessions.'); };
   for (const name of ['WebSocket', 'WebTransport', 'RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel']) {
     try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
   }
@@ -847,17 +847,17 @@ async function installInteractiveCaptureContextGuards(
       try {
         parsed = new URL(ws.url())
       } catch {
-        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter browser session policy.' })
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo browser session policy.' })
         return
       }
       if (parsed.protocol !== 'wss:' && !(policy.allowLocalLab && parsed.protocol === 'ws:')) {
-        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter browser session policy.' })
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo browser session policy.' })
         return
       }
       const httpEquiv = new URL(parsed.toString().replace(/^wss:/i, 'https:').replace(/^ws:/i, 'http:'))
       const verdict = evaluateInteractiveCaptureOrigin(policy, httpEquiv.origin, 'GET', httpEquiv)
       if (!verdict.allowed || typeof ws.connectToServer !== 'function') {
-        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter browser session policy.' })
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo browser session policy.' })
         return
       }
       await ws.connectToServer()
@@ -1260,17 +1260,17 @@ async function installBrowserSessionContextGuards(
       try {
         parsed = new URL(ws.url())
       } catch {
-        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter browser session scope.' })
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo browser session scope.' })
         return
       }
       if (parsed.protocol !== 'wss:' && !(egressPolicy.allowLocalLab && parsed.protocol === 'ws:')) {
-        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter browser session scope.' })
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo browser session scope.' })
         return
       }
       const httpEquiv = new URL(parsed.toString().replace(/^wss:/i, 'https:').replace(/^ws:/i, 'http:'))
       const verdict = evaluateBrowserSessionProxyOrigin(egressPolicy, httpEquiv.origin, 'GET', httpEquiv)
       if (!verdict.allowed || typeof ws.connectToServer !== 'function') {
-        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter browser session scope.' })
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo browser session scope.' })
         return
       }
       await ws.connectToServer()

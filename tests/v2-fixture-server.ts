@@ -303,7 +303,7 @@ export async function createV2FixtureServer(options: V2FixtureOptions) {
       sseBody = sseMessage(JSON.stringify({ checks: ['hsts', 'nosniff', 'referrer-policy', 'content-security-policy', 'frame-protection', 'server-disclosure'] }))
     } else {
       modelCalls.push('coordinator_chat')
-      sseBody = sseMessage('Kovo Hunter coordinator status: active assessment progressing under approved scope.')
+      sseBody = sseMessage('Kovo coordinator status: active assessment progressing under approved scope.')
     }
 
     res.writeHead(200, { 'Content-Type': 'text/event-stream' })

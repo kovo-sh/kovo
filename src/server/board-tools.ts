@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v5 M5 (phase 2/3) — specialist-facing Swarm Board tools.
+ * Kovo v5 M5 (phase 2/3) — specialist-facing Swarm Board tools.
  *
  * This module owns the *tool surface* only. It deliberately does not import `execution.ts`
  * or mutate any worker lifecycle: `execution.ts` wires these handlers into its

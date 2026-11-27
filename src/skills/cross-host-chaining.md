@@ -26,7 +26,7 @@ Evaluate every pair of approved origins `(Origin A, Origin B)` against these def
 4. **Cross-Origin Token / Secret Leakage:**
    - **Primitive A:** Staging, docs, preview, or client JS bundle on Host A exposes an internal API key, service token, GraphQL introspection schema, or private endpoint URL.
    - **Primitive B:** Privileged API/admin/billing service on Host B accepts that token or exposes the referenced route without independent authorization.
-   - **Verification:** Always verify with a strictly read-only negative-control vs positive-probe check (redacted by Kovo Hunter's broker—never print raw secrets).
+   - **Verification:** Always verify with a strictly read-only negative-control vs positive-probe check (redacted by Kovo's broker—never print raw secrets).
 
 5. **Cross-Origin `postMessage` & Iframe Trust Mismatch:**
    - **Primitive A:** Host A embeds Host B (or vice versa) and exchanges sensitive state/tokens via `postMessage` with `targetOrigin: '*'` or weak `event.origin.includes(...)` / missing `event.origin` checks.

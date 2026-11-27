@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter reason-bench product harness (M4).
+ * Kovo reason-bench product harness (M4).
  *
  * Drives the *real* `Execution` loop (the same engine the product runs) against the
  * `benchmarks/reason-bench/` loopback labs and reports the reasoning metrics defined in
@@ -288,7 +288,7 @@ export interface ReasonArgs {
   help: boolean
 }
 
-const usage = `Kovo Hunter reason-bench (real Execution loop, plans/reason-bench.md §5–§6)
+const usage = `Kovo reason-bench (real Execution loop, plans/reason-bench.md §5–§6)
 
 Usage:
   KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:reason -- [flags]
@@ -309,7 +309,7 @@ Flags:
   --budget-usd <n>          per-cell USD budget (default: ${DEFAULT_BUDGET_USD})
   --max-duration-ms <n|10m|30m|45m|60m>
                             wall-clock cap per cell (default: ${Math.round(DEFAULT_MAX_DURATION_MS / 60_000)}m)
-  --data-dir <path>         Kovo Hunter data dir; single cell uses it verbatim, matrices use it
+  --data-dir <path>         Kovo data dir; single cell uses it verbatim, matrices use it
                             as the per-cell isolation source
                             (default: $KOVO_DATA_DIR)
   --keep-data-dirs          keep isolated per-cell data dirs after grading

@@ -1,6 +1,6 @@
 // v5 M6: OOB callback wiring for the graded realistic-bench harness.
 // The app's contained egress only reaches loopback ports it was started with; the harness must
-// create the Kovo Hunter canary listener first, pass that exact port to the app, and reuse the same
+// create the Kovo canary listener first, pass that exact port to the app, and reuse the same
 // broker for SSRF/XXE verification. Unregistered loopback ports must stay blocked.
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -113,7 +113,7 @@ test('OOB wiring: registered canary port accepts an SSRF callback; an unregister
   })
 })
 
-test('OOB wiring: a simulated OOB callback correlates to its Kovo Hunter token', async () => {
+test('OOB wiring: a simulated OOB callback correlates to its Kovo token', async () => {
   const oob = await startOobCanaryBroker()
   try {
     const broker = oob.broker as {

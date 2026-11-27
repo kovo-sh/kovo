@@ -181,7 +181,7 @@ export function assertSafeLabImageReference(image: unknown, context = 'lab conta
 /**
  * Choose the non-root user lab containers run as. Defaults to the invoking uid:gid so a bind
  * mounted, owner-only IAST telemetry dir or proxy handshake dir stays writable without world
- * permissions; when Kovo Hunter itself runs as root the container falls back to nobody:nogroup.
+ * permissions; when Kovo itself runs as root the container falls back to nobody:nogroup.
  */
 export function resolveLabContainerUser(env: NodeJS.ProcessEnv = process.env): string {
   const override = env[LAB_CONTAINER_USER_ENV]?.trim()
@@ -934,8 +934,8 @@ export function createLabProxyDir(
   if (hostUid !== undefined && hostUid !== 0 && containerUid !== hostUid) {
     throw new Error(
       `Lab proxy handshake dir must be writable by the lab container user (uid ${containerUid}); ` +
-      `Kovo Hunter runs as uid ${hostUid}. Set ${LAB_CONTAINER_USER_ENV}=${hostUid}:${containerUser.split(':')[1]} ` +
-      'or run Kovo Hunter as root.',
+      `Kovo runs as uid ${hostUid}. Set ${LAB_CONTAINER_USER_ENV}=${hostUid}:${containerUser.split(':')[1]} ` +
+      'or run Kovo as root.',
     )
   }
   const slug = runId.replace(/[^a-z0-9]/gi, '').slice(0, 12).toLowerCase() || 'run'
@@ -1277,7 +1277,7 @@ export function resolveLabStackServices(params: {
 function dockerHost(): string {
   const host = process.env.DOCKER_HOST || 'unix:///var/run/docker.sock'
   if (!/^unix:\/\/\/[^/?#\r\n][^?#\r\n]*$/.test(host)) {
-    throw new Error('Kovo Hunter LabRunner requires a local Docker Unix socket.')
+    throw new Error('Kovo LabRunner requires a local Docker Unix socket.')
   }
   return host
 }

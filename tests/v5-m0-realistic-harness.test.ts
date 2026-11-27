@@ -212,7 +212,7 @@ test('mapping: login route preference avoids legacy surfaces', () => {
 })
 
 // ---------------------------------------------------------------------------------------------
-// Finding translation (persisted Kovo Hunter rows -> grader schema)
+// Finding translation (persisted Kovo rows -> grader schema)
 // ---------------------------------------------------------------------------------------------
 
 function finding(overrides: Partial<Finding> & { id: string }): Finding {
@@ -662,7 +662,7 @@ test('isolation: two cell Stores run concurrently, profile visible via KOVO_CRED
     }
 
     // Bind KOVO_CREDENTIALS_DIR via ref-counted helper and open both Stores concurrently:
-    // no "Another Kovo Hunter server" collision, and profiles resolve from host credentials.
+    // no "Another Kovo server" collision, and profiles resolve from host credentials.
     releases.push(acquireCredentialsDirEnv(a.credentialsDir))
     releases.push(acquireCredentialsDirEnv(b.credentialsDir))
     assert.equal(process.env[CREDENTIALS_DIR_ENV], hostCredsDir)

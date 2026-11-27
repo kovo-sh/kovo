@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v5 M5 (execution wiring) — board tools in worker turns, deterministic 0-LLM posters,
+ * Kovo v5 M5 (execution wiring) — board tools in worker turns, deterministic 0-LLM posters,
  * operator routing, delta injection, warm specialist lifecycle and Tier-3 pause.
  */
 import assert from 'node:assert/strict'

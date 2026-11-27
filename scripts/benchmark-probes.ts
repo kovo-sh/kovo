@@ -2,7 +2,7 @@
  * Generic hypothesis formation and probe execution for the recall benchmark.
  *
  * Nothing here knows about any benchmark challenge: hypotheses are derived only from the
- * endpoints/params Kovo Hunter's recon discovered (names, locations, path shapes, methods), then
+ * endpoints/params Kovo's recon discovered (names, locations, path shapes, methods), then
  * handed to the real `probeDifferential` engine. Profile capabilities decide which discovery
  * strategies, parameter encodings and probe classes are available.
  */

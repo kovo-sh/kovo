@@ -34,7 +34,7 @@ export async function loadV4Module<T = Record<string, unknown>>(relPathFromRepoR
   const abs = resolve(repoRoot, relPathFromRepoRoot)
   assert.ok(
     existsSync(abs),
-    `Expected Kovo Hunter v4 module "${relPathFromRepoRoot}" to exist at ${abs}`,
+    `Expected Kovo v4 module "${relPathFromRepoRoot}" to exist at ${abs}`,
   )
   return await import(pathToFileURL(abs).href) as T
 }
@@ -767,7 +767,7 @@ export async function dockerAvailable(): Promise<boolean> {
 }
 
 export async function assertZeroKovoOrphans(runId?: string): Promise<void> {
-  assert.equal(await dockerAvailable(), true, 'Docker daemon is required to verify zero Kovo Hunter orphans')
+  assert.equal(await dockerAvailable(), true, 'Docker daemon is required to verify zero Kovo orphans')
   // Scope the assertion to the caller: a run id covers worker + lab containers for that run.
   // Without one, only this process's worker containers are ours to assert on — a global
   // `dev.kovo.run` filter would flag concurrent streams' live containers as orphans.
@@ -870,7 +870,7 @@ export function baseReplaySpecFields(origin: string) {
   return {
     version: 1 as const,
     origin,
-    title: 'Kovo Hunter v4 Opaque-Box Replay Test',
+    title: 'Kovo v4 Opaque-Box Replay Test',
     category: 'broken-access-control' as const,
     cwe: 'CWE-639',
     severity: 'high' as const,

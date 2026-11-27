@@ -1,7 +1,7 @@
 /**
- * kovo_verify (TypeScript) — thin, zero-dependency verification SDK for Kovo Hunter Layer 3.
+ * kovo_verify (TypeScript) — thin, zero-dependency verification SDK for Kovo Layer 3.
  *
- * Every network/DOM/OOB/crypto/proof action crosses a Unix-domain socket into the Kovo Hunter host
+ * Every network/DOM/OOB/crypto/proof action crosses a Unix-domain socket into the Kovo host
  * process (`VerifyRpcServer`), which owns scope, credentials, HMAC-signed transcripts, and the
  * authoritative oracle (`prove.*` / `composite.verify`). Zero runtime dependencies beyond Node builtins.
  */

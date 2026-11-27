@@ -2,7 +2,7 @@
  * Agentic benchmark matrix (v5 M6 measurement).
  *
  * Runs app x seed x mode cells in parallel child processes. Every cell gets its own
- * artifact directory and an isolated Kovo Hunter data dir initialized from --data-dir, so
+ * artifact directory and an isolated Kovo data dir initialized from --data-dir, so
  * cells never contend for the source Store lock. Agentic cells require a
  * worker-session-capable verifier (`--verifier docker`); the matrix fails closed when a
  * cell is inert, when worker sessions cannot be opened, or when a preflight/lock error
@@ -938,7 +938,7 @@ export function renderMatrixSummary(totals: MatrixTotals): string {
   ].join('\n')
 }
 
-export const MATRIX_USAGE = `Kovo Hunter agentic benchmark matrix (v5 M6)
+export const MATRIX_USAGE = `Kovo agentic benchmark matrix (v5 M6)
 
 Usage:
   KOVO_ALLOW_LOCAL_LAB=1 node scripts/benchmark-agentic-matrix.ts [flags]
@@ -957,7 +957,7 @@ Flags:
   --max-duration-ms <n>   per-cell wall cap (default: ${DEFAULT_MATRIX_MAX_DURATION_MS})
   --concurrency <n>       parallel cells (default: ${DEFAULT_MATRIX_CONCURRENCY})
   --out-dir <dir>         matrix artifacts (default: .kovo/agentic-matrix)
-  --data-dir <path>       Kovo Hunter data dir with an enabled model profile
+  --data-dir <path>       Kovo data dir with an enabled model profile
                           (default: $KOVO_DATA_DIR); each cell gets an isolated copy
   --verifier <kind>       auto | docker | local-jq (default: docker; auto with --no-llm)
   --no-llm                deterministic cells (no model profile)

@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v4 Zero-Trust Boundary Suite (SPEC-v4 §2 invariants, §7 threat model, §8 release gates).
+ * Kovo v4 Zero-Trust Boundary Suite (SPEC-v4 §2 invariants, §7 threat model, §8 release gates).
  *
  * Covers all 8 mandatory v4 zero-trust boundary controls:
  *   V4-B1: session-jar isolation, BVA, control/probe separation, scope revocation purge, zero leak
@@ -181,7 +181,7 @@ interface V4TranspilerModule {
 
 async function loadV4Module<T>(relPathFromRepoRoot: string, description: string): Promise<T> {
   const abs = join(repoRootDir, relPathFromRepoRoot)
-  assert.ok(existsSync(abs), `Required Kovo Hunter v4 module missing (${description}): ${abs}`)
+  assert.ok(existsSync(abs), `Required Kovo v4 module missing (${description}): ${abs}`)
   return (await import(pathToFileURL(abs).href)) as T
 }
 

@@ -858,7 +858,7 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
       )
       this.storage.message(
         current.id, current.coordinatorId, 'kovo',
-        `No model profile is configured, so Kovo Hunter ran a bounded deterministic probe pass (${requestsUsed} requests) and proposed ${findingsCreated} deterministic replay spec(s) for Zero-LLM verification.`,
+        `No model profile is configured, so Kovo ran a bounded deterministic probe pass (${requestsUsed} requests) and proposed ${findingsCreated} deterministic replay spec(s) for Zero-LLM verification.`,
       )
     } finally {
       this.completeFloorWorker(claimed.id, `Deterministic probes: ${requestsUsed} request(s), ${findingsCreated} spec(s).`)

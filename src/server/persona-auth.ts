@@ -174,7 +174,7 @@ export interface PlaywrightFormBrowserLike {
 
 export interface PersonaAuthManagerOptions {
   /**
-   * Transport override for tests/embedders. When supplied without `resolveHost`, Kovo Hunter cannot
+   * Transport override for tests/embedders. When supplied without `resolveHost`, Kovo cannot
    * observe or pin that transport's DNS, so the injector owns the pinning contract. Production
    * (default fetch) always resolves and connects to the validated address.
    */
@@ -200,11 +200,11 @@ const CAPTCHA_PATTERN = /challenges\.cloudflare\.com|cf-turnstile|turnstile|capt
 const MFA_PATTERN = /needs_second_factor|second_factor|mfa_required|two_factor|totp_required|multi[- ]?factor/i
 
 function captchaAbortMessage(target: string): string {
-  return `Authentication aborted: CAPTCHA / Cloudflare Turnstile challenge detected on ${target}. Kovo Hunter never bypasses CAPTCHA or anti-bot challenges — use a Session Cookie / Bearer persona or disable CAPTCHA for dedicated test accounts.`
+  return `Authentication aborted: CAPTCHA / Cloudflare Turnstile challenge detected on ${target}. Kovo never bypasses CAPTCHA or anti-bot challenges — use a Session Cookie / Bearer persona or disable CAPTCHA for dedicated test accounts.`
 }
 
 function mfaAbortMessage(email: string): string {
-  return `Authentication aborted: Multi-factor authentication (MFA / second factor) is required for ${email}. Kovo Hunter cannot bypass MFA — use a Clerk __client cookie (auto-refresh), a Session Cookie / Bearer persona, or a test account without MFA.`
+  return `Authentication aborted: Multi-factor authentication (MFA / second factor) is required for ${email}. Kovo cannot bypass MFA — use a Clerk __client cookie (auto-refresh), a Session Cookie / Bearer persona, or a test account without MFA.`
 }
 
 function decodeJwtPayload(jwt: string): { exp?: number; iat?: number; sub?: string; sid?: string } | null {
@@ -865,7 +865,7 @@ export function buildFormChromiumLaunchOptions(
 }
 
 const webrtcGuardScript = `(() => {
-  const deny = function () { throw new Error('WebRTC is disabled inside Kovo Hunter browser sessions.'); };
+  const deny = function () { throw new Error('WebRTC is disabled inside Kovo browser sessions.'); };
   for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel', 'WebTransport']) {
     try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
   }
@@ -877,7 +877,7 @@ const webrtcGuardScript = `(() => {
  * unreachable for non-pinned names because of `--host-resolver-rules`.
  */
 const formTransportDenyScript = `(() => {
-  const deny = function () { throw new Error('WebSocket/WebTransport are disabled inside Kovo Hunter browser sessions.'); };
+  const deny = function () { throw new Error('WebSocket/WebTransport are disabled inside Kovo browser sessions.'); };
   for (const name of ['WebSocket', 'WebTransport', 'RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel']) {
     try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
   }
@@ -932,7 +932,7 @@ function rejectUnexpectedRedirect(res: Response, label: string): void {
     const location = res.headers.get('location') ?? ''
     throw new PersonaAuthError(
       'AUTH_FAILED',
-      `${label} returned an unexpected ${res.status} redirect${location ? ` to ${location.slice(0, 200)}` : ''}; Kovo Hunter never replays credentials across redirects.`,
+      `${label} returned an unexpected ${res.status} redirect${location ? ` to ${location.slice(0, 200)}` : ''}; Kovo never replays credentials across redirects.`,
     )
   }
 }
@@ -2147,7 +2147,7 @@ export class PersonaAuthManager {
         `${label} host ${parsed.hostname} is a shared public/private suffix or an opaque single-label host and cannot anchor a credential scope.`,
       )
     }
-    // An injected transport without an injected resolver is an embedding/test seam: Kovo Hunter
+    // An injected transport without an injected resolver is an embedding/test seam: Kovo
     // cannot observe or pin that transport's DNS, so resolution is the injector's contract.
     // Production (default EgressGateway) always resolves and pins.
     if (options.requireResolution === false || (this.fetchImplInjected && !this.resolveHostInjected)) {
@@ -3723,21 +3723,21 @@ export class PersonaAuthManager {
             const websocketOrigin = `${url.protocol === 'wss:' ? 'https:' : 'http:'}//${url.host}`
             if ((url.protocol !== 'wss:' && url.protocol !== 'ws:') || !allowedOrigins.has(websocketOrigin) ||
               typeof ws.connectToServer !== 'function') {
-              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
               return
             }
             if (url.protocol === 'ws:' && !isLoopbackLiteral(url.hostname)) {
-              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
               return
             }
             const safety = await this.browserHostSafety(websocketOrigin, scopeForSubresources)
             if (!safety.safe) {
-              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
               return
             }
             await ws.connectToServer()
           } catch {
-            await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+            await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
           }
         })
       } else if (context.addInitScript) {
@@ -4131,30 +4131,30 @@ export class PersonaAuthManager {
           try {
             const url = new URL(ws.url())
             if (url.protocol !== 'wss:' && url.protocol !== 'ws:') {
-              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
               return
             }
             const websocketOrigin = `${url.protocol === 'wss:' ? 'https:' : 'http:'}//${url.host}`
             if (!allowedOrigins.has(websocketOrigin)) {
-              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
               return
             }
             if (url.protocol === 'ws:' && !isLoopbackLiteral(url.hostname)) {
-              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
               return
             }
             const safety = await this.browserHostSafety(websocketOrigin, scopeForSubresources)
             if (!safety.safe) {
-              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
               return
             }
             if (typeof ws.connectToServer !== 'function') {
-              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
               return
             }
             await ws.connectToServer()
           } catch {
-            await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+            await ws.close({ code: 1008, reason: 'Blocked by Kovo scope.' })
           }
         })
       } else {

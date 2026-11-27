@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v5.1 — agentic trace capture (standalone, unwired).
+ * Kovo v5.1 — agentic trace capture (standalone, unwired).
  *
  * The trace is the fast-iteration substrate for agentic runs: every LLM turn, tool result,
  * planner decision, and lane lifecycle transition is appended to `events.jsonl` under

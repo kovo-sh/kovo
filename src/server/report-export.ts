@@ -605,7 +605,7 @@ export function exportReportMarkdown(
     : storage.listPatchProposals(run.id).filter(p => findings.some(f => f.id === p.findingId))
 
   const lines = [
-    `# Kovo Hunter v3 ${report.partial ? 'partial' : 'complete'} report`, '',
+    `# Kovo v3 ${report.partial ? 'partial' : 'complete'} report`, '',
     `**${confirmed} runtime/baseline confirmed ${confirmed === 1 ? 'finding' : 'findings'}**` +
       `${chainConfirmed ? ` (${chainConfirmed} multi-step ${chainConfirmed === 1 ? 'chain' : 'chains'})` : ''}` +
       `${staticVerified ? ` · **${staticVerified} static-verified ${staticVerified === 1 ? 'finding' : 'findings'}**` : ''}`, '',
@@ -927,7 +927,7 @@ export function exportReportMarkdown(
   }
 
   lines.push('## Methodology and limitations', '',
-    '- Kovo Hunter evaluated only the approved hosts, capability tier, personas, and recorded evidence identified in this report.',
+    '- Kovo evaluated only the approved hosts, capability tier, personas, and recorded evidence identified in this report.',
     '- A confirmed finding strictly requires a deterministic Zero-LLM Replay Verification or air-gapped baseline comparison linked to its source evidence. Model commentary and CVE version matches alone cannot confirm a finding.',
     '- All target network traffic and headless browser requests were mediated by the host RequestBroker with DNS-rebinding defense, persona credential isolation, and secret redaction.',
     '- Inconclusive, ruled-out, not-applicable, and untested checks are retained in coverage instead of being treated as passes.',

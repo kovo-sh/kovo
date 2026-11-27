@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v6 Phase 1 — store scale & data-integrity suite.
+ * Kovo v6 Phase 1 — store scale & data-integrity suite.
  *
  * Covers: WAL/NORMAL pragmas + VACUUM INTO snapshot compatibility, additive
  * `resource_samples.collection_path` migration and multi-collection integrity, bounded async

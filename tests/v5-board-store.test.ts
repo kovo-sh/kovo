@@ -1,5 +1,5 @@
 /**
- * Kovo Hunter v5 M5 Phase 1 — Swarm Message Board schema & store suite.
+ * Kovo v5 M5 Phase 1 — Swarm Message Board schema & store suite.
  *
  * Covers: lossless v2–v4 → v5 auto-migration, roster seeding/upsert, IMMEDIATE seq
  * allocation, mention parsing/validation, filters, runDetail hydration, and operator

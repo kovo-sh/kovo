@@ -1,9 +1,9 @@
 # XML Parser Hardening & Benign Canary Verification (XXE Audit)
 Tags: xxe, xml, parser, dtd, soap, svg, docx, canary, oob, static-analysis
-Summary: Audit XML, SOAP, SAML, RSS, SVG, and office-document parsers offline for unsafe DTD/external-entity defaults and verify outbound resolution strictly with Kovo Hunter’s signed HTTP/DNS CanaryBroker.
+Summary: Audit XML, SOAP, SAML, RSS, SVG, and office-document parsers offline for unsafe DTD/external-entity defaults and verify outbound resolution strictly with Kovo’s signed HTTP/DNS CanaryBroker.
 
 ## 1. Strictly Defensive Boundary
-Kovo Hunter strictly prohibits reading local host files, probing RFC1918/internal services or cloud metadata addresses, or sending entity-expansion denial-of-service documents ("billion laughs"). All runtime XXE verification MUST use ONLY Kovo Hunter’s self-hosted signed `CanaryBroker` HTTP/DNS callbacks—never local file paths and never third-party OAST services.
+Kovo strictly prohibits reading local host files, probing RFC1918/internal services or cloud metadata addresses, or sending entity-expansion denial-of-service documents ("billion laughs"). All runtime XXE verification MUST use ONLY Kovo’s self-hosted signed `CanaryBroker` HTTP/DNS callbacks—never local file paths and never third-party OAST services.
 
 ## 2. Source-First XML Parser Audit (`/repos`)
 Run `run_sast_scan` (`opengrep`, `ast-grep`, `bandit`) and inspect XML/SVG/SAML/Office parsing libraries in `/repos`:
@@ -17,7 +17,7 @@ Run `run_sast_scan` (`opengrep`, `ast-grep`, `bandit`) and inspect XML/SVG/SAML/
 4. **Hidden XML Entry Points:** Remember endpoints accepting `application/xml`, `text/xml`, `image/svg+xml` uploads, SAML assertions, SOAP actions, RSS/Atom feeds, or zipped XML formats (DOCX/XLSX/PPTX/ODT) and JSON endpoints whose middleware also parses XML when `Content-Type: application/xml` is sent.
 
 ## 3. Safe Non-Destructive Runtime Verification
-- Mint a single-use Kovo Hunter canary via `mint_canary` (using Kovo Hunter’s self-hosted HTTP callback URL or authoritative DNS hostname when configured).
+- Mint a single-use Kovo canary via `mint_canary` (using Kovo’s self-hosted HTTP callback URL or authoritative DNS hostname when configured).
 - Compare a clean valid XML baseline control against a benign external-DTD canary reference check strictly within approved scope (Tier 2/3 as appropriate for `POST` XML endpoints), then poll `check_canary` for an authoritative callback correlated to the minted token.
 - Never request local files or internal IPs; confirm strictly via `kovo_verify` (`ctx.prove_oob_callback({ inject: async (canary) => ctx.http(...), timeoutMs: 6000 })` + `return ctx.result({ title })`) or static AST proof (`static_ast_proof` -> `static_verified`).
 

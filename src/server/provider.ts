@@ -511,7 +511,7 @@ export function isQuotaBody(body: string): boolean {
 }
 
 const CONTEXT_OVERFLOW_RE = /(?:context[_\s-]?(?:length|window|limit)|maximum context|too many tokens|token[\s_-]?limit|prompt is too long|exceeds the context)/i
-const NON_PROVIDER_ABORT_OR_LOCAL_RE = /(?:aborted|cancelled|canceled|budget|exceeded Kovo Hunter’s size limit|Unexpected model endpoint|Local provider request|refused by SSRF policy|never permitted|Plaintext HTTP egress|without local-lab or explicit loopback|Egress (?:host|origin|destination|URL|redirect)|KOVO_ALLOW_LOCAL_MODEL)/i
+const NON_PROVIDER_ABORT_OR_LOCAL_RE = /(?:aborted|cancelled|canceled|budget|exceeded Kovo’s size limit|Unexpected model endpoint|Local provider request|refused by SSRF policy|never permitted|Plaintext HTTP egress|without local-lab or explicit loopback|Egress (?:host|origin|destination|URL|redirect)|KOVO_ALLOW_LOCAL_MODEL)/i
 const INFRA_ONLY_ERROR_RE = /\b(?:docker|container|sandbox|epipe|openSession|spawn)\b/i
 const MAX_PROVIDER_RETRY_AFTER_SLEEP_MS = 10_000
 
@@ -1195,7 +1195,7 @@ function makeFetch(
 
     const raw = await request.text()
     if (Buffer.byteLength(raw) > maxRequestBytes) {
-      throw new Error('The model request exceeded Kovo Hunter’s size limit.')
+      throw new Error('The model request exceeded Kovo’s size limit.')
     }
     const payload = JSON.parse(raw) as Record<string, unknown>
     // R3-H-10 / H-8: Scrub live registered/rotated secrets EXCLUSIVELY from content-bearing
@@ -1212,7 +1212,7 @@ function makeFetch(
     const locallyMutated = scrubbedPayload !== payload
     const outboundRaw = locallyMutated ? JSON.stringify(scrubbedPayload) : raw
     if (outboundRaw !== raw && Buffer.byteLength(outboundRaw) > maxRequestBytes) {
-      throw new Error('The model request exceeded Kovo Hunter’s size limit.')
+      throw new Error('The model request exceeded Kovo’s size limit.')
     }
     const estimatedRequestInputTokens = Math.max(1, Math.ceil(Buffer.byteLength(outboundRaw, 'utf8') / 4))
 
@@ -2314,8 +2314,8 @@ export async function testProvider(
     }),
   )
   const stream = models.stream(model, {
-    systemPrompt: 'Kovo Hunter connection test. Call kovo_connection with status ready. Do not add prose.',
-    messages: [{ role: 'user', content: 'Check the Kovo Hunter connection.', timestamp: Date.now() }],
+    systemPrompt: 'Kovo connection test. Call kovo_connection with status ready. Do not add prose.',
+    messages: [{ role: 'user', content: 'Check the Kovo connection.', timestamp: Date.now() }],
     tools: [{
       name: 'kovo_connection',
       description: 'Return status ready to confirm this synthetic connection test.',

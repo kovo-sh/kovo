@@ -4662,7 +4662,7 @@ export function trackFloorCanarySubscriptions(
               assignmentId: input.assignmentId,
               canaryId: minted.id,
               token: minted.token,
-              // Empty artifact: a real async callback does not carry Kovo Hunter's artifact marker,
+              // Empty artifact: a real async callback does not carry Kovo's artifact marker,
               // and a truthy artifact would reject it at ingest. Token↔canary binding is the link.
               artifact: '',
               immediateMs: floorOobImmediateMs,

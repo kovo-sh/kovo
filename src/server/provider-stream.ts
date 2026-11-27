@@ -1478,7 +1478,7 @@ export function sanitizeProviderStream(
         }
       }
       size += chunk.byteLength
-      if (size > responseLimit) throw new Error('The model response exceeded Kovo Hunter’s size limit.')
+      if (size > responseLimit) throw new Error('The model response exceeded Kovo’s size limit.')
       append(decoder.decode(chunk, { stream: true }), controller)
     },
     flush(controller) {

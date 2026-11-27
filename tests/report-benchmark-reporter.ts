@@ -128,9 +128,9 @@ export default class ReportBenchmarkReporter implements Reporter {
     this.writeJson('comparison-scorecard.json', comparison)
     if (comparison.status === 'failed' || comparison.evidence.status !== 'passed' ||
         !comparison.accuracy.kovo || !comparison.coverage.multiHost) {
-      throw new Error('The Kovo Hunter report comparison did not pass its local checks. See comparison-scorecard.json.')
+      throw new Error('The Kovo report comparison did not pass its local checks. See comparison-scorecard.json.')
     }
-    console.log('Saved Kovo Hunter run evidence for ' + comparison.accuracy.kovo.agreeingVerdicts + '/' +
+    console.log('Saved Kovo run evidence for ' + comparison.accuracy.kovo.agreeingVerdicts + '/' +
       comparison.accuracy.kovo.cases + ' matched case verdicts. Release comparison is ' + comparison.status + '.')
   }
 
@@ -144,7 +144,7 @@ export default class ReportBenchmarkReporter implements Reporter {
       return benchmarkScenarios[scenario].cases.map(expected => {
         const id = benchmarkCaseId(scenario, expected)
         const row = entries.get(id)
-        if (!row) throw new Error('Missing Kovo Hunter verdict for ' + id + '.')
+        if (!row) throw new Error('Missing Kovo verdict for ' + id + '.')
         return { ...expected, ...row, scenario }
       })
     })

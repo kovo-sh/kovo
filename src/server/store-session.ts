@@ -54,7 +54,7 @@ export class SchemaDowngradeError extends Error {
   constructor(dbVersion: number, supportedVersion: number) {
     super(
       `Database schema version ${dbVersion} is newer than supported version ${supportedVersion}. `
-      + 'Refusing to open to prevent downgrade corruption; upgrade Kovo Hunter before opening this data directory.',
+      + 'Refusing to open to prevent downgrade corruption; upgrade Kovo before opening this data directory.',
     )
     this.name = 'SchemaDowngradeError'
     this.dbVersion = dbVersion

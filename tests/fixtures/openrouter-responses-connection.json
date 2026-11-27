@@ -12,14 +12,14 @@
         "input": [
           {
             "role": "system",
-            "content": "Kovo Hunter connection test. Call kovo_connection with status ready. Do not add prose."
+            "content": "Kovo connection test. Call kovo_connection with status ready. Do not add prose."
           },
           {
             "role": "user",
             "content": [
               {
                 "type": "input_text",
-                "text": "Check the Kovo Hunter connection."
+                "text": "Check the Kovo connection."
               }
             ]
           }

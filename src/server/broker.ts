@@ -1185,14 +1185,14 @@ function encodeMultipartParts(parts: readonly BrokerMultipartPart[]): { contentT
     }
     const serialized = `${part.name}\n${part.filename ?? ''}\n${part.contentType}\n${part.content}`
     if (hasDestructiveContent(serialized)) {
-      throw new BrokerDenied('Multipart upload blocked by Kovo Hunter destructive-payload denylist.')
+      throw new BrokerDenied('Multipart upload blocked by Kovo destructive-payload denylist.')
     }
     if (containsWebshellSignature(serialized)) {
-      throw new BrokerDenied('Multipart upload blocked by Kovo Hunter webshell signature filter.')
+      throw new BrokerDenied('Multipart upload blocked by Kovo webshell signature filter.')
     }
     totalBytes += Buffer.byteLength(part.content, 'utf8')
     if (totalBytes > maxMultipartBytes) {
-      throw new BrokerDenied(`Multipart upload exceeds Kovo Hunter 256 KiB limit (${totalBytes} bytes).`)
+      throw new BrokerDenied(`Multipart upload exceeds Kovo 256 KiB limit (${totalBytes} bytes).`)
     }
   }
 
@@ -1277,7 +1277,7 @@ function defaultWsTransport(
       'Connection: Upgrade',
       `Sec-WebSocket-Key: ${wsKey}`,
       'Sec-WebSocket-Version: 13',
-      'User-Agent: KovoHunter/3 defensive websocket probe',
+      'User-Agent: Kovo/3 defensive websocket probe',
     ]
     if (options.subprotocols && options.subprotocols.length > 0) {
       reqLines.push(`Sec-WebSocket-Protocol: ${options.subprotocols.join(', ')}`)
@@ -1530,7 +1530,7 @@ function defaultTransport(
     Host: url.host,
     Accept: 'text/html, application/json;q=0.9, */*;q=0.1',
     'Accept-Encoding': 'gzip, deflate, br',
-    'User-Agent': 'KovoHunter/2 defensive evidence review',
+    'User-Agent': 'Kovo/2 defensive evidence review',
     ...(options?.headers ?? {}),
   }
   if (options?.body !== undefined && !headers['Content-Type'] && !headers['content-type']) {
@@ -4532,7 +4532,7 @@ export class RequestBroker {
           deny('jku_x5u_canary URL must not contain query, fragment, or userinfo.')
         }
         if (!canaryUrlRegex.test(parsedCanary.pathname)) {
-          deny('jku_x5u_canary URL must target a Kovo Hunter CanaryBroker endpoint.')
+          deny('jku_x5u_canary URL must target a Kovo CanaryBroker endpoint.')
         }
         const canaryHost = parsedCanary.hostname.toLowerCase().replace(/^\[|\]$/g, '')
         const canaryAddrClass = EgressGateway.classifyDetailedAddress(canaryHost)
@@ -4562,7 +4562,7 @@ export class RequestBroker {
             }
           }
           if (allowedOrigins.size > 0 && !allowedOrigins.has(parsedCanary.origin)) {
-            deny('jku_x5u_canary URL origin does not match the active Kovo Hunter CanaryBroker.')
+            deny('jku_x5u_canary URL origin does not match the active Kovo CanaryBroker.')
           }
         }
       } else {
@@ -5418,7 +5418,7 @@ export class RequestBroker {
         }
       }
       if (!('user-agent' in outboundHeaders)) {
-        outboundHeaders['user-agent'] = 'KovoHunter/2 defensive evidence review'
+        outboundHeaders['user-agent'] = 'Kovo/2 defensive evidence review'
       }
       if (!('accept' in outboundHeaders)) {
         outboundHeaders.accept = 'text/html, application/json;q=0.9, */*;q=0.1'

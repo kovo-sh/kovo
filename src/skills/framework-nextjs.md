@@ -1,6 +1,6 @@
 # Framework Audit: Next.js (App Router, Pages Router, Middleware & Server Actions)
 Tags: framework, nextjs, react, server-actions, middleware, rsc, ssr, cache, authz
-Summary: Audit Next.js App Router, Pages API, Server Actions, middleware matchers, image optimizer, and caching layers for auth bypasses, IDOR, SSRF, and data leakage using Kovo Hunter’s offline SAST and brokered verification.
+Summary: Audit Next.js App Router, Pages API, Server Actions, middleware matchers, image optimizer, and caching layers for auth bypasses, IDOR, SSRF, and data leakage using Kovo’s offline SAST and brokered verification.
 
 ## 1. High-Risk Next.js Surfaces
 Map the repository (`/repos`) via `run_sast_scan` (`engines: ["opengrep", "ast-grep"]`) and `derive_evidence` before live probing:

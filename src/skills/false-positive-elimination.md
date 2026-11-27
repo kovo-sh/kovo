@@ -1,6 +1,6 @@
 # False-Positive Elimination & Zero-LLM Verification Discipline
 Tags: verification, false-positives, controls, spa-catchall, kovo-verify, precision
-Summary: Enforce Kovo Hunter's 100% precision bar by applying mandatory negative controls, SPA catch-all rejection, version-vs-reachability separation, and strict TypeScript `kovo_verify` assertions.
+Summary: Enforce Kovo's 100% precision bar by applying mandatory negative controls, SPA catch-all rejection, version-vs-reachability separation, and strict TypeScript `kovo_verify` assertions.
 
 ## 1. The Five Most Common Automated Pentester False Positives
 1. **SPA `200 index.html` Catch-All Illusion:**

@@ -851,7 +851,7 @@ export async function judgeSemanticDuplicate(
   }
 
   const systemPrompt = [
-    'You are Kovo Hunter’s security finding deduplication judge.',
+    'You are Kovo’s security finding deduplication judge.',
     'Determine whether the CANDIDATE vulnerability shares the SAME underlying root cause and single remediation fix as one of the EXISTING findings.',
     'Rules:',
     '- Return STRICT JSON only with keys: {"isDuplicate": boolean, "duplicateOfId": string | null, "shouldUpgrade": boolean, "rationale": string}.',

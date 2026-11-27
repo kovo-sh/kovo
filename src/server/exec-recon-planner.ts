@@ -4572,7 +4572,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         this.storage.message(current.id, current.coordinatorId, 'kovo',
           nextPhase === 'investigation'
             ? deterministicMode
-              ? `Threat model ranked ${finalEntries.length} hosts. No model profile is configured, so Kovo Hunter will run a bounded deterministic probe pass over discovered endpoints instead of agentic investigation.`
+              ? `Threat model ranked ${finalEntries.length} hosts. No model profile is configured, so Kovo will run a bounded deterministic probe pass over discovered endpoints instead of agentic investigation.`
               : `Threat model ranked ${finalEntries.length} hosts and queued ${totalQueued} initial investigation steps${codeAuditStepsCreated ? ` (including ${codeAuditStepsCreated} from Source-First Code Audit)` : ''}.`
             : 'Baseline capture complete. Deterministic verification is checking the recorded evidence.')
       }, { behavior: 'immediate' })

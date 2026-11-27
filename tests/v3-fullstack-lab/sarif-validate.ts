@@ -1,6 +1,6 @@
 /**
- * Structural OASIS SARIF 2.1.0 validator for Kovo Hunter v3 tests.
- * Enforces the normative constraints Kovo Hunter relies on (no network schema fetch needed):
+ * Structural OASIS SARIF 2.1.0 validator for Kovo v3 tests.
+ * Enforces the normative constraints Kovo relies on (no network schema fetch needed):
  *  - §3.13 sarifLog: version "2.1.0", runs[] array, optional $schema URI
  *  - §3.14 run.tool.driver.name required; rules[] ids unique
  *  - §3.27 result: message.text required; ruleIndex ⇔ ruleId consistency (§3.27.6)

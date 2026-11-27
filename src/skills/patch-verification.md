@@ -1,6 +1,6 @@
 # Air-Gapped Patch Authoring & Independent 6-Gate Verification
 Tags: patch, remediation, verification, code-review, diff, security-fix, offline
-Summary: Author minimal, repository-native security patches inside an air-gapped container and validate every diff through Kovo Hunter’s independent 6-gate Patch Reviewer without breaking legitimate callers.
+Summary: Author minimal, repository-native security patches inside an air-gapped container and validate every diff through Kovo’s independent 6-gate Patch Reviewer without breaking legitimate callers.
 
 ## 1. Patch Author Workflow (`patch-author`)
 Work strictly inside the `--network none` container over a writable tmpfs copy of `/repos/<owner>/<repo>` (never modifying read-only `/repos` or contacting remote git hosts):
