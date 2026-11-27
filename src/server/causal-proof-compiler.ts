@@ -20,9 +20,9 @@ import type {
   HostTranscriptEntry,
 } from './composite-receipt.ts'
 import { HostFactLog, type HostExchangeFact } from './host-fact-log.ts'
-import { isReadMethod, parseRoleMemberships, routeFamily, stepReadsState } from './oracle-invariants.ts'
-import { extractTenantMarkers, type V8OracleFamily } from './v8-oracle-families.ts'
-import { canonicalNonAuthQuery, cleanExactPath, entryMatchesEntity, isPrivilegedActorOrRole, type CapOriginIndex } from './v8-oracle-hydrate.ts'
+import { isReadMethod, parseRoleMemberships, ROLE_RANK, routeFamily, stepReadsState } from './oracle-invariants.ts'
+import { deriveRecordAuthzDimension, extractTenantMarkers, isJobOrHandleStub, type V8OracleFamily } from './v8-oracle-families.ts'
+import { buildCapOriginIndex, canonicalNonAuthQuery, cleanExactPath, entryMatchesEntity, isPrivilegedActorOrRole, resolveEntryIdentity, type CapOriginIndex, type EconomicAutoHydrateContext, type HydratableEntry, type HydratableTranscriptIndex } from './v8-oracle-hydrate.ts'
 
 const CAP_HANDLE_RE = /^cap:[A-Za-z0-9._:-]{1,180}$/
 const SHA256_RE = /^[0-9a-f]{64}$/
@@ -109,28 +109,35 @@ const DIRECTORY_KEY_ALLOWLIST = new Set([
   'tenant', 'tenantid', 'tenant_id', 'workspace', 'workspaceid', 'workspace_id', 'status',
   'active', 'createdat', 'created_at', 'updatedat', 'updated_at', 'count', 'total', 'members',
   'users', 'roster', 'directory', 'teams', 'groups', 'orgs', 'organizations', 'metadata', 'profile',
+  'title', 'folder', 'folders', 'docs', 'documents', 'items', 'files', 'projects', 'workspaces',
+  'category', 'type', 'kind', 'label', 'labels', 'tag', 'tags', 'visibility', 'public', 'shared',
+  'parentid', 'parent_id', 'folderid', 'folder_id', 'page', 'limit', 'offset', 'cursor',
+  'nextcursor', 'next_cursor', 'hasmore', 'has_more', 'archived', 'pinned', 'version',
+  'owner', 'ownerid', 'owner_id',
 ])
 const DIRECTORY_MARKER_KEYS = new Set([
-  'members', 'roster', 'directory', 'users', 'pendingemail', 'pending_email', 'email', 'role', 'roles', 'org', 'orgs', 'metadata', 'profile',
+  'members', 'roster', 'directory', 'users', 'pendingemail', 'pending_email', 'email', 'role', 'roles',
+  'org', 'orgs', 'metadata', 'profile', 'docs', 'documents', 'folders', 'files', 'items', 'workspaces',
+  'workspace', 'projects', 'teams', 'groups', 'folder',
 ])
 const SENSITIVE_PAYLOAD_KEY_RE =
   /secret|passw|private|credential|api_?key|vault|audit|ledger|balance|amount|payout|settlement|token|signing|canary|ssn|card|iban/i
 
 /**
  * True when a read-only GET terminal exchange is a directory/roster/member/metadata listing
- * (never sufficient alone to confirm `privilege_escalation` or `bfla` without mutation + readback
- * or a verified v8 oracle family).
+ * (never sufficient alone to confirm `privilege_escalation`, `bfla`, or cross-tenant reads
+ * without private payload content, mutation + readback, or a verified v8 oracle family).
  */
 export function isReadOnlyDirectoryOrMetadataImpact(termEx: HostTranscriptEntry | undefined): boolean {
   if (!termEx || !stepReadsState(termEx.step)) return false
   const cleanPath = cleanExactPath(termEx.step.route ?? termEx.step.pathAndQuery)
   if (cleanPath && PRIVILEGED_SENSITIVE_PATH_RE.test(cleanPath)) return false
-  if (cleanPath && READONLY_DIRECTORY_PATH_RE.test(cleanPath)) return true
+  const isDirPath = Boolean(cleanPath && READONLY_DIRECTORY_PATH_RE.test(cleanPath))
   let parsed = termEx.step.json
   if (parsed === undefined && typeof termEx.step.body === 'string' && /^[\[{]/.test(termEx.step.body.trim())) {
     try { parsed = JSON.parse(termEx.step.body) } catch { parsed = undefined }
   }
-  if (!parsed || typeof parsed !== 'object') return false
+  if (!parsed || typeof parsed !== 'object') return isDirPath
   let hasDirMarker = false
   let allAllowed = true
   let visited = 0
@@ -146,7 +153,7 @@ export function isReadOnlyDirectoryOrMetadataImpact(termEx: HostTranscriptEntry 
     }
   }
   walk(parsed, 0)
-  return hasDirMarker && allAllowed
+  return allAllowed && (hasDirMarker || isDirPath)
 }
 
 const TENANT_TEXT_KEY_RE = /^(?:tenant|tenant_id|tenantid|org|org_id|orgid|organization|organization_id|workspace|workspace_id|owner_tenant|owner_tenant_id|merchant_id)$/i
@@ -219,6 +226,19 @@ function extractCsvOrKvTenantMarkers(body: string | undefined): Set<string> {
   return out
 }
 
+const STATIC_WEB_ASSET_CT_RE =
+  /^(?:text\/css|application\/(?:x-)?javascript|text\/javascript|application\/ecmascript|text\/ecmascript|image\/|font\/|application\/font-|application\/vnd\.ms-fontobject)/i
+const STATIC_WEB_ASSET_EXT_RE =
+  /\.(?:css|js|mjs|map|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|otf|eot)$/i
+
+function isStaticWebAssetEntry(entry: HostTranscriptEntry): boolean {
+  const rawCt = Object.entries(entry.step.responseHeaders ?? {}).find(([k]) => k.toLowerCase() === 'content-type')?.[1] ?? ''
+  const ct = rawCt.split(';', 1)[0]!.trim().toLowerCase()
+  if (ct && STATIC_WEB_ASSET_CT_RE.test(ct)) return true
+  const cleanPath = cleanExactPath(entry.step.route ?? entry.step.pathAndQuery)
+  return Boolean((!ct || ct === 'application/octet-stream') && cleanPath && STATIC_WEB_ASSET_EXT_RE.test(cleanPath))
+}
+
 function isCsvOrJsonEntry(entry: HostTranscriptEntry): boolean {
   if (entry.step.json !== undefined) return true
   const body = typeof entry.step.body === 'string' ? entry.step.body.trim() : ''
@@ -253,8 +273,9 @@ export function analyzeCrossTenantTerminalEvidence(
   if (!termEx) {
     return { ownTenantOnly: false, hasForeignTenantData: false, reflectedTenantOnly: false, crossTenantSatisfied: hasPostMutation }
   }
+  const isStaticAsset = isStaticWebAssetEntry(termEx)
   const jsonMarkers = extractTenantMarkers(termEx.step.json, termEx.step.body)
-  const textMarkers = termEx.step.json === undefined ? extractCsvOrKvTenantMarkers(termEx.step.body) : new Set<string>()
+  const textMarkers = termEx.step.json === undefined && !isStaticAsset ? extractCsvOrKvTenantMarkers(termEx.step.body) : new Set<string>()
   const allMarkers = new Set<string>([...jsonMarkers, ...textMarkers])
   const { pathTokens, queryAndBodyTokens } = collectRequestTokensBySource(termEx)
   const reqCitesOwnTenant = attackerTenants.size > 0
@@ -281,7 +302,7 @@ export function analyzeCrossTenantTerminalEvidence(
 
   const hasForeignTenantData = directForeign || upstreamNonReflectedForeign
   const opaquePlainTextMultiHop = Boolean(
-    !isStub && hasBody && !ownTenantOnly && !reflectedTenantOnly && !isCsvOrJsonEntry(termEx) && hasVerifiedMultiHopTermEdge,
+    !isStub && hasBody && !ownTenantOnly && !reflectedTenantOnly && !isCsvOrJsonEntry(termEx) && !isStaticAsset && hasVerifiedMultiHopTermEdge,
   )
   const crossTenantSatisfied = hasPostMutation || hasForeignTenantData || opaquePlainTextMultiHop
 
@@ -289,6 +310,114 @@ export function analyzeCrossTenantTerminalEvidence(
 }
 
 const DUAL_ABAC_MODES = new Set(['cross_org_transfer', 'dual_org_cache_bleed', 'batch_partial_authz'])
+
+function findOwnerTenantField(val: unknown, depth = 0): string {
+  if (depth > 4 || !val || typeof val !== 'object') return ''
+  if (Array.isArray(val)) { for (const x of val.slice(0, 32)) { const h = findOwnerTenantField(x, depth + 1); if (h) return h } return '' }
+  const keys = new Set(['ownertenantid', 'owner_tenant_id', 'ownerorgid', 'owner_org_id', 'destinationtenant', 'destination_tenant', 'desttenantid', 'dest_tenant_id', 'tenantid', 'tenant_id', 'tenant', 'orgid', 'org_id'])
+  for (const [k, v] of Object.entries(val as Record<string, unknown>)) if (typeof v === 'string' && v.trim() && keys.has(k.toLowerCase())) return v.trim().toLowerCase()
+  for (const v of Object.values(val as Record<string, unknown>)) if (v && typeof v === 'object') { const h = findOwnerTenantField(v, depth + 1); if (h) return h }
+  return ''
+}
+
+/**
+ * Derive a host-observed `dual_tenant_abac` raw reference input strictly from host transcript
+ * records in `idx` + `econCtx` (never worker assertions). Returns `null` when the transcript
+ * does not match a specific `cross_org_transfer` or `dual_org_cache_bleed` pattern.
+ */
+export function deriveHostDualTenantRawInput(
+  idx: HydratableTranscriptIndex,
+  econCtx: EconomicAutoHydrateContext | undefined,
+): Record<string, unknown> | null {
+  if (!econCtx) return null
+  const capIdx = buildCapOriginIndex(idx.entriesById.values(), ANON_FACT_ACTOR_RE)
+  const resolveActor = (e: HydratableEntry | undefined): string => {
+    const a = e ? (e.actorPersona !== undefined ? e.actorPersona : e.step.actor.handle)?.trim() ?? '' : ''
+    if (!a || ANON_FACT_ACTOR_RE.test(a)) return ''
+    return a.startsWith('cap:') ? (capIdx.emitterActorOf(a)?.actor?.trim() ?? capIdx.actorOf(a)?.trim() ?? '') : a
+  }
+  const actorIds = [...econCtx.termHopExchangeIds, ...(econCtx.citedExchangeIds ?? []), ...econCtx.preChainControlExchangeIds]
+    .map(id => resolveActor(idx.entriesById.get(id))).filter(Boolean)
+  const actorId = actorIds[0]
+  if (!actorId) return null
+  const actorLower = actorId.toLowerCase(), rolesByTenant: Record<string, 'viewer' | 'member' | 'admin' | 'owner'> = {}
+  const recordRole = (tenant: string | null | undefined, role: 'viewer' | 'member' | 'admin' | 'owner' | null | undefined): void => {
+    const t = tenant?.trim().toLowerCase()
+    if (!t || !role || t === '__proto__' || t === 'constructor' || t === 'prototype') return
+    const prev = rolesByTenant[t]
+    if (!prev || ROLE_RANK[role] > ROLE_RANK[prev]) rolesByTenant[t] = role
+  }
+  for (const e of idx.entriesById.values()) {
+    if (resolveActor(e).toLowerCase() !== actorLower) continue
+    const idn = resolveEntryIdentity(e); recordRole(idn.tenant, idn.role)
+    if (e.actorRoleLabel) for (const m of parseRoleMemberships(e.actorRoleLabel)) recordRole(m.tenant, m.role)
+  }
+  for (const reg of [idx.personaRoleLabels, econCtx.personaRoleLabels]) {
+    if (!reg) continue
+    for (const [k, label] of Object.entries(reg)) {
+      if (k.trim().toLowerCase() === actorLower) for (const m of parseRoleMemberships(label)) recordRole(m.tenant, m.role)
+    }
+  }
+  const adminTenants = new Set(Object.entries(rolesByTenant).filter(([, r]) => ROLE_RANK[r] >= ROLE_RANK.admin).map(([t]) => t))
+  const lowTenants = new Set(Object.entries(rolesByTenant).filter(([, r]) => ROLE_RANK[r] < ROLE_RANK.admin).map(([t]) => t))
+  if (adminTenants.size === 0) return null
+
+  const isPos = (ts: unknown): ts is number => typeof ts === 'number' && Number.isFinite(ts) && ts > 0
+  const dimOf = (e: HydratableEntry | undefined, stripUrl = false) => {
+    const personaTenant = ((e ? resolveEntryIdentity(e).tenant : null) ?? '').trim().toLowerCase()
+    return deriveRecordAuthzDimension(e ? { route: e.step.route, pathAndQuery: e.step.pathAndQuery, json: e.step.json, body: e.step.body, tenantId: personaTenant || null } : undefined, { personaTenant, stripUrlTokens: stripUrl })
+  }
+  const preCtrls = econCtx.preChainControlExchangeIds
+    .map(id => idx.entriesById.get(id))
+    .filter((e): e is HydratableEntry => {
+      if (!e || !isPos(e.timestampMs) || (e.step.status !== 401 && e.step.status !== 403)) return false
+      const cAct = resolveActor(e).toLowerCase()
+      return e.step.status === 403 || (Boolean(cAct) && cAct === actorLower)
+    })
+  const termHopSet = new Set(econCtx.termHopExchangeIds)
+  const termEx = [...econCtx.termHopExchangeIds].reverse()
+    .map(id => idx.entriesById.get(id))
+    .find((e): e is HydratableEntry => Boolean(e && e.step.arm === 'probe' && is2xx(e.step.status) && isPos(e.timestampMs)))
+  const upstreamExecs = (econCtx.citedExchangeIds ?? [])
+    .filter(id => !termHopSet.has(id))
+    .map(id => idx.entriesById.get(id))
+    .filter((e): e is HydratableEntry => Boolean(e && (e.step.arm === 'probe' || e.step.arm === 'setup') && is2xx(e.step.status) && isPos(e.timestampMs)))
+  const postRbs = econCtx.postChainReadbackExchangeIds
+    .map(id => idx.entriesById.get(id))
+    .filter((e): e is HydratableEntry => Boolean(e && is2xx(e.step.status) && isPos(e.timestampMs) && !isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method, e.step.route ?? e.step.pathAndQuery)))
+  const normRt = (e: HydratableEntry): string => cleanExactPath(e.step.route ?? e.step.pathAndQuery)
+
+  // 1. Detect host-observed cross_org_transfer.
+  const xfer = (termEx && !stepReadsState(termEx.step) ? termEx : [...upstreamExecs].reverse().find(u => !stepReadsState(u.step)))
+  const rb = postRbs.find(r => !xfer || (r.exchangeId !== xfer.exchangeId && r.timestampMs! >= xfer.timestampMs!))
+    ?? (termEx && xfer && termEx.exchangeId !== xfer.exchangeId && stepReadsState(termEx.step) && termEx.timestampMs! >= xfer.timestampMs! ? termEx : undefined)
+  const srcCtrl = preCtrls.find(c => { const t = dimOf(c).personaTenant; return Boolean(t && lowTenants.has(t)) })
+  if (xfer && rb && srcCtrl) {
+    const ownerTenant = findOwnerTenantField(rb.step.json)
+    const srcT = dimOf(srcCtrl).personaTenant
+    const eid = xfer.entityId?.trim() || rb.entityId?.trim() || srcCtrl.entityId?.trim() || ''
+    if (ownerTenant && adminTenants.has(ownerTenant) && ownerTenant !== srcT && eid && entryMatchesEntity(rb, eid) && (entryMatchesEntity(xfer, eid) || entryMatchesEntity(srcCtrl, eid))) {
+      return { mode: 'cross_org_transfer', sourceControlDenied: srcCtrl.exchangeId, transferRecord: xfer.exchangeId, postTransferReadback: rb.exchangeId, entityId: eid }
+    }
+  }
+
+  // 2. Detect host-observed dual_org_cache_bleed.
+  if (termEx && !isJobOrHandleStub(termEx.step.json, termEx.step.body, termEx.step.status, termEx.step.method, termEx.step.route ?? termEx.step.pathAndQuery)) {
+    const bledMarkers = dimOf(termEx, !hasSubstantiveJsonRecords(termEx.step.json)).responseTenants
+    const foreignTarget = [...bledMarkers].find(t => !adminTenants.has(t))
+    const ctrl = preCtrls.find(c => { const cr = normRt(c), br = normRt(termEx); return !cr || !br || cr === br })
+    const prime = foreignTarget ? upstreamExecs.find(u => {
+      if (u.timestampMs! > termEx.timestampMs!) return false
+      const d = dimOf(u)
+      const pt = [...d.responseTenants].find(t => adminTenants.has(t)) ?? (adminTenants.has(d.personaTenant) ? d.personaTenant : '')
+      return Boolean(pt && pt !== foreignTarget)
+    }) : undefined
+    if (foreignTarget && ctrl && prime && prime.timestampMs! >= ctrl.timestampMs!) {
+      return { mode: 'dual_org_cache_bleed', baselineDeniedControl: ctrl.exchangeId, primeAction: prime.exchangeId, bledAccess: termEx.exchangeId }
+    }
+  }
+  return null
+}
 
 /**
  * Deterministically infer a v8 oracle family from `terminalImpact.oracleInput` when
@@ -434,6 +563,49 @@ function canReach(adj: ReadonlyMap<string, readonly string[]>, start: string, go
   return false
 }
 
+const SECRET_FACT_KEY_RE = /secret|passw|token|auth|cookie|cred|private|api_?key|jwt|session|sig|hmac/i
+const CORR_FACT_HDR_KEYS = new Set(['x-kovo-correlation', 'x-correlation-id', 'x-request-id'])
+const ANON_FACT_ACTOR_RE = /^(?:anon(?:ymous)?|unauth(?:enticated)?|guest)$/i
+
+function collectSafeJsonBodyLeaves(raw: string | null | undefined, out: Set<string>): void {
+  if (!raw?.trim()) return
+  let parsed: unknown
+  try { parsed = JSON.parse(raw) } catch { return }
+  const walk = (v: unknown, d: number): void => {
+    if (d > 5 || out.size > 256 || v == null) return
+    if (typeof v === 'string') { const t = v.trim(); if (t.length > 0 && t.length <= 512 && !t.includes('[redacted')) out.add(t) }
+    else if (typeof v === 'number' || typeof v === 'boolean') out.add(String(v))
+    else if (Array.isArray(v)) for (const x of v) walk(x, d + 1)
+    else if (typeof v === 'object') for (const [k, x] of Object.entries(v as Record<string, unknown>)) if (!SECRET_FACT_KEY_RE.test(k)) walk(x, d + 1)
+  }
+  walk(parsed, 0)
+}
+
+function isValidCorrelationToken(raw: string): boolean {
+  const cid = raw.trim()
+  return cid.length >= 6 && new Set(cid).size >= 4 && !cid.includes('[redacted')
+}
+
+function factMatchesCorrelation(fact: Readonly<HostExchangeFact>, correlationId: string): boolean {
+  const cid = correlationId.trim()
+  if (!isValidCorrelationToken(cid)) return false
+  if (fact.correlationIds?.includes(cid) || fact.entityId === cid) return true
+  const pq = fact.pathAndQuery ?? ''
+  if (pq) {
+    const [p = '', q = ''] = pq.split('?', 2)
+    for (const seg of p.split('/')) if (seg === cid) return true
+    if (q) for (const [k, v] of new URLSearchParams(q).entries()) if (!SECRET_FACT_KEY_RE.test(k) && v.trim() === cid) return true
+  }
+  for (const hdrs of [fact.requestHeaders, fact.responseHeaders]) {
+    if (!hdrs) continue
+    for (const [k, v] of Object.entries(hdrs)) if (CORR_FACT_HDR_KEYS.has(k.toLowerCase()) && v.trim() === cid) return true
+  }
+  const leaves = new Set<string>()
+  collectSafeJsonBodyLeaves(fact.rawRequestBody, leaves)
+  collectSafeJsonBodyLeaves(fact.rawResponseBody, leaves)
+  return leaves.has(cid)
+}
+
 function factMatchesEntityId(fact: Readonly<HostExchangeFact>, entityId: string): boolean {
   const lid = entityId.trim().toLowerCase()
   if (!lid) return false
@@ -446,9 +618,33 @@ function factMatchesEntityId(fact: Readonly<HostExchangeFact>, entityId: string)
       if (seg.toLowerCase() === lid) return true
       try { if (decodeURIComponent(seg).toLowerCase() === lid) return true } catch { /* ignore */ }
     }
-    if (q) for (const v of new URLSearchParams(q).values()) if (v.trim().toLowerCase() === lid) return true
+    if (q) for (const [k, v] of new URLSearchParams(q).entries()) if (!SECRET_FACT_KEY_RE.test(k) && v.trim().toLowerCase() === lid) return true
   }
+  const leaves = new Set<string>()
+  collectSafeJsonBodyLeaves(fact.rawRequestBody, leaves)
+  collectSafeJsonBodyLeaves(fact.rawResponseBody, leaves)
+  for (const leaf of leaves) if (leaf.toLowerCase() === lid) return true
   return false
+}
+
+function factActorLineage(fact: Readonly<HostExchangeFact>, factLog: HostFactLog): Set<string> {
+  const out = new Set<string>()
+  const add = (raw: string | null | undefined): void => {
+    const a = raw?.trim().toLowerCase() ?? ''
+    if (a && !ANON_FACT_ACTOR_RE.test(a) && !a.startsWith('cap:')) out.add(a)
+  }
+  add(fact.actor)
+  const caps = [
+    ...(fact.actor?.startsWith('cap:') ? [fact.actor] : []),
+    ...(fact.consumedCapabilities ?? []),
+    ...(fact.cryptoAttestations ?? []).map(a => a.derivedFromCapabilityId),
+  ]
+  if (caps.length > 0) {
+    for (const ex of factLog.orderedExchanges()) {
+      if (ex.emittedCapabilities?.some(c => caps.includes(c))) add(ex.actor)
+    }
+  }
+  return out
 }
 
 function findMutatingStateTransitionEdge(
@@ -457,6 +653,8 @@ function findMutatingStateTransitionEdge(
   factLog: HostFactLog,
   termHopId: string,
   allHopExIds: ReadonlySet<string>,
+  preChainCtrlIds?: ReadonlySet<string>,
+  allowLogicalFallback = false,
 ): Extract<CausalEdgeBinding, { kind: 'state_transition_binding' }> | null {
   const fromFacts = fromHop.exchangeIds
     .map(id => factLog.getExchange(id))
@@ -466,35 +664,143 @@ function findMutatingStateTransitionEdge(
     .filter((f): f is HostExchangeFact => Boolean(f && isExecArm(f.arm, toHop.hopId === termHopId) && is2xx(f.status) && isFiniteTs(f.timestampMs)))
   if (fromFacts.length === 0 || toFacts.length === 0) return null
 
+  const pair = fromFacts.flatMap(f => toFacts.filter(t => f.timestampMs! <= t.timestampMs!).map(t => ({ f, t })))[0]
+  if (!pair) return null
+
   const candidateEids = new Set<string>()
   for (const eid of [fromHop.entityId, toHop.entityId, ...fromFacts.map(f => f.entityId), ...toFacts.map(f => f.entityId)]) {
     if (eid?.trim()) candidateEids.add(eid.trim())
   }
-  if (candidateEids.size === 0) return null
-
-  const pair = fromFacts.flatMap(f => toFacts.filter(t => f.timestampMs! <= t.timestampMs!).map(t => ({ f, t })))[0]
-  if (!pair) return null
-
   const sharedEid = [...candidateEids].find(eid => factMatchesEntityId(pair.f, eid) && factMatchesEntityId(pair.t, eid))
-  if (!sharedEid) return null
+  const fLineage = factActorLineage(pair.f, factLog), tLineage = factActorLineage(pair.t, factLog)
+  const sameLineage = (fLineage.size > 0 && tLineage.size > 0 && [...fLineage].some(a => tLineage.has(a)))
+    || (fLineage.size === 0 && tLineage.size === 0)
+  const toUsesCap = Boolean(pair.t.actor?.startsWith('cap:') || (pair.t.consumedCapabilities?.length ?? 0) > 0 || (pair.t.cryptoAttestations?.length ?? 0) > 0)
+  const logicalEid = !sharedEid && allowLogicalFallback && (sameLineage || toUsesCap)
+    ? (fromHop.entityId?.trim() || toHop.entityId?.trim() || pair.f.entityId?.trim() || pair.t.entityId?.trim() || `state:${[...fLineage][0] ?? [...tLineage][0] ?? fromHop.hopId}`)
+    : null
+  const chosenEid = sharedEid ?? logicalEid
+  if (!chosenEid) return null
 
-  const toFam = normalizeCompositeTerminalEndpoint(pair.t.pathAndQuery, sharedEid)
-  const ablation = factLog.orderedExchanges().find(ab => {
-    if (allHopExIds.has(ab.exchangeId)) return false
-    if (ab.cleanSession === false) return false
+  const pairHopExIds = new Set([...fromHop.exchangeIds, ...toHop.exchangeIds])
+  const toFam = normalizeCompositeTerminalEndpoint(pair.t.pathAndQuery, chosenEid)
+  const isCleanAblation = (ab: Readonly<HostExchangeFact>): boolean => {
+    if (pairHopExIds.has(ab.exchangeId) || (!preChainCtrlIds?.has(ab.exchangeId) && allHopExIds.has(ab.exchangeId))) return false
+    if (ab.cleanSession !== true) return false
     if (ab.arm !== 'control' && ab.replayAttempt !== 'ablation_control') return false
     if (ab.status == null || !ABLATION_DENIED_STATUSES.has(ab.status)) return false
-    const sameFam = Boolean(toFam) && normalizeCompositeTerminalEndpoint(ab.pathAndQuery, ab.entityId ?? sharedEid) === toFam
-    return factMatchesEntityId(ab, sharedEid) || sameFam
-  })
+    const abAct = ab.actor?.trim().toLowerCase() ?? ''
+    if (abAct.startsWith('cap:') && abAct !== pair.t.actor?.trim().toLowerCase()) return false
+    const abLineage = factActorLineage(ab, factLog)
+    const toAuth = Boolean(pair.t.actor && !ANON_FACT_ACTOR_RE.test(pair.t.actor))
+    if (!toUsesCap && toAuth && tLineage.size > 0 && (abLineage.size === 0 || ![...abLineage].some(a => tLineage.has(a)))) {
+      if (logicalEid || (abAct && !ANON_FACT_ACTOR_RE.test(abAct))) return false
+    }
+    const sameFam = Boolean(toFam) && normalizeCompositeTerminalEndpoint(ab.pathAndQuery, ab.entityId ?? chosenEid) === toFam
+    return logicalEid ? sameFam : (factMatchesEntityId(ab, chosenEid) || sameFam)
+  }
+  const ordered = factLog.orderedExchanges()
+  const ablation = ordered.find(ab => preChainCtrlIds?.has(ab.exchangeId) && isCleanAblation(ab))
+    ?? ordered.find(ab => ab.replayAttempt === 'ablation_control' && isCleanAblation(ab))
+    ?? ordered.find(isCleanAblation)
   if (!ablation) return null
 
   return {
     kind: 'state_transition_binding',
     fromHopId: fromHop.hopId,
     toHopId: toHop.hopId,
-    entityId: sharedEid,
+    entityId: chosenEid,
     ablationExchangeIds: [ablation.exchangeId],
+  }
+}
+
+function inferAsyncPivotEdges(
+  receipt: CompositeProofReceipt,
+  backwardsHops: readonly CompositeProofReceipt['hops'][number][],
+  hopsById: ReadonlyMap<string, CompositeProofReceipt['hops'][number]>,
+  ownerHopByEx: ReadonlyMap<string, string>,
+  factLog: HostFactLog,
+  termHopId: string,
+  outAdj: ReadonlyMap<string, readonly string[]>,
+  tryAppendEdge: (edge: CausalEdgeBinding) => boolean,
+): void {
+  const hopMinTriggerTs = (hop: CompositeProofReceipt['hops'][number], cid: string): number | null => {
+    const ts: number[] = []
+    for (const id of hop.exchangeIds) {
+      const f = factLog.getExchange(id)
+      if (f && is2xx(f.status) && isFiniteTs(f.timestampMs) && factMatchesCorrelation(f, cid)) ts.push(f.timestampMs)
+    }
+    for (const id of hop.browserTraceIds) {
+      const tr = factLog.getBrowserTrace(id)
+      if (tr && isFiniteTs(tr.timestampMs) && tr.correlationIds?.includes(cid)) ts.push(tr.timestampMs)
+    }
+    return ts.length > 0 ? Math.min(...ts) : null
+  }
+  const matchesPollDigest = (f: Readonly<HostExchangeFact>, digests: readonly string[] | undefined): boolean => {
+    if (!digests?.length) return false
+    const set = new Set(digests.map(d => d.toLowerCase()))
+    if (f.observedResponseDigests?.some(d => set.has(d.toLowerCase()))) return true
+    return Boolean(f.rawResponseBody && set.has(sha256Hex(f.rawResponseBody)))
+  }
+
+  // 1. Host-recorded converged `HostAsyncPollRecord` -> `async_pivot_binding (poll_convergence)`
+  for (const poll of factLog.listAsyncPolls()) {
+    if (!poll.converged || !isFiniteTs(poll.tTriggerMs) || !isFiniteTs(poll.tObservedMs) || poll.tObservedMs < poll.tTriggerMs) continue
+    const cids = [...new Set([...(poll.correlationIds ?? []), ...(poll.entityId ? [poll.entityId] : [])])].filter(isValidCorrelationToken)
+    for (const cid of cids) {
+      const trigOwner = poll.triggerExchangeId ? hopsById.get(ownerHopByEx.get(poll.triggerExchangeId) ?? '') : undefined
+      const fromCandidates = trigOwner ? [trigOwner, ...receipt.hops.filter(h => h.hopId !== trigOwner.hopId)] : receipt.hops
+      const fromHop = fromCandidates.find(h => {
+        const minT = hopMinTriggerTs(h, cid)
+        return minT !== null && poll.tObservedMs >= minT
+      })
+      if (!fromHop) continue
+      const minTrig = hopMinTriggerTs(fromHop, cid)!
+      const toHop = backwardsHops.find(h => {
+        if (h.hopId === fromHop.hopId || canReach(outAdj, fromHop.hopId, h.hopId)) return false
+        return h.exchangeIds.some(id => {
+          const f = factLog.getExchange(id)
+          if (!f || !isExecArm(f.arm, h.hopId === termHopId) || !is2xx(f.status)) return false
+          return matchesPollDigest(f, poll.observedValueDigests) || (factMatchesCorrelation(f, cid) && isFiniteTs(f.timestampMs) && f.timestampMs >= minTrig)
+        })
+      })
+      if (toHop && tryAppendEdge({ kind: 'async_pivot_binding', fromHopId: fromHop.hopId, toHopId: toHop.hopId, correlationId: cid, channel: 'poll_convergence', pollRecordId: poll.id })) break
+    }
+  }
+
+  // 2. Async job trigger -> downstream readback/job exchange (`channel: 'async_job'`)
+  for (const hopB of backwardsHops) {
+    const isTermB = hopB.hopId === termHopId
+    for (const exId of hopB.exchangeIds) {
+      const toFact = factLog.getExchange(exId)
+      if (!toFact || !isExecArm(toFact.arm, isTermB) || !is2xx(toFact.status) || !isFiniteTs(toFact.timestampMs)) continue
+      const stub = isJobOrHandleStub(undefined, toFact.rawResponseBody ?? undefined, toFact.status, toFact.method, toFact.pathAndQuery)
+      const validAsyncTo = (/^(?:POST|PUT|PATCH)$/i.test(toFact.method) && (toFact.status === 202 || stub))
+        || (isReadMethod(toFact.method) && Boolean(toFact.rawResponseBody?.trim()))
+      if (!validAsyncTo) continue
+      const explicitCids = new Set<string>([
+        ...(toFact.correlationIds ?? []),
+        ...(toFact.entityId ? [toFact.entityId] : []),
+        ...(hopB.entityId ? [hopB.entityId] : []),
+      ])
+      const cids = [...explicitCids].filter(isValidCorrelationToken)
+      for (const cid of cids) {
+        if (!factMatchesCorrelation(toFact, cid)) continue
+        for (const hopA of receipt.hops) {
+          if (hopA.hopId === hopB.hopId || canReach(outAdj, hopA.hopId, hopB.hopId)) continue
+          const minTrig = hopMinTriggerTs(hopA, cid)
+          if (minTrig === null || toFact.timestampMs <= minTrig) continue
+          const hasAsyncCue = hopA.surface === 'async_job' || hopB.surface === 'async_job'
+            || Boolean(toFact.correlationIds?.includes(cid))
+            || hopA.exchangeIds.some(id => {
+              const f = factLog.getExchange(id)
+              return Boolean(f && is2xx(f.status) && factMatchesCorrelation(f, cid) && (!isReadMethod(f.method) || f.status === 202 || f.correlationIds?.includes(cid)))
+            })
+          if (!hasAsyncCue) continue
+          if (tryAppendEdge({ kind: 'async_pivot_binding', fromHopId: hopA.hopId, toHopId: hopB.hopId, correlationId: cid, channel: 'async_job' })) break
+        }
+      }
+    }
   }
 }
 
@@ -721,19 +1027,18 @@ export function compileCausalChainFromTranscript(
     return true
   }
 
-  // 4. Infer valid mutating `state_transition_binding` for rewired hop pairs on shared entityId.
+  // 4. Infer async pivots (`poll_convergence` / `async_job`) and valid mutating `state_transition_binding` for rewired hop pairs.
+  const backwardsHops = [hopsById.get(termHopId)!, ...[...receipt.hops].filter(h => h.hopId !== termHopId).reverse()]
+  inferAsyncPivotEdges(receipt, backwardsHops, hopsById, ownerHopByEx, factLog, termHopId, outAdj, tryAppendEdge)
+  const preChainCtrlIds = new Set(receipt.terminalImpact.preChainControlExchangeIds)
   for (const cand of stateTransitionCandidates) {
     const fromHop = hopsById.get(cand.fromHopId), toHop = hopsById.get(cand.toHopId)
-    if (!fromHop || !toHop) continue
-    const stEdge = findMutatingStateTransitionEdge(fromHop, toHop, factLog, termHopId, allHopExIds)
+    if (!fromHop || !toHop || canReach(outAdj, fromHop.hopId, toHop.hopId)) continue
+    const stEdge = findMutatingStateTransitionEdge(fromHop, toHop, factLog, termHopId, allHopExIds, preChainCtrlIds, true)
     if (stEdge) tryAppendEdge(stEdge)
   }
 
   // 5. Pass 2: Backwards transcript-first compilation from terminal hop to earlier hops.
-  const backwardsHops = [
-    hopsById.get(termHopId)!,
-    ...[...receipt.hops].filter(h => h.hopId !== termHopId).reverse(),
-  ]
 
   for (const hopB of backwardsHops) {
     const isTermB = hopB.hopId === termHopId
@@ -811,24 +1116,18 @@ export function compileCausalChainFromTranscript(
     }
   }
 
-  // 5d. Backwards mutating `state_transition_binding` for any remaining orphan mutating hop with shared entityId + clean ablation.
+  // 5d. Backwards mutating `state_transition_binding` for any remaining orphan mutating hop.
   for (const hopA of receipt.hops) {
     if (hopA.hopId === termHopId || canReach(outAdj, hopA.hopId, termHopId)) continue
     for (const hopB of backwardsHops) {
       if (hopB.hopId === hopA.hopId || !canReach(outAdj, hopB.hopId, termHopId)) continue
-      const stEdge = findMutatingStateTransitionEdge(hopA, hopB, factLog, termHopId, allHopExIds)
+      const stEdge = findMutatingStateTransitionEdge(hopA, hopB, factLog, termHopId, allHopExIds, preChainCtrlIds, true)
       if (stEdge && tryAppendEdge(stEdge)) break
     }
   }
 
-  if (inferredEdges.length === 0 && rewiredEdges.length === 0) {
-    return { receipt, inferredEdges: [], rewiredEdges: [] }
-  }
-  return {
-    receipt: { ...receipt, causalEdges: [...baseEdges, ...inferredEdges] },
-    inferredEdges,
-    rewiredEdges,
-  }
+  if (inferredEdges.length === 0 && rewiredEdges.length === 0) return { receipt, inferredEdges: [], rewiredEdges: [] }
+  return { receipt: { ...receipt, causalEdges: [...baseEdges, ...inferredEdges] }, inferredEdges, rewiredEdges }
 }
 
 // ---------------------------------------------------------------------------

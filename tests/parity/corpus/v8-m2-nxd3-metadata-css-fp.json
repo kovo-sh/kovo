@@ -1,0 +1,119 @@
+{
+  "id": "v8-m2-nxd3-metadata-css-fp",
+  "side": "fp",
+  "archetype": "v8-m2-readonly-metadata-listing-cross-tenant",
+  "description": "M2 kernel FP guard: a read-only workspace document metadata listing ({ workspace, docs: [{ id, title, folder }] } with zero private payload content) MUST NOT confirm cross_tenant_document_read or cross_tenant_read.",
+  "covers": {
+    "files": [
+      "src/server/causal-proof-compiler.ts",
+      "src/server/composite-receipt.ts",
+      "src/server/v8-oracle-hydrate.ts"
+    ],
+    "classes": [
+      "cross_tenant_document_read",
+      "cross_tenant_read",
+      "dual_tenant_abac"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Read-only workspace document metadata listing falsely claimed as cross-tenant document read",
+    "impact": "A metadata-only workspace listing containing only document IDs, titles, and folder names without private document content cannot confirm cross-tenant document read.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "cross_tenant_document_read"
+  },
+  "freeTextLabel": {
+    "title": "Cross-tenant document access claimed from read-only workspace folder metadata listing"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (org_a)",
+      "role": "member",
+      "tenant": "org_a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-v8m2-member-a"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "hop1_ex",
+      "arm": "probe",
+      "role": "setup",
+      "method": "POST",
+      "pathAndQuery": "/api/v1/workspaces/org_a/preview-token",
+      "persona": "member_a",
+      "emittedCapabilities": [
+        "cap:hop_1:ws_listing_tok"
+      ],
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"token\":\"preview-listing-tok-1\",\"workspace\":\"org_a\"}"
+    },
+    {
+      "id": "hop2_ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/workspaces/org_b/docs",
+      "persona": "member_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "hop2_prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/workspaces/org_b/docs",
+      "persona": null,
+      "consumedCapabilities": [
+        "cap:hop_1:ws_listing_tok"
+      ],
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"workspace\":\"org_b\",\"tenantId\":\"org_b\",\"docs\":[{\"id\":\"doc-101\",\"title\":\"Quarterly Overview\",\"folder\":\"general\"},{\"id\":\"doc-102\",\"title\":\"Onboarding Guide\",\"folder\":\"handbook\"}]}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-V8-M2-NXD3-METADATA-CSS-FP",
+    "terminalVulnClass": "cross_tenant_document_read",
+    "oracleFamily": "",
+    "capabilityToken": "ws_listing_tok",
+    "terminalExchangeId": "hop2_prb",
+    "preChainControlIds": [
+      "hop2_ctl"
+    ],
+    "attackerPersonas": [
+      "member_a"
+    ],
+    "forbiddenShortcutPersonas": [
+      "owner_a"
+    ],
+    "expectedFailedStage": "terminal_impact",
+    "claimedDelta": "Read-only workspace document metadata listing with zero private payload content must reject at terminal_impact."
+  }
+}

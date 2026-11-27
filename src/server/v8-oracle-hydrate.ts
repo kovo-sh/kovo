@@ -886,13 +886,8 @@ export function hydrateV8OracleInput(
     ] as const) hydrateRole(f, a)
     const mode = pickEnum(rawInput, 'mode', DUAL_MODE_SET)
     if (mode) out.mode = mode
-    const citedEntry = (field: string): HydratableEntry | undefined =>
-      isRecObj(out[field]) ? idx.entriesById.get((out[field] as HostSignedRecord).id) : undefined
-    const cited = [
-      citedEntry('transferRecord'), citedEntry('postTransferReadback'), citedEntry('sourceControlDenied'),
-      citedEntry('baselineDeniedControl'), citedEntry('primeAction'), citedEntry('bledAccess'),
-      citedEntry('singleForeignControlDenied'), citedEntry('batchRequest'), citedEntry('postMutationReadback'),
-    ]
+    const citedEntry = (field: string): HydratableEntry | undefined => isRecObj(out[field]) ? idx.entriesById.get((out[field] as HostSignedRecord).id) : undefined
+    const cited = ['transferRecord', 'postTransferReadback', 'sourceControlDenied', 'baselineDeniedControl', 'primeAction', 'bledAccess', 'singleForeignControlDenied', 'batchRequest', 'postMutationReadback'].map(citedEntry)
     const actor = deriveDualActorFromTranscript(idx, cited, rawInput, econCtx)
     if (actor) out.actor = actor
     // Allowlist ONLY record selector IDs (with minimum length); tenant scope and role requirements are host-derived.
@@ -901,8 +896,9 @@ export function hydrateV8OracleInput(
       if (v && v.length >= MIN_TOKEN_LEN) out[k] = v
     }
     const tenantOf = (e: HydratableEntry | undefined): string | null => hostAuthzDim(e).personaTenant || null
-    // R3-C-5 + Move-1 + R4-C-5: shared host-attested authz-dimension primitive, stripping attacker-supplied URL path/query tokens.
-    const markersOf = (e: HydratableEntry | undefined): Set<string> => hostAuthzDim(e, undefined, undefined, true).responseTenants
+    const hasSubJson = (j: unknown): boolean => Boolean(j && typeof j === 'object' && (Array.isArray(j) ? j.some(x => x && typeof x === 'object') : Object.entries(j as Record<string, unknown>).some(([k, v]) => (/(?:secret|passw|private|credential|api_?key|vault|audit|ledger|balance|amount|payout|settlement|content|body|text|records|rows|entries|invoices)/i.test(k) && v !== null && v !== undefined && v !== '') || (Array.isArray(v) && v.some(x => x && typeof x === 'object' && Object.keys(x as Record<string, unknown>).length >= 2)))))
+    // R3-C-5 + Move-1 + R4-C-5: shared host-attested authz-dimension primitive; strip URL path tokens unless JSON has substantive records.
+    const markersOf = (e: HydratableEntry | undefined): Set<string> => hostAuthzDim(e, undefined, undefined, !hasSubJson(e?.step.json)).responseTenants
     const hostKnownTenants = new Set<string>()
     for (const e of idx.entriesById.values()) { const t = tenantOf(e); if (t) hostKnownTenants.add(t); if (e.actorRoleLabel) for (const m of parseRoleMemberships(e.actorRoleLabel)) if (m.tenant) hostKnownTenants.add(m.tenant.trim().toLowerCase()) }
     if (mode === 'cross_org_transfer') {

@@ -7,7 +7,7 @@ import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
 import { routeFamily, stepReadsState, type RoleName } from './oracle-invariants.ts'
 import { augmentCompositeReceiptWithAutoDag, matchesBoundTerminalControl, matchesNormalizedCtrlPath } from './composite-autodag.ts'
-import { analyzeCrossTenantTerminalEvidence, collectCitedReceiptExchanges, evaluateExchangeTenantPrivilege, inferV8OracleFamilyFromInput, isReadOnlyDirectoryOrMetadataImpact, normalizeCompositeTerminalEndpoint, parsePersonaPrivilegeProfile, verifyReadOnlyStateTransitionGuard } from './causal-proof-compiler.ts'
+import { analyzeCrossTenantTerminalEvidence, collectCitedReceiptExchanges, deriveHostDualTenantRawInput, evaluateExchangeTenantPrivilege, inferV8OracleFamilyFromInput, isReadOnlyDirectoryOrMetadataImpact, normalizeCompositeTerminalEndpoint, parsePersonaPrivilegeProfile, verifyReadOnlyStateTransitionGuard } from './causal-proof-compiler.ts'
 import { resolveCompositeTerminalExchange } from './composite-terminal.ts'
 import { HostFactLog } from './host-fact-log.ts'
 import { proofReceiptSchema, receiptIdSchema } from './proof-receipt.ts'
@@ -442,8 +442,8 @@ function verifyAttackerProvenance(receipt: CompositeProofReceipt, dag: DagTopolo
   const allowedSet = options.attackerPersonas?.length ? new Set(options.attackerPersonas) : null, forbiddenSet = new Set(options.forbiddenShortcutPersonas ?? []), dualAbacSet = new Set(options.dualTenantAbacPersonas ?? [])
   const ti = receipt.terminalImpact, normCls = receipt.terminalVulnClass.trim().toLowerCase(), rawOracleIn = ti.oracleInput ?? options.v8OracleInput
   const inferredFam = !ti.oracleFamily && !V8_ORACLE_FAMILY_SET.has(normCls) && rawOracleIn ? inferV8OracleFamilyFromInput(rawOracleIn) : null
-  const isDualAbac = ti.oracleFamily === 'dual_tenant_abac' || normCls === 'dual_tenant_abac' || inferredFam === 'dual_tenant_abac', explicitDualAbac = ti.oracleFamily === 'dual_tenant_abac' || inferredFam === 'dual_tenant_abac', allowDualCrossTenant = isDualAbac || (CROSS_TENANT_CLASS_RE.test(normCls) && !/\b(?:bola|idor)\b/i.test(normCls))
-  const dualAbacExempt = (a: string | null): boolean => Boolean(a && dualAbacSet.has(a) && explicitDualAbac), labelFor = (a: string | null, rl?: string | null): string | null => { const reg = a ? options.personaRoleLabels?.[a] : undefined; return reg && rl && reg !== rl ? `${reg}; ${rl}` : (reg ?? rl ?? null) }
+  const isDualAbac = ti.oracleFamily === 'dual_tenant_abac' || normCls === 'dual_tenant_abac' || inferredFam === 'dual_tenant_abac', allowDualCrossTenant = isDualAbac || (CROSS_TENANT_CLASS_RE.test(normCls) && !/\b(?:bola|idor)\b/i.test(normCls))
+  const dualAbacExempt = (a: string | null): boolean => Boolean(a && dualAbacSet.has(a) && allowDualCrossTenant), labelFor = (a: string | null, rl?: string | null): string | null => { const reg = a ? options.personaRoleLabels?.[a] : undefined; return reg && rl && reg !== rl ? `${reg}; ${rl}` : (reg ?? rl ?? null) }
   const rootSet = new Set(dag.roots), dagCaps = new Set<string>(), probeTenants = new Set<string>(), boundTraces = new Set<string>(), boundOobs = new Set<string>(), forbiddenTraceCaps = new Set<string>()
   const termHop = dag.hopsById.get(ti.terminalHopId)!, termExForDual = ti.terminalExchangeId ? idx.entriesById.get(ti.terminalExchangeId) : [...termHop.exchangeIds].reverse().map(id => idx.entriesById.get(id)!).find(e => e.step.arm === 'probe' && is2xx(e.step.status))
   const isBlockedByList = (a: string | null): boolean => Boolean(a !== null && ((forbiddenSet.has(a) && !dualAbacExempt(a)) || (allowedSet && !allowedSet.has(a) && !dualAbacExempt(a))))
@@ -543,16 +543,9 @@ type DefaultV8Ctx = { termEndpoint: string; termFam: string; hasOob: boolean; ha
 let defaultOracleEvaluator: CompositeOracleEvaluator | null = null
 export function registerDefaultCompositeOracleEvaluator(evaluator: CompositeOracleEvaluator | null): void { defaultOracleEvaluator = evaluator }
 export class UnregisteredOracleEvaluatorError extends Error {
-  constructor(message = 'CompositeProofReceipt verification failed closed: no TerminalOracleRegistry evaluator is registered (unsanitized fallback evaluator removed in R3-16).') {
-    super(message)
-    this.name = 'UnregisteredOracleEvaluatorError'
-  }
+  constructor(message = 'CompositeProofReceipt verification failed closed: no TerminalOracleRegistry evaluator is registered (unsanitized fallback evaluator removed in R3-16).') { super(message); this.name = 'UnregisteredOracleEvaluatorError' }
 }
-const resolveOracleEvaluator = (options: CompositeVerifyOptions): CompositeOracleEvaluator => {
-  const evaluator = options.oracleEvaluator ?? defaultOracleEvaluator
-  if (!evaluator) throw new UnregisteredOracleEvaluatorError()
-  return evaluator
-}
+const resolveOracleEvaluator = (options: CompositeVerifyOptions): CompositeOracleEvaluator => { const evaluator = options.oracleEvaluator ?? defaultOracleEvaluator; if (!evaluator) throw new UnregisteredOracleEvaluatorError(); return evaluator }
 
 function dispatchDefaultV8Oracle(
   receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, factLog: HostFactLog, termEx: HostTranscriptEntry | undefined, options: CompositeVerifyOptions,
@@ -563,7 +556,7 @@ function dispatchDefaultV8Oracle(
   const family = ti.oracleFamily ?? (V8_ORACLE_FAMILY_SET.has(normCls) ? normCls as V8OracleFamily : inferredFam); if (!family) return null
   const policy = { signingKey: options.signingKey, strictHostDerivation: true }, evalOracle = resolveOracleEvaluator(options)
   const rejectFam = (reason: string, missingEvidence: string[], rejectedBy = `v8_oracle_${family}`) => ({ ok: false as const, reason, rejectedBy, missingEvidence })
-  if (ti.oracleFamily && !ti.oracleInput) return rejectFam(`v8_oracle_failed (${family}): missing_v8_oracle_input — terminalImpact.oracleFamily requires terminalImpact.oracleInput.`, ['terminalImpact.oracleInput'])
+  if (ti.oracleFamily && !ti.oracleInput && family !== 'dual_tenant_abac') return rejectFam(`v8_oracle_failed (${family}): missing_v8_oracle_input — terminalImpact.oracleFamily requires terminalImpact.oracleInput.`, ['terminalImpact.oracleInput'])
   if (family === 'dual_tenant_abac' && receipt.hops.length < 2) return rejectFam('v8_oracle_failed (dual_tenant_abac): multi_hop_causal_chain_required', ['upstream_causal_hop_or_oracle_input'])
   if (family === 'dual_tenant_abac' && !terminalCtrl) {
     const received = ti.preChainControlExchangeIds.slice(0, 3).map(id => { const c = idx.entriesById.get(id); return c ? `${c.step.method} ${normRouteFam(c.step.route ?? c.step.pathAndQuery, c.entityId) || '/'} (${c.step.status ?? 'null'})` : `${id}(missing)` }).join(', ') || 'none'
@@ -572,7 +565,8 @@ function dispatchDefaultV8Oracle(
   const mapFail = (reason: string) => (reason === 'terminal_impact_unproven_intermediate_stub' || reason === 'bled_access_own_tenant_only') ? rejectFam(TERMINAL_IMPACT_UNPROVEN_HINT, [TERMINAL_IMPACT_UNPROVEN_HINT], 'terminal_impact_unproven') : rejectFam(`v8_oracle_failed (${family}): ${reason}`, [reason])
   const econCtx = { preChainControlExchangeIds: ti.preChainControlExchangeIds, termHopExchangeIds: dag.hopsById.get(ti.terminalHopId)!.exchangeIds, postChainReadbackExchangeIds: ti.postChainReadbackExchangeIds, citedExchangeIds: receipt.hops.flatMap(h => h.exchangeIds), ...(options.personaRoleLabels ? { personaRoleLabels: options.personaRoleLabels } : {}) }
   const freeFormDualFallback = family === 'dual_tenant_abac' && !ti.oracleFamily && !options.v8OracleInput && !inferredFam && Boolean(explicitInput && typeof explicitInput.mode !== 'string')
-  if (explicitInput && !freeFormDualFallback) { const res = evalOracle.evaluate(factLog, { kind: 'v8_family', family, rawInput: explicitInput, econCtx }, policy); return res.confirmed ? { ok: true, family, explicit: true } : mapFail(res.reason) }
+  const effInput = (explicitInput && !freeFormDualFallback) ? explicitInput : (family === 'dual_tenant_abac' && !explicitInput ? deriveHostDualTenantRawInput({ entriesById: idx.entriesById, personaRoleLabels: options.personaRoleLabels }, econCtx) : null)
+  if (effInput) { const res = evalOracle.evaluate(factLog, { kind: 'v8_family', family, rawInput: effInput, econCtx }, policy); return res.confirmed ? { ok: true, family, explicit: true } : mapFail(res.reason) }
   if (family === 'cross_surface_pivot') {
     if (receipt.hops.length < 2) return rejectFam('v8_oracle_failed (cross_surface_pivot): invalid_hop_count — requires >= 2 hops across distinct surfaces.', ['cross_surface_pivot_requires_2_plus_hops'])
     const rootHop = dag.hopsById.get(dag.roots[0]!)!, rootEx = rootHop.exchangeIds.map(id => idx.entriesById.get(id)!).find(e => isExecArm(e, rootHop.hopId === ti.terminalHopId)) ?? idx.entriesById.get(rootHop.exchangeIds[0]!)
@@ -590,7 +584,8 @@ function dispatchDefaultV8Oracle(
   }
   if (ctx.isStub && !postMutRb) return mapFail('terminal_impact_unproven_intermediate_stub')
   if (ctx.ownTenantOnly && !postMutRb && family !== 'temporal_revocation') return mapFail('bled_access_own_tenant_only')
-  const multiHopDualDag = family === 'dual_tenant_abac' && !ti.oracleFamily && receipt.hops.length >= 2 && ctx.hasVerifiedTermEdge && Boolean(terminalCtrl && terminalCtrl.step.status !== 401 && actorOf(terminalCtrl)) && (ctx.hasForeignTenantData || Boolean(postMutRb))
+  if (family === 'dual_tenant_abac' && !postMutRb && isReadOnlyDirectoryOrMetadataImpact(termEx)) return mapFail('terminal_impact_unproven_intermediate_stub')
+  const ctrlAct = terminalCtrl ? actorOf(terminalCtrl) : null, multiHopDualDag = family === 'dual_tenant_abac' && receipt.hops.length >= 2 && ctx.hasVerifiedTermEdge && Boolean(terminalCtrl && (terminalCtrl.step.status === 401 || terminalCtrl.step.status === 403 || terminalCtrl.step.status === 404) && ctrlAct && !ANON_ACTOR_RE.test(ctrlAct)) && (ctx.hasForeignTenantData || Boolean(postMutRb))
   if (multiHopDualDag) return { ok: true, family, explicit: false }
   const miss = family === 'economic_conservation' ? 'missing_economic_oracle_input' : 'missing_v8_oracle_input'
   return rejectFam(`v8_oracle_failed (${family}): ${miss} — provide terminalImpact.oracleInput.`, [miss, 'terminalImpact.oracleInput'])
@@ -684,7 +679,7 @@ function verifyTerminalImpactGate(
   if (!singleHopProofOk) {
     if (!hasCleanDeniedCtrl && !hasDerivedTerminalProof) return failUnproven(`Missing clean denied control (401/403/404) bound to terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['clean_denied_control_401_403_404'])
     if ((!termEx && !hasPostMutation) || !termEndpoint || !termFam) return failUnproven(`Missing concrete terminal exchange or endpoint for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['terminal_exchange_with_endpoint'])
-    if (!v8Default && !hasPostMutation && PRIV_ESC_CLASS_RE.test(receipt.terminalVulnClass) && isReadOnlyDirectoryOrMetadataImpact(termEx)) return failUnproven('terminal_impact_unproven: privilege_escalation/bfla cannot confirm on a read-only directory/roster/metadata GET without a state-mutating terminal action + postChainReadbackExchangeIds or a verified v8 oracle family.')
+    if (!v8Default && !hasPostMutation && (PRIV_ESC_CLASS_RE.test(receipt.terminalVulnClass) || isCrossTenantCls) && isReadOnlyDirectoryOrMetadataImpact(termEx)) return failUnproven('terminal_impact_unproven: privilege_escalation/bfla/cross-tenant cannot confirm on a read-only directory/roster/metadata listing GET without private payload content, a state-mutating terminal action + postChainReadbackExchangeIds, or a verified v8 oracle family.')
     if (!v8Default && isCrossTenantCls && !crossTenantSatisfied) return failUnproven('terminal_impact_unproven: cross-tenant class requires positive non-reflected foreign tenant data (request URL/query tokens stripped) or persisted mutation readback.')
     if (termEx && !hasPostMutation && (!hasBody || isStub || (ownTenantOnly && crossOrReplay))) return failUnproven()
   }
