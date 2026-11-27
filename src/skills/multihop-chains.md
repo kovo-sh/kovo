@@ -1,13 +1,13 @@
 # Multi-Hop Chain Playbook
 Tags: multihop, hop-checkpoint, composite-receipt, derived-custody, async-pivot
-Summary: Verify N-hop CompositeProofReceipt chains via ctx.chain, seal_capability, hmac_sign/jwt_sign, await_async, prove_composite.
+Summary: Verify N-hop CompositeProofReceipt chains via ctx.chain and prove_composite.
 
 ## 1. Quick-Reference Contract
 1. **Origin:** Low-priv (`actor_low`/`actor_dual` non-admin tenant; NEVER `actor_victim`/`owner`/`admin`); minted: `kind:"bearer_token"`, `{capability:{handle,target:"bearer"}}`, OMIT `as`.
-2. **One Script:** Explore via `kovo_http`; no seal-only `kovo_verify` — Hop 1->N+`ctx.chain().prove()`/`ctx.prove_composite` in ONE script (no link/token stubs or standalone `prove_*`).
-3. **Helpers:** `ctx.seal_capability` (`jsonPath`/`header`/`cookie`/`value`, no `regex`), `ctx.hmac_sign`/`ctx.jwt_sign`, `ctx.await_async`, `ctx.prove_race_burst`.
-4. **Class/Ablation:** Match `terminalVulnClass` (`dual_tenant_abac` only w/ctrl); ablation=SAME actor as `toHop`; econ: `baselineReadbackExchangeId`+`finalReadbackExchangeId`.
-5. **DAG/Twins:** `causalEdges` (`value_binding|derived_crypto_binding|state_transition_binding|async_pivot_binding`)->`terminalHopId`; `fresh_clean_replay`+`ctx.result`; `invariant_enforced_hardened`.
+2. **One Script:** Probe w/`kovo_http`; NEVER seal-only `kovo_verify`, link/token stubs, or standalone `prove_race_burst`/`prove_access_boundary`/`prove_persisted_mutation` — `ctx.chain`/`ctx.prove_composite` in ONE script.
+3. **Tools:** `ctx.seal_capability` (`jsonPath`/`header`/`cookie`/`value`, no `regex`), `ctx.hmac_sign`/`ctx.jwt_sign`, `ctx.await_async`, `ctx.prove_race_burst`.
+4. **Class/Econ:** Match `terminalVulnClass` (`dual_tenant_abac` only w/ctrl); ablation=SAME actor; `economic_conservation`: `baselineReadbackExchangeId`+`finalReadbackExchangeId`.
+5. **DAG/Twins:** Declare EVERY executed causal hop (Hop 1->terminal) in `hops[]`->`terminalHopId` via `causalEdges[]` (no orphan hops); `fresh_clean_replay`+`ctx.result`; `invariant_enforced_hardened`.
 
 ## 2. Working from a Pre-Hydrated `hopCheckpoint`
 Your `AssignmentBrief` may include a bounded (`<= 2 KB`) `hopCheckpoint` object:
@@ -76,7 +76,7 @@ await chain.prove({ claimedImpact: 'Unauthorized cross-tenant read confirmed via
 return ctx.result({ title: 'Multi-hop cross-tenant capability pivot' })
 ```
 
-- **Single-Script Mode-A Rule (Never Seal-Only `kovo_verify`):** NEVER call `kovo_verify` just to seal a single hop — explore routes/parameters with `kovo_http` first, then execute Hop 1 -> Hop N + `ctx.chain(...).prove()` (or `ctx.prove_composite`) inside **ONE single script**. **NEVER** call standalone `ctx.prove_race_burst`, `ctx.prove_access_boundary`, or `ctx.prove_persisted_mutation` as your final proof whenever your verification script executes prerequisite setup hops (e.g., disclosure/extraction, token/session acquisition, parser differential, cache prime, state rebind, or async job polling) before the terminal impact. Even when the terminal hop is a concurrent race burst, execute the race burst inside the chain and wrap ALL prerequisite setup hops plus the terminal race hop inside `ctx.prove_composite` (calling standalone `prove_race_burst` records `hopCount = 0` and fails multi-hop chain confirmation).
+- **Mandatory `ctx.prove_composite` Rule (Single-Script Mode-A; Never Seal-Only `kovo_verify` or Standalone Helpers After Setup Hops):** NEVER call `kovo_verify` just to seal a single hop — explore routes/parameters with `kovo_http` first, then execute Hop 1 -> Hop N + `ctx.chain(...).prove()` (or `ctx.prove_composite`) inside **ONE single script**. **NEVER** call standalone `ctx.prove_race_burst`, `ctx.prove_access_boundary`, or `ctx.prove_persisted_mutation` as your final proof whenever your verification script executes prerequisite setup hops (e.g., disclosure/extraction, token/session acquisition, parser differential, cache prime, state rebind, or async job polling) before the terminal impact. Even when the terminal hop is a concurrent race burst, execute the race burst inside the chain and wrap ALL prerequisite setup hops plus the terminal race hop inside `ctx.prove_composite` (calling standalone `prove_race_burst` records `hopCount = 0` and fails multi-hop chain confirmation).
 - **Terminal Class Matching Rule (Never Hardcode `dual_tenant_abac`):** Set `terminalVulnClass` to the actual terminal impact class (e.g., `broken_access_control`, `privilege_escalation`, `stale_privilege_use`, `cross_tenant_export`, `ledger_overcredit`, `forged_settlement`, `economic_conservation`, `cryptographic_scope_replay`, `parser_cache_differential`, `cross_surface_pivot`); pass `dual_tenant_abac` **ONLY** when genuinely proving cross-tenant ABAC with a terminal denied control.
 - **Complete Causal Hop Declaration Rule (Hop 1 Through Terminal):** Declare **EVERY** causal hop your verification script executed — from Hop 1 (entry disclosure/extraction) through every intermediate pivot, token/invite resolve, parser differential, cache prime, state rebind, signing, or async-poll hop to the terminal hop — in `prove_composite.hops[]` and connect them end-to-end with `causalEdges[]`. Omitting Hop 1 or any intermediate setup hop yields an incomplete receipt even when all hops executed in the transcript.
 - **Strict-CamelCase Inline Schema (`prove_composite`):**
