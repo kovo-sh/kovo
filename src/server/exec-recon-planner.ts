@@ -64,7 +64,7 @@ import {
 import { extractCoverageEvidenceMetadata, normalizeOriginForCoverage } from './coverage-category.ts'
 import { extractSpecDedupeFields, normalizeEndpointTemplate } from './dedupe.ts'
 import { normalizeRouteTemplate } from './route-template.ts'
-import { buildWave1UncoveredOriginFallbackSteps, classifyRepoDirTier, resolveWave1MultiOriginFallback, selectBalancedRepoSourceCandidates } from './exec-recon-multiorigin.ts'
+import { buildWave1UncoveredOriginFallbackSteps, classifyRepoDirTier, materializeGreyBoxDataflowWave1Steps, resolveWave1MultiOriginFallback, selectBalancedRepoSourceCandidates } from './exec-recon-multiorigin.ts'
 import { meetsBaseline, type EvidenceReview } from './evidence-checks.ts'
 import {
   CHAIN_CONTINUATION_SKILL_PREFIX,
@@ -3564,19 +3564,19 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         ...(d.personaHandle !== undefined ? { personaHandle: d.personaHandle } : {}),
       }))
     const frontierController = this.frontierControllerFor(run.id)
-    const created = synthesizeRuntimeCompositeWave1Steps(this.storage, run, {
+    const compositeCreated = synthesizeRuntimeCompositeWave1Steps(this.storage, run, {
       sourceMounted: false,
       facts: resolvedBundle.facts.filter(f => activeOrigins.has(f.origin)),
       endpoints: resolvedBundle.endpoints.filter(ep => activeOrigins.has(ep.origin)),
-      apiDependencies,
-      specs: resolvedBundle.specs,
-      hostTiers,
-      frontierController,
+      apiDependencies, specs: resolvedBundle.specs, hostTiers, frontierController,
     })
+    const dataflowCreated = materializeGreyBoxDataflowWave1Steps(this.storage, run, {
+      activeOrigins, sourceMounted: false, maxSteps: 6, routeStep: routeStepToSpecialist,
+    })
+    const created = [...dataflowCreated, ...compositeCreated]
     for (const step of created) {
       const origin = step.sourceOrigins[0] ?? [...approvedOrigins][0] ?? ''
-      const depEndpoint = resolvedBundle.endpoints.find(ep =>
-        step.sourceOrigins.includes(ep.origin) && step.hypothesis.includes(ep.pathTemplate))
+      const depEndpoint = resolvedBundle.endpoints.find(ep => step.sourceOrigins.includes(ep.origin) && step.hypothesis.includes(ep.pathTemplate))
       if (origin) {
         this.registerStepTargets(run.id, step.id, [{
           origin: depEndpoint?.origin ?? origin,
@@ -4491,11 +4491,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       // Fallback steps include reachable sibling origins and stay capped below white-box leads.
       const reachableFinalEntries = finalEntries.filter(entry => activeOrigins.has(entry.origin))
       const preFallbackSteps = this.storage.listChainSteps(freshRun.id, freshRun.goalRevision)
-      const discoveredEndpointOrigins = new Set(
-        this.storage.listEndpoints(freshRun.id, { limit: 250 })
-          .filter(ep => activeOrigins.has(ep.origin))
-          .map(ep => ep.origin),
-      )
+      const discoveredEndpointOrigins = new Set(this.storage.listEndpoints(freshRun.id, { limit: 250 })
+        .filter(ep => activeOrigins.has(ep.origin)).map(ep => ep.origin))
       const fallbackResult = buildWave1UncoveredOriginFallbackSteps({
         reachableFinalEntries,
         seededSteps,
@@ -4507,6 +4504,9 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         capabilityTier: freshRun.capabilityTier,
         whiteBoxCapPriority: WHITEBOX_BLACKBOX_CAP_PRIORITY,
         classifyTier: classifyHostTier,
+        storage: this.storage,
+        run: freshRun,
+        activeOrigins,
       })
       seededSteps = fallbackResult.seededSteps
       const uncoveredFallbackSlots = fallbackResult.uncoveredAddedCount
