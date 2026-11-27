@@ -506,8 +506,8 @@ function selectBalancedBriefOriginRoutes(
   const paramReads = sortBucket([...byKey.values()].filter(x => x.bucket === 'param_read'))
   const plainReads = sortBucket([...byKey.values()].filter(x => x.bucket === 'plain_read'))
 
-  // Reserve explicit balanced slots per origin (up to 3 mutating + 2 parameterized reads + 1 read),
-  // then backfill remaining capacity in priority order so plain GETs never crowd out actions.
+  // Reserve explicit balanced slots per origin (2 mutating + 1 param read + 1 read for cap<=4;
+  // 3 mutating + 2 param reads + 1 read for cap>=6), then backfill in priority order.
   const picked: SelectableBriefEndpoint[] = []
   const used = new Set<string>()
   const pushFrom = (list: Array<{ ep: SelectableBriefEndpoint }>, count: number) => {
@@ -521,8 +521,10 @@ function selectBalancedBriefOriginRoutes(
       added += 1
     }
   }
-  pushFrom(mutating, Math.min(3, maxPerOrigin))
-  pushFrom(paramReads, Math.min(2, Math.max(0, maxPerOrigin - picked.length)))
+  const mutatingReserve = maxPerOrigin <= 4 ? Math.min(2, maxPerOrigin) : Math.min(3, maxPerOrigin)
+  const paramReserve = maxPerOrigin <= 4 ? 1 : 2
+  pushFrom(mutating, mutatingReserve)
+  pushFrom(paramReads, Math.min(paramReserve, Math.max(0, maxPerOrigin - picked.length)))
   pushFrom(plainReads, Math.min(1, Math.max(0, maxPerOrigin - picked.length)))
   pushFrom(mutating, maxPerOrigin - picked.length)
   pushFrom(paramReads, maxPerOrigin - picked.length)
@@ -541,14 +543,14 @@ export function selectBriefRoutes(
   },
 ): AssignmentBriefRoute[] {
   const { publicOrigins, targetOrigins, confirmedPaths, confirmedOriginPaths, normalizePath } = options
-  const maxPerOrigin = 6
-  const maxMultiOriginTotal = 24
   if (publicOrigins.length <= 1) {
     const originEndpoints = endpoints.filter(ep => targetOrigins.includes(ep.origin))
     const unconfirmed = originEndpoints.filter(ep => !confirmedPaths.has(normalizePath(ep.pathTemplate)))
-    return selectBalancedBriefOriginRoutes(unconfirmed.length > 0 ? unconfirmed : originEndpoints, maxPerOrigin)
+    return selectBalancedBriefOriginRoutes(unconfirmed.length > 0 ? unconfirmed : originEndpoints, 6)
       .map(ep => ({ method: ep.method, path: ep.pathTemplate, riskScore: ep.riskScore }))
   }
+  const maxPerOrigin = 4
+  const maxMultiOriginTotal = 20
   const perOrigin = new Map<string, SelectableBriefEndpoint[]>()
   for (const orig of publicOrigins) {
     const epsForOrigin = endpoints.filter(ep => ep.origin === orig)
@@ -982,11 +984,11 @@ export function buildMultiHopProofContract(compact = false, input?: AssignmentBr
   const helperPatterns = detectMultiHopHelperPatterns(input, compact)
   if (compact) {
     return {
-      attackerOriginRule: 'Low-priv only; outsider persona (other tenant) for invite/rebind/cross-tenant; non-admin tenant->dual_tenant_abac; SAME actor; {arm:"control"}.',
-      continueChainRule: 'kovo_http; no own-tenant stubs; seal_capability Hops 3-5->terminalHopId+ctx.chain().prove() in 1 script.',
+      attackerOriginRule: 'Low-priv(no victim/owner/admin); outsider persona on invite/rebind; non-admin tenant->dual_tenant_abac; SAME actor; {arm:"control"}.',
+      continueChainRule: 'kovo_http; no own-tenant; ctx.seal_capability Hops 3-5->terminalHopId+ctx.chain().prove() in SAME script.',
       ...(helperPatterns.length ? { helperPatterns } : {}),
       modeATsRecipe: COMPACT_MULTIHOP_MODE_A_RECIPE,
-      hardenedTwinRule: 'Guard holds: record_coverage(status="ruled_out",proofGapReason="invariant_enforced_hardened")+complete_intent.',
+      hardenedTwinRule: 'Hardened: record_coverage(status="ruled_out",proofGapReason="invariant_enforced_hardened")+complete_intent.',
     }
   }
   return {
@@ -1165,7 +1167,7 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
   )].slice(0, 8)
   const publicOrigins = rawPublicOrigins.length > 1 ? rawPublicOrigins : []
   const routes = publicOrigins.length > 1
-    ? interleaveMultiOriginRoutes(input.routes ?? [], publicOrigins, primaryOrigin, 24)
+    ? interleaveMultiOriginRoutes(input.routes ?? [], publicOrigins, primaryOrigin, 20)
     : sortRoutes(input.routes ?? []).slice(0, 12)
   const linked = sortRoutes(input.linkedRoutes ?? []).slice(0, 8)
 

@@ -339,7 +339,7 @@ test('selectBriefRoutes balances mutating + parameterized + read routes up to 6/
   assert.equal(singleParamReads.length, 2, `expected 2 parameterized reads, got ${JSON.stringify(single)}`)
   assert.equal(singlePlainReads.length, 1, `expected 1 plain read, got ${JSON.stringify(single)}`)
 
-  // Multi-origin: up to 6 routes per origin (12 total for 2 origins), interleaved across origins
+  // Multi-origin: preserves <= 4 routes per origin (2 mutating + 1 param read + 1 read), interleaved
   const multi = selectBriefRoutes([...makeOriginPool(ORIGIN_A), ...makeOriginPool(ORIGIN_B)], {
     publicOrigins: [ORIGIN_A, ORIGIN_B],
     targetOrigins: [ORIGIN_A, ORIGIN_B],
@@ -347,14 +347,16 @@ test('selectBriefRoutes balances mutating + parameterized + read routes up to 6/
     confirmedOriginPaths: new Set(),
     normalizePath: p => p,
   })
-  assert.equal(multi.length, 12, `expected 6 routes/origin x 2 origins = 12, got ${multi.length}`)
+  assert.equal(multi.length, 8, `expected 4 balanced routes/origin x 2 origins = 8, got ${multi.length}`)
   const fromA = multi.filter(r => r.origin === ORIGIN_A)
   const fromB = multi.filter(r => r.origin === ORIGIN_B)
-  assert.equal(fromA.length, 6)
-  assert.equal(fromB.length, 6)
+  assert.equal(fromA.length, 4)
+  assert.equal(fromB.length, 4)
+  assert.equal(fromA.filter(r => ['POST', 'PATCH', 'PUT', 'DELETE'].includes(r.method)).length, 2)
+  assert.equal(fromB.filter(r => ['POST', 'PATCH', 'PUT', 'DELETE'].includes(r.method)).length, 2)
   assert.ok(fromA.some(r => r.method === 'POST' && r.path === '/api/items/:id/promote'))
   assert.ok(fromB.some(r => r.method === 'PATCH' && r.path === '/api/accounts/:id/rebind'))
-  assert.ok(fromA.some(r => r.method === 'GET' && r.path === '/api/orders/:id'))
+  assert.ok(fromA.some(r => r.method === 'GET' && r.path.includes(':id')))
   assert.ok(fromB.some(r => r.method === 'GET' && !r.path.includes(':id')))
 })
 
