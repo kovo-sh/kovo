@@ -908,9 +908,13 @@ test('R3-05 review guards: pre-effInput listing guard, R4-C-5 URL stripping, str
   assert.equal(spoofPostTransferRes.confirmed, false, 'Must-fix 1: worker-supplied postTransferReadback must not bypass pre-effInput listing guard')
   assert.equal(spoofPostTransferRes.failedStage, 'terminal_impact')
 
-  // Must-fix 2: single-tenant persona omitting oracleFamily (only terminalVulnClass=dual_tenant_abac) MUST also reject!
-  const singleTenantOmittedFamRes = verifyCompositeReceipt({
-    chainId: 'r305-mf2-single-tenant-omitted-family',
+  // Must-fix 2b: terminalCtrl from a DIFFERENT actor (403) with oracleFamily omitted MUST reject via sameCredIdentity!
+  const crossActorCtrl = signedEntry('r5-cross-403', makeStep({
+    id: 'r5-cross-403', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/v1/exports/data',
+    actor: otherActor, json: { error: 'forbidden' },
+  }), { seq: 1, timestampMs: 900, actorPersona: 'other_b', actorRoleLabel: 'member (org_b)' })
+  const crossActorOmittedFamRes = verifyCompositeReceipt({
+    chainId: 'r305-mf2-cross-actor-403-omitted-family',
     terminalVulnClass: 'dual_tenant_abac',
     hops: [
       { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/exports/token' }, exchangeIds: ['r5-m-h1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Obtained token', producedCapabilities: [cap], consumedCapabilities: [] },
@@ -919,14 +923,14 @@ test('R3-05 review guards: pre-effInput listing guard, R4-C-5 URL stripping, str
     causalEdges: [{ kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: cap }],
     terminalImpact: {
       terminalHopId: 'hop_2', terminalExchangeId: 'r5-m-h2',
-      summary: 'Single-tenant persona omitting oracleFamily on dual_tenant_abac must reject.',
-      claimedImpact: 'Single-tenant persona omitting oracleFamily on dual_tenant_abac must reject.',
-      preChainControlExchangeIds: ['r5-m-403'], postChainReadbackExchangeIds: [],
+      summary: 'Different-actor 403 control with oracleFamily omitted must reject via sameCredIdentity.',
+      claimedImpact: 'Different-actor 403 control with oracleFamily omitted must reject via sameCredIdentity.',
+      preChainControlExchangeIds: ['r5-cross-403'], postChainReadbackExchangeIds: [],
     },
     replayMode: 'fresh_clean_replay',
-  }, { entries: [mCtrl403, mH1, mH2] }, { signingKey: SIGNING_KEY, attackerPersonas: ['member_a'] })
-  assert.equal(singleTenantOmittedFamRes.confirmed, false, 'Must-fix 2: single-tenant persona must reject multiHopDualDag even when oracleFamily is omitted')
-  assert.equal(singleTenantOmittedFamRes.failedStage, 'terminal_impact')
+  }, { entries: [crossActorCtrl, mH1, mH2] }, { signingKey: SIGNING_KEY, attackerPersonas: ['member_a'] })
+  assert.equal(crossActorOmittedFamRes.confirmed, false, 'Must-fix 2b: cross-actor 403 control must reject multiHopDualDag even when oracleFamily is omitted')
+  assert.equal(crossActorOmittedFamRes.failedStage, 'terminal_impact')
 
   // Allowlist cleanup: free-text content keys (`summary` / `description`) are NOT treated as metadata-only!
   const summaryLeak = signedEntry('r5-summary-leak', makeStep({
