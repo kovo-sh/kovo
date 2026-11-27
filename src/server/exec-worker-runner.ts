@@ -40,10 +40,10 @@ import {
 import { DETERMINISTIC_PARAM_HINT_RE } from './exec-floor-lane.ts'
 import { isPersistentWorkflowContinuationStep, sortPersonasLowPrivFirst, type ExecReconPlanner } from './exec-recon-planner.ts'
 import { FindingsRepository } from './store-findings.ts'
+import { STATIC_AST_LIVE_TARGET_REJECT_MESSAGE, guardConfirmedFindingMutation, isLiveRuntimeVerificationRun, type ExecVerifier, type InlineDeferredFindingCandidate } from './exec-verify.ts'
 import {
-  STATIC_AST_LIVE_TARGET_REJECT_MESSAGE, guardConfirmedFindingMutation, isLiveRuntimeVerificationRun,
-  type ExecVerifier, type InlineDeferredFindingCandidate,
-} from './exec-verify.ts'
+  extractVerifiedNegativeEdge } from './exploiter-tools.ts'
+import { normalizeRouteTemplate } from './route-template.ts'
 import { resolveProfilePoolForRole, type ResolvedModelProfile } from './model-settings.ts'
 import type { PersonaAuthManager, PersonaSessionClone } from './persona-auth.ts'
 import { crawlStateGraph } from './phase0-recon.ts'
@@ -2505,12 +2505,12 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               })
             }
             if (!proof.verdict.confirmed) {
+              const negEdge = extractVerifiedNegativeEdge({ result: proof as unknown as Record<string, unknown>, transcriptRecords: proof.transcriptRecords, script, defaultOrigin: [...approved][0] ?? '', fallbackCategory: step.category })
+              if (negEdge) this.recordNegativeEdgeCoverage(curRun.id, { ...negEdge, assignmentId: job.assignment.id })
               const summarized = checkpointOnlyGuard.summarizeOutcome({
-                verdict: proof.verdict, sealedCapabilities: ledgerSync.sealedCapabilities,
-                verifiedHops: ledgerSync.verifiedHops,
-                ...(compositeReceipt ? { compositeReceipt } : {}),
+                verdict: proof.verdict, sealedCapabilities: ledgerSync.sealedCapabilities, verifiedHops: ledgerSync.verifiedHops, ...(compositeReceipt ? { compositeReceipt } : {}),
               })
-              return proof.compositeReceipt?.verification.rejectedBy ? { ...summarized, compositeRejectedBy: proof.compositeReceipt.verification.rejectedBy } : summarized
+              return proof.compositeReceipt?.verification.rejectedBy ? { ...summarized, compositeRejectedBy: proof.compositeReceipt.verification.rejectedBy, ...(negEdge ? { negativeEdgeRecorded: true } : {}) } : (negEdge ? { ...summarized, negativeEdgeRecorded: true } : summarized)
             }
             confirmedDuringAssignment = true
             const persisted = this.host.persistAgentScriptProof({
@@ -2824,7 +2824,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           onProfileFailure: (pid, err, hard) => this.recordWorkerProfileFailure(turnState, pid, err, hard, baseLlmHooks.onProfileFailure),
         },
         onProofConfirmed: () => { confirmedDuringAssignment = true; this.host.schedulePlanner(run.id) },
-        onToolExecuted: () => { turnState.toolCallsInTurn += 1; turnState.totalToolCalls += 1 }, isSessionCapabilityHandle: h => sessionSealedCapHandles.includes(h) || this.storage.capabilityLedger(run.id).listCapabilities().some(c => c.capId === h), recordNegativeEdge: neg => { this.recordNegativeEdgeCoverage(run.id, { origin: neg.origin, category: neg.vulnClass || step.category, summary: `Preflight non-2xx terminal (${neg.status}) on ${neg.method} ${neg.path}`, proofGapReason: 'control_blocked_cleanly', route: `${neg.method} ${neg.path}`, ...(neg.exchangeId ? { exchangeIds: [neg.exchangeId] } : {}), assignmentId: job.assignment.id }) },
+        onToolExecuted: () => { turnState.toolCallsInTurn += 1; turnState.totalToolCalls += 1 }, isSessionCapabilityHandle: h => sessionSealedCapHandles.includes(h) || this.storage.capabilityLedger(run.id).listCapabilities().some(c => c.capId === h), recordNegativeEdge: neg => { if (!neg.capabilityBearing && !(neg.preconditionCapIds?.length)) return; const normRoute = `${neg.method} ${normalizeRouteTemplate(neg.path, { preserveCase: false })}`; this.recordNegativeEdgeCoverage(run.id, { origin: neg.origin, category: neg.vulnClass || step.category, summary: `Capability-bearing non-2xx terminal (${neg.status}) on ${normRoute}`, proofGapReason: neg.reason, route: normRoute, ...(neg.preconditionCapIds?.length ? { preconditionCapIds: neg.preconditionCapIds } : {}), ...(neg.exchangeId ? { exchangeIds: [neg.exchangeId] } : {}), assignmentId: job.assignment.id }) },
       }) : undefined
       let sessionResult: Awaited<ReturnType<typeof runAgentSession>>
       try {

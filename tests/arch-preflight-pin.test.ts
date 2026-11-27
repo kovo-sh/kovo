@@ -9,10 +9,12 @@ import { SpecSubmissionTracker } from '../src/server/agent-session.ts'
 import {
   buildConsolidatedExploiterToolset,
   buildExploiterUserPrompt,
+  extractVerifiedNegativeEdge,
   prepareDecoupledExploiterSession,
   resolveExploiterActingPersona,
   type PreflightNegativeEdge,
 } from '../src/server/exploiter-tools.ts'
+import { MULTIHOP_ATTACKER_ORIGIN_RULE } from '../src/server/assignment-brief.ts'
 import type { RecordedRequestExchange } from '../src/server/trace-proof-compiler.ts'
 import { VerifyContext } from '../worker/kovo_verify/kovo_verify.ts'
 
@@ -164,6 +166,49 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
       personas,
     })) as { actingPersona?: string }
     assert.equal(promptDual.actingPersona, 'dual_member')
+
+    // Regression A guard: boilerplate assignmentBrief / specialistFocus mentioning "dual-tenant" / "dual_tenant_abac" MUST NOT pin dual_member!
+    const withBoilerplate = resolveExploiterActingPersona({
+      personas,
+      step: { title: 'Webhook replay check', hypothesis: 'Verify webhook HMAC validation on settlement endpoint', category: 'business-logic' },
+      assignmentBrief: `${MULTIHOP_ATTACKER_ORIGIN_RULE} Always check dual-tenant and dual_tenant_abac rules.`,
+      specialistFocus: 'Check dual-tenant cross-org privilege bleed where applicable.',
+    })
+    assert.equal(withBoilerplate, 'member_a', 'boilerplate assignmentBrief/specialistFocus must NEVER pin dual_member')
+
+    const promptWithBoilerplate = JSON.parse(buildExploiterUserPrompt({
+      goal: 'Verify cross-tenant and dual-tenant isolation',
+      step: { id: 's3', title: 'Standard BOLA', hypothesis: 'Access invoice by ID', category: 'bola' },
+      origins: [API_ORIGIN],
+      capabilityTier: 2,
+      maxTurns: 12,
+      personas,
+      assignmentBrief: MULTIHOP_ATTACKER_ORIGIN_RULE,
+      specialistFocus: 'Focus on dual_tenant_abac when dual-tenant personas exist',
+    })) as { actingPersona?: string }
+    assert.equal(promptWithBoilerplate.actingPersona, 'member_a')
+
+    // Explicit [acting_persona=...] tags honor low-priv attackerBase, ignore cap: and elevated/non-dual-tenant dual_member
+    assert.equal(
+      resolveExploiterActingPersona({ personas, step: { title: 'Pivot', hypothesis: '[acting_persona=member_b] Probe route', category: 'bola' } }),
+      'member_b',
+    )
+    assert.equal(
+      resolveExploiterActingPersona({ personas, step: { title: 'Pivot', hypothesis: '[acting_persona=cap:hop_1:tok] Probe route', category: 'bola' } }),
+      'member_a',
+    )
+    assert.equal(
+      resolveExploiterActingPersona({ personas, step: { title: 'Pivot', hypothesis: '[acting_persona=owner_a] Probe route', category: 'bola' } }),
+      'member_a',
+    )
+    assert.equal(
+      resolveExploiterActingPersona({ personas, step: { title: 'Pivot', hypothesis: '[acting_persona=dual_member] Standard BOLA probe', category: 'bola' } }),
+      'member_a',
+    )
+    assert.equal(
+      resolveExploiterActingPersona({ personas, step: { title: 'Cache bleed', hypothesis: '[acting_persona=dual_member] Test cache-bleed across orgs', category: 'cache' } }),
+      'dual_member',
+    )
   })
 
   test('20-call run-scale mixed sequence: enforces actingPersona pin, allows cap: handles, control arm tagging, read-only victim_setup, and blocks mutating victim_setup', async () => {
@@ -216,6 +261,8 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
       specSubmission: { tracker },
     })
     const httpTool = tools.find(t => t.name === 'http')!
+    assert.match(httpTool.description, /\{\s*capability:\s*cap\.handle\s*\}/, 'http tool description must instruct { capability: cap.handle } for kovo_verify')
+    assert.doesNotMatch(httpTool.description, /pinned to actingPersona or cap: handle/i, 'http tool description must never imply passing cap: as persona/as')
     const call = (args: Record<string, unknown>) =>
       httpTool.execute(args, {} as never, { abortSignal: new AbortController().signal } as never) as Promise<{
         isError?: boolean; output: Array<{ type: string; text?: string }>
@@ -232,7 +279,7 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
       { label: 'pinned explicit attacker', args: { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/items', persona: 'member_a', purpose: 'attacker' } },
       { label: 'pinned batch', args: { mode: 'batch', requests: [{ origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/a', persona: 'member_a' }, { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/b', persona: 'member_a' }] } },
       // 4-8: non-pinned personas blocked on attacker arm in <1ms
-      { label: 'block member_b', args: { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/items/2', persona: 'member_b' }, expectError: /persona_pin_violation.*actingPersona "member_a"/ },
+      { label: 'block member_b', args: { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/items/2', persona: 'member_b' }, expectError: /persona_pin_violation.*actingPersona "member_a".*\{\s*capability:\s*cap\.handle\s*\}/ },
       { label: 'block dual_member', args: { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/cache/prime', persona: 'dual_member' }, expectError: /persona_pin_violation.*actingPersona "member_a"/ },
       { label: 'block owner_a', args: { origin: API_ORIGIN, method: 'DELETE', pathAndQuery: '/v1/items/9', persona: 'owner_a' }, expectError: /persona_pin_violation.*actingPersona "member_a"/ },
       { label: 'block batch with member_b', args: { mode: 'batch', requests: [{ origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/ok', persona: 'member_a' }, { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/bad', persona: 'member_b' }] }, expectError: /persona_pin_violation/ },
@@ -290,12 +337,13 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
 })
 
 describe('Move B: <1ms Pre-Flight Rejection, Negative-Edge Recording, and Literal Token Carry-Over Guard', () => {
-  test('submit_exploit_trace rejects non-2xx terminals in <5ms with 0 runKovoVerify calls and records negative edges', async () => {
+  test('submit_exploit_trace rejects non-2xx terminals in <5ms with 0 runKovoVerify calls, does NOT poison negative edges on exploratory 401/403 controls, and records only capability-bearing negative edges', async () => {
     const recorded = new Map<string, RecordedRequestExchange>([
       ['ex-401', { exchangeId: 'ex-401', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/admin/keys?org=b', persona: 'member_a', status: 401, timestampMs: 100 }],
       ['ex-403', { exchangeId: 'ex-403', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/payouts/9/approve', persona: 'member_a', status: 403, timestampMs: 110 }],
       ['ex-404', { exchangeId: 'ex-404', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/exports/99', persona: 'member_a', status: 404, timestampMs: 120 }],
       ['ex-500', { exchangeId: 'ex-500', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/webhooks/settle', persona: 'member_a', status: 500, timestampMs: 130 }],
+      ['ex-cap-403', { exchangeId: 'ex-cap-403', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/payouts/9/approve', persona: 'cap:hop_1:derived_tok', status: 403, timestampMs: 140 }],
     ])
     const negEdges: PreflightNegativeEdge[] = []
     let verifyCalls = 0
@@ -317,12 +365,7 @@ describe('Move B: <1ms Pre-Flight Rejection, Negative-Edge Recording, and Litera
     })
     const submit = tools.find(t => t.name === 'submit_exploit_trace')!
 
-    for (const [id, status, expectedPath, expectedReason] of [
-      ['ex-401', 401, '/v1/admin/keys', 'control_blocked_cleanly'],
-      ['ex-403', 403, '/v1/payouts/9/approve', 'control_blocked_cleanly'],
-      ['ex-404', 404, '/v1/exports/99', 'control_blocked_cleanly'],
-      ['ex-500', 500, '/v1/webhooks/settle', 'terminal_non_2xx'],
-    ] as const) {
+    for (const id of ['ex-401', 'ex-403', 'ex-404', 'ex-500'] as const) {
       const t0 = performance.now()
       const out = JSON.parse(extractText(await submit.execute({
         title: `Attempt ${id}`, vulnClass: 'bfla', exchangeIds: [id], terminalExchangeId: id,
@@ -334,19 +377,26 @@ describe('Move B: <1ms Pre-Flight Rejection, Negative-Edge Recording, and Litera
       assert.equal(out.ok, false)
       assert.equal(out.confirmed, false)
       assert.equal(out.rejectedBy, 'terminal_exchange_not_succeeding')
-      assert.deepEqual(out.negativeEdge, {
-        origin: API_ORIGIN,
-        method: recorded.get(id)!.method,
-        path: expectedPath,
-        status,
-        reason: expectedReason,
-      })
+      assert.equal(out.negativeEdge, undefined, `${id} exploratory base-persona non-2xx must not emit a negativeEdge`)
     }
+    assert.equal(negEdges.length, 0, 'exploratory base-persona 401/403/404/500 must NOT poison CapabilityLedger negative edges')
+
+    // Capability-bearing 403 terminal DOES record a normalized negative edge with preconditionCapIds
+    const capOut = JSON.parse(extractText(await submit.execute({
+      title: 'Attempt cap 403', vulnClass: 'bfla', exchangeIds: ['ex-cap-403'], terminalExchangeId: 'ex-cap-403',
+    }, {} as never, { abortSignal: new AbortController().signal } as never))) as {
+      ok: boolean; confirmed: boolean; rejectedBy: string; negativeEdge?: PreflightNegativeEdge
+    }
+    assert.equal(capOut.ok, false)
+    assert.equal(capOut.rejectedBy, 'terminal_exchange_not_succeeding')
+    assert.equal(capOut.negativeEdge?.path, '/v1/payouts/:id/approve')
+    assert.equal(capOut.negativeEdge?.reason, 'control_blocked_cleanly')
+    assert.deepEqual(capOut.negativeEdge?.preconditionCapIds, ['cap:hop_1:derived_tok'])
     assert.equal(verifyCalls, 0, '0 Docker/runKovoVerify calls on non-2xx terminals')
-    assert.equal(negEdges.length, 4, 'recordNegativeEdge callback must receive all 4 negative edges')
+    assert.equal(negEdges.length, 1, 'only capability-bearing non-2xx terminal must call recordNegativeEdge')
   })
 
-  test('direct kovo_verify tool short-circuits non-2xx terminal routes and literal token carry-over in <5ms with 0 Docker calls', async () => {
+  test('direct kovo_verify preflight exempts crypto/seal/cap/async/race scripts, excludes control-arm exchanges, compares by (method, routeTemplate), and does NOT poison negative edges on exploratory 401/403', async () => {
     const recorded = new Map<string, RecordedRequestExchange>([
       ['ex-mint', {
         exchangeId: 'ex-mint', origin: AUTH_ORIGIN, method: 'POST', pathAndQuery: '/oauth/token',
@@ -357,6 +407,14 @@ describe('Move B: <1ms Pre-Flight Rejection, Negative-Edge Recording, and Litera
         exchangeId: 'ex-denied', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/admin/ledger',
         persona: 'member_a', status: 403, responseBody: '{"error":"forbidden"}', timestampMs: 120,
       }],
+      ['ex-item-403', {
+        exchangeId: 'ex-item-403', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/orders/101',
+        persona: 'member_a', status: 403, responseBody: '{"error":"forbidden"}', timestampMs: 125,
+      }],
+      ['ex-ctrl-401', Object.assign({
+        exchangeId: 'ex-ctrl-401', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/webhooks/settle',
+        persona: 'member_a', status: 401, responseBody: '{"error":"unauthorized"}', timestampMs: 130,
+      }, { purpose: 'control' })],
       ['ex-ok', {
         exchangeId: 'ex-ok', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/vault/data',
         persona: 'member_a', status: 200, responseBody: '{"secret":"ok"}', timestampMs: 140,
@@ -387,7 +445,7 @@ describe('Move B: <1ms Pre-Flight Rejection, Negative-Edge Recording, and Litera
     })
     const kvTool = tools.find(t => t.name === 'kovo_verify')!
 
-    // 1. Non-2xx terminal route (only 403 recorded, 0 2xx) -> rejected in <5ms, 0 Docker calls, negative edge recorded
+    // 1. Non-exempt non-2xx terminal route (only 403 recorded, 0 2xx) -> rejected in <5ms, 0 Docker calls, 0 negative edges recorded
     const t0 = performance.now()
     const non2xxRes = JSON.parse(extractText(await kvTool.execute({
       title: 'Doomed 403 admin ledger',
@@ -398,12 +456,51 @@ describe('Move B: <1ms Pre-Flight Rejection, Negative-Edge Recording, and Litera
     assert.ok(performance.now() - t0 < 5)
     assert.equal(non2xxRes.ok, false)
     assert.equal(non2xxRes.rejectedBy, 'terminal_exchange_not_succeeding')
-    assert.equal(non2xxRes.negativeEdge?.status, 403)
-    assert.equal(non2xxRes.negativeEdge?.path, '/v1/admin/ledger')
+    assert.equal(non2xxRes.negativeEdge, undefined, 'exploratory base-persona 403 must not emit negativeEdge')
     assert.equal(dockerVerifyCalls, 0)
-    assert.equal(negEdges.length, 1)
+    assert.equal(negEdges.length, 0, 'exploratory base-persona 403 must NOT poison CapabilityLedger negative edges')
+
+    // 1b. Route-template match on non-exempt script (GET /v1/orders/101 403 blocks GET /v1/orders/202)
+    const templRes = JSON.parse(extractText(await kvTool.execute({
+      title: 'Normalized route 403',
+      script: `const ch = ctx.chain('c1b', 'bola'); await ch.step('GET /v1/orders/202', { as: 'member_a' }); return await ch.prove({ claimedImpact: 'read order' })`,
+    }, {} as never, { abortSignal: new AbortController().signal } as never))) as { ok: boolean; rejectedBy: string }
+    assert.equal(templRes.ok, false)
+    assert.equal(templRes.rejectedBy, 'terminal_exchange_not_succeeding')
+    assert.equal(dockerVerifyCalls, 0)
+
+    // 1c. Different HTTP method (POST vs prior GET 403) is NOT blocked
+    const diffMethodRes = JSON.parse(extractText(await kvTool.execute({
+      title: 'POST on GET-403 path',
+      script: `const ch = ctx.chain('c1c', 'bfla'); await ch.step('POST /v1/admin/ledger', { as: 'member_a' }); return await ch.prove({ claimedImpact: 'write ledger' })`,
+    }, {} as never, { abortSignal: new AbortController().signal } as never))) as { confirmed: boolean }
+    assert.equal(diffMethodRes.confirmed, true)
+    assert.equal(dockerVerifyCalls, 1)
+
+    // 1d. Control-arm 401 exchange is excluded and does NOT block kovo_verify
+    const ctrlAllowedRes = JSON.parse(extractText(await kvTool.execute({
+      title: 'Post-control settle',
+      script: `const ch = ctx.chain('c1d', 'forged_settlement'); await ch.step('POST /v1/webhooks/settle', { as: 'member_a' }); return await ch.prove({ claimedImpact: 'settle' })`,
+    }, {} as never, { abortSignal: new AbortController().signal } as never))) as { confirmed: boolean }
+    assert.equal(ctrlAllowedRes.confirmed, true)
+    assert.equal(dockerVerifyCalls, 2)
+
+    // 1e. Regression C exemption: hmac_sign, ch.seal, cap:, await_async, ch.race are NOT blocked by prior exploratory 403 on GET /v1/admin/ledger!
+    const exemptScripts = [
+      `const ch = ctx.chain('e1', 'forged_settlement'); const sig = await ctx.hmac_sign({ secretHandle: 'cap:hop_1:k', payload: '{}', alg: 'sha256' }); await ch.step('GET /v1/admin/ledger', { headers: { 'x-signature': sig.signature } }); return await ch.prove({ claimedImpact: 'signed read' })`,
+      `const ch = ctx.chain('e2', 'privilege_escalation'); const h1 = await ch.step('POST /oauth/token', { as: 'member_a' }); const cap = await ch.seal(h1, 'access_token'); await ch.step('GET /v1/admin/ledger', { capability: cap }); return await ch.prove({ claimedImpact: 'sealed read' })`,
+      `const ch = ctx.chain('e3', 'bfla'); await ch.step('GET /v1/admin/ledger', { capability: 'cap:hop_1:tok' }); return await ch.prove({ claimedImpact: 'cap read' })`,
+      `const ch = ctx.chain('e4', 'economic_conservation'); await ch.race({ request: { method: 'GET', path: '/v1/admin/ledger', as: 'member_a' }, count: 6 }); return await ch.prove({ claimedImpact: 'race read' })`,
+      `const ch = ctx.chain('e5', 'cross_surface_pivot'); await ctx.await_async({ pollRequest: { path: '/v1/admin/ledger', as: 'member_a' }, matchPredicate: { status: 200 } }); await ch.step('GET /v1/admin/ledger', { as: 'member_a' }); return await ch.prove({ claimedImpact: 'async read' })`,
+    ]
+    for (const script of exemptScripts) {
+      const res = JSON.parse(extractText(await kvTool.execute({ title: 'Exempt script', script }, {} as never, { abortSignal: new AbortController().signal } as never))) as { confirmed: boolean }
+      assert.equal(res.confirmed, true, `exempt script must NOT be blocked by prior exploratory 403: ${script.slice(0, 60)}`)
+    }
+    assert.equal(dockerVerifyCalls, 2 + exemptScripts.length)
 
     // 2. Literal token carry-over in kovo_verify script (pastes SAMPLE_JWT from ex-mint instead of ch.seal) -> rejected in <5ms, 0 Docker calls
+    const beforeCarry = dockerVerifyCalls
     const t1 = performance.now()
     const carryRes = JSON.parse(extractText(await kvTool.execute({
       title: 'Stale exploration JWT carry-over',
@@ -415,7 +512,7 @@ describe('Move B: <1ms Pre-Flight Rejection, Negative-Edge Recording, and Litera
     assert.equal(carryRes.ok, false)
     assert.equal(carryRes.rejectedBy, 'literal_token_carryover')
     assert.match(carryRes.error ?? '', /ch\.seal\(\.\.\.\).*cap: handle/i)
-    assert.equal(dockerVerifyCalls, 0)
+    assert.equal(dockerVerifyCalls, beforeCarry)
 
     // 3. Clean script using ch.seal + cap: handle on 2xx route passes pre-flight and invokes verifier
     const okRes = JSON.parse(extractText(await kvTool.execute({
@@ -423,7 +520,38 @@ describe('Move B: <1ms Pre-Flight Rejection, Negative-Edge Recording, and Litera
       script: `const ch = ctx.chain('c3', 'privilege_escalation'); const h1 = await ch.step('POST /oauth/token', { as: 'member_a' }); const cap = await ch.seal(h1, 'access_token'); await ch.step('GET /v1/vault/data', { capability: cap }); return await ch.prove({ claimedImpact: 'vault read' })`,
     }, {} as never, { abortSignal: new AbortController().signal } as never))) as { confirmed: boolean }
     assert.equal(okRes.confirmed, true)
-    assert.equal(dockerVerifyCalls, 1)
+    assert.equal(dockerVerifyCalls, beforeCarry + 1)
+  })
+
+  test('extractVerifiedNegativeEdge ignores exploratory base-persona 401/403 and normalizes capability-bearing/signed container negative edges', () => {
+    // Exploratory base-persona 403 -> null (must NOT poison CapabilityLedger)
+    const exploratory = extractVerifiedNegativeEdge({
+      result: { evidence: { negativeEdge: { origin: API_ORIGIN, method: 'GET', path: '/v1/admin/keys', status: 403, reason: 'control_blocked_cleanly' } } },
+      fallbackCategory: 'bfla',
+    })
+    assert.equal(exploratory, null)
+
+    // Capability-bearing / signed container negativeEdge -> normalized route + origin + preconditionCapIds
+    const capBearing = extractVerifiedNegativeEdge({
+      result: {
+        evidence: {
+          negativeEdge: {
+            origin: API_ORIGIN, method: 'POST', path: '/v1/payouts/98765/approve?foo=1', status: 403,
+            reason: 'control_blocked_cleanly', preconditionCapIds: ['cap:hop_1:derived_tok'], exchangeId: 'ex-v-403',
+          },
+        },
+      },
+      fallbackCategory: 'bfla',
+    })
+    assert.deepEqual(capBearing, {
+      origin: API_ORIGIN,
+      category: 'bfla',
+      route: 'POST /v1/payouts/:id/approve',
+      proofGapReason: 'control_blocked_cleanly',
+      summary: 'Verified capability-bearing non-2xx terminal (403) on POST /v1/payouts/:id/approve',
+      preconditionCapIds: ['cap:hop_1:derived_tok'],
+      exchangeIds: ['ex-v-403'],
+    })
   })
 
   test('submit_exploit_trace catches literal token carry-over from unincluded exploration exchange in <5ms with 0 runKovoVerify calls', async () => {
@@ -541,5 +669,122 @@ describe('Move B: <1ms Pre-Flight Rejection, Negative-Edge Recording, and Litera
     const resGood = await chGood.prove({ claimedImpact: 'vault read via sealed cap' })
     assert.equal(resGood.confirmed, true)
     assert.equal(rpcOps.filter(op => op === 'composite.verify').length, 1)
+  })
+})
+
+describe('R9: Generic post-escalation continuation nudge in complete_intent', () => {
+  test('nudges ONCE when a privilege/role mutation succeeds without probing a privileged terminal resource, and never loops', async () => {
+    const recorded = new Map<string, RecordedRequestExchange>([
+      ['ex-role-patch', {
+        exchangeId: 'ex-role-patch', origin: API_ORIGIN, method: 'PATCH', pathAndQuery: '/scim/v2/Users/u_42',
+        persona: 'member_a', requestJson: { Operations: [{ op: 'replace', path: 'roles', value: ['admin'] }] },
+        status: 200, responseJson: { id: 'u_42', role: 'admin' }, responseBody: '{"id":"u_42","role":"admin"}', timestampMs: 200,
+      }],
+    ])
+    let completed = 0
+    const tools = buildConsolidatedExploiterToolset({
+      handlers: makeDummyHandlers(),
+      runId: 'run-post-esc',
+      assignmentId: 'asg-post-esc',
+      publicOrigins: [API_ORIGIN],
+      personasPub: [{ handle: 'member_a', role: 'member' }],
+      recordedExchanges: recorded,
+      hasMountedRepos: false,
+      allowWebSearch: false,
+      scrub: v => v,
+      rootSignal: new AbortController().signal,
+      inlineLimit: 16_384,
+      hasRemainingBudget: () => true,
+      onCompleteIntent: () => { completed += 1 },
+      runKovoVerify: async () => ({ confirmed: true }),
+    })
+    const completeTool = tools.find(t => t.name === 'complete_intent')!
+
+    // First call -> blocked ONCE with keepChaining: true
+    const first = await completeTool.execute(
+      { status: 'proved', summary: 'Escalated role to admin via PATCH' },
+      {} as never,
+      { abortSignal: new AbortController().signal } as never,
+    ) as { isError?: boolean; output: Array<{ type: string; text?: string }> }
+    assert.equal(first.isError, true)
+    const firstBody = JSON.parse(extractText(first)) as { blocked?: boolean; keepChaining?: boolean; reason?: string }
+    assert.equal(firstBody.blocked, true)
+    assert.equal(firstBody.keepChaining, true)
+    assert.equal(firstBody.reason, 'post_escalation_terminal_probe_required')
+    assert.equal(completed, 0)
+
+    // Second call -> allowed (bounded to 1 nudge per assignment, never loops!)
+    const second = await completeTool.execute(
+      { status: 'proved', summary: 'Escalated role to admin via PATCH' },
+      {} as never,
+      { abortSignal: new AbortController().signal } as never,
+    ) as { isError?: boolean; output: Array<{ type: string; text?: string }> }
+    assert.equal(second.isError, undefined)
+    assert.equal(completed, 1)
+  })
+
+  test('does NOT nudge when a privileged terminal resource was already probed after escalation OR when budget is exhausted', async () => {
+    const recordedWithTerminal = new Map<string, RecordedRequestExchange>([
+      ['ex-role-patch', {
+        exchangeId: 'ex-role-patch', origin: API_ORIGIN, method: 'PATCH', pathAndQuery: '/api/users/42/role',
+        persona: 'member_a', requestJson: { role: 'admin' }, status: 200, responseJson: { role: 'admin' }, timestampMs: 200,
+      }],
+      ['ex-admin-read', {
+        exchangeId: 'ex-admin-read', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/api/admin/vault/secrets',
+        persona: 'member_a', status: 200, responseJson: { items: ['s1'] }, timestampMs: 250,
+      }],
+    ])
+    let completed = 0
+    const toolsDone = buildConsolidatedExploiterToolset({
+      handlers: makeDummyHandlers(),
+      runId: 'run-post-esc-done',
+      assignmentId: 'asg-post-esc-done',
+      publicOrigins: [API_ORIGIN],
+      personasPub: [{ handle: 'member_a', role: 'member' }],
+      recordedExchanges: recordedWithTerminal,
+      hasMountedRepos: false,
+      allowWebSearch: false,
+      scrub: v => v,
+      rootSignal: new AbortController().signal,
+      inlineLimit: 16_384,
+      hasRemainingBudget: () => true,
+      onCompleteIntent: () => { completed += 1 },
+      runKovoVerify: async () => ({ confirmed: true }),
+    })
+    const resDone = await toolsDone.find(t => t.name === 'complete_intent')!.execute(
+      { status: 'proved', summary: 'Escalated and read admin vault' },
+      {} as never,
+      { abortSignal: new AbortController().signal } as never,
+    ) as { isError?: boolean }
+    assert.equal(resDone.isError, undefined)
+    assert.equal(completed, 1)
+
+    // Budget exhausted -> no nudge
+    const recordedNoBudget = new Map<string, RecordedRequestExchange>([
+      ['ex-role-patch', recordedWithTerminal.get('ex-role-patch')!],
+    ])
+    const toolsNoBudget = buildConsolidatedExploiterToolset({
+      handlers: makeDummyHandlers(),
+      runId: 'run-post-esc-nb',
+      assignmentId: 'asg-post-esc-nb',
+      publicOrigins: [API_ORIGIN],
+      personasPub: [{ handle: 'member_a', role: 'member' }],
+      recordedExchanges: recordedNoBudget,
+      hasMountedRepos: false,
+      allowWebSearch: false,
+      scrub: v => v,
+      rootSignal: new AbortController().signal,
+      inlineLimit: 16_384,
+      hasRemainingBudget: () => false,
+      onCompleteIntent: () => { completed += 1 },
+      runKovoVerify: async () => ({ confirmed: true }),
+    })
+    const resNoBudget = await toolsNoBudget.find(t => t.name === 'complete_intent')!.execute(
+      { status: 'partial', summary: 'Out of budget after escalation' },
+      {} as never,
+      { abortSignal: new AbortController().signal } as never,
+    ) as { isError?: boolean }
+    assert.equal(resNoBudget.isError, undefined)
+    assert.equal(completed, 2)
   })
 })
