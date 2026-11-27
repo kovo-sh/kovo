@@ -6,7 +6,7 @@
  * MEDIUM #11 — worker stdout is bounded per line and in total, terminating on flood.
  */
 import assert from 'node:assert/strict'
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -150,8 +150,9 @@ test('safeResolveUnderRoot rejects traversal, absolute paths and symlinked compo
   assert.throws(() => safeResolveUnderRoot(root, 'linked-dir/new.ts'), /symlink|escapes/i)
 
   // Legitimate existing files and new files resolve under the root.
-  assert.equal(safeResolveUnderRoot(root, 'app.ts'), join(root, 'app.ts'))
-  assert.equal(safeResolveUnderRoot(root, 'new-file.ts'), join(root, 'new-file.ts'))
+  const realRoot = realpathSync(root)
+  assert.equal(safeResolveUnderRoot(root, 'app.ts'), join(realRoot, 'app.ts'))
+  assert.equal(safeResolveUnderRoot(root, 'new-file.ts'), join(realRoot, 'new-file.ts'))
 })
 
 test('patch application cannot write through a symlinked target', t => {

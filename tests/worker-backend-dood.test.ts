@@ -89,7 +89,7 @@ test('host-native mode: resolveDoodScratchConfig returns null and host bind beha
 })
 
 test('KOVO_HOST_SCRATCH_DIR translates per-session container paths without exposing root scratch', t => {
-  const scratchRoot = withTempDir(t, 'kovo-dood-bind-')
+  const scratchRoot = realpathSync(withTempDir(t, 'kovo-dood-bind-'))
   const env: NodeJS.ProcessEnv = {
     KOVO_CONTAINER_SCRATCH_DIR: scratchRoot,
     KOVO_HOST_SCRATCH_DIR: '/var/lib/kovo/scratch',
@@ -128,7 +128,7 @@ test('KOVO_HOST_SCRATCH_DIR translates per-session container paths without expos
 })
 
 test('KOVO_WORKER_SCRATCH_VOLUME emits per-session volume-subpath mounts', t => {
-  const scratchRoot = withTempDir(t, 'kovo-dood-vol-')
+  const scratchRoot = realpathSync(withTempDir(t, 'kovo-dood-vol-'))
   const env: NodeJS.ProcessEnv = {
     KOVO_CONTAINER_SCRATCH_DIR: scratchRoot,
     KOVO_WORKER_SCRATCH_VOLUME: 'kovo_scratch',

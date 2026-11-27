@@ -15,6 +15,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -78,7 +79,7 @@ test('safeResolveUnderRoot rejects dangling symlink components (leaf and nested 
   assert.throws(() => safeResolveUnderRoot(root, 'dangling-dir/deeper/new.ts'), /symlink|escapes/i)
 
   // A legitimate new file still resolves.
-  assert.equal(safeResolveUnderRoot(root, 'fresh.ts'), join(root, 'fresh.ts'))
+  assert.equal(safeResolveUnderRoot(root, 'fresh.ts'), join(realpathSync(root), 'fresh.ts'))
 })
 
 test('create-file patch cannot be written through a dangling symlink', t => {
