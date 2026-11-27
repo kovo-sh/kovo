@@ -12,6 +12,7 @@ import ipaddr from 'ipaddr.js'
 import { z } from 'zod'
 import type { AnalyzerName } from '../../worker/analyzers.ts'
 import { isSensitiveRepoEntry } from './safety-primitives.ts'
+import { PTC_CONTAINER_DIR, ptcExecRequestSchema, ptcExecResultSchema, preparePtcHostDir, readPtcClientSource, type PtcExecRequest, type PtcExecResult } from './ptc-rpc.ts'
 import {
   VERIFY_RPC_CONTAINER_DIR, VERIFY_RPC_CONTEXT_ENV, VERIFY_RPC_CONTEXT_NAME,
   VERIFY_RPC_SOCKET_ENV, VERIFY_RPC_SOCKET_NAME, VERIFY_RPC_TOKEN_ENV,
@@ -443,8 +444,10 @@ export type AstVerifyRequest = z.input<typeof astVerifyRequestSchema>
 export type AstVerifyResult = z.output<typeof astVerifyResultSchema>
 export type CallGraphRequest = z.input<typeof callGraphRequestSchema>
 export type CallGraphResult = z.output<typeof callGraphResultSchema>
+export { ptcExecRequestSchema, ptcExecResultSchema, type PtcExecRequest, type PtcExecResult }
 
 export interface WorkerSession {
+  readonly ptcHostDir?: string
   stage(name: string, content: string, signal: AbortSignal): Promise<string>
   exec(command: string, outputs: string[], signal: AbortSignal, timeoutMs?: number): Promise<WorkerResult>
   analyze(tool: AnalyzerName, args: Record<string, unknown>, signal: AbortSignal): Promise<Record<string, unknown>>
@@ -452,6 +455,7 @@ export interface WorkerSession {
   runScript(req: OfflineScriptRequest, signal: AbortSignal): Promise<OfflineScriptResult>
   /** Layer-3 `kovo_verify` script; claims are oracle-checked host-side. */
   verifyScript?(req: VerifyScriptRequest, signal: AbortSignal): Promise<VerifyScriptResult>
+  ptcExec?(req: PtcExecRequest, signal: AbortSignal): Promise<PtcExecResult>
   verifyStaticAst(req: AstVerifyRequest, signal: AbortSignal): Promise<AstVerifyResult>
   callGraph?(req: CallGraphRequest, signal: AbortSignal): Promise<CallGraphResult>
   close(): Promise<void>
@@ -911,6 +915,17 @@ function makeOneShotIpcDir(sessionId?: string, env: NodeJS.ProcessEnv = process.
   return { ipcDir: dir, cleanupDir: dir }
 }
 
+function allocatePtcHostDir(sessionId: string, env: NodeJS.ProcessEnv = process.env): string {
+  const dir = resolveDoodScratchConfig(env) ? preparePtcHostDir(prepareSessionScratchDir(sessionId, 'ptc', env)) : preparePtcHostDir()
+  trackLiveStagedRepoDir(dir)
+  return dir
+}
+function disposePtcHostDir(dir: string | undefined, env: NodeJS.ProcessEnv = process.env): void {
+  if (!dir) return
+  liveStagedRepoDirs.delete(dir)
+  cleanupSessionSubdir(dir, env)
+}
+
 function cleanupSessionSubdir(dir: string, env: NodeJS.ProcessEnv = process.env): void {
   try { rmSync(dir, { recursive: true, force: true }) } catch { /* ignore */ }
   const dood = resolveDoodScratchConfig(env)
@@ -1195,6 +1210,8 @@ interface ContainerArgsInput {
   options?: WorkerSessionOptions
   /** One-shot only: host tmpfs (or DooD scratch) dir mounted at /kovo-ipc for large-output pointers. */
   ipcDir?: string
+  /** Per-container host dir mounted readonly at /kovo-ptc for warm-container PTC RPC. */
+  ptcHostDir?: string
   /** Optional environment override for sibling-container (DooD) mount resolution. */
   env?: NodeJS.ProcessEnv
 }
@@ -1607,6 +1624,7 @@ export function workerContainerCreateArgs(input: ContainerArgsInput): string[] {
     '--tmpfs', `/tmp:rw,nosuid,nodev,noexec,size=${tmpfsMb}m,mode=1777`,
     ...resolveReposMountArgs(options?.reposDir, input.env),
     ...resolveRpcMountArgs(options?.rpcMountDir, input.env),
+    ...(input.ptcHostDir && !options?.rpcMountDir ? ['--mount', resolveDoodMountArg(realpathSync(input.ptcHostDir), PTC_CONTAINER_DIR, { readonly: true, env: input.env })] : []),
     ...(input.ipcDir
       ? [
           '--mount', resolveDoodMountArg(realpathSync(input.ipcDir), '/kovo-ipc', { readonly: false, env: input.env }),
@@ -1780,6 +1798,7 @@ export class WarmWorkerPool {
   private capacity: number
   private readonly idle: string[] = []
   private readonly createdAtByName = new Map<string, number>()
+  private readonly ptcHostDirs = new Map<string, string>()
   private readonly idleMaxAgeMs: number
   private readonly inflight = new Set<Promise<void>>()
   private readonly used = new Set<string>()
@@ -1829,29 +1848,10 @@ export class WarmWorkerPool {
     if (this.disabled) return 'disabled'
     return this.idle.length ? 'ready' : 'warming'
   }
-  get stats(): {
-    state: string
-    capacity: number
-    idle: number
-    prewarmed: number
-    failures: number
-    created: number
-    reused: number
-    returned: number
-    discarded: number
-    removed: number
-  } {
+  get stats(): { state: string; capacity: number; idle: number; prewarmed: number; failures: number; created: number; reused: number; returned: number; discarded: number; removed: number } {
     return {
-      state: this.state,
-      capacity: this.capacity,
-      idle: this.idle.length,
-      prewarmed: this.created,
-      failures: this.failures,
-      created: this.created,
-      reused: this.reused,
-      returned: this.returned,
-      discarded: this.discarded,
-      removed: this.removed,
+      state: this.state, capacity: this.capacity, idle: this.idle.length, prewarmed: this.created, failures: this.failures,
+      created: this.created, reused: this.reused, returned: this.returned, discarded: this.discarded, removed: this.removed,
     }
   }
 
@@ -1864,8 +1864,13 @@ export class WarmWorkerPool {
   }
 
   /** True when the pool currently owns an idle container with this name. */
-  owns(name: string): boolean {
-    return this.idle.includes(name)
+  owns(name: string): boolean { return this.idle.includes(name) }
+  ptcHostDirFor(name: string): string | undefined { return this.ptcHostDirs.get(name) }
+  private cleanupPtcDir(name: string): void {
+    const dir = this.ptcHostDirs.get(name)
+    if (!dir) return
+    this.ptcHostDirs.delete(name)
+    disposePtcHostDir(dir)
   }
 
   private cleanupRetiredPreparedRepos(): void {
@@ -1879,6 +1884,7 @@ export class WarmWorkerPool {
   forget(name: string): void {
     this.outstanding.delete(name)
     this.used.delete(name)
+    this.cleanupPtcDir(name)
     this.cleanupRetiredPreparedRepos()
     this.fill()
   }
@@ -1905,6 +1911,8 @@ export class WarmWorkerPool {
 
   private async create(): Promise<void> {
     const name = 'kovo-' + randomUUID()
+    const ptcHostDir = allocatePtcHostDir(`warm-ptc-${randomUUID()}`)
+    this.ptcHostDirs.set(name, ptcHostDir)
     try {
       await ensureWorkerImageAvailable(this.image, this.docker, AbortSignal.timeout(DEFAULT_WORKER_PULL_TIMEOUT_MS))
       await this.docker(workerContainerCreateArgs({
@@ -1914,14 +1922,11 @@ export class WarmWorkerPool {
         extraArgs: ['--session'],
         runLabel: this.runLabel,
         ...(this.owner ? { owner: this.owner } : {}),
-        cell: this.cell,
-        warm: true,
-        ownerPid: process.pid,
-        poolInstanceId: this.instanceId,
-        options: this.effectiveCreateOptions(),
+        cell: this.cell, warm: true, ownerPid: process.pid, poolInstanceId: this.instanceId, options: this.effectiveCreateOptions(), ptcHostDir,
       }), AbortSignal.timeout(15_000))
       if (this.closed) {
         await this.docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
+        this.cleanupPtcDir(name)
         this.removed += 1
         return
       }
@@ -1935,6 +1940,7 @@ export class WarmWorkerPool {
       this.createdAtByName.set(name, Date.now())
       trackLiveContainer(name)
     } catch (error) {
+      this.cleanupPtcDir(name)
       this.failures += 1
       this.disabled = true
       if (this.idle.length === 0 && this.outstanding.size === 0) {
@@ -2015,6 +2021,7 @@ export class WarmWorkerPool {
     liveContainers.delete(name)
     this.createdAtByName.delete(name)
     await this.docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
+    this.cleanupPtcDir(name)
     this.removed += 1
   }
 
@@ -2688,22 +2695,15 @@ export class LinuxWorkerBackend implements WorkerBackend {
     await this.docker(['container', 'rm', '--force', ...inactive], signal).catch(() => undefined)
   }
 
-  private containerCreateArgs(name: string, assignmentId: string, extraArgs: string[] = [], options?: WorkerSessionOptions, ipcDir?: string) {
+  private containerCreateArgs(name: string, assignmentId: string, extraArgs: string[] = [], options?: WorkerSessionOptions, ipcDir?: string, ptcHostDir?: string) {
     // Every container is attributable even when the caller did not supply a run id:
     // `run` falls back to the workspace hash or this process's ad-hoc session.
     const runLabelValue = this.runId ?? (this.owner ? `workspace-${this.owner.slice(0, 12)}` : `adhoc-${processSessionId.slice(0, 8)}`)
     return workerContainerCreateArgs({
-      image: this.image,
-      name,
-      assignmentId,
-      extraArgs,
-      runLabel: runLabelValue,
-      ...(this.owner ? { owner: this.owner } : {}),
-      ...(this.cell ? { cell: this.cell } : {}),
-      ownerPid: process.pid,
-      poolInstanceId: this.instanceId,
-      ...(options ? { options } : {}),
-      ...(ipcDir ? { ipcDir } : {}),
+      image: this.image, name, assignmentId, extraArgs, runLabel: runLabelValue,
+      ...(this.owner ? { owner: this.owner } : {}), ...(this.cell ? { cell: this.cell } : {}),
+      ownerPid: process.pid, poolInstanceId: this.instanceId,
+      ...(options ? { options } : {}), ...(ipcDir ? { ipcDir } : {}), ...(ptcHostDir ? { ptcHostDir } : {}),
     })
   }
 
@@ -2823,15 +2823,9 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const activePool = activeSlot?.pool
     const warmRepos = activeSlot?.preparedRepos
     const matchesWarmRepos = Boolean(
-      activeSlot
-      && activePool
-      && !options?.rpcMountDir
-      && warmRepos
-      && effectiveRunKey
-      && activeSlot.runKey === effectiveRunKey
-      && warmRepos.runKey === effectiveRunKey
-      && options?.reposDir
-      && normalizeReposDirKey(options.reposDir) === warmRepos.sourceDir,
+      activeSlot && activePool && !options?.rpcMountDir && warmRepos && effectiveRunKey
+      && activeSlot.runKey === effectiveRunKey && warmRepos.runKey === effectiveRunKey
+      && options?.reposDir && normalizeReposDirKey(options.reposDir) === warmRepos.sourceDir,
     )
     let heldWarmRepos: RunRepoSnapshotLease | undefined
     let releasedWarmRepos = false
@@ -2869,15 +2863,21 @@ export class LinuxWorkerBackend implements WorkerBackend {
     this.activeContainers.add(name)
     trackLiveContainer(name)
     let repoAcquisition: { mountDir: string; release: () => void } | null = null
+    let coldPtcHostDir: string | undefined
+    let sessionPtcHostDir: string | undefined = pooled ? activePool?.ptcHostDirFor(name) : undefined
     const cleanupRepos = () => {
       const current = repoAcquisition
       repoAcquisition = null
       current?.release()
+      disposePtcHostDir(coldPtcHostDir)
+      coldPtcHostDir = undefined
     }
     const createColdSessionContainer = async (targetName: string) => {
       repoAcquisition = this.acquireReposForCall(options, `sess-${randomUUID()}`)
       const effectiveOptions = repoAcquisition ? { ...options, reposDir: repoAcquisition.mountDir } : options
-      await this.docker(this.containerCreateArgs(targetName, assignmentId, ['--session'], effectiveOptions), AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
+      coldPtcHostDir = !options?.rpcMountDir ? allocatePtcHostDir(`ptc-${randomUUID()}`) : undefined
+      sessionPtcHostDir = coldPtcHostDir
+      await this.docker(this.containerCreateArgs(targetName, assignmentId, ['--session'], effectiveOptions, undefined, coldPtcHostDir), AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
     }
     if (!pooled) {
       try {
@@ -3026,13 +3026,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
         // Warm reuse: a clean session (no pending op, process still alive) resets `/tmp` first,
         // then asks the worker to shut down so the stopped container can serve the next
         // assignment without a cold `container create`.
-        const reusable = pooled
-          && activePool?.enabled === true
-          && activeSlot !== undefined
-          && !activeSlot.retired
-          && this.warmPools.get(activeSlot.policy) === activeSlot
-          && pending.size === 0
-          && !exited
+        const reusable = pooled && activePool?.enabled === true && activeSlot !== undefined
+          && !activeSlot.retired && this.warmPools.get(activeSlot.policy) === activeSlot && pending.size === 0 && !exited
         let recycled = false
         if (reusable) {
           // 1) Reset the tmpfs scratch while the bridge is still running; 2) stop the container
@@ -3136,6 +3131,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     }
 
     return {
+      get ptcHostDir() { return sessionPtcHostDir },
       async stage(fileName, content, opSignal) {
         const clean = pathSchema.parse(fileName)
         const res = await request({ op: 'stage', name: clean, content }, opSignal, 15_000)
@@ -3166,15 +3162,19 @@ export class LinuxWorkerBackend implements WorkerBackend {
         const parsed = verifyScriptRequestSchema.parse(rawReq)
         const preparedCode = prepareVerifyScript(parsed.code, parsed.runtime, parsed.title)
         const timeoutMs = (parsed.timeoutMs ?? 90_000) + 15_000
-        const res = await request({
-          op: 'verify',
-          runtime: parsed.runtime,
-          code: preparedCode,
-          nonce: parsed.nonce,
-          ...(parsed.timeoutMs !== undefined ? { timeoutMs: parsed.timeoutMs } : {}),
-          sdkFiles: readVerifySdkFiles(),
-        }, opSignal, timeoutMs)
+        const res = await request({ op: 'verify', runtime: parsed.runtime, code: preparedCode, nonce: parsed.nonce, ...(parsed.timeoutMs !== undefined ? { timeoutMs: parsed.timeoutMs } : {}), sdkFiles: readVerifySdkFiles() }, opSignal, timeoutMs)
         return verifyScriptResultSchema.parse(res.result)
+      },
+      async ptcExec(rawReq, opSignal) {
+        const parsed = ptcExecRequestSchema.parse(rawReq)
+        const res = await request({
+          op: 'ptc',
+          code: parsed.code,
+          clientCode: readPtcClientSource(),
+          ...(parsed.timeoutMs !== undefined ? { timeoutMs: parsed.timeoutMs } : {}),
+          ...(parsed.maxOutputBytes !== undefined ? { maxOutputBytes: parsed.maxOutputBytes } : {}),
+        }, opSignal, (parsed.timeoutMs ?? 60_000) + 15_000)
+        return ptcExecResultSchema.parse(res.result)
       },
       async verifyStaticAst(rawReq, opSignal) {
         const parsed = astVerifyRequestSchema.parse(rawReq)
