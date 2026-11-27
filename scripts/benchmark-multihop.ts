@@ -2859,6 +2859,44 @@ export function resolveMultihopWorkerConcurrency(
   return Math.max(1, Math.min(maxWorkerConcurrency, Math.trunc(args.workerConcurrency)))
 }
 
+/**
+ * Construct the per-cell environment for multihop-saas benchmark runs:
+ * - Always sets `KOVO_BENCH_MODE=1` to guarantee external web search stays disabled.
+ * - Cleanly forwards `KOVO_DECOUPLED_PROOF_PIPELINE` when set so A/B runs are tracked in
+ *   `effectiveConfig` and `effectiveConfigHash`.
+ */
+export function buildMultihopCellEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const decoupled = baseEnv.KOVO_DECOUPLED_PROOF_PIPELINE?.trim()
+  return {
+    ...baseEnv,
+    KOVO_BENCH_MODE: '1',
+    ...(decoupled ? { KOVO_DECOUPLED_PROOF_PIPELINE: decoupled } : {}),
+  }
+}
+
+let benchModeScopeCount = 0
+let benchModeScopePrev: string | undefined
+
+/** Ref-counted helper that keeps `KOVO_BENCH_MODE=1` set while multihop cells run concurrently. */
+export function acquireBenchModeEnv(): () => void {
+  if (benchModeScopeCount === 0) {
+    benchModeScopePrev = process.env.KOVO_BENCH_MODE
+    process.env.KOVO_BENCH_MODE = '1'
+  }
+  benchModeScopeCount += 1
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    benchModeScopeCount = Math.max(0, benchModeScopeCount - 1)
+    if (benchModeScopeCount === 0) {
+      if (benchModeScopePrev === undefined) delete process.env.KOVO_BENCH_MODE
+      else process.env.KOVO_BENCH_MODE = benchModeScopePrev
+      benchModeScopePrev = undefined
+    }
+  }
+}
+
 export function cellKeys(args: Pick<MultihopArgs, 'apps' | 'seeds'>): Array<{ app: MultihopAppName; seed: number }> {
   const cells: Array<{ app: MultihopAppName; seed: number }> = []
   for (const app of args.apps) for (const seed of args.seeds) cells.push({ app, seed })
@@ -2896,6 +2934,7 @@ export async function runCell(
   let dataDir = join(args.outDir, 'data', slug)
   let isolated: IsolatedDataDirResult | undefined
   let releaseCredentialsDir: (() => void) | undefined
+  let releaseBenchMode: (() => void) | undefined
   let loadedSnapshot: ReturnType<typeof readRunSnapshot> | undefined
   if (resumeRequested) {
     const resumeDir = resolveResumeSnapshotDirectory(args.resumeSnapshotDir!, slug)
@@ -2999,6 +3038,8 @@ export async function runCell(
   const unregisterCleanup = cleanup.add(teardownCell)
 
   try {
+    releaseBenchMode = acquireBenchModeEnv()
+    const cellEnv = buildMultihopCellEnv(process.env)
     // --- Preflight (before booting any lab service): fail fast on missing model profile or local-jq ---
     let profiles: ResolvedModelProfile[] = []
     let profileLoadError: string | undefined
@@ -3120,9 +3161,10 @@ export async function runCell(
         ...(canaryBaseUrl ? { newCanaryBaseUrls: [canaryBaseUrl] } : {}),
         personaCredentials: plan.personas.map(p => ({ handle: p.handle, email: p.email, password: p.password })),
       })
-      if (workerConcurrency !== undefined) {
-        storage.updateRun(runId, { workerConcurrency })
-      }
+      storage.updateRun(runId, {
+        allowWebSearch: false,
+        ...(workerConcurrency !== undefined ? { workerConcurrency } : {}),
+      })
       snapshotMeta.resume.originsRebound = applied.origins.rowsUpdated
       snapshotMeta.resume.personaSessionsRebound = applied.personaSessionsRebound
       snapshotMeta.resume.phase0Skipped = applied.phase0Skipped
@@ -3209,6 +3251,7 @@ export async function runCell(
         ...(workerConcurrency !== undefined ? { workerConcurrency } : {}),
         workerMaxTurns: 40,
         multiTrialEnabled: true,
+        allowWebSearch: false,
       }
       const createdRun = storage.createRun(createRunInput as Parameters<Store['createRun']>[0])
       runId = createdRun.id
@@ -3401,6 +3444,13 @@ export async function runCell(
       workerImageId: workerImage?.imageId ?? null,
       workerSourceHash: workerImage?.sourceHash ?? null,
       sdkVersion: VERIFY_RPC_SDK_VERSION,
+      env: cellEnv,
+      extra: {
+        allowWebSearch: false,
+        ...(cellEnv.KOVO_DECOUPLED_PROOF_PIPELINE !== undefined
+          ? { decoupledProofPipeline: cellEnv.KOVO_DECOUPLED_PROOF_PIPELINE }
+          : {}),
+      },
     })
     if (!cfgResolved.observed) {
       notes.push('missing observed run.effective_config event (Execution-backed scorer requires observed config)')
@@ -3584,6 +3634,7 @@ export async function runCell(
     if (whiteBoxRoot) { try { unlockAndRemove(whiteBoxRoot) } catch { /* best-effort */ } }
     try { storage.close() } catch { /* already closed */ }
     releaseCredentialsDir?.()
+    releaseBenchMode?.()
     if (isolated && !args.keepDataDirs) { try { unlockAndRemove(dataDir) } catch { /* best-effort */ } }
   }
 }

@@ -498,7 +498,7 @@ export class RunsRepository {
       eq(tables.approvalLeases.scopeRevision, row.scopeRevision),
     )).all()
     const approvedEndpointPatterns = this.projectApprovedPatternsFromLeases(liveLeases, row.scopeRevision)
-    return { ...row, approvedEndpointPatterns, label: this.readRunLabel(runId) }
+    return { ...row, allowWebSearch: row.allowWebSearch ?? true, approvedEndpointPatterns, label: this.readRunLabel(runId) }
   }
 
   /**
@@ -1372,6 +1372,7 @@ export class RunsRepository {
     const rows = this.session.db.select().from(tables.runs).where(and(
       eq(tables.runs.workspaceId, this.session.workspace.id), eq(tables.runs.status, 'running'),
     )).orderBy(asc(tables.runs.createdAt)).all()
+      .map(row => ({ ...row, allowWebSearch: row.allowWebSearch ?? true }))
     if (!this.session.tenantId) return rows
     return rows.filter(row => (this.session.effectiveRunTenant(row.id) ?? 'default') === this.session.tenantId)
   }
@@ -1385,6 +1386,7 @@ export class RunsRepository {
     const rows = this.session.db.select().from(tables.runs).where(and(
       eq(tables.runs.workspaceId, this.session.workspace.id), inArray(tables.runs.id, ids),
     )).all()
+      .map(row => ({ ...row, allowWebSearch: row.allowWebSearch ?? true }))
     if (!this.session.tenantId) return rows
     return rows.filter(row => (this.session.effectiveRunTenant(row.id) ?? 'default') === this.session.tenantId)
   }
@@ -3124,10 +3126,7 @@ export class RunsRepository {
 
   // --- Run Creation, Workers, Scope Revocation, Reports & Commands ---
 
-  createRun(input: Omit<z.output<typeof newRun>, 'approvalPolicy' | 'multiTrialEnabled'> & {
-    approvalPolicy?: ApprovalPolicy
-    multiTrialEnabled?: boolean
-  }) {
+  createRun(input: Omit<z.output<typeof newRun>, 'approvalPolicy' | 'multiTrialEnabled' | 'allowWebSearch'> & { approvalPolicy?: ApprovalPolicy; multiTrialEnabled?: boolean; allowWebSearch?: boolean }) {
     return this.session.operate(input, () => {
       const project = this.projects.project(input.projectId)
       const goal = redact(input.goal)
@@ -3167,6 +3166,7 @@ export class RunsRepository {
         workerMaxTurns: input.workerMaxTurns ?? defaultWorkerMaxTurns,
         dynamicStepBudget: null,
         multiTrialEnabled: input.multiTrialEnabled ?? true,
+        allowWebSearch: input.allowWebSearch ?? true,
         phase0CompletedAt: null,
         candidates: [],
         approved: [],

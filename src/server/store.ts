@@ -372,11 +372,7 @@ function repairKnownSchemaDrift(client: DatabaseSync, jsonSupported: boolean): v
     }
   }
   if (ctx.tableExists('approval_leases')) {
-    ctx.ensureColumn(
-      'approval_leases',
-      'lease_scope',
-      "TEXT NOT NULL DEFAULT 'route' CHECK (lease_scope IN ('route', 'prefix', 'host_nondestructive'))",
-    )
+    ctx.ensureColumn('approval_leases', 'lease_scope', "TEXT NOT NULL DEFAULT 'route' CHECK (lease_scope IN ('route', 'prefix', 'host_nondestructive'))")
     ctx.ensureColumn('approval_leases', 'max_uses', 'INTEGER')
     ctx.ensureColumn('approval_leases', 'cross_persona', 'INTEGER NOT NULL DEFAULT 0')
   }
@@ -384,6 +380,7 @@ function repairKnownSchemaDrift(client: DatabaseSync, jsonSupported: boolean): v
     ctx.ensureColumn('personas', 'tenant_ref', 'TEXT')
     ctx.ensureColumn('personas', 'privilege', 'TEXT')
   }
+  if (ctx.tableExists('runs')) ctx.ensureColumn('runs', 'allow_web_search', 'INTEGER NOT NULL DEFAULT 1')
   // Always ensure confirmation triggers match the current strict R2-12 SQL definition.
   installConfirmationGuards(ctx, jsonSupported)
 }
@@ -568,7 +565,7 @@ const STORE_MIGRATIONS: readonly MigrationStep[] = [
           worker_concurrency INTEGER NOT NULL DEFAULT 6,
           worker_max_turns INTEGER NOT NULL DEFAULT 150,
           dynamic_step_budget INTEGER,
-          multi_trial_enabled INTEGER NOT NULL DEFAULT 1,
+          multi_trial_enabled INTEGER NOT NULL DEFAULT 1, allow_web_search INTEGER NOT NULL DEFAULT 1,
           phase0_completed_at INTEGER,
           review_plan TEXT,
           candidates TEXT NOT NULL,
@@ -1513,6 +1510,9 @@ const STORE_MIGRATIONS: readonly MigrationStep[] = [
       ctx.ensureColumn('personas', 'tenant_ref', 'TEXT')
       ctx.ensureColumn('personas', 'privilege', 'TEXT')
     },
+  },
+  { version: 13, name: 'v13_run_allow_web_search',
+    up(ctx) { if (ctx.tableExists('runs')) ctx.ensureColumn('runs', 'allow_web_search', 'INTEGER NOT NULL DEFAULT 1') },
   },
 ]
 

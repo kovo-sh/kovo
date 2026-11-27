@@ -105,8 +105,8 @@ test('R2-17: schema v12 migration adds tenant_ref & privilege, verifies schema, 
   const version = Number(
     (store.client.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
   )
-  assert.equal(version, 12)
-  assert.equal(STORE_SCHEMA_VERSION, 12)
+  assert.equal(version, STORE_SCHEMA_VERSION)
+  assert.equal(STORE_SCHEMA_VERSION, 13)
   Store.verifySchema(store.client)
 
   const v12Cols = new Set(
