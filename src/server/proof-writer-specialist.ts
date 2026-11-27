@@ -92,24 +92,24 @@ const VALID_TERMINAL_CLASSES =
 
 export function buildProofWriterSystemPrompt(): string {
   return [
-    'Proof-Writer: write/repair a TS `kovo_verify` script producing a Mode-A (`fresh_clean_replay`) confirmed `CompositeProofReceipt`.',
-    'ChainBuilder v2 (`ctx.chain()`, runs twice on clean state):',
+    'Proof-Writer: TS `kovo_verify` script for Mode-A (`fresh_clean_replay`) `CompositeProofReceipt`.',
+    'ChainBuilder v2 (`ctx.chain()`, 2x replay):',
     '```ts',
-    'const ch = ctx.chain({ chainId: "chain_1", terminalVulnClass: "<class>" })',
-    'const ctrl = await ch.control(target, { as: attacker }) // OUTSIDE any hop',
-    'const h1 = await ch.step(hop1, { hopId: "hop_1", method: "POST", as: attacker, body: {}, claimedDelta: "..." })',
-    'const cap = await ch.seal(h1, { jsonPath: "$.token", kind: "bearer_token" }) // STRING — NEVER cap.handle!',
-    'const h2 = await ch.hop("hop_2", { claimedDelta: "..." }, () => ctx.http_send(target, { capability: { handle: cap, target: "bearer" }, role: "probe" }))',
+    'const ch = ctx.chain({ chainId: "c1", terminalVulnClass: "<class>" })',
+    'const ctrl = await ch.control(t, { as: atk }) // OUTSIDE any hop',
+    'const h1 = await ch.step(u1, { hopId: "hop_1", method: "POST", as: atk, body: {}, claimedDelta: "d" })',
+    'const cap = await ch.seal(h1, { jsonPath: "$.token", kind: "bearer_token" }) // STRING, NEVER cap.handle',
+    'const h2 = await ch.hop("hop_2", { claimedDelta: "d" }, () => ctx.http_send(t, { capability: { handle: cap, target: "bearer" }, role: "probe" }))',
     'const urlCap = await ch.seal(h2, { kind: "signed_url", jsonPath: "$.url" }) // NO leading `/`',
-    'const h3 = await ch.hop("hop_3", { claimedDelta: "..." }, () => ctx.http_send({ method: "GET", path: urlCap }))',
-    'await ch.readback(target, { as: attacker })',
-    'await ch.prove({ terminalHopId: "hop_3", claimedImpact: "..." })',
-    'return ctx.result({ title: "..." })',
+    'const h3 = await ch.hop("hop_3", { claimedDelta: "d" }, () => ctx.http_send({ method: "GET", path: urlCap }))',
+    'await ch.readback(t, { as: atk })',
+    'await ch.prove({ terminalHopId: "hop_3", claimedImpact: "i" })',
+    'return ctx.result({ title: "t" })',
     '```',
-    '**`ch.seal` returns handle STRING directly — pass `cap`, NEVER write `cap.handle`!** (Legacy `ctx.seal_capability` returned `{ handle }`; no regex.) Selectors: `jsonPath|header|setCookie|locationQuery`; `kind`: `bearer_token|signed_url|cookie|api_token|header_secret|hmac_key|jwt|generic_secret`. Use `body` (not `jsonBody`/`textBody`).',
-    'Helpers: `ch.race`/`ctx.race_burst`, `ctx.hmac_sign`, `ctx.jwt_sign`, `ctx.await_async`, `ch.stateTransition({ fromHopId, toHopId, entityId, ablationExchange })`, `ch.edge`.',
+    '`ch.seal` returns handle STRING directly — pass `cap`, NEVER write `cap.handle`! (Legacy `ctx.seal_capability` -> `{handle}`; no regex.) Selectors: `jsonPath|header|setCookie|locationQuery`; `kind`: `bearer_token|signed_url|cookie|api_token|header_secret|hmac_key|jwt|generic_secret`. Use `body`, not `jsonBody`/`textBody`.',
+    'Helpers: `ch.race`/`ctx.race_burst`, `ctx.hmac_sign`, `ctx.jwt_sign`, `ctx.await_async`, `ch.stateTransition`, `ch.edge`.',
     `Classes: ${VALID_TERMINAL_CLASSES}. Never \`cross_tenant_data_access\`.`,
-    'Rules: 1. Link every hop to `terminalHopId`; prune orphan `hop_*` hops. 2. Run `ch.control` BEFORE mutations, OUTSIDE any hop. 3. Patch `draftScript` for `compilerFailure` (`rejectedBy`/`reason`/`detail`/`missingEvidence`). 4. Keep Mode-A idempotent (`ctx.nonce`); stop on `confirmed: true`; `complete_intent` only if unconfirmable.',
+    'Rules: 1. Link hops to `terminalHopId`; prune orphan `hop_*`. 2. `ch.control` BEFORE mutations, OUTSIDE any hop (strictly for denied controls). 3. Call `ctx.hmac_sign(...)` BEFORE/OUTSIDE `ch.step`/`ch.hop`, NEVER inside a hop (else method=`HMAC_SIGN`, not `POST`). 4. `webhook_forgery`/`forged_settlement`: after forged webhook POST hop, add `ch.readback(...)` proving resource/ledger state changed (or `cross_tenant_write` + denied control + readback). 5. `economic_conservation`: `await ch.readback(balanceTarget, { as: attacker })` BEFORE hop 1 (baseline) AND AFTER `ch.race(...)` (final). 6. Patch `draftScript` for `compilerFailure`; use `ctx.nonce`; stop on `confirmed: true`; `complete_intent` only if unconfirmable.',
   ].join('\n')
 }
 

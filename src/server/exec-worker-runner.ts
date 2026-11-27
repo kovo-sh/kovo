@@ -20,7 +20,7 @@ import { DERIVED_CAPABILITY_HANDLE_RE, type NegativeEdge } from './capability-le
 import type { CompositeProofReceipt, CompositeReceiptVerification, HostSignedTranscript } from './composite-receipt.ts'
 import { extractCoverageEvidenceMetadata } from './coverage-category.ts'
 import { queryCves } from './cve-broker.ts'
-import { vaultScrubDescriptors, type DerivedCapabilityVault } from './derived-custody.ts'
+import { DerivedCapabilityVault, vaultScrubDescriptors } from './derived-custody.ts'
 import { createEgressSanitizer } from './egress-sanitizer.ts'
 import { createProviderLlmCall, evaluateSubmissionDedupe, extractSpecDedupeFields, normalizeEndpointTemplate } from './dedupe.ts'
 import type { ExecBoardManager } from './exec-board.ts'
@@ -2464,14 +2464,14 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               )
             }
             const approved = this.host.approvedOriginsSet(curRun)
-            const runVault = this.host.capabilityVaultFor(curRun.id)
+            const runVault = this.host.capabilityVaultFor(curRun.id), verifyVault = new DerivedCapabilityVault({ runId: runVault.runId })
             const verifySignal = toolSignal
               ? AbortSignal.any([job.controller.signal, toolSignal])
               : job.controller.signal
             const proof = await this.host.verifier.runAgentScriptProof({
               script, runtime, ...(args.title?.trim() ? { title: args.title.trim() } : {}),
               grant, runId: curRun.id, assignmentId: job.assignment.id,
-              targetOrigins: [...approved].slice(0, 8), signal: verifySignal, capabilityVault: runVault,
+              targetOrigins: [...approved].slice(0, 8), signal: verifySignal, capabilityVault: verifyVault,
               ...(args.timeoutMs ? { timeoutMs: args.timeoutMs } : {}),
             })
             const ledgerSync = this.host.verifier.syncVerifyArtifactsToLedger({
@@ -2501,7 +2501,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               captureVerifyCorpusRecord({
                 app: [...approved][0] ?? curRun.projectId, runId: curRun.id, assignmentId: job.assignment.id,
                 receipt: proof.compositeReceipt.receipt, verification: proof.compositeReceipt.verification, hostTranscript: proof.hostTranscript,
-                ...(personaRoleLabels ? { personaRoleLabels } : {}), secrets: [...currentSecrets(), ...vaultScrubDescriptors(runVault)],
+                ...(personaRoleLabels ? { personaRoleLabels } : {}), secrets: [...currentSecrets(), ...vaultScrubDescriptors(runVault), ...vaultScrubDescriptors(verifyVault)],
               })
             }
             if (!proof.verdict.confirmed) {
@@ -2516,7 +2516,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             const persisted = this.host.persistAgentScriptProof({
               run: curRun, assignment: job.assignment, script, runtime,
               title: args.title?.trim() || proof.claimTitle || undefined, proof,
-              secrets: [...currentSecrets(), ...vaultScrubDescriptors(runVault)],
+              secrets: [...currentSecrets(), ...vaultScrubDescriptors(runVault), ...vaultScrubDescriptors(verifyVault)],
             })
             this.host.schedulePlanner(curRun.id)
             return checkpointOnlyGuard.summarizeOutcome({

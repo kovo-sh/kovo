@@ -65,10 +65,10 @@ function makeSessionResult(overrides: Partial<AgentSessionResult> = {}): AgentSe
   }
 }
 
-test('buildProofWriterSystemPrompt is short (<2500 chars), teaches ctx.chain() + valid classes, and has zero recon noise', () => {
+test('buildProofWriterSystemPrompt is short (<2700 chars), teaches ctx.chain() + valid classes + HMAC/webhook/conservation rules, and has zero recon noise', () => {
   const prompt = buildProofWriterSystemPrompt()
   assert.ok(prompt.length > 200, 'system prompt should be non-empty')
-  assert.ok(prompt.length < 2_500, `system prompt length ${prompt.length} must stay < 2500 chars`)
+  assert.ok(prompt.length < 2_700, `system prompt length ${prompt.length} must stay < 2700 chars`)
 
   for (const requiredToken of [
     'ctx.chain',
@@ -89,6 +89,10 @@ test('buildProofWriterSystemPrompt is short (<2500 chars), teaches ctx.chain() +
     'terminalHopId',
     'dual_tenant_abac',
     'economic_conservation',
+    'webhook_forgery',
+    'forged_settlement',
+    'cross_tenant_write',
+    'HMAC_SIGN',
     'draftScript',
     'compilerFailure',
     'confirmed: true',
@@ -109,6 +113,11 @@ test('buildProofWriterSystemPrompt is short (<2500 chars), teaches ctx.chain() +
   assert.match(prompt, /returns handle STRING directly/i)
   assert.match(prompt, /NEVER write `cap\.handle`/i)
   assert.match(prompt, /NO leading `\/`/i)
+  assert.match(prompt, /ctx\.hmac_sign\(\.\.\.\)` BEFORE\/OUTSIDE `ch\.step`\/`ch\.hop`, NEVER inside a hop/i)
+  assert.match(prompt, /HMAC_SIGN.*POST/i)
+  assert.match(prompt, /webhook_forgery.*forged_settlement.*ch\.readback/i)
+  assert.match(prompt, /economic_conservation.*await ch\.readback\(balanceTarget, \{ as: attacker \}\).*BEFORE.*AND AFTER `ch\.race/i)
+  assert.match(prompt, /strictly for denied controls/i)
 
   for (const forbiddenReconTool of [
     'request_http',
