@@ -99,7 +99,7 @@ export interface ChainRaceBurstOptions extends ChainHopOptions, Omit<HttpOptions
 export interface StateTransitionEdgeInput { fromHopId: string; toHopId: string; entityId: string; ablationExchange?: ExchangeRef | ExchangeRef[]; ablationExchanges?: ExchangeRef | ExchangeRef[]; ablation?: ExchangeRef | ExchangeRef[]; ablationExchangeIds?: string[]; mutationKind?: string }
 export interface ChainProveOptions { terminalHopId?: string; claimedImpact?: string; summary?: string; terminalExchange?: ExchangeRef; terminalExchangeId?: string; control?: ExchangeRef | ExchangeRef[]; controlExchanges?: ExchangeRef | ExchangeRef[]; preChainControlExchangeIds?: string[]; readback?: ExchangeRef | ExchangeRef[]; postChainReadbackExchangeIds?: string[]; modeAFailureExchange?: ExchangeRef; modeAFailureExchangeId?: string; oracleFamily?: OracleFamily; oracleInput?: Record<string, unknown>; proofReceipt?: ProofReceiptInput; replayMode?: ReplayMode; benchmarkMode?: boolean }
 interface HopRecorder { hopId: string; target?: HopTargetObject; exchangeIds: string[]; oobEventIds: string[]; browserTraceIds: string[]; producedCapabilities: string[]; consumedCapabilities: string[]; entityId?: string; correlationIds: string[]; controlExCount: number; nonControlExCount: number; capConsumeExchange: Map<string, string>; cryptoConsumptions: Array<{ sourceCapabilityId: string; derivedCapabilityId?: string; alg?: string }>; asyncPolls: Array<{ pollRecordId: string; correlationId?: string; triggerExchangeId?: string }>; onProduce(cap: string, exchangeId?: string): void; onExchange(exchangeId: string, isControl?: boolean): void; onCorrelation(correlationId: string): void }
-interface ExSealDiag { status: number; mediaType: string; isJson: boolean; parsedJson: unknown; topKeys: string[]; headerNames: string[]; hasLocation: boolean; locationParamNames: string[]; hasSetCookie: boolean }
+interface ExSealDiag { status: number; mediaType: string; isJson: boolean; parsedJson: unknown; topKeys: string[]; headerNames: string[]; hasLocation: boolean; locationParamNames: string[]; hasSetCookie: boolean; origin: string; method: string; path: string; secrets: string[] }
 interface RpcTransport { socketPath: string; token: string; nonce: string }
 export const KOVO_VERIFY_SDK_VERSION = 'kovo_verify/v8'
 function readContext(): RpcContext {
@@ -525,7 +525,7 @@ export class VerifyContext {
   readonly claims: VerifyClaim[] = []; readonly expect: Expectations; readonly assert: Expectations
   private readonly defaultOrigin: string | undefined; private readonly transport: RpcTransport
   private _lastRpcOp: string | null = null; private _lastFailedClaims: VerifyClaim[] = []
-  private readonly _hopStack: HopRecorder[] = []; private readonly _capOrigins = new Map<string, string>(); private readonly _exMeta = new Map<string, ExSealDiag>()
+  private readonly _hopStack: HopRecorder[] = []; private readonly _capOrigins = new Map<string, string>(); private readonly _exMeta = new Map<string, ExSealDiag>(); private readonly _exCarryover = new Map<string, string>()
 
   constructor() {
     const context = readContext()
@@ -534,15 +534,11 @@ export class VerifyContext {
     this.transport = { socketPath: process.env.KOVO_RPC_SOCKET ?? '/kovo-rpc/verify.sock', token: readFileSync(process.env.KOVO_RPC_TOKEN_FILE ?? '/kovo-rpc/token', 'utf8').trim(), nonce: this.nonce }
     const push = <T extends VerifyClaim>(claim: T): T => { this.claims.push(claim); return claim }
     const expectations: Expectations = {
-      status: (ex, expected, message) => push({ kind: 'status', exchangeId: ex.exchangeId, expected, ...(message ? { message } : {}) }),
-      statusNot: (ex, unexpected, message) => push({ kind: 'status', exchangeId: ex.exchangeId, expected: [200, 201, 202, 204, 301, 302, 400, 401, 403, 404, 405].filter(c => c !== unexpected), ...(message ? { message } : {}) }),
+      status: (ex, expected, message) => push({ kind: 'status', exchangeId: ex.exchangeId, expected, ...(message ? { message } : {}) }), statusNot: (ex, unexpected, message) => push({ kind: 'status', exchangeId: ex.exchangeId, expected: [200, 201, 202, 204, 301, 302, 400, 401, 403, 404, 405].filter(c => c !== unexpected), ...(message ? { message } : {}) }),
       header: (ex, name, expected, message) => push({ kind: 'header', exchangeId: ex.exchangeId, name, ...(typeof expected === 'string' ? { equals: expected } : (expected ?? {})), ...(message ? { message } : {}) }),
-      bodyContains: (ex, text, message) => push({ kind: 'body_contains', exchangeId: ex.exchangeId, text, ...(message ? { message } : {}) }),
-      bodyAbsent: (ex, text, message) => push({ kind: 'body_contains', exchangeId: ex.exchangeId, text, absent: true, ...(message ? { message } : {}) }),
-      jsonPath: (ex, path, expected, message) => push({ kind: 'jsonpath', exchangeId: ex.exchangeId, path, ...(expected === undefined ? { exists: true } : { equals: expected }), ...(message ? { message } : {}) }),
-      css: (ex, selector, expected, message) => push({ kind: 'css', exchangeId: ex.exchangeId, selector, ...(expected ?? {}), ...(message ? { message } : {}) }),
-      domSentinel: (ex, sentinel, mode, message) => push({ kind: 'dom_sentinel', exchangeId: ex.exchangeId, sentinel, mode: mode ?? 'executed', ...(message ? { message } : {}) }),
-      oob: (ex, expectHit, message) => push({ kind: 'oob', exchangeId: ex.exchangeId, expectHit: expectHit ?? true, ...(message ? { message } : {}) }),
+      bodyContains: (ex, text, message) => push({ kind: 'body_contains', exchangeId: ex.exchangeId, text, ...(message ? { message } : {}) }), bodyAbsent: (ex, text, message) => push({ kind: 'body_contains', exchangeId: ex.exchangeId, text, absent: true, ...(message ? { message } : {}) }),
+      jsonPath: (ex, path, expected, message) => push({ kind: 'jsonpath', exchangeId: ex.exchangeId, path, ...(expected === undefined ? { exists: true } : { equals: expected }), ...(message ? { message } : {}) }), css: (ex, selector, expected, message) => push({ kind: 'css', exchangeId: ex.exchangeId, selector, ...(expected ?? {}), ...(message ? { message } : {}) }),
+      domSentinel: (ex, sentinel, mode, message) => push({ kind: 'dom_sentinel', exchangeId: ex.exchangeId, sentinel, mode: mode ?? 'executed', ...(message ? { message } : {}) }), oob: (ex, expectHit, message) => push({ kind: 'oob', exchangeId: ex.exchangeId, expectHit: expectHit ?? true, ...(message ? { message } : {}) }),
     }
     this.expect = expectations; this.assert = expectations
   }
@@ -573,15 +569,19 @@ export class VerifyContext {
     return { args: { ...(target.origin ? { origin: target.origin } : {}), path: target.path, method: (merged.method ?? target.method ?? 'GET').toUpperCase(), ...(headers ? { headers } : {}), ...(body !== undefined ? { body } : {}), ...(persona ? { persona } : {}), ...(sessionGroupRole ? { sessionGroupRole } : {}), ...(arm ? { arm } : {}), ...(capability !== undefined && capability !== '' ? { capability } : {}), ...pickDefined(merged as Record<string, unknown>, ['session', 'followRedirects', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'authMutation', 'entityId', 'evidenceRole', 'replayAttempt']), ...(merged.correlationIds?.length ? { correlationIds: merged.correlationIds } : {}) }, timeoutMs: (merged.timeoutMs ?? 60_000) + 10_000 }
   }
 
-  private extractExDiag(raw: { status?: unknown; mediaType?: unknown; headers?: unknown; json?: unknown; body?: unknown }): ExSealDiag {
+  private extractExDiag(raw: { status?: unknown; mediaType?: unknown; headers?: unknown; json?: unknown; body?: unknown; method?: unknown; pathAndQuery?: unknown }, origin = this.targetOrigin): ExSealDiag {
     const status = typeof raw.status === 'number' ? raw.status : 0, sanitizeKey = (k: string): string => k.replace(/[^\w.-]/g, '').slice(0, 32)
     const keysOf = (v: unknown): string[] => { if (!v || typeof v !== 'object') return []; const src = Array.isArray(v) ? (v[0] && typeof v[0] === 'object' && !Array.isArray(v[0]) ? Object.keys(v[0] as Record<string, unknown>).map(k => `[0].${k}`) : ['<array>']) : Object.keys(v as Record<string, unknown>); const out = src.slice(0, 12).map(sanitizeKey).filter(k => Boolean(k) && !/redacted/i.test(k)); if (src.length > 12) out.push('...'); return out }
     let isJson = false, parsedJson: unknown = null
     if (raw.json !== undefined && raw.json !== null) { isJson = true; parsedJson = raw.json } else if (typeof raw.body === 'string') { const c = raw.body.replace(/^\uFEFF/, '').trim(); if (c) try { parsedJson = JSON.parse(c); isJson = true } catch { isJson = false } }
     const hdrs: Record<string, string> = {}; if (raw.headers && typeof raw.headers === 'object' && !Array.isArray(raw.headers)) for (const [k, v] of Object.entries(raw.headers as Record<string, unknown>)) if (typeof v === 'string') hdrs[k.toLowerCase()] = v
-    const mediaType = (hdrs['content-type'] ?? (typeof raw.mediaType === 'string' ? raw.mediaType : '')).split(';')[0]!.trim().replace(/[^\w./+-]/g, '').slice(0, 64), loc = (hdrs.location ?? '').trim(), locParams: string[] = []
-    if (loc) try { const u = new URL(loc, 'http://kovo-local.invalid'); for (const k of u.searchParams.keys()) pushUnique(locParams, sanitizeKey(k)); if (u.hash.length > 1) for (const k of new URLSearchParams(u.hash.slice(1)).keys()) pushUnique(locParams, sanitizeKey(k)) } catch { /* ignore */ }
-    return { status, mediaType, isJson, parsedJson, topKeys: isJson ? keysOf(parsedJson) : [], headerNames: Object.keys(hdrs).slice(0, 16), hasLocation: loc.length > 0, locationParamNames: locParams.slice(0, 12), hasSetCookie: 'set-cookie' in hdrs }
+    const mediaType = (hdrs['content-type'] ?? (typeof raw.mediaType === 'string' ? raw.mediaType : '')).split(';')[0]!.trim().replace(/[^\w./+-]/g, '').slice(0, 64), loc = (hdrs.location ?? '').trim(), locParams: string[] = [], secrets: string[] = []
+    const addSec = (v: unknown, min = 12) => { if (typeof v === 'string') { const t = v.trim(); if (t.length >= min && !t.startsWith('cap:') && !/\s/.test(t) && new Set(t).size >= 4 && !secrets.includes(t)) secrets.push(t) } }
+    const walkSec = (n: unknown, d = 0) => { if (d > 3 || !n || typeof n !== 'object') return; if (Array.isArray(n)) { n.slice(0, 4).forEach(x => walkSec(x, d + 1)); return } for (const [k, v] of Object.entries(n as Record<string, unknown>)) { if (typeof v === 'string' && /(?:^|[_-])(?:token|access[_-]?token|id[_-]?token|session[_-]?token|api[_-]?key|jwt|bearer|secret|invite[_-]?token|grant[_-]?token|credential|sig|signature|hmac)(?:$|[_-])/i.test(k)) addSec(v); else if (v && typeof v === 'object') walkSec(v, d + 1) } }
+    if (isJson) walkSec(parsedJson); if (typeof raw.body === 'string') for (const m of raw.body.matchAll(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}\b/g)) addSec(m[0], 16)
+    if (loc) try { const u = new URL(loc, 'http://kovo-local.invalid'); for (const [k, v] of [...u.searchParams.entries(), ...(u.hash.length > 1 ? [...new URLSearchParams(u.hash.slice(1)).entries()] : [])]) { pushUnique(locParams, sanitizeKey(k)); if (/^(?:token|access_token|jwt|code|sig|signature|hmac|secret)$/i.test(k)) addSec(v, 10) } } catch { /* ignore */ }
+    if (hdrs['set-cookie']) for (const ck of hdrs['set-cookie'].split(/\r?\n/)) { const eq = ck.split(';', 1)[0]!.indexOf('='); if (eq > 0) addSec(ck.split(';', 1)[0]!.slice(eq + 1)) }
+    return { status, mediaType, isJson, parsedJson, topKeys: isJson ? keysOf(parsedJson) : [], headerNames: Object.keys(hdrs).slice(0, 16), hasLocation: loc.length > 0, locationParamNames: locParams.slice(0, 12), hasSetCookie: 'set-cookie' in hdrs, origin, method: typeof raw.method === 'string' ? raw.method.toUpperCase() : 'GET', path: (typeof raw.pathAndQuery === 'string' ? raw.pathAndQuery : '/').split(/[?#]/, 1)[0] || '/', secrets }
   }
   private resolveVisibleJsonPath(root: unknown, rawPath: string): { found: boolean; value?: unknown } {
     let s = rawPath.trim(); if (s.startsWith('$')) s = s.slice(1); if (s.startsWith('.')) s = s.slice(1); if (!s) return { found: true, value: root }
@@ -611,9 +611,16 @@ export class VerifyContext {
     if (hasVal) return `capability.seal: value selector not found in host-visible/unredacted transcript (or failed min-length/entropy validation). Use jsonPath / header / setCookie / locationQuery selector on the exchange that minted the value.${diag ? ` [status=${diag.status}, topKeys=[${diag.topKeys.join(', ')}]]` : ''}`
     return diag ? `${msg} [status=${diag.status}, topKeys=[${diag.topKeys.join(', ')}]]` : msg
   }
-  private rememberEx(ex: HttpExchange | null | undefined): void { if (!ex?.exchangeId) return; if (this._exMeta.size >= 256) { const first = this._exMeta.keys().next().value; if (first) this._exMeta.delete(first) } this._exMeta.set(ex.exchangeId, this.extractExDiag(ex)) }
+  private rememberEx(ex: HttpExchange | null | undefined, origin?: string): void { if (!ex?.exchangeId) return; if (this._exMeta.size >= 256) { const first = this._exMeta.keys().next().value; if (first) this._exMeta.delete(first) } this._exMeta.set(ex.exchangeId, this.extractExDiag(ex, origin || this.targetOrigin)) }
+  private detectCarryover(args: Record<string, unknown>): string | undefined {
+    if (args.capability || args.sessionGroupRole === 'control' || args.arm === 'control') return undefined
+    const reqText = `${typeof args.path === 'string' ? args.path : ''}\n${args.headers ? JSON.stringify(args.headers) : ''}\n${typeof args.body === 'string' ? args.body : ''}`
+    for (const [srcId, diag] of this._exMeta.entries()) if (diag.secrets.some(s => reqText.includes(s))) return srcId
+    return this._capOrigins.size === 0 && this._exMeta.size > 0 && /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}\b/.test(reqText) ? 'exploration' : undefined
+  }
   private async sendHttp(op: 'http' | 'http.send', input: HttpTarget, options: HttpOptions = {}, recordHop = true): Promise<HttpExchange> {
-    const { args, timeoutMs } = this.buildHttpRpcArgs(input, options), ex = hydrateExchange(await this.callRpc(op, args, timeoutMs) as HttpExchange); this.rememberEx(ex)
+    const { args, timeoutMs } = this.buildHttpRpcArgs(input, options), carryoverSrc = this.detectCarryover(args), ex = hydrateExchange(await this.callRpc(op, args, timeoutMs) as HttpExchange)
+    this.rememberEx(ex, typeof args.origin === 'string' ? args.origin : this.targetOrigin); if (carryoverSrc) this._exCarryover.set(ex.exchangeId, carryoverSrc)
     const hop = recordHop ? this.activeHop() : undefined
     if (hop) {
       hop.onExchange(ex.exchangeId, args.sessionGroupRole === 'control' || args.arm === 'control')
@@ -702,7 +709,17 @@ export class VerifyContext {
   awaitAsync(input: AsyncAwaitInput | Record<string, unknown>): Promise<AsyncAwaitResult> { return this.await_async(input) }
   private recordProofClaims(ok: boolean, claims: readonly VerifyClaim[]): void { if (claims.length) { if (ok) { this._lastFailedClaims = []; this.claims.push(...claims) } else { this._lastFailedClaims = [...claims] } } }
   async prove_composite(receipt: CompositeProofReceiptInput): Promise<CompositeVerificationResult> {
-    const res = await this.callRpc('composite.verify', normalizeCompositeReceipt(receipt, this.defaultOrigin, this._capOrigins), 30_000) as CompositeVerificationResult
+    const norm = normalizeCompositeReceipt(receipt, this.defaultOrigin, this._capOrigins), r = norm.receipt as CompositeProofReceiptInput
+    if (Array.isArray(r?.hops) && r.hops.length > 0) {
+      const termHop = r.hops.find(h => h.hopId === r.terminalImpact?.terminalHopId) ?? r.hops[r.hops.length - 1]!, termId = r.terminalImpact?.terminalExchangeId, allow3xx = /^(?:open_redirect|redirect|ssrf_redirect)$/.test(r.terminalVulnClass ?? '')
+      const isHardNon2xx = (st: number) => st < 200 || (st >= 300 && st < 400 && !allow3xx) || (st >= 400 && st !== 409)
+      const preflightFail = (rejectedBy: string, reason: string, evidence?: Record<string, unknown>): CompositeVerificationResult => { const claim: CompositeReceiptClaim = { kind: 'composite_receipt', chainId: r.chainId, terminalVulnClass: r.terminalVulnClass, exchangeIds: r.hops.flatMap(h => h.exchangeIds ?? []), ...(termId ? { terminalExchangeId: termId } : {}), replayMode: r.replayMode ?? 'fresh_clean_replay', hopCount: r.hops.length, rejectedBy: 'composite_receipt', reason }; this.recordProofClaims(false, [claim]); return { confirmed: false, ok: false, verified: false, chainId: r.chainId, terminalVulnClass: r.terminalVulnClass, replayMode: r.replayMode ?? 'fresh_clean_replay', modeBVerified: false, hopCount: r.hops.length, verifiedEdges: [], failedStage: 'preflight', rejectedBy, reason, claim, ...(evidence ? { evidence } : {}) } }
+      const termDiag = termId ? this._exMeta.get(termId) : undefined, hopIds = termHop.exchangeIds ?? [], hopDiags = !termId && hopIds.length > 0 ? hopIds.map(id => this._exMeta.get(id)).filter((d): d is ExSealDiag => Boolean(d)) : []
+      const failDiag = termDiag && isHardNon2xx(termDiag.status) ? termDiag : (!termId && hopDiags.length === hopIds.length && hopDiags.length > 0 && hopDiags.every(d => isHardNon2xx(d.status)) ? hopDiags[hopDiags.length - 1] : undefined)
+      if (failDiag) return preflightFail('terminal_exchange_not_succeeding', `Terminal exchange returned HTTP ${failDiag.status} (non-2xx); short-circuited in preflight.`, { negativeEdge: { origin: failDiag.origin, method: failDiag.method, path: failDiag.path, status: failDiag.status, reason: failDiag.status === 401 || failDiag.status === 403 || failDiag.status === 404 ? 'control_blocked_cleanly' : 'terminal_non_2xx' } })
+      if (r.hops.length >= 2 && r.hops.slice(1).some(h => !(h.consumedCapabilities ?? []).some(c => /^cap:/.test(c)) && (h.exchangeIds ?? []).some(id => this._exCarryover.has(id)))) return preflightFail('literal_token_carryover', 'literal_token_carryover: use ch.seal(...) and pass the cap: handle so replay binds a fresh capability instead of a stale exploration literal!')
+    }
+    const res = await this.callRpc('composite.verify', norm, 30_000) as CompositeVerificationResult
     const confirmed = res.confirmed === true || res.ok === true || res.verified === true; if (res.claim) this.recordProofClaims(confirmed, [res.claim])
     return { ...res, confirmed, ok: confirmed, verified: confirmed }
   }
@@ -762,13 +779,9 @@ export class VerifyContext {
   }
   prove_injection_differential(input: InjectionDifferentialInput | Record<string, unknown>): Promise<InjectionDifferentialProof> { return this.callProof<InjectionDifferentialProof>('prove.injection', input, 'prove_injection_differential requires { control, probe, expectedOutput?, vulnClass? }.', 70_000, ['control', 'probe']) }
   prove_signed_url_mint(input: SignedUrlMintInput | Record<string, unknown>): Promise<SignedUrlMintProof> { return this.callProof<SignedUrlMintProof>('prove.signedUrlMint', input, 'prove_signed_url_mint requires { control, probe } (or route + controlBody/probeBody, or controlExchangeId/probeExchangeId).', 70_000, ['control', 'probe']) }
-  proveAccessBoundary(i: AccessBoundaryInput | Record<string, unknown>) { return this.prove_access_boundary(i) }; provePersistedMutation(i: PersistedMutationInput | Record<string, unknown>) { return this.prove_persisted_mutation(i) }
-  proveBooleanOrTimingDiff(i: BooleanOrTimingDiffInput | Record<string, unknown>) { return this.prove_boolean_or_timing_diff(i) }; proveInjectionDifferential(i: InjectionDifferentialInput | Record<string, unknown>) { return this.prove_injection_differential(i) }
-  proveSignedUrlMint(i: SignedUrlMintInput | Record<string, unknown>) { return this.prove_signed_url_mint(i) }; proveOobCallback(i: OobCallbackInput | Record<string, unknown>) { return this.prove_oob_callback(i) }; proveRaceBurst(i: RaceBurstInput | Record<string, unknown>) { return this.prove_race_burst(i) }
-  result(input: { title: string; severity?: string; description?: string }): ProofResult {
-    if (!input.title || !input.title.trim()) throw new Error('Proof result requires a title.')
-    return { sdk: 'kovo_verify.ts', nonce: this.nonce, title: input.title.slice(0, 300), severity: (input.severity ?? 'high').slice(0, 32), ...(input.description ? { description: input.description.slice(0, 4000) } : {}), claims: this.effectiveClaims() }
-  }
+  proveAccessBoundary(i: AccessBoundaryInput | Record<string, unknown>) { return this.prove_access_boundary(i) }; provePersistedMutation(i: PersistedMutationInput | Record<string, unknown>) { return this.prove_persisted_mutation(i) }; proveBooleanOrTimingDiff(i: BooleanOrTimingDiffInput | Record<string, unknown>) { return this.prove_boolean_or_timing_diff(i) }
+  proveInjectionDifferential(i: InjectionDifferentialInput | Record<string, unknown>) { return this.prove_injection_differential(i) }; proveSignedUrlMint(i: SignedUrlMintInput | Record<string, unknown>) { return this.prove_signed_url_mint(i) }; proveOobCallback(i: OobCallbackInput | Record<string, unknown>) { return this.prove_oob_callback(i) }; proveRaceBurst(i: RaceBurstInput | Record<string, unknown>) { return this.prove_race_burst(i) }
+  result(input: { title: string; severity?: string; description?: string }): ProofResult { if (!input.title || !input.title.trim()) throw new Error('Proof result requires a title.'); return { sdk: 'kovo_verify.ts', nonce: this.nonce, title: input.title.slice(0, 300), severity: (input.severity ?? 'high').slice(0, 32), ...(input.description ? { description: input.description.slice(0, 4000) } : {}), claims: this.effectiveClaims() } }
 }
 export interface VerificationScript { setup?(ctx: VerifyContext): Promise<void> | void; verify(ctx: VerifyContext): Promise<ProofResult | unknown> | ProofResult | unknown; cleanup?(ctx: VerifyContext): Promise<void> | void }
 export type VerificationEntrypoint = VerificationScript | ((ctx: VerifyContext) => Promise<ProofResult | unknown> | ProofResult | unknown)
@@ -776,20 +789,9 @@ export function defineVerification(script: VerificationScript): VerificationScri
 function writeResult(value: unknown): void { writeFileSync(process.env.KOVO_PROOF_RESULT_FILE ?? join(dirname(process.env.KOVO_RPC_CONTEXT_FILE ?? '/kovo-rpc/context.json'), 'result.json'), JSON.stringify(value), { mode: 0o600 }) }
 function normalizeProofResult(ctx: VerifyContext, returned: unknown, defaultTitle?: string): ProofResult {
   const fallbackTitle = (defaultTitle && defaultTitle.trim() ? defaultTitle.trim() : 'Verification script proof').slice(0, 300), fallbackClaims = ctx.effectiveClaims()
-  if (returned && typeof returned === 'object' && !Array.isArray(returned) && Array.isArray((returned as Record<string, unknown>).claims)) {
-    const rec = returned as Record<string, unknown>
-    return { sdk: 'kovo_verify.ts', nonce: typeof rec.nonce === 'string' && rec.nonce ? rec.nonce : ctx.nonce, title: typeof rec.title === 'string' && rec.title.trim() ? rec.title.trim().slice(0, 300) : fallbackTitle, severity: typeof rec.severity === 'string' && rec.severity.trim() ? rec.severity.trim().slice(0, 32) : 'high', ...(typeof rec.description === 'string' && rec.description ? { description: rec.description.slice(0, 4000) } : {}), claims: (rec.claims as VerifyClaim[]).length > 0 ? (rec.claims as VerifyClaim[]) : fallbackClaims }
-  }
+  if (returned && typeof returned === 'object' && !Array.isArray(returned) && Array.isArray((returned as Record<string, unknown>).claims)) { const rec = returned as Record<string, unknown>; return { sdk: 'kovo_verify.ts', nonce: typeof rec.nonce === 'string' && rec.nonce ? rec.nonce : ctx.nonce, title: typeof rec.title === 'string' && rec.title.trim() ? rec.title.trim().slice(0, 300) : fallbackTitle, severity: typeof rec.severity === 'string' && rec.severity.trim() ? rec.severity.trim().slice(0, 32) : 'high', ...(typeof rec.description === 'string' && rec.description ? { description: rec.description.slice(0, 4000) } : {}), claims: (rec.claims as VerifyClaim[]).length > 0 ? (rec.claims as VerifyClaim[]) : fallbackClaims } }
   return { sdk: 'kovo_verify.ts', nonce: ctx.nonce, title: fallbackTitle, severity: 'high', claims: fallbackClaims }
 }
 function failScript(ctx: VerifyContext, message: string, claims: VerifyClaim[]): void { writeResult({ sdk: 'kovo_verify.ts', nonce: ctx.nonce, error: message.slice(0, 2000), ...(ctx.lastRpcOp ? { lastRpcOp: ctx.lastRpcOp } : {}), claims }); process.stderr.write(`kovo_verify: ${message}\n`); process.exitCode = 1 }
-export async function runVerification(script: VerificationScript, defaultTitle?: string): Promise<void> {
-  const ctx = new VerifyContext(); let result: unknown = null
-  try { await script.setup?.(ctx); result = await script.verify(ctx); await script.cleanup?.(ctx) } catch (error) { failScript(ctx, error instanceof Error ? error.message : 'Verification script failed.', ctx.effectiveClaims()); return }
-  const normalized = normalizeProofResult(ctx, result, defaultTitle); writeResult(normalized); process.stdout.write(`kovo_verify: ${normalized.claims.length} transcript-backed claim(s) recorded\n`)
-}
-export async function runEntrypoint(entry: VerificationEntrypoint, defaultTitle?: string): Promise<void> {
-  if (typeof entry === 'function') return runVerification({ verify: entry }, defaultTitle)
-  if (entry && typeof entry === 'object' && typeof entry.verify === 'function') return runVerification(entry, defaultTitle)
-  failScript(new VerifyContext(), 'kovo_verify script must export a default async (ctx) => ... function, an object with verify(ctx), or execute ctx.prove_* directly.', [])
-}
+export async function runVerification(script: VerificationScript, defaultTitle?: string): Promise<void> { const ctx = new VerifyContext(); let result: unknown = null; try { await script.setup?.(ctx); result = await script.verify(ctx); await script.cleanup?.(ctx) } catch (error) { failScript(ctx, error instanceof Error ? error.message : 'Verification script failed.', ctx.effectiveClaims()); return }; const normalized = normalizeProofResult(ctx, result, defaultTitle); writeResult(normalized); process.stdout.write(`kovo_verify: ${normalized.claims.length} transcript-backed claim(s) recorded\n`) }
+export async function runEntrypoint(entry: VerificationEntrypoint, defaultTitle?: string): Promise<void> { if (typeof entry === 'function') return runVerification({ verify: entry }, defaultTitle); if (entry && typeof entry === 'object' && typeof entry.verify === 'function') return runVerification(entry, defaultTitle); failScript(new VerifyContext(), 'kovo_verify script must export a default async (ctx) => ... function, an object with verify(ctx), or execute ctx.prove_* directly.', []) }
