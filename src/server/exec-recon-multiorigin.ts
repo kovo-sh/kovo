@@ -418,6 +418,81 @@ function collectDiscoveredEndpointsByOrigin(
   return { byOrigin, segsByOrigin }
 }
 
+const FALLBACK_MUTATING_METHODS = new Set(['POST', 'PATCH', 'PUT', 'DELETE'])
+const FALLBACK_STATIC_ASSET_RE = /\.(?:js|css|map|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|eot|html?)$/i
+
+function fallbackRouteMetrics(ep: Wave1OriginFallbackEndpoint): {
+  method: string
+  path: string
+  key: string
+  priorityPool: boolean
+  score: number
+} | null {
+  const path = (ep.pathTemplate ?? '').trim()
+  if (!path || path === '/') return null
+  const method = (ep.method || 'GET').toUpperCase()
+  const bare = path.split(/[?#]/, 1)[0] || '/'
+  const segs = bare.split('/').filter(Boolean)
+  const isMutating = FALLBACK_MUTATING_METHODS.has(method)
+  const isNonGet = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS'
+  const paramIdx = segs.findIndex(seg => PARAM_SEGMENT_RE.test(seg))
+  const hasIdParam = paramIdx >= 0
+  const hasParamSubResource = hasIdParam && paramIdx < segs.length - 1
+  const hasQuery = path.includes('?')
+  const isStaticAsset = FALLBACK_STATIC_ASSET_RE.test(bare)
+  const score = (ep.riskScore ?? 0)
+    + (isMutating ? 30 : isNonGet ? 20 : 0)
+    + (hasIdParam ? 16 : 0)
+    + (hasParamSubResource ? 12 : 0)
+    + (hasQuery ? 6 : 0)
+    + (segs.length >= 2 ? 4 : 0)
+    + (isStaticAsset ? -40 : 0)
+  return {
+    method,
+    path,
+    key: `${method} ${path}`,
+    priorityPool: isMutating || isNonGet || hasIdParam,
+    score,
+  }
+}
+
+/**
+ * Rank discovered routes within an origin for Wave-1 fallback steps: prioritize state-mutating
+ * verbs (POST/PATCH/PUT/DELETE), ID-parameterized sub-resources (`/:id/...`), and non-GET action
+ * endpoints while still preserving 1 read/entry route when available.
+ */
+export function rankOriginFallbackRoutes(
+  endpoints: readonly Wave1OriginFallbackEndpoint[],
+  maxRoutes = 4,
+): string[] {
+  if (maxRoutes <= 0 || !endpoints.length) return []
+  const byKey = new Map<string, NonNullable<ReturnType<typeof fallbackRouteMetrics>>>()
+  for (const ep of endpoints) {
+    const metrics = fallbackRouteMetrics(ep)
+    if (!metrics) continue
+    const prev = byKey.get(metrics.key)
+    if (!prev || metrics.score > prev.score) byKey.set(metrics.key, metrics)
+  }
+  const ranked = [...byKey.values()].sort((a, b) =>
+    b.score - a.score || a.path.localeCompare(b.path) || a.method.localeCompare(b.method),
+  )
+  const priority = ranked.filter(r => r.priorityPool)
+  const reads = ranked.filter(r => !r.priorityPool)
+  if (!priority.length || !reads.length) return ranked.slice(0, maxRoutes).map(r => r.key)
+  const reservedPriority = Math.max(1, maxRoutes - 1)
+  const pickedPriority = priority.slice(0, reservedPriority)
+  const pickedReads = reads.slice(0, 1)
+  const selected = [...pickedPriority, ...pickedReads]
+  const used = new Set(selected.map(r => r.key))
+  for (const cand of [...priority.slice(pickedPriority.length), ...reads.slice(pickedReads.length)]) {
+    if (selected.length >= maxRoutes) break
+    if (used.has(cand.key)) continue
+    used.add(cand.key)
+    selected.push(cand)
+  }
+  return selected.map(r => r.key)
+}
+
 /**
  * Guarantee every reachable approved origin with discovered endpoints receives Wave-1 coverage
  * even when `codeAuditStepsCreated > 0` or the LLM threat model only seeded steps for a subset
@@ -473,11 +548,7 @@ export function buildWave1UncoveredOriginFallbackSteps(
       : [entry.origin, ...nonStaticReachableOrigins.filter(o => o !== entry.origin)]
     const hostLabel = parseOriginHostLabel(entry.origin)
     const originEps = endpointsByOrigin.get(entry.origin) ?? []
-    const topRoutes = [...new Set(
-      originEps
-        .filter(ep => ep.pathTemplate && ep.pathTemplate.trim() !== '/')
-        .map(ep => `${(ep.method || 'GET').toUpperCase()} ${ep.pathTemplate}`),
-    )].slice(0, 4)
+    const topRoutes = rankOriginFallbackRoutes(originEps, 4)
     const hasVerifiedRoutes = topRoutes.length > 0
     const endpointsNote = hasVerifiedRoutes ? ` Endpoints: ${topRoutes.join(', ')}.` : ''
     const siblingNote = stepOrigins.length > 1

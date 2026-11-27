@@ -77,23 +77,24 @@ export const defaultEngineMaxDurationMs = 240_000
 export const defaultEngineMaxEndpoints = 120
 export const defaultEngineMaxHypotheses = 120
 export const defaultEnginePerProbeRequests = 28
-/**
- * Fixed wall-clock margin over `maxDurationMs`. The engine terminates on requests first; time is an
- * emergency brake only, so a loaded or slow host cannot truncate a different queue tail. The margin
- * is deliberately generous (2 minutes): normal completion is request-count driven.
- */
+/** Wall-clock safety margin over `maxDurationMs` for `--no-llm` runs (request-count driven). */
 export const deterministicWallMarginMs = 120_000
+/** Tight wall-clock safety margin for agentic Phase-A floor runs (never inflates 75s -> 195s). */
+export const agenticFloorWallMarginMs = 15_000
+/** Per-GET harvest timeout (ms) and max share of floor duration reserved for surface harvesting. */
+export const harvestRequestTimeoutMs = 2_500
+export const harvestDurationShare = 0.4
+
+/** Compute floor hard-deadline margin: full 120s for `--no-llm`, <= 15s for bounded/agentic passes. */
+export function resolveFloorWallMarginMs(maxDurationMs: number, explicitWallMarginMs?: number): number {
+  if (typeof explicitWallMarginMs === 'number' && Number.isFinite(explicitWallMarginMs)) return Math.max(0, Math.floor(explicitWallMarginMs))
+  return maxDurationMs < defaultEngineMaxDurationMs
+    ? Math.min(agenticFloorWallMarginMs, Math.max(200, Math.floor(maxDurationMs * 0.2)))
+    : deterministicWallMarginMs
+}
 
 export const engineDisableEnv = 'KOVO_DETERMINISTIC_ENGINE'
-
-/**
- * Conventional noun/action route wordlists (e.g. `/api/tokens`, `/api/admin/users`) are a local-lab
- * convenience: they only match when the target happens to use the same English nouns as the list.
- * They default OFF (`false`) so capability is measured from discovered/declared surface only unless
- * a caller explicitly opts in (`KOVO_CONVENTIONAL_WORDLIST=1|true|on|yes`). The switch never changes
- * what is probed on a route the target itself exposed; it only drops endpoints whose sole source is
- * that wordlist.
- */
+/** Conventional wordlist routes default OFF unless `KOVO_CONVENTIONAL_WORDLIST=1|true|on|yes`. */
 export const conventionalWordlistEnv = 'KOVO_CONVENTIONAL_WORDLIST'
 
 export function conventionalWordlistEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -251,14 +252,13 @@ export interface DeterministicEngineInput {
   tier: number
   maxRequests?: number
   maxDurationMs?: number
+  /** Optional explicit wall-clock safety margin over `maxDurationMs` (agentic Phase A caps <= 15s). */
+  wallMarginMs?: number
   maxEndpoints?: number
   maxHypotheses?: number
   /** Evidence-gated `det_lead` emission cap for this pass (default 6, severity-ranked). */
   maxLeads?: number
-  /**
-   * v6 Phase A: the floor always runs with the same deep per-class policy as `--no-llm`.
-   * Breadth-first caps are opt-in only for callers whose remaining budget cannot fund a deep pass.
-   */
+  /** v6 Phase A deep per-class policy; breadth-first caps are opt-in only for tight budgets. */
   breadthFirst?: boolean
   /** v6: environment contract. `prod_readonly` generates no mutating hypotheses at all. */
   environmentMode?: 'prod_readonly' | 'staging_isolated' | 'ephemeral_lab'
@@ -2744,14 +2744,11 @@ interface JsonHarvest {
   /** Runtime value shape per field (url/path/xml/jwt/uuid/number/email/text). */
   shapes: Record<string, ParamValueShape>
   textValues: string[]
-  /**
-   * Row correlation for collection responses: `scalar value -> record identifier`. Lets the engine
-   * address the *caller's own* row (e.g. an identity handle that appears as a column on the row)
-   * without a route- or app-specific lookup.
-   */
+  /** Row correlation for collection responses: `scalar value -> record identifier`. */
   rowIds: Record<string, string>
   body: string
   evidence: HarvestEvidence
+  streaming?: boolean
 }
 
 const credentialFieldRe = /(?:^|[_-])(?:access[_-]?token|refresh[_-]?token|api[_-]?key|apikey|secret|secret[_-]?key|client[_-]?secret|password|passwd|private[_-]?key|signing[_-]?key|webhook[_-]?secret|credential|authorization)$/i
@@ -2836,38 +2833,41 @@ function harvestJson(body: string): JsonHarvest {
     }
   }
   walk(parsed, 0)
-  return {
-    status: 200,
-    ids: [...new Set(ids)].filter(isSafeResourceId),
-    fields: [...new Set(Object.keys(values))],
-    values,
-    shapes,
-    textValues: [...new Set(textValues)],
-    rowIds,
-    body,
-    evidence,
-  }
+  return { status: 200, ids: [...new Set(ids)].filter(isSafeResourceId), fields: [...new Set(Object.keys(values))], values, shapes, textValues: [...new Set(textValues)], rowIds, body, evidence }
 }
 
-/** Bounded GET harvest of the target's own responses; every exchange is recorded by the caller. */
-class SurfaceHarvester {
+const STREAMING_CONTENT_TYPE_RE = /text\/event-stream|application\/x-ndjson/i
+const emptyJsonHarvest = (status = 0, streaming = false): JsonHarvest => ({
+  ids: [], fields: [], values: {}, shapes: {}, textValues: [], rowIds: {}, body: '', status, evidence: {}, ...(streaming ? { streaming: true } : {}),
+})
+
+/** Bounded GET harvest of the target's own responses; bails on deadline or streaming/SSE paths. */
+export class SurfaceHarvester {
   private readonly cache = new Map<string, Promise<JsonHarvest>>()
   private readonly inflight = new Set<string>()
+  private readonly streamingPaths = new Set<string>()
   private readonly deps: Pick<DeterministicEngineInput, 'broker' | 'grant' | 'signal' | 'storage' | 'recordExchange'>
   private readonly log: (kind: string, message: string, data?: Record<string, unknown>) => void
   private readonly origin: string
+  private readonly deadlineAt?: number
+  private readonly requestTimeoutMs: number
 
   constructor(
     deps: Pick<DeterministicEngineInput, 'broker' | 'grant' | 'signal' | 'storage' | 'recordExchange'>,
     log: (kind: string, message: string, data?: Record<string, unknown>) => void,
     origin: string,
+    deadlineAt?: number,
+    requestTimeoutMs = harvestRequestTimeoutMs,
   ) {
-    this.deps = deps
-    this.log = log
-    this.origin = origin
+    this.deps = deps; this.log = log; this.origin = origin; this.deadlineAt = deadlineAt; this.requestTimeoutMs = Math.max(100, requestTimeoutMs)
   }
 
+  isExpired(): boolean { return this.deadlineAt !== undefined && Date.now() >= this.deadlineAt }
+  isStreamingPath(pathAndQuery: string): boolean { return this.streamingPaths.has(pathAndQuery.split('?')[0] || '/') }
+
   get(persona: string | undefined, pathAndQuery: string): Promise<JsonHarvest> {
+    if (this.isStreamingPath(pathAndQuery)) return Promise.resolve(emptyJsonHarvest(0, true))
+    if (this.isExpired()) return Promise.resolve(emptyJsonHarvest(0, false))
     const key = `${persona ?? ''}|${pathAndQuery}`
     const cached = this.cache.get(key)
     if (cached) return cached
@@ -2877,16 +2877,16 @@ class SurfaceHarvester {
   }
 
   private async fetch(persona: string | undefined, pathAndQuery: string): Promise<JsonHarvest> {
+    const barePath = pathAndQuery.split('?')[0] || '/'
+    const remainingMs = this.deadlineAt !== undefined ? this.deadlineAt - Date.now() : this.requestTimeoutMs
+    if (remainingMs <= 0) return emptyJsonHarvest(0, false)
+    const timeoutMs = Math.max(100, Math.min(this.requestTimeoutMs, remainingMs))
+    const startedAt = Date.now()
     this.inflight.add(pathAndQuery)
     try {
-      const exchange = await this.deps.broker.executeHttp({
-        origin: this.origin,
-        method: 'GET',
-        pathAndQuery,
-        ...(persona ? { persona } : {}),
-        followRedirects: false,
-        timeoutMs: 8_000,
-      }, this.deps.grant, this.deps.signal)
+      const exchange = await this.deps.broker.executeHttp({ origin: this.origin, method: 'GET', pathAndQuery, ...(persona ? { persona } : {}), followRedirects: false, timeoutMs }, this.deps.grant, this.deps.signal)
+      const contentType = String(exchange.mediaType ?? exchange.respHeaders?.['content-type'] ?? '')
+      if (STREAMING_CONTENT_TYPE_RE.test(contentType)) { this.streamingPaths.add(barePath); return emptyJsonHarvest(exchange.status, true) }
       if (exchange.status >= 200 && exchange.status < 300) {
         try { this.deps.recordExchange?.(exchange) } catch { /* persistence is best-effort */ }
         const harvested = harvestJson(exchange.body)
@@ -2899,12 +2899,12 @@ class SurfaceHarvester {
         if (headerNames.length > 0) evidence.headerNames = headerNames.slice(0, 32)
         return { ...harvested, status: exchange.status, evidence }
       }
-      return { ids: [], fields: [], values: {}, shapes: {}, textValues: [], rowIds: {}, body: '', status: exchange.status, evidence: {} }
-    } catch {
-      return { ids: [], fields: [], values: {}, shapes: {}, textValues: [], rowIds: {}, body: '', status: 0, evidence: {} }
-    } finally {
-      this.inflight.delete(pathAndQuery)
-    }
+      return emptyJsonHarvest(exchange.status, false)
+    } catch (err) {
+      const timedOut = !this.deps.signal.aborted && (Date.now() - startedAt >= Math.max(80, timeoutMs - 50) || /timeout|timed out|abort/i.test(String(err)))
+      if (timedOut) this.streamingPaths.add(barePath)
+      return emptyJsonHarvest(0, timedOut)
+    } finally { this.inflight.delete(pathAndQuery) }
   }
 }
 
@@ -2983,27 +2983,23 @@ function mergeViewerHarvest(target: EndpointHarvest, next: JsonHarvest): void {
   target.viewerValues = viewerValues
 }
 
-async function harvestSurface(
+export async function harvestSurface(
   input: DeterministicEngineInput,
   ranked: readonly EngineEndpoint[],
   harvester: SurfaceHarvester,
   picks: ReturnType<typeof personaPicks>,
   budget: { requestsUsed: number; maxRequests: number },
   log: (kind: string, message: string, data?: Record<string, unknown>) => void,
-  /** Tight-budget reserve: harvest may not spend past this many total requests. */
   ceiling = budget.maxRequests,
+  deadlineAt?: number,
 ): Promise<{ harvests: Map<string, EndpointHarvest>; endpointsHarvested: number }> {
   const harvests = new Map<string, EndpointHarvest>()
   let endpointsHarvested = 0
   const owner = picks.owner?.handle
   const other = picks.crossTenant?.handle
   const lower = picks.lower?.handle
-  /**
-   * A privileged route only publishes its records to an entitled caller: reading the admin
-   * directory as the generic member harvests a 403 and leaves the authz matrix with no object id.
-   * Harvest those routes as the admin persona when one exists; every other route keeps the member
-   * harvest so cross-tenant contrast stays the member's own view.
-   */
+  const timeUp = (): boolean => (deadlineAt !== undefined && Date.now() >= deadlineAt) || harvester.isExpired()
+  // Privileged routes publish records only to entitled callers; use admin when available.
   const harvestPersonaFor = (endpoint: EngineEndpoint): string | undefined => {
     const bare = endpoint.pathTemplate.split('?')[0] || '/'
     return pathHasPrivilegedHint(bare) && picks.admin?.handle ? picks.admin.handle : owner
@@ -3019,9 +3015,8 @@ async function harvestSurface(
     return created
   }
 
-  // Bounded identifier-form discovery for declared mutating object routes with no readable
-  // collection. Runs first so the detail read below can seed the body schema from a live object.
-  if (input.environmentMode === 'staging_isolated' && owner) {
+  // Bounded identifier-form discovery for declared mutating object routes with no readable collection.
+  if (input.environmentMode === 'staging_isolated' && owner && !timeUp()) {
     const tenants = [...new Set(input.personas
       .filter(persona => persona.privilege !== 'admin')
       .map(persona => persona.tenant ?? '')
@@ -3035,39 +3030,36 @@ async function harvestSurface(
         return endpoint.source !== 'conventional' && PLACEHOLDER_SEGMENT_RE.test(last)
       })
       .slice(0, 3)
-    let tried = 0
-    let found = 0
+    let tried = 0, found = 0
     for (const endpoint of targets) {
+      if (budget.requestsUsed + tried >= limit || tried >= 10 || input.signal.aborted || timeUp()) break
       const target = take(endpoint)
       if (target.ownerIds.length > 0) continue
       const bare = endpoint.pathTemplate.split('?')[0] || '/'
       const forms = identifierFormsForRoute(bare, tenants)
       for (const candidate of forms) {
-        if (budget.requestsUsed + tried >= limit || tried >= 10 || input.signal.aborted) break
+        if (budget.requestsUsed + tried >= limit || tried >= 10 || input.signal.aborted || timeUp()) break
         const detailPath = bare.replace(DYNAMIC_ID_SEGMENT_RE, `/${encodeURIComponent(candidate)}`)
+        if (harvester.isStreamingPath(detailPath)) continue
         const probe = await harvester.get(harvestPersonaFor(endpoint), detailPath)
         budget.requestsUsed += 1
         tried += 1
-        if (!probe.body.trim().startsWith('{')) continue
+        if (probe.streaming || !probe.body.trim().startsWith('{')) continue
         const errorOnly = probe.fields.length > 0 && probe.fields.every(field =>
           /^(?:error|errors|message|detail|path|status|code)$/i.test(field))
         if (errorOnly || probe.fields.length < 2) continue
         target.ownerIds.push(candidate)
         mergeHarvest(target, probe)
         found += 1
-        log('deterministic_engine.identifier_forms', `Declared object route ${endpoint.method} ${bare}: verified identifier form "${candidate}" with an owner read.`, {
-          endpoint: bare, method: endpoint.method, candidate, tried,
-        })
+        log('deterministic_engine.identifier_forms', `Declared object route ${endpoint.method} ${bare}: verified identifier form "${candidate}" with an owner read.`, { endpoint: bare, method: endpoint.method, candidate, tried })
         break
       }
     }
-    log('deterministic_engine.identifier_forms_summary',
-      `Identifier-form discovery: ${targets.length} declared object route(s), ${tried} candidate read(s), ${found} verified (tenants: ${tenants.join(', ') || 'none'}).`,
-      { routes: targets.map(endpoint => `${endpoint.method} ${endpoint.pathTemplate.split('?')[0]}`), tried, found, tenants })
+    log('deterministic_engine.identifier_forms_summary', `Identifier-form discovery: ${targets.length} declared object route(s), ${tried} candidate read(s), ${found} verified (tenants: ${tenants.join(', ') || 'none'}).`, { routes: targets.map(endpoint => `${endpoint.method} ${endpoint.pathTemplate.split('?')[0]}`), tried, found, tenants })
   }
 
   for (const endpoint of ranked) {
-    if (budget.requestsUsed >= limit || input.signal.aborted) break
+    if (budget.requestsUsed >= limit || input.signal.aborted || timeUp()) break
     if (isStaticOrBaselinePath(endpoint.pathTemplate)) continue
     const bare = endpoint.pathTemplate.split('?')[0] || '/'
     const method = endpoint.method.toUpperCase()
@@ -3076,26 +3068,31 @@ async function harvestSurface(
     const readPersona = harvestPersonaFor(endpoint)
     let baseline: JsonHarvest | null = null
     if (method === 'GET' && !hasDynamicIdSegment(bare)) {
-      // The route itself is a readable collection/detail page.
+      if (harvester.isStreamingPath(bare)) continue
       const own = await harvester.get(readPersona, bare)
       budget.requestsUsed += 1
+      if (own.streaming || harvester.isStreamingPath(bare)) continue
       mergeHarvest(target, own)
       if (target.ownerReadStatus === undefined) target.ownerReadStatus = own.status
       baseline = own
     }
     if (collection && collection !== '/' && (hasDynamicIdSegment(bare) || method !== 'GET')) {
-      const own = await harvester.get(readPersona, collection)
-      budget.requestsUsed += 1
-      mergeHarvest(target, own)
-      if (other) {
-        const theirs = await harvester.get(other, collection)
+      if (budget.requestsUsed >= limit || input.signal.aborted || timeUp()) break
+      if (!harvester.isStreamingPath(collection)) {
+        const own = await harvester.get(readPersona, collection)
         budget.requestsUsed += 1
-        mergeOtherHarvest(target, theirs)
+        if (!own.streaming) {
+          mergeHarvest(target, own)
+          if (other && !harvester.isStreamingPath(collection) && budget.requestsUsed < limit && !input.signal.aborted && !timeUp()) {
+            const theirs = await harvester.get(other, collection)
+            budget.requestsUsed += 1
+            if (!theirs.streaming) mergeOtherHarvest(target, theirs)
+          }
+        }
       }
     }
-    // Query-name discovery: a benign value that changes the response identifies the real filter
-    // parameter, so later SQLi/traversal/SSRF/XSS probes do not burn their budget on ignored names.
-    if (method === 'GET' && baseline && target.activeQueryParams.length === 0) {
+    // Query-name discovery: identify active filter params so later probes do not burn budget on ignored names.
+    if (method === 'GET' && baseline && !baseline.streaming && !harvester.isStreamingPath(bare) && target.activeQueryParams.length === 0 && !timeUp()) {
       const candidates = inferEndpointParams(endpoint)
         .filter(param => param.location === 'query')
         .filter(param => !hasDynamicIdSegment(param.name))
@@ -3108,27 +3105,28 @@ async function harvestSurface(
         return target.seedValues[0] ?? 'kovo'
       }
       for (const candidate of candidates) {
+        if (budget.requestsUsed >= limit || input.signal.aborted || timeUp() || harvester.isStreamingPath(bare)) break
         const separator = bare.includes('?') ? '&' : '?'
         const probePath = `${bare}${separator}${encodeURIComponent(candidate.name)}=${encodeURIComponent(sampleFor(candidate.name))}`
         const probed = await harvester.get(readPersona, probePath)
         budget.requestsUsed += 1
+        if (probed.streaming) break
         mergeHarvest(target, probed)
-        const changed = probed.body.length > 0 && (
-          baseline.body.length === 0 ||
-          responseSimilarity(baseline.body, probed.body) < 0.98
-        )
+        const changed = probed.body.length > 0 && (baseline.body.length === 0 || responseSimilarity(baseline.body, probed.body) < 0.98)
         if (changed && !target.activeQueryParams.includes(candidate.name)) {
           target.activeQueryParams.push(candidate.name)
         }
       }
     }
     // Detail read with a harvested owner id, so field names (body schema) are observable.
-    if (hasDynamicIdSegment(bare) && target.fields.length === 0) {
+    if (hasDynamicIdSegment(bare) && target.fields.length === 0 && !timeUp() && !input.signal.aborted && budget.requestsUsed < limit) {
       const detailId = target.ownerIds[0] ?? '1'
       const detailPath = bare.replace(DYNAMIC_ID_SEGMENT_RE, `/${encodeURIComponent(detailId)}`)
-      const detail = await harvester.get(readPersona, detailPath)
-      budget.requestsUsed += 1
-      mergeHarvest(target, detail)
+      if (!harvester.isStreamingPath(detailPath)) {
+        const detail = await harvester.get(readPersona, detailPath)
+        budget.requestsUsed += 1
+        if (!detail.streaming) mergeHarvest(target, detail)
+      }
     }
   }
 
@@ -3137,10 +3135,12 @@ async function harvestSurface(
     .filter(endpoint => endpoint.method.toUpperCase() === 'GET' && /(?:^|\/)(?:me|session|whoami)(?:\/|$)/i.test(endpoint.pathTemplate))
     .map(endpoint => endpoint.pathTemplate.split('?')[0])
   for (const path of identityPaths.slice(0, 2)) {
+    if (budget.requestsUsed >= limit || input.signal.aborted || timeUp()) break
     for (const persona of [owner, other, lower]) {
-      if (!persona) continue
+      if (!persona || budget.requestsUsed >= limit || input.signal.aborted || timeUp() || harvester.isStreamingPath(path)) continue
       const identity = await harvester.get(persona, path)
       budget.requestsUsed += 1
+      if (identity.streaming) break
       const target = ranked.find(e => (e.pathTemplate.split('?')[0] || '/') === path)
       if (!target) continue
       const profile = take(target)
@@ -5022,19 +5022,21 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     return sb.declared - sa.declared || sb.total - sa.total || a.localeCompare(b)
   })
 
-  // Harvest each origin independently (the engine is per-run but a run may carry several assets).
-  // Under the tight staging cap, harvesting the whole surface would starve every behavioural probe;
-  // reserve at least half the budget for probe/replay work so a wired route can still be converted
-  // into a confirmed finding. Wide-budget local floors keep the previous unbounded harvest.
+  // Harvest each origin independently with a bounded wall-clock cap (<= 40% of floor duration)
+  // and bounded agentic wall-clock margin (<= 15s vs 120s for `--no-llm`) so SSE/slow GETs
+  // cannot starve hypothesis probing or inflate agentic Phase A past 90s.
+  // Under tight caps, also reserve at least half the request budget for probe/replay work.
+  const hardDeadlineMs = maxDurationMs + resolveFloorWallMarginMs(maxDurationMs, input.wallMarginMs)
+  const harvestDeadlineAt = started + Math.min(Math.floor(maxDurationMs * harvestDurationShare), Math.max(500, hardDeadlineMs - 500))
   const harvestCeiling = maxRequests < 600
     ? Math.max(40, Math.floor(maxRequests * 0.45))
     : maxRequests
   const harvests = new Map<string, EndpointHarvest>()
   for (const origin of origins) {
-    if (budget.requestsUsed >= harvestCeiling || input.signal.aborted) break
+    if (budget.requestsUsed >= harvestCeiling || input.signal.aborted || Date.now() >= harvestDeadlineAt) break
     const originEndpoints = ranked.filter(endpoint => endpoint.origin === origin)
-    const harvester = new SurfaceHarvester({ ...input, recordExchange: trackExchange }, log, origin)
-    const result = await harvestSurface(input, originEndpoints, harvester, picks, budget, log, harvestCeiling)
+    const harvester = new SurfaceHarvester({ ...input, recordExchange: trackExchange }, log, origin, harvestDeadlineAt)
+    const result = await harvestSurface(input, originEndpoints, harvester, picks, budget, log, harvestCeiling, harvestDeadlineAt)
     report.endpointsHarvested += result.endpointsHarvested
     for (const [id, harvest] of result.harvests) harvests.set(id, harvest)
   }
@@ -5141,9 +5143,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     }
     probeQueue.sort((a, b) => priority(a) - priority(b))
   }
-  // Request-count termination is the deterministic contract; the wall clock is only a safety net
-  // with a fixed margin, so a slow host cannot silently truncate a different tail of the queue.
-  const hardDeadlineMs = maxDurationMs + deterministicWallMarginMs
+  // Hard deadline was computed above with bounded agentic vs full `--no-llm` wall margin.
   // Bounded blind-SQLi follow-ups: a response-identical boolean arm is the signature of a sink whose
   // oracle is time, not content, so one timing probe is scheduled for that parameter.
   let timingFollowUps = 0

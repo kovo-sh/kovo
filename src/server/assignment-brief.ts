@@ -361,11 +361,39 @@ function cleanHarvestedId(value: unknown): string {
   return trimmed
 }
 
+const BRIEF_MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+const BRIEF_ID_SEGMENT_RE = /^(?::[^/]+|\{[^}]+\}|\[[^\]]+\]|<[^>]+>|\{\{id\}\}|\d{2,16}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i
+const BRIEF_STATIC_ASSET_RE = /\.(?:js|css|map|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|eot|html?)$/i
+
+function classifyBriefRoute(methodRaw: string, pathRaw: string): {
+  isMutating: boolean
+  isNonGet: boolean
+  hasIdParam: boolean
+  hasParamSubResource: boolean
+  hasQuery: boolean
+  isStaticAsset: boolean
+} {
+  const method = (methodRaw || 'GET').toUpperCase()
+  const bare = (pathRaw || '/').split(/[?#]/, 1)[0] || '/'
+  const segs = bare.split('/').filter(Boolean)
+  const paramIdx = segs.findIndex(seg => BRIEF_ID_SEGMENT_RE.test(seg))
+  return {
+    isMutating: BRIEF_MUTATING_METHODS.has(method),
+    isNonGet: method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS',
+    hasIdParam: paramIdx >= 0,
+    hasParamSubResource: paramIdx >= 0 && paramIdx < segs.length - 1,
+    hasQuery: (pathRaw || '').includes('?'),
+    isStaticAsset: BRIEF_STATIC_ASSET_RE.test(bare),
+  }
+}
+
 function routeSignal(route: AssignmentBriefRoute): number {
-  const method = route.method.toUpperCase()
-  const methodWeight = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE' ? 8 : 0
+  const shape = classifyBriefRoute(route.method, route.path)
+  const methodWeight = shape.isMutating ? 14 : shape.isNonGet ? 10 : 0
+  const paramPathWeight = (shape.hasIdParam ? 8 : 0) + (shape.hasParamSubResource ? 4 : 0)
+  const staticPenalty = shape.isStaticAsset ? -30 : 0
   const params = route.params?.length ?? 0
-  return (route.riskScore ?? 0) + methodWeight + Math.min(params, 4)
+  return (route.riskScore ?? 0) + methodWeight + paramPathWeight + staticPenalty + Math.min(params, 4)
 }
 
 function normalizeRoute(route: AssignmentBriefRoute): AssignmentBriefRoute {
@@ -440,8 +468,72 @@ function interleaveMultiOriginRoutes(
   return interleaved
 }
 
+type SelectableBriefEndpoint = { origin: string; method: string; pathTemplate: string; riskScore: number }
+
+function selectBalancedBriefOriginRoutes(
+  endpoints: readonly SelectableBriefEndpoint[],
+  maxPerOrigin = 6,
+): SelectableBriefEndpoint[] {
+  if (maxPerOrigin <= 0 || !endpoints.length) return []
+  const byKey = new Map<string, { ep: SelectableBriefEndpoint; score: number; bucket: 'mutating' | 'param_read' | 'plain_read' }>()
+  for (const ep of endpoints) {
+    const method = (ep.method || 'GET').toUpperCase()
+    const path = ep.pathTemplate || '/'
+    const key = `${method} ${path}`
+    const shape = classifyBriefRoute(method, path)
+    const bucket = shape.isMutating || shape.isNonGet
+      ? 'mutating'
+      : (shape.hasIdParam || shape.hasQuery)
+        ? 'param_read'
+        : 'plain_read'
+    const score = (ep.riskScore ?? 0)
+      + (shape.isMutating ? 28 : shape.isNonGet ? 20 : 0)
+      + (shape.hasIdParam ? 16 : 0)
+      + (shape.hasParamSubResource ? 10 : 0)
+      + (shape.hasQuery ? 6 : 0)
+      + (path.trim() === '/' ? -20 : 0)
+      + (shape.isStaticAsset ? -40 : 0)
+    const prev = byKey.get(key)
+    if (!prev || score > prev.score) byKey.set(key, { ep, score, bucket })
+  }
+  const sortBucket = (list: Array<{ ep: SelectableBriefEndpoint; score: number }>) =>
+    list.sort((a, b) =>
+      b.score - a.score
+      || a.ep.pathTemplate.localeCompare(b.ep.pathTemplate)
+      || a.ep.method.localeCompare(b.ep.method),
+    )
+  const mutating = sortBucket([...byKey.values()].filter(x => x.bucket === 'mutating'))
+  const paramReads = sortBucket([...byKey.values()].filter(x => x.bucket === 'param_read'))
+  const plainReads = sortBucket([...byKey.values()].filter(x => x.bucket === 'plain_read'))
+
+  // Reserve explicit balanced slots per origin (2 mutating + 1 param read + 1 read for cap<=4;
+  // 3 mutating + 2 param reads + 1 read for cap>=6), then backfill in priority order.
+  const picked: SelectableBriefEndpoint[] = []
+  const used = new Set<string>()
+  const pushFrom = (list: Array<{ ep: SelectableBriefEndpoint }>, count: number) => {
+    let added = 0
+    for (const item of list) {
+      if (added >= count || picked.length >= maxPerOrigin) break
+      const key = `${(item.ep.method || 'GET').toUpperCase()} ${item.ep.pathTemplate}`
+      if (used.has(key)) continue
+      used.add(key)
+      picked.push(item.ep)
+      added += 1
+    }
+  }
+  const mutatingReserve = maxPerOrigin <= 4 ? Math.min(2, maxPerOrigin) : Math.min(3, maxPerOrigin)
+  const paramReserve = maxPerOrigin <= 4 ? 1 : 2
+  pushFrom(mutating, mutatingReserve)
+  pushFrom(paramReads, Math.min(paramReserve, Math.max(0, maxPerOrigin - picked.length)))
+  pushFrom(plainReads, Math.min(1, Math.max(0, maxPerOrigin - picked.length)))
+  pushFrom(mutating, maxPerOrigin - picked.length)
+  pushFrom(paramReads, maxPerOrigin - picked.length)
+  pushFrom(plainReads, maxPerOrigin - picked.length)
+  return picked
+}
+
 export function selectBriefRoutes(
-  endpoints: readonly { origin: string; method: string; pathTemplate: string; riskScore: number }[],
+  endpoints: readonly SelectableBriefEndpoint[],
   options: {
     publicOrigins: readonly string[]
     targetOrigins: readonly string[]
@@ -454,24 +546,25 @@ export function selectBriefRoutes(
   if (publicOrigins.length <= 1) {
     const originEndpoints = endpoints.filter(ep => targetOrigins.includes(ep.origin))
     const unconfirmed = originEndpoints.filter(ep => !confirmedPaths.has(normalizePath(ep.pathTemplate)))
-    return (unconfirmed.length > 0 ? unconfirmed : originEndpoints)
-      .slice(0, 6)
+    return selectBalancedBriefOriginRoutes(unconfirmed.length > 0 ? unconfirmed : originEndpoints, 6)
       .map(ep => ({ method: ep.method, path: ep.pathTemplate, riskScore: ep.riskScore }))
   }
-  const perOrigin = new Map<string, typeof endpoints[number][]>()
+  const maxPerOrigin = 4
+  const maxMultiOriginTotal = 20
+  const perOrigin = new Map<string, SelectableBriefEndpoint[]>()
   for (const orig of publicOrigins) {
     const epsForOrigin = endpoints.filter(ep => ep.origin === orig)
     if (epsForOrigin.length === 0) continue
     const unconfirmed = epsForOrigin.filter(ep => !confirmedOriginPaths.has(`${orig} ${normalizePath(ep.pathTemplate)}`))
-    perOrigin.set(orig, (unconfirmed.length > 0 ? unconfirmed : epsForOrigin).slice(0, 4))
+    perOrigin.set(orig, selectBalancedBriefOriginRoutes(unconfirmed.length > 0 ? unconfirmed : epsForOrigin, maxPerOrigin))
   }
   const routes: AssignmentBriefRoute[] = []
-  for (let slot = 0; slot < 4 && routes.length < 20; slot += 1) {
+  for (let slot = 0; slot < maxPerOrigin && routes.length < maxMultiOriginTotal; slot += 1) {
     for (const orig of publicOrigins) {
       const ep = perOrigin.get(orig)?.[slot]
       if (!ep) continue
       routes.push({ origin: ep.origin, method: ep.method, path: ep.pathTemplate, riskScore: ep.riskScore })
-      if (routes.length >= 20) break
+      if (routes.length >= maxMultiOriginTotal) break
     }
   }
   return routes
@@ -771,7 +864,7 @@ export interface AssignmentBriefMultiHopContract {
 }
 
 export const MULTIHOP_ATTACKER_ORIGIN_RULE =
-  'Run discovery & attack hops as low-privilege/attacker persona(s) ONLY — NEVER privileged victim/owner/admin shortcuts (negative control only, passing { arm: "control" }). Shared/dual-tenant persona crossing into non-admin tenant -> dual_tenant_abac (not broken_access_control). Ablation = SAME actor as toHop.'
+  'Run discovery & attack hops as low-privilege/attacker persona(s) ONLY — NEVER privileged victim/owner/admin shortcuts (negative control only, passing { arm: "control" }). For invite, tenant-resolution, rebind, or cross-tenant entry flows, choose an outsider persona whose tenant differs from the target tenant. Shared/dual-tenant persona crossing into non-admin tenant -> dual_tenant_abac (not broken_access_control). Ablation = SAME actor as toHop.'
 
 export const MULTIHOP_CONTINUE_CHAIN_RULE =
   'Explore with http_request/kovo_http first; NEVER seal-only kovo_verify. Never submit a proof for reading your own tenant resource or stopping at an intermediate invite/token/metadata/job/export-handle/role-write mint — seal (ctx.seal_capability) and chain Hops 3-5 in ONE SAME script to cross-tenant/unauthorized victim impact on terminalHopId via ctx.chain(...).prove().'
@@ -891,11 +984,11 @@ export function buildMultiHopProofContract(compact = false, input?: AssignmentBr
   const helperPatterns = detectMultiHopHelperPatterns(input, compact)
   if (compact) {
     return {
-      attackerOriginRule: 'Low-priv only (no victim/owner/admin); non-admin tenant->dual_tenant_abac; SAME actor; {arm:"control"}.',
-      continueChainRule: 'kovo_http; no own-tenant/handle stubs; ctx.seal_capability Hops 3-5->terminalHopId+ctx.chain().prove() in SAME script.',
+      attackerOriginRule: 'Low-priv(no victim/owner/admin); outsider persona on invite/rebind; non-admin tenant->dual_tenant_abac; SAME actor; {arm:"control"}.',
+      continueChainRule: 'kovo_http; no own-tenant; ctx.seal_capability Hops 3-5->terminalHopId+ctx.chain().prove() in SAME script.',
       ...(helperPatterns.length ? { helperPatterns } : {}),
       modeATsRecipe: COMPACT_MULTIHOP_MODE_A_RECIPE,
-      hardenedTwinRule: 'Guard holds: no Hop1-2 finding; record_coverage(status="ruled_out", proofGapReason="invariant_enforced_hardened")+complete_intent.',
+      hardenedTwinRule: 'Hardened: record_coverage(status="ruled_out",proofGapReason="invariant_enforced_hardened")+complete_intent.',
     }
   }
   return {

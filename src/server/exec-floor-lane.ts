@@ -4,6 +4,7 @@ import { declarativeReplaySpecSchema, replaySpecOrigins, type DeclarativeReplayS
 import { BrokerDenied, type BrokerExchangeResult, type Grant } from './broker.ts'
 import { checkStructuralDuplicate, extractSpecDedupeFields } from './dedupe.ts'
 import {
+  agenticFloorWallMarginMs,
   runDeterministicEngine,
   type EngineConfirmed,
   type EngineEndpoint,
@@ -1060,9 +1061,10 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
         ? Math.max(50, Math.floor((current.budgetRequests > 0 ? current.budgetRequests : requestCap) * 0.2))
         : requestCap
       const maxRequests = Math.min(requestCap, stagingCap)
-      const maxDurationMs = environmentMode === 'staging_isolated'
-        ? Math.min(durationCap, 90_000)
-        : durationCap
+      const maxDurationMs = environmentMode === 'staging_isolated' ? Math.min(durationCap, 90_000) : durationCap
+      const wallMarginMs = laneOptions.maxDurationMs !== undefined
+        ? Math.min(agenticFloorWallMarginMs, Math.max(200, Math.floor(maxDurationMs * 0.2)))
+        : undefined
       const maxHypotheses = 90
 
       this.storage.event(
@@ -1157,9 +1159,8 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
         browser: this.browser,
         storage: this.storage,
         tier: current.capabilityTier,
-        maxRequests,
-        maxDurationMs,
-        maxHypotheses,
+        maxRequests, maxDurationMs, maxHypotheses,
+        ...(wallMarginMs !== undefined ? { wallMarginMs } : {}),
         environmentMode,
         ...(entityTag ? { entityTag } : {}),
         ...(entityTag ? { cleanupEndpoints: allEndpoints } : {}),
