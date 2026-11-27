@@ -498,7 +498,7 @@ export function ReadFollow({ it }: { it: FollowItem }) {
       {related.slice(0, 5).map(f => <LinkRow key={f.id} glyph={<SevGlyph sev={f.severity} />} right={<VState status={f.status} />} trailing={null} onClick={() => links.finding(f.id)}>{f.title}</LinkRow>)}
     </Section>}
     <Section title="If queued">
-      <p>Kovo Hunter sends the coordinator a steering hint for <span className="font-mono text-[12px]">{host(x.origin)}</span> · {prettyCat(x.category)}; it becomes a plan step in the next planner round. Requests requiring higher permissions come back here for approval.</p>
+      <p>Kovo sends the coordinator a steering hint for <span className="font-mono text-[12px]">{host(x.origin)}</span> · {prettyCat(x.category)}; it becomes a plan step in the next planner round. Requests requiring higher permissions come back here for approval.</p>
     </Section>
     <Section title="Coordinator context"><CoordinatorContext origins={[x.origin]} category={x.category} excludeCoverageId={x.id} follow /></Section>
     <FoundBy workers={x.assignmentId && model.workerById.has(x.assignmentId) ? [x.assignmentId] : []} title="Recorded by" />

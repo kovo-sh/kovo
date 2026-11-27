@@ -12,7 +12,7 @@ export const Route = createRootRoute({
     meta: [
       { charSet: 'utf-8' },
       { name: 'viewport', content: 'width=device-width, initial-scale=1' },
-      { title: 'Kovo Hunter' },
+      { title: 'Kovo' },
     ],
     links: [
       { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' },
@@ -26,7 +26,7 @@ export const Route = createRootRoute({
   shellComponent: Document,
   errorComponent: ({ error }) => (
     <main className="mx-auto w-full max-w-[960px] px-6 pb-[72px] pt-6">
-      <h1>Kovo Hunter couldn’t open this view</h1>
+      <h1>Kovo couldn’t open this view</h1>
       <p className="mb-3.5 mt-2 text-fg-subtle">
         {error instanceof Error ? error.message : 'This view is unavailable.'}
       </p>

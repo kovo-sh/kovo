@@ -1,5 +1,5 @@
 /* =====================================================================
-   Kovo Hunter shared design tokens — unified with /runs/$runId (.rw).
+   Kovo shared design tokens — unified with /runs/$runId (.rw).
    Warm-stone light (#fbfbfa / #f5f5f4 / #ffffff) & neutral-charcoal dark
    (#121212 / #161616 / #191919), driven by html[data-appearance] and
    html[data-theme] (persisted as `kovo-appearance`).

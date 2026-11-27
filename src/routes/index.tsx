@@ -364,7 +364,7 @@ function Workspace() {
             Start your first project
           </h2>
           <p className="mb-5 max-w-[520px] text-[13px] leading-5 text-fg-muted">
-            Register the hosts you own or have written authorization to test. Kovo Hunter verifies scope before dispatching any live requests.
+            Register the hosts you own or have written authorization to test. Kovo verifies scope before dispatching any live requests.
           </p>
           <CreateProjectSheet
             isModal={false}

@@ -446,7 +446,7 @@ export function PatchProposalReview({
         { icon: 'check' },
       )
     } catch (e) {
-      toast.show(e instanceof Error ? e.message : 'Kovo Hunter could not update this patch review.', { tone: 'error' })
+      toast.show(e instanceof Error ? e.message : 'Kovo could not update this patch review.', { tone: 'error' })
     } finally {
       setBusy(null)
     }
@@ -535,7 +535,7 @@ function TriageBar({ runId, f }: { runId: string; f: FindingWithTriage }) {
       await refresh()
       toast.show('Triage saved', { icon: 'check', sub: f.title })
     } catch (e) {
-      toast.show(e instanceof Error ? e.message : 'Kovo Hunter could not save triage.', { tone: 'error' })
+      toast.show(e instanceof Error ? e.message : 'Kovo could not save triage.', { tone: 'error' })
     } finally {
       setSaving(false)
     }
@@ -620,7 +620,7 @@ function FixVerifyActions({ f, primaryExchangeId }: { f: FindingRow; primaryExch
       await refresh()
       toast.show('Verified patch generated', { icon: 'check', sub: f.title })
     } catch (e) {
-      toast.show(e instanceof Error ? e.message : 'Kovo Hunter could not generate a verified patch.', { tone: 'error' })
+      toast.show(e instanceof Error ? e.message : 'Kovo could not generate a verified patch.', { tone: 'error' })
     } finally {
       setPatching(false)
     }

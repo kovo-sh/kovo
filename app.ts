@@ -371,7 +371,7 @@ function render() {
         ? `<article class="coordinator-message coordinator-user"><strong>You</strong><p>${esc(message.text)}</p></article>`
         : `<article class="coordinator-message coordinator-reply"><span class="thread-avatar coordinator-avatar" aria-hidden="true">${brandMark}</span><div><strong>Coordinator</strong><p>${esc(message.text)}</p></div></article>`).join('')}
       ${stage === 'review' && !paused ? '<div class="chat-scope-action"><button data-action="gate">Review discovered hosts <span aria-hidden="true">→</span></button></div>' : ''}
-      ${stage === 'discover' ? '<section class="scope"><h2>Authorize discovery</h2><p>Kovo Hunter will review a prepared inventory for the project’s seed domain in this demo.</p><button class="primary" data-action="discover">Consent and discover</button></section>' : ''}
+      ${stage === 'discover' ? '<section class="scope"><h2>Authorize discovery</h2><p>Kovo will review a prepared inventory for the project’s seed domain in this demo.</p><button class="primary" data-action="discover">Consent and discover</button></section>' : ''}
     </div>
     <form id="chat"><input name="message" aria-label="Message the coordinator" placeholder="Message coordinator…" autocomplete="off" value="${esc(coordinatorDraft)}" required><button class="primary" aria-label="Send message">↑</button></form>
   </section>`;
@@ -614,7 +614,7 @@ function render() {
   const currentPage = tab === 'Report' ? 'Report' : 'Workflow';
   const statusClass = stage === 'done' ? 'done' : stage === 'review' || paused ? 'attention' : stage === 'analyze' || stage === 'verify' ? 'running' : '';
   const tabs = ['Workflow', 'Report'];
-  const brand = `<div class="brand" aria-label="Kovo Hunter">${brandMark}<span class="rail-text">Kovo Hunter</span></div>`;
+  const brand = `<div class="brand" aria-label="Kovo">${brandMark}<span class="rail-text">Kovo</span></div>`;
   const workspace = '<div class="workspace"><span class="initial" aria-hidden="true">P</span><span class="rail-text">Personal workspace</span></div>';
   const runIndicator = `<i class="nav-state ${statusClass}" aria-hidden="true"></i>`;
   const runLink = `<button class="run-link" data-action="tab:Run" aria-label="Website review" title="Website review">

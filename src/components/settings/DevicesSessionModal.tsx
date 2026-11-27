@@ -52,7 +52,7 @@ async function copyTextToClipboard(text: string): Promise<boolean> {
 }
 
 async function readAuthError(response: Response, fallback: string): Promise<string> {
-  if (response.status === 401) return 'Local session expired. Open Kovo Hunter using the startup login URL.'
+  if (response.status === 401) return 'Local session expired. Open Kovo using the startup login URL.'
   if (response.status === 404) return 'Local session controls are only available when running the local server.'
   try {
     const contentType = response.headers.get('content-type') ?? ''
@@ -143,7 +143,7 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
         setAuthStatus(null)
         if (response.status === 401) {
           setSessionState('expired')
-          setErrorMessage(await readAuthError(response, 'Local session expired. Open Kovo Hunter using the startup login URL.'))
+          setErrorMessage(await readAuthError(response, 'Local session expired. Open Kovo using the startup login URL.'))
           return
         }
         setSessionState('unavailable')
@@ -344,7 +344,7 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
                   Pair another device
                 </h3>
                 <p className="m-0 text-[12.5px] leading-[18px] text-fg-muted">
-                  Create a single-use 5-minute link to open Kovo Hunter on another browser or phone.
+                  Create a single-use 5-minute link to open Kovo on another browser or phone.
                 </p>
               </div>
             </div>

@@ -281,7 +281,7 @@ export function DecisionsProvider({ children }: { children: ReactNode }) {
           for (const k of affectedKeys) delete n[k]
           return n
         })
-        toast.show(e instanceof Error ? e.message : 'Kovo Hunter could not complete the action.', { tone: 'error' })
+        toast.show(e instanceof Error ? e.message : 'Kovo could not complete the action.', { tone: 'error' })
       },
     )
     return true

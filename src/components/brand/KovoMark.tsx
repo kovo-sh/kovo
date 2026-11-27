@@ -1,17 +1,17 @@
-// Inline Kovo Hunter R2-06 crescent bow-and-arrow brand mark.
-// Source geometry: public/brand/kovo-hunter-mark-{cobalt,light,dark}.svg & kovo-hunter-icon-cobalt.svg.
+// Inline Kovo R2-06 crescent bow-and-arrow brand mark.
+// Source geometry: public/brand/kovo-mark-{cobalt,light,dark}.svg & kovo-icon-cobalt.svg.
 import type { CSSProperties } from 'react'
 
-export type KovoHunterMarkVariant = 'monochrome' | 'cobalt' | 'icon'
+export type KovoMarkVariant = 'monochrome' | 'cobalt' | 'icon'
 
-export function KovoHunterMark({
+export function KovoMark({
   variant = 'monochrome',
   size = 18,
   className = 'mark',
   style,
   title,
 }: {
-  variant?: KovoHunterMarkVariant
+  variant?: KovoMarkVariant
   size?: number
   className?: string
   style?: CSSProperties

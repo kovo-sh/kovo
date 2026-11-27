@@ -658,7 +658,7 @@ function QueueInspector({ sel }: InspectorProps) {
   const acts = sec !== 'done' ? (it.kind === 'consent' ? [['scope', 'Review scope', 'a', true] as const] : actionsFor(it, now)) : []
   const icon = (a: DecisionAct): IconName => a === 'deny' ? 'x' : a === 'queue' ? 'follow' : 'check'
   const bannerBody: ReactNode = dec
-    ? <><Icon name={ACTIONS[dec.act].icon} /><span>{ACTIONS[dec.act].label} by you · {fmtTimeS(dec.at)}{dec.state === 'sent' ? ' · sent to Kovo Hunter' : ''}</span></>
+    ? <><Icon name={ACTIONS[dec.act].icon} /><span>{ACTIONS[dec.act].label} by you · {fmtTimeS(dec.at)}{dec.state === 'sent' ? ' · sent to Kovo' : ''}</span></>
     : expiredApproval
       ? <><StatusGlyph status="expired" /><span>Expired · this approval window closed at {fmtTimeS(it.ap.expiresAt)}.</span></>
       : sec === 'done' && it.kind === 'approval'

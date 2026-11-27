@@ -267,7 +267,7 @@ export function ProjectPersonasTab({ data, assets, personaTests, onTestPersona, 
             Test accounts <span className="font-normal tabular-nums text-fg-subtle">({personas.length})</span>
           </h2>
           <p className="mt-0.5 text-[12px] text-fg-subtle">
-            Add test logins so Kovo Hunter can scan behind sign-in and check whether one user can reach another user&apos;s data. Credentials stay encrypted on your machine.
+            Add test logins so Kovo can scan behind sign-in and check whether one user can reach another user&apos;s data. Credentials stay encrypted on your machine.
           </p>
         </div>
         {personas.length > 0 && (
