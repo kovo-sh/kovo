@@ -290,7 +290,7 @@ export class ChainBuilder {
   private readonly replayMode: ReplayMode; private readonly benchmarkMode?: boolean
   private readonly hops: RecordedHop[] = []; private readonly capProducer = new Map<string, { hopId: string; exchangeId?: string }>()
   private readonly exchangeToHop = new Map<string, string>(); private readonly correlationToHop = new Map<string, string>()
-  private readonly explicitEdges: CausalEdgeInput[] = []; private readonly controlIds: string[] = []; private readonly readbackIds: string[] = []; private readonly raceActionIds: string[] = []
+  private readonly explicitEdges: CausalEdgeInput[] = []; private readonly controlIds: string[] = []; private readonly baselineReadbackIds: string[] = []; private readonly readbackIds: string[] = []; private readonly raceActionIds: string[] = []; private readonly exStatus = new Map<string, number>()
   private hopSeq = 0; private sealSeq = 0
 
   constructor(ctx: VerifyContext, opts: ChainBuilderOptions) {
@@ -301,22 +301,24 @@ export class ChainBuilder {
   }
 
   private nextHopId(): string { let id: string; do { id = `hop_${++this.hopSeq}` } while (this.hops.some(h => h.receipt.hopId === id)); return id }
+  private recordRefs(list: string[], ref: ExchangeRef | ExchangeRef[] | undefined): void { for (const x of !ref ? [] : Array.isArray(ref) ? ref : [ref]) { const id = typeof x === 'string' ? x : x?.exchangeId; pushUnique(list, id); if (id && x && typeof x === 'object' && typeof (x as Partial<HttpExchange>).status === 'number') this.exStatus.set(id, (x as Partial<HttpExchange>).status!) } }
 
   control(target: HttpTargetString | HttpTargetObj, opts?: HttpOptions): Promise<HttpExchange>
   control(target: string, opts: HttpOptions): Promise<HttpExchange>
   control(ref: ExchangeRef | ExchangeRef[]): this
   control(targetOrRef: ExchangeRef | ExchangeRef[] | HttpTarget, opts?: HttpOptions): this | Promise<HttpExchange> {
-    if (!isHttpTargetArg(targetOrRef, opts !== undefined)) { for (const id of extractExchangeIds(targetOrRef as ExchangeRef | ExchangeRef[])) pushUnique(this.controlIds, id); return this }
+    if (!isHttpTargetArg(targetOrRef, opts !== undefined)) { this.recordRefs(this.controlIds, targetOrRef as ExchangeRef | ExchangeRef[]); return this }
     const inlineSess = targetOrRef && typeof targetOrRef === 'object' && !Array.isArray(targetOrRef) && typeof (targetOrRef as HttpOptions).session === 'string' ? (targetOrRef as HttpOptions).session : undefined
-    return this.ctx._httpSendDetached(targetOrRef as HttpTarget, { ...(opts ?? {}), role: 'control', arm: 'control', session: opts?.session ?? inlineSess ?? `ctrl_${this.chainId.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 27)}` }).then(ex => { pushUnique(this.controlIds, ex.exchangeId); return ex })
+    return this.ctx._httpSendDetached(targetOrRef as HttpTarget, { ...(opts ?? {}), role: 'control', arm: 'control', session: opts?.session ?? inlineSess ?? `ctrl_${this.chainId.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 27)}` }).then(ex => { pushUnique(this.controlIds, ex.exchangeId); this.exStatus.set(ex.exchangeId, ex.status); return ex })
   }
 
   readback(target: HttpTargetString | HttpTargetObj, opts?: HttpOptions): Promise<HttpExchange>
   readback(target: string, opts: HttpOptions): Promise<HttpExchange>
   readback(ref: ExchangeRef | ExchangeRef[]): this
   readback(targetOrRef: ExchangeRef | ExchangeRef[] | HttpTarget, opts?: HttpOptions): this | Promise<HttpExchange> {
-    if (!isHttpTargetArg(targetOrRef, opts !== undefined)) { for (const id of extractExchangeIds(targetOrRef as ExchangeRef | ExchangeRef[])) pushUnique(this.readbackIds, id); return this }
-    return this.ctx._httpSendDetached(targetOrRef as HttpTarget, { ...(opts ?? {}), role: 'control', arm: 'control' }).then(ex => { pushUnique(this.readbackIds, ex.exchangeId); return ex })
+    const dest = this.hops.length === 0 ? this.baselineReadbackIds : this.readbackIds
+    if (!isHttpTargetArg(targetOrRef, opts !== undefined)) { this.recordRefs(dest, targetOrRef as ExchangeRef | ExchangeRef[]); return this }
+    return this.ctx._httpSendDetached(targetOrRef as HttpTarget, { ...(opts ?? {}), role: 'control', arm: 'control' }).then(ex => { pushUnique(dest, ex.exchangeId); this.exStatus.set(ex.exchangeId, ex.status); return ex })
   }
 
   step<T = HttpExchange>(hopId: string, fn: () => Promise<T> | T): Promise<T>
@@ -366,7 +368,7 @@ export class ChainBuilder {
   recordHop(hop: HopReceiptInput & { role?: 'setup' | 'control' | 'probe' | 'cleanup'; arm?: 'setup' | 'control' | 'probe' | 'cleanup' }): this {
     const { role, arm, ...cleanHop } = hop, target = normalizeHopTarget(cleanHop.target, cleanHop.method, this.ctx.targetOrigin || undefined) as HopTargetObject
     const receipt: HopReceiptInput = { ...cleanHop, surface: cleanHop.surface ?? 'http', target, ...(cleanHop.producedCapabilities ? { producedCapabilities: normCapList(cleanHop.producedCapabilities) as string[] } : {}), ...(cleanHop.consumedCapabilities ? { consumedCapabilities: normCapList(cleanHop.consumedCapabilities) as string[] } : {}) }
-    for (const exId of receipt.exchangeIds ?? []) this.exchangeToHop.set(exId, receipt.hopId)
+    for (const exId of receipt.exchangeIds ?? []) if (!this.exchangeToHop.has(exId)) this.exchangeToHop.set(exId, receipt.hopId)
     for (const cap of receipt.producedCapabilities ?? []) if (!this.capProducer.has(cap)) this.capProducer.set(cap, { hopId: receipt.hopId, exchangeId: receipt.exchangeIds?.[0] })
     this.hops.push({ receipt, isControlOnly: (role ?? arm) === 'control', capConsumeExchange: new Map(), cryptoConsumptions: [], asyncPolls: [] }); return this
   }
@@ -382,10 +384,10 @@ export class ChainBuilder {
       producedCapabilities: [...(normCapList(meta.producedCapabilities ?? []) as string[])], consumedCapabilities: [...(normCapList(meta.consumedCapabilities ?? []) as string[])], entityId: meta.entityId, correlationIds: [],
       controlExCount: 0, nonControlExCount: 0, capConsumeExchange: new Map(), cryptoConsumptions: [], asyncPolls: [],
       onProduce: (cap, exId) => { pushUnique(rec.producedCapabilities, cap); if (!this.capProducer.has(cap)) this.capProducer.set(cap, { hopId: trimmedId, ...(exId ? { exchangeId: exId } : {}) }) },
-      onExchange: (exId, isControl) => { pushUnique(rec.exchangeIds, exId); this.exchangeToHop.set(exId, trimmedId); if (isControl) rec.controlExCount++; else rec.nonControlExCount++ },
+      onExchange: (exId, isControl) => { pushUnique(rec.exchangeIds, exId); if (!this.exchangeToHop.has(exId)) this.exchangeToHop.set(exId, trimmedId); if (isControl) rec.controlExCount++; else rec.nonControlExCount++ },
       onCorrelation: cid => { pushUnique(rec.correlationIds, cid); if (!this.correlationToHop.has(cid)) this.correlationToHop.set(cid, trimmedId) },
     }
-    for (const exId of rec.exchangeIds) this.exchangeToHop.set(exId, trimmedId)
+    for (const exId of rec.exchangeIds) if (!this.exchangeToHop.has(exId)) this.exchangeToHop.set(exId, trimmedId)
     for (const cap of rec.producedCapabilities) if (!this.capProducer.has(cap)) this.capProducer.set(cap, { hopId: trimmedId, exchangeId: rec.exchangeIds[0] })
     this.ctx._pushHopRecorder(rec); let out: T; try { out = await fn() } finally { this.ctx._popHopRecorder(rec) }
     const resolvedTarget = meta.target !== undefined ? normalizeHopTarget(meta.target, meta.method, this.ctx.targetOrigin || undefined) as HopTargetObject : (rec.target ?? { origin: this.ctx.targetOrigin, method: meta.method ?? 'GET', pathAndQuery: '/' })
@@ -404,17 +406,17 @@ export class ChainBuilder {
     const trimmedId = hopId.trim(); if (!trimmedId) throw new Error('chain.raceBurst requires a non-empty hopId.')
     const rawReqs = Array.isArray(opts.requests) && opts.requests.length > 0 ? opts.requests : opts.request !== undefined ? Array.from({ length: Math.max(2, Math.min(10, Math.floor(opts.count ?? 4))) }, () => opts.request!) : []
     if (rawReqs.length < 2 || rawReqs.length > 10) throw new Error('chain.raceBurst requires between 2 and 10 requests (or { request, count }).')
-    if (opts.baseline) this.control(opts.baseline)
+    if (opts.baseline) this.recordRefs(this.baselineReadbackIds, opts.baseline)
     let baseline: HttpExchange | undefined
-    if (!opts.baseline && opts.readRoute) { baseline = await this.ctx._httpSendDetached(opts.readRoute, { method: opts.readMethod ?? 'GET', ...(opts.readPersona ? { as: opts.readPersona } : {}), role: 'control', arm: 'control', ...(opts.session ? { session: `${opts.session}-base` } : {}) }); pushUnique(this.controlIds, baseline.exchangeId) }
+    if (!opts.baseline && opts.readRoute) { baseline = await this.ctx._httpSendDetached(opts.readRoute, { method: opts.readMethod ?? 'GET', ...(opts.readPersona ? { as: opts.readPersona } : {}), role: 'control', arm: 'control', ...(opts.session ? { session: `${opts.session}-base` } : {}) }); pushUnique(this.baselineReadbackIds, baseline.exchangeId); this.exStatus.set(baseline.exchangeId, baseline.status) }
     const { hopId: _h, requests: _rq, request: _r, count: _c, barrier, session, readRoute, readMethod, readPersona, baseline: _b, readback: _rb, correlationIds, ...hopMeta } = opts
     const burst = await this.hop(trimmedId, { ...hopMeta, claimedDelta: hopMeta.claimedDelta ?? `Concurrent race burst (${rawReqs.length} requests) on ${trimmedId}.` }, () =>
       this.ctx.race_burst(rawReqs, { ...(barrier ? { barrier } : {}), ...(session ? { session } : {}), ...(opts.entityId ? { entityId: opts.entityId } : {}), ...(correlationIds?.length ? { correlationIds } : {}) }),
     )
     for (const ex of burst.results) pushUnique(this.raceActionIds, ex.exchangeId)
-    if (opts.readback) this.readback(opts.readback)
+    if (opts.readback) this.recordRefs(this.readbackIds, opts.readback)
     let post: HttpExchange | undefined
-    if (!opts.readback && readRoute) { post = await this.ctx._httpSendDetached(readRoute, { method: readMethod ?? 'GET', ...(readPersona ? { as: readPersona } : {}), role: 'control', arm: 'control', ...(session ? { session: `${session}-post` } : {}) }); pushUnique(this.readbackIds, post.exchangeId) }
+    if (!opts.readback && readRoute) { post = await this.ctx._httpSendDetached(readRoute, { method: readMethod ?? 'GET', ...(readPersona ? { as: readPersona } : {}), role: 'control', arm: 'control', ...(session ? { session: `${session}-post` } : {}) }); pushUnique(this.readbackIds, post.exchangeId); this.exStatus.set(post.exchangeId, post.status) }
     return { ...burst, ...(baseline ? { baseline } : {}), ...(post ? { post } : {}) }
   }
 
@@ -423,8 +425,10 @@ export class ChainBuilder {
     const fill = (k: string, aliases: readonly string[], v: unknown): void => { if (v !== undefined && aliases.every(a => oi[a] === undefined)) oi[k] = v }
     const firstEx = activeHops[0]?.receipt.exchangeIds?.[0], ctrl = preControl[0], rb = postReadback[0]
     if (family === 'economic_conservation') {
-      fill('baselineReadbackExchangeId', ['baselineReadback', 'baselineReadbackExchangeId', 'baselineExchangeId'], ctrl)
-      fill('finalReadbackExchangeId', ['finalReadback', 'finalReadbackExchangeId', 'finalExchangeId'], rb)
+      const stOf = (id: string) => this.exStatus.get(id) ?? this.ctx._exStatusOf(id)
+      const pickOk = (ids: string[]) => { const r = [...ids].reverse(); return r.find(id => { const s = stOf(id); return s !== undefined && s >= 200 && s < 300 }) ?? r.find(id => stOf(id) === undefined) }
+      fill('baselineReadbackExchangeId', ['baselineReadback', 'baselineReadbackExchangeId', 'baselineExchangeId'], pickOk(this.baselineReadbackIds) ?? pickOk(preControl))
+      fill('finalReadbackExchangeId', ['finalReadback', 'finalReadbackExchangeId', 'finalExchangeId'], pickOk(postReadback))
       const acts = this.raceActionIds.length > 0 ? [...this.raceActionIds] : activeHops.flatMap(h => h.receipt.exchangeIds ?? []).filter(id => !preControl.includes(id) && !postReadback.includes(id))
       if (acts.length > 0) fill('actionExchangeIds', ['actions', 'actionExchangeIds', 'actionsExchangeIds'], acts)
     } else if (family === 'cryptographic_scope_replay') {
@@ -455,14 +459,14 @@ export class ChainBuilder {
 
   build(opts: ChainProveOptions = {}): CompositeProofReceiptInput {
     if (this.hops.length === 0) throw new Error(`ChainBuilder "${this.chainId}" has no recorded hops.`)
-    const edges: CausalEdgeInput[] = [], seenEdges = new Set<string>()
-    const addEdge = (edge: CausalEdgeInput): void => { if (edge.fromHopId === edge.toHopId) return; const key = `${edge.fromHopId}->${edge.toHopId}:${edge.kind}`; if (!seenEdges.has(key)) { seenEdges.add(key); edges.push(edge) } }
+    const hopIdx = new Map(this.hops.map((h, i) => [h.receipt.hopId, i])), edges: CausalEdgeInput[] = [], seenEdges = new Set<string>()
+    const addEdge = (edge: CausalEdgeInput): void => { const fi = hopIdx.get(edge.fromHopId) ?? -1, ti = hopIdx.get(edge.toHopId) ?? -1; if (fi < 0 || fi >= ti) return; const key = `${edge.fromHopId}->${edge.toHopId}:${edge.kind}`; if (!seenEdges.has(key)) { seenEdges.add(key); edges.push(edge) } }
     for (const explicit of this.explicitEdges) addEdge(explicit)
     const resolveProducer = (cap: string): { hopId: string; exchangeId?: string } | undefined => {
       const direct = this.capProducer.get(cap); if (direct) return direct
       const srcEx = this.ctx._capOriginOf(cap), hopId = srcEx ? this.exchangeToHop.get(srcEx) : undefined; if (!hopId) return undefined
       const prodHop = this.hops.find(h => h.receipt.hopId === hopId)?.receipt; if (prodHop) { prodHop.producedCapabilities ??= []; pushUnique(prodHop.producedCapabilities, cap) }
-      const resolved = { hopId, ...(srcEx ? { exchangeId: srcEx } : {}) }; this.capProducer.set(cap, resolved); return resolved
+      const resolved = { hopId, ...(srcEx ? { exchangeId: srcEx } : {}) }; if (!this.capProducer.has(cap)) this.capProducer.set(cap, resolved); return resolved
     }
     for (const hop of this.hops) {
       const toHopId = hop.receipt.hopId, cryptoBound = new Set<string>()
@@ -486,11 +490,12 @@ export class ChainBuilder {
     const activeHops = controlOnlyHops.length < this.hops.length ? this.hops.filter(h => !controlOnlyHops.includes(h)) : this.hops
     const demotedCtrlIds = activeHops.length < this.hops.length ? controlOnlyHops.flatMap(h => h.receipt.exchangeIds ?? []) : []
     const lastHop = activeHops[activeHops.length - 1]!.receipt, preControl: string[] = [], postReadback: string[] = []
-    for (const id of [...this.controlIds, ...demotedCtrlIds, ...extractExchangeIds(opts.control), ...extractExchangeIds(opts.controlExchanges), ...(opts.preChainControlExchangeIds ?? [])]) pushUnique(preControl, id)
-    for (const id of [...this.readbackIds, ...extractExchangeIds(opts.readback), ...(opts.postChainReadbackExchangeIds ?? [])]) pushUnique(postReadback, id)
+    for (const id of [...this.controlIds, ...this.baselineReadbackIds, ...demotedCtrlIds]) pushUnique(preControl, id)
+    this.recordRefs(preControl, opts.control); this.recordRefs(preControl, opts.controlExchanges); for (const id of opts.preChainControlExchangeIds ?? []) pushUnique(preControl, id)
+    for (const id of this.readbackIds) pushUnique(postReadback, id); this.recordRefs(postReadback, opts.readback); for (const id of opts.postChainReadbackExchangeIds ?? []) pushUnique(postReadback, id)
     const terminalExchangeId = opts.terminalExchangeId ?? extractExchangeIds(opts.terminalExchange)[0], modeAFailureExchangeId = opts.modeAFailureExchangeId ?? extractExchangeIds(opts.modeAFailureExchange)[0]
     const lastExIds = lastHop.exchangeIds ?? [], resolvedTermEx = terminalExchangeId ?? lastExIds[lastExIds.length - 1]
-    const effFamily: OracleFamily | undefined = opts.oracleFamily ?? (this.terminalVulnClass.trim().toLowerCase() === 'economic_conservation' ? 'economic_conservation' : undefined)
+    const effFamily: OracleFamily | undefined = opts.oracleFamily ?? (/^(?:economic_conservation|conserved_balance|ledger_overcredit|over_refund|double_spend|race_condition)$/.test(this.terminalVulnClass.trim().toLowerCase().replace(/[\s-]+/g, '_')) ? 'economic_conservation' : undefined)
     const oracleInput = effFamily ? this.synthOracleInput(effFamily, opts.oracleInput, activeHops, edges, preControl, postReadback, resolvedTermEx) : (opts.oracleInput ? { ...opts.oracleInput } : undefined)
     return {
       chainId: this.chainId, terminalVulnClass: this.terminalVulnClass, replayMode: opts.replayMode ?? this.replayMode,
@@ -539,6 +544,7 @@ export class VerifyContext {
   /** @internal */ _pushHopRecorder(rec: HopRecorder): void { this._hopStack.push(rec) }
   /** @internal */ _popHopRecorder(rec: HopRecorder): void { const i = this._hopStack.lastIndexOf(rec); if (i >= 0) this._hopStack.splice(i, 1) }
   /** @internal */ _capOriginOf(cap: string): string | undefined { return this._capOrigins.get(cap) }
+  /** @internal */ _exStatusOf(id: string): number | undefined { return this._exMeta.get(id)?.status }
   private activeHop(): HopRecorder | undefined { return this._hopStack[this._hopStack.length - 1] }
   private recordExCaps(hop: HopRecorder, ex: HttpExchange, explicitCap?: unknown): void {
     for (const c of [resolveCapHandle(explicitCap), ex.consumedCapabilityId, ...(ex.consumedCapabilities ?? [])]) if (typeof c === 'string' && c.trim()) { pushUnique(hop.consumedCapabilities, c); hop.capConsumeExchange.set(c, ex.exchangeId) }
@@ -645,7 +651,7 @@ export class VerifyContext {
       if (/structured field not found/i.test(msg)) throw new Error(this.diagnoseSealFailure(msg, raw, this._exMeta.get(exchangeId) ?? (raw.exchange && typeof raw.exchange === 'object' ? this.extractExDiag(raw.exchange as Record<string, unknown>) : undefined)))
       throw err
     }
-    const srcEx = res.exchangeId || exchangeId; if (res.handle && srcEx) this._capOrigins.set(res.handle, srcEx); activeHop?.onProduce(res.handle, srcEx); return res
+    const srcEx = res.exchangeId || exchangeId; if (res.handle && srcEx && !this._capOrigins.has(res.handle)) this._capOrigins.set(res.handle, srcEx); activeHop?.onProduce(res.handle, srcEx); return res
   }
   sealCapability(input: SealCapabilityInput): Promise<SealedCapabilityResult> { return this.seal_capability(input) }
 

@@ -215,7 +215,7 @@ const formatTarget = (origin: string, pathExpr: string, runOrigin?: string, asPa
   origin.trim() && (!runOrigin || origin.trim() !== runOrigin.trim())
     ? `{ origin: ${JSON.stringify(origin.trim())}, path: ${pathExpr} }`
     : asPathObj ? `{ path: ${pathExpr} }` : pathExpr
-function formatHttpOpts(o: { hopId?: string; method: string; persona?: string; headersExpr?: string; bodyExpr?: string; followRedirectsFalse?: boolean; capability?: PrimaryCapSpec; arm?: 'control'; role?: 'control'; session?: string; entityIdExpr?: string; claimedDelta?: string }): string {
+function formatHttpOpts(o: { hopId?: string; method: string; persona?: string; headersExpr?: string; bodyExpr?: string; followRedirectsFalse?: boolean; capability?: PrimaryCapSpec; arm?: 'control'; role?: 'control' | 'setup'; session?: string; entityIdExpr?: string; claimedDelta?: string }): string {
   const f: string[] = []
   if (o.hopId) f.push(`hopId: ${JSON.stringify(o.hopId)}`)
   f.push(`method: ${JSON.stringify(o.method.toUpperCase())}`)
@@ -527,16 +527,33 @@ export function compileTraceToKovoVerifyScript(input: {
   const passWarnings: string[] = []
   let { st, readbackPlan } = runBindingPass(causal, terminalIdx, explicitReadback, allowedSet, blocked, passWarnings)
   const reachable = computeReachableToTerminal(st.edges, terminalIdx)
+  const prunedPollsBy202Id = new Map<string, RecordedRequestExchange>()
   for (let i = 0; i < causal.length; i += 1) {
     if (!reachable.has(i)) {
-      const m = causal[i]!.method.toUpperCase(), kind = READ_ONLY_METHODS.has(m) ? 'unlinked read-only recon' : 'unreachable'
-      warnings.push(`pruned ${kind} exchange "${causal[i]!.exchangeId}" (${m} ${causal[i]!.pathAndQuery || '/'})`)
+      const ex = causal[i]!, m = ex.method.toUpperCase(), kind = READ_ONLY_METHODS.has(m) ? 'unlinked read-only recon' : 'unreachable'
+      warnings.push(`pruned ${kind} exchange "${ex.exchangeId}" (${m} ${ex.pathAndQuery || '/'})`)
+      if (m === 'GET' && ex.status === 200) {
+        for (const depIdx of st.plans[i]!.dynamicDepSteps) {
+          if (reachable.has(depIdx) && causal[depIdx]!.status === 202) prunedPollsBy202Id.set(causal[depIdx]!.exchangeId, ex)
+        }
+      }
     }
   }
   if (reachable.size < causal.length) {
     causal = causal.filter((_, i) => reachable.has(i)); terminalIdx = causal.findIndex(e => e.exchangeId === terminalEx.exchangeId)
     ;({ st, readbackPlan } = runBindingPass(causal, terminalIdx, explicitReadback, allowedSet, blocked, warnings))
   } else warnings.push(...passWarnings)
+
+  const asyncPollsByStep = new Map<number, StepPlan>()
+  for (let i = 0; i < st.plans.length; i += 1) {
+    if (causal[i]!.status !== 202 || (i >= st.plans.length - 1 && !readbackPlan)) continue
+    const pollEx = prunedPollsBy202Id.get(causal[i]!.exchangeId)
+    if (!pollEx) continue
+    const pollPlan = mkStepPlan(pollEx, st.plans.length + 1, `async_poll_${i + 1}`), prevBindLen = st.inferredBindings.length
+    bindStepPlan(st, pollPlan, st.plans.length, i + 1)
+    st.inferredBindings.length = prevBindLen
+    asyncPollsByStep.set(i, pollPlan)
+  }
 
   const { terminalVulnClass, validOracleFamily } = normalizeVulnClass(submission.vulnClass, submission.oracleFamily, causal.length, warnings)
   const { plans } = st, termPlan = plans[terminalIdx]!, controlSynthesized = !explicitControl
@@ -558,7 +575,7 @@ export function compileTraceToKovoVerifyScript(input: {
     const cPath = (!explicitControl && ctrlUsesDyn) ? termPlan.pathExpr : JSON.stringify(explicitControl ? (srcEx.pathAndQuery || '/') : sanitizeControlPath(srcEx.pathAndQuery || '/', st.sealedValues, stripAllQ))
     lines.push(`  const ctrl = await ch.control(${formatTarget(srcEx.origin, cPath, runOrigin)}, ${formatHttpOpts({ method: srcEx.method || 'GET', persona: explicitControl ? (explicitControl.persona?.trim() || attackerPersona) : attackerPersona, headersExpr: sanitizeControlHeaders(srcEx.requestHeaders), bodyExpr: cBody, session: 'ctrl_clean' })})`)
   }
-  const planOpts = (p: StepPlan, fallbackPersona?: string, stepMeta?: { hopId: string; claimedDelta: string }) => formatHttpOpts({ ...(stepMeta ?? {}), method: p.exchange.method || 'GET', persona: p.omitPersona ? undefined : (p.exchange.persona?.trim() || fallbackPersona), headersExpr: p.headersExpr, bodyExpr: p.bodyExpr, followRedirectsFalse: p.forceNoFollowRedirects, capability: p.primaryCapability, entityIdExpr: p.entityIdExpr })
+  const planOpts = (p: StepPlan, fallbackPersona?: string, stepMeta?: { hopId: string; claimedDelta: string }, role?: 'control' | 'setup') => formatHttpOpts({ ...(stepMeta ?? {}), method: p.exchange.method || 'GET', persona: p.omitPersona ? undefined : (p.exchange.persona?.trim() || fallbackPersona), headersExpr: p.headersExpr, bodyExpr: p.bodyExpr, followRedirectsFalse: p.forceNoFollowRedirects, capability: p.primaryCapability, ...(role ? { role } : {}), entityIdExpr: p.entityIdExpr })
 
   if (ctrlAfterIdx < 0) emitCtrl()
   for (let i = 0; i < plans.length; i += 1) {
@@ -569,6 +586,11 @@ export function compileTraceToKovoVerifyScript(input: {
       ...p.vars.map(v => `  const ${v.varName} = ${stepJsAccess(v.source.jsAccess, stepVar)}`),
       ...st.edges.filter(e => e.toStepIdx === i).map(e => formatEdgeLine(e, plans)),
     )
+    if (p.exchange.status === 202 && (i < plans.length - 1 || Boolean(readbackPlan))) {
+      lines.push(`  if (${stepVar}.status === 202) await new Promise((r) => setTimeout(r, 400))`)
+      const pollPlan = asyncPollsByStep.get(i)
+      if (pollPlan) lines.push(`  if (${stepVar}.status === 202) await ctx.http_send(${formatTarget(pollPlan.exchange.origin, pollPlan.pathExpr, runOrigin, Boolean(pollPlan.signedUrlCapVar))}, ${planOpts(pollPlan, attackerPersona, undefined, 'setup')})`)
+    }
     if (ctrlAfterIdx === i) emitCtrl()
   }
   if (readbackPlan) lines.push(`  const rb = await ch.readback(${formatTarget(readbackPlan.exchange.origin, readbackPlan.pathExpr, runOrigin, Boolean(readbackPlan.signedUrlCapVar))}, ${planOpts(readbackPlan, attackerPersona)})`)

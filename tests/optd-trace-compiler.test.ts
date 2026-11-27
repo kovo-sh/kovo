@@ -855,4 +855,74 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
     )
     assertAllHopsReachTerminal(log.hops, [...log.edges, ...log.stateTransitions], 'step_3')
   })
+
+  it('emits an async wait (and detached setup poll if pruned) after a 202 hop before downstream consumption', async () => {
+    const jobId = 'job_async_774411'
+    const exchanges: RecordedRequestExchange[] = [
+      {
+        exchangeId: 'a1',
+        origin: 'https://app.example.test',
+        method: 'POST',
+        pathAndQuery: '/api/v1/renders',
+        persona: 'member_a',
+        status: 202,
+        responseJson: { jobId },
+        timestampMs: 100,
+      },
+      {
+        // Pure-status GET poll that does NOT echo jobId -> pruned from DAG hops, emitted as detached setup poll after wait
+        exchangeId: 'a_poll',
+        origin: 'https://app.example.test',
+        method: 'GET',
+        pathAndQuery: `/api/v1/jobs/${jobId}/status`,
+        persona: 'member_a',
+        status: 200,
+        responseJson: { status: 'ready' },
+        timestampMs: 200,
+      },
+      {
+        exchangeId: 'a2',
+        origin: 'https://app.example.test',
+        method: 'GET',
+        pathAndQuery: `/api/v1/jobs/${jobId}/trace`,
+        persona: 'member_a',
+        status: 200,
+        responseJson: { leakedSecret: 'secret_val_99887766' },
+        timestampMs: 300,
+      },
+    ]
+
+    const compiled = compileTraceToKovoVerifyScript({
+      submission: {
+        title: 'Async 202 render job trace consumption',
+        vulnClass: 'dual_tenant_abac',
+        exchangeIds: ['a1', 'a_poll', 'a2'],
+        terminalExchangeId: 'a2',
+        attackerPersona: 'member_a',
+      },
+      exchanges,
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(compiled.ok, true)
+    assert.ok(compiled.script)
+    assert.match(compiled.script, /if \(step_1\.status === 202\) await new Promise\(\(r\) => setTimeout\(r, \d+\)\)/)
+    assert.match(compiled.script, /if \(step_1\.status === 202\) await ctx\.http_send\(/)
+    assert.match(compiled.script, /role:\s*"setup"/)
+
+    const fn = loadCompiledEntrypoint(compiled.script)
+    const { ctx, log } = createMockCtx([
+      { status: 403 }, // synthesized control
+      { status: 202, json: { jobId: 'job_live_991122' } }, // step_1
+      { status: 200, json: { status: 'ready' } }, // detached setup poll
+      { status: 200, json: { leakedSecret: 'secret_live_1122' } }, // step_2
+    ])
+    const t0 = Date.now()
+    await fn(ctx)
+    assert.ok(Date.now() - t0 >= 350, 'Expected compiled script to wait after 202 before downstream consumption')
+    assert.deepEqual(log.hops, ['step_1', 'step_2'])
+    assert.equal(log.httpCalls[2]!.target, '/api/v1/jobs/job_live_991122/status')
+    assert.equal(log.httpCalls[2]!.opts.role, 'setup')
+    assert.equal(log.httpCalls[3]!.target, '/api/v1/jobs/job_live_991122/trace')
+    assertAllHopsReachTerminal(log.hops, log.edges, 'step_2')
+  })
 })
