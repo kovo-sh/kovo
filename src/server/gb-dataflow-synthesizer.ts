@@ -325,25 +325,22 @@ function buildEdges(nodes: readonly EndpointNode[], byId: ReadonlyMap<string, En
   return outgoing
 }
 
-const CACHE_OR_DUAL_TENANT_SIGNAL_RE = /(?:^|[^a-z0-9])(?:cache|cached|cache[_-]?bleed|prime|warm|cdn|cross[_-]?tenant|dual[_-]?tenant|abac|switch[_-]?(?:tenant|org)|tenant[_-]?switch|org[_-]?switch)(?:[^a-z0-9]|$)/i
-const TENANT_SCOPE_PATH_RE = /\/(?:tenants?|orgs?|organizations?|workspaces?)(?:\/|$)/i
-const TENANT_SCOPE_PARAM_RE = /^(?:tenant|tenant_id|org|org_id|organization_id|workspace|workspace_id|cache_key)$/i
+const CACHE_OR_DUAL_TENANT_SIGNAL_RE = /(?:^|[^a-z0-9])(?:cache|cached|cache[_-]?bleed|cache[_-]?key|shared[_-]?(?:edge[_-]?)?cache|edge[_-]?cache|prime|primed[_-]?cache|warm|cdn|cross[_-]?tenant|dual[_-]?tenant|multi[_-]?tenant|abac|switch[_-]?(?:tenant|org|workspace)|(?:tenant|org|workspace)[_-]?switch)(?:[^a-z0-9]|$)/i
+const ORG_SWITCH_PATH_RE = /\/(?:orgs?|tenants?|organizations?|workspaces?)(?:\/[^/]+)?\/switch(?:\/|$)/i
 
 function isMultiTenantChainHypothesis(
   pNodes: readonly EndpointNode[],
   pEdges: readonly DataflowEdge[],
   diffs: readonly string[],
 ): boolean {
+  if (pNodes.some(n => ORG_SWITCH_PATH_RE.test(n.normPath))) return true
   const signalCorpus = [
     ...pNodes.map(n => n.normPath),
+    ...pNodes.flatMap(n => [...n.paramNames]),
     ...pEdges.map(e => e.field),
     ...diffs,
   ].join(' ')
-  if (CACHE_OR_DUAL_TENANT_SIGNAL_RE.test(signalCorpus)) return true
-  const hasTenantScope = pNodes.some(
-    n => TENANT_SCOPE_PATH_RE.test(n.normPath) || [...n.paramNames].some(p => TENANT_SCOPE_PARAM_RE.test(p)),
-  )
-  return hasTenantScope && (pNodes.some(n => n.personaDiff.hasAsymmetry) || pNodes.some(n => n.role === 'edge'))
+  return CACHE_OR_DUAL_TENANT_SIGNAL_RE.test(signalCorpus)
 }
 
 function orderPersonasLowPrivFirst(

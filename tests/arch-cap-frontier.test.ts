@@ -536,4 +536,83 @@ describe('Generic Capability-Consumer Frontier Matcher', () => {
       'gb-dataflow-synthesizer wave materialization must not duplicate already-materialized frontier steps',
     )
   })
+
+  test('strips cap:* actingPersona, downgrades dual_member on non-dual-tenant pairs, prunes surface:*/vulnClass negative edges, and classifies sparse kovo_verify metadata', () => {
+    const personas = [
+      { handle: 'owner_a', roleLabel: 'owner' },
+      { handle: 'dual_member', roleLabel: 'memberships=admin:org_a,viewer:org_b' },
+      { handle: 'member_a', roleLabel: 'member' },
+    ]
+    const pairs = rankCapabilityConsumerPairs({
+      llmMode: 'agentic',
+      approvedOrigins: [API_ORIGIN, EDGE_ORIGIN],
+      capabilities: [
+        {
+          capId: 'cap:hop_webhook_salt:v1',
+          origin: API_ORIGIN,
+          actingPersona: 'cap:hop_webhook_salt:v1', // invalid cap:* handle must be stripped
+          ledgerKind: 'state_handle',
+          secretKind: 'generic_secret',
+          slot: 'v1',
+          provenance: 'runtime_discovery',
+        },
+        {
+          capId: 'cap:hop_h20:scim_delegation',
+          origin: API_ORIGIN,
+          actingPersona: 'dual_member', // must downgrade to member_a on non-dual-tenant consumer
+          ledgerKind: 'scoped_token',
+          secretKind: 'bearer_token',
+          slot: 'scim_delegation',
+          provenance: 'derived_hop',
+        },
+        {
+          capId: 'cap:hop_h21:cache_token',
+          origin: API_ORIGIN,
+          actingPersona: 'dual_member', // explicit cache-bleed pair preserves dual_member
+          ledgerKind: 'parser_or_cache_primitive',
+          fieldName: 'cache_key',
+          provenance: 'derived_hop',
+        },
+      ],
+      endpoints: [
+        { origin: EDGE_ORIGIN, method: 'POST', pathTemplate: '/v1/webhooks/ingest', riskScore: 92 },
+        { origin: EDGE_ORIGIN, method: 'POST', pathTemplate: '/v1/webhooks/blocked', riskScore: 90 },
+        { origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/admin/sync', authRequirement: 'bearerAuth', riskScore: 90 },
+        { origin: EDGE_ORIGIN, method: 'POST', pathTemplate: '/v1/cache/:id/warm', authRequirement: 'bearerAuth', riskScore: 86 },
+      ],
+      observedResponses: [
+        { origin: EDGE_ORIGIN, method: 'POST', pathAndQuery: '/v1/webhooks/ingest', status: 401, bodyPreview: 'invalid signature' },
+        { origin: EDGE_ORIGIN, method: 'POST', pathAndQuery: '/v1/webhooks/blocked', status: 401, bodyPreview: 'invalid signature' },
+        { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/admin/sync', status: 403, personaHandle: 'member_a', bodyPreview: 'forbidden' },
+      ],
+      negativeEdges: [
+        {
+          preconditionCapIds: ['surface:POST /v1/webhooks/blocked'],
+          targetSurfaceKey: 'POST /v1/webhooks/blocked',
+          hypothesisClass: 'broken_access_control',
+          pruned: true,
+          attemptCount: 2,
+        },
+      ],
+      personas,
+    })
+
+    const webhookPair = pairs.find(p => p.consumer.normPath === '/v1/webhooks/ingest')
+    assert.ok(webhookPair, 'sparse kovo_verify signing capability must pair with 401 webhook consumer')
+    assert.equal(webhookPair.affordance, 'derive_signature')
+    assert.equal(webhookPair.capability.actingPersona, 'member_a', 'cap:* actingPersona must fall back to approved basePersona')
+    assert.ok(!pairs.some(p => p.consumer.normPath === '/v1/webhooks/blocked'), 'surface:* + vulnClass negative edge must prune matching route')
+
+    const nonDualPair = pairs.find(p => p.consumer.normPath === '/v1/admin/sync' && p.capability.capId === 'cap:hop_h20:scim_delegation')
+    assert.ok(nonDualPair, 'sparse scim/delegation token must pair with 403 admin route')
+    assert.equal(nonDualPair.capability.actingPersona, 'member_a', 'dual_member must downgrade to single-tenant basePersona on non-dual-tenant step')
+
+    const cachePair = pairs.find(p => p.consumer.normPath === '/v1/cache/:id/warm' && p.capability.capId === 'cap:hop_h21:cache_token')
+    assert.ok(cachePair, 'cache-bleed pair must still rank')
+    assert.equal(cachePair.capability.actingPersona, 'dual_member', 'explicit dual-tenant cache-bleed pair may keep dual_member')
+
+    for (const p of pairs) {
+      assert.ok(!p.capability.actingPersona.startsWith('cap:'), `must never emit cap:* actingPersona: ${p.capability.actingPersona}`)
+    }
+  })
 })
