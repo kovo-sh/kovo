@@ -13,11 +13,8 @@ import { parseBodyFromCarrierText, type WireCredentialProvenance } from './host-
 import { ROLE_RANK, normalizeRole, parseRoleMemberships, resolvePersonaIdentity, stepReadsState, type RoleName } from './oracle-invariants.ts'
 import type { ProofReceipt } from './proof-receipt.ts'
 import { deriveRecordAuthzDimension, extractIssuedSignedUrl, extractTenantMarkers, findNonErrorBatchRecord, isJobOrHandleStub, type HostAuthzDimension, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
-import {
-  buildTerminalClassContractMap,
-  resolveTerminalContractKind,
-  type OracleTerminalContractKind,
-} from './oracle-spec.ts'
+import { buildTerminalClassContractMap, resolveTerminalContractKind, type OracleTerminalContractKind } from './oracle-spec.ts'
+import { normalizeTerminalVulnClass } from './own-org-terminal-guard.ts'
 
 export interface HydratableEntry {
   exchangeId: string; seq?: number; timestampMs?: number
@@ -1173,9 +1170,10 @@ export function selectStateTransitionPair<T extends HydratableEntry>(
   })
   return matched ? { ok: true, from: matched.from, to: matched.to, logicalFallback: true } : { ok: false, reason: 'actor_discontinuity', missingSide: fromLit.length === 0 ? 'from' : 'to' }
 }
+export { normalizeTerminalVulnClass }
 export type TerminalContractKind = OracleTerminalContractKind
 export const TERMINAL_CLASS_CONTRACT: Readonly<Record<string, TerminalContractKind>> = buildTerminalClassContractMap()
-export const resolveTerminalContract = (cls: string): TerminalContractKind | null => { const n = cls.trim().toLowerCase(); return TERMINAL_CLASS_CONTRACT[n] ?? resolveTerminalContractKind(n) }
+export const resolveTerminalContract = (cls: string): TerminalContractKind | null => { const raw = cls.trim().toLowerCase(), n = normalizeTerminalVulnClass(cls); return TERMINAL_CLASS_CONTRACT[n] ?? resolveTerminalContractKind(n) ?? (n !== raw ? (TERMINAL_CLASS_CONTRACT[raw] ?? resolveTerminalContractKind(raw)) : null) }
 const SECRET_LEAF_KEY_RE = /secret|passw|token|auth|cookie|cred|private|api_?key|jwt|session|sig|hmac/i
 const CORR_HEADER_KEYS = new Set(['x-kovo-correlation', 'x-correlation-id', 'x-request-id'])
 const AUTH_QUERY_KEYS = new Set(['sig', 'signature', 'hmac', 'mac', 'token', 'access_token', 'code', 'state', 'nonce', 'ts', 'timestamp', 'expires', 'exp'])
@@ -1263,7 +1261,7 @@ export function resolveV8OracleFamilyOrDiagnostic(
     if (conflicts.length > 0) return { ok: false, reason: `v8_oracle_failed (conflicting_oracle_input_keys): terminalImpact.oracleInput contains conflicting duplicate values for normalized keys (${conflicts.join(', ')}) — supply each field under a single canonical spelling.`, rejectedBy: 'v8_oracle_conflicting_keys', missingEvidence: ['deduplicated_oracle_input_keys'] }
   }
   if (oracleFamily) return { ok: true, family: oracleFamily, inferred: false }
-  if (V8_VALID_FAMILY_SET.has(normCls)) return { ok: true, family: normCls as V8OracleFamily, inferred: false }
+  const normalizedCls = normalizeTerminalVulnClass(normCls); if (V8_VALID_FAMILY_SET.has(normalizedCls)) return { ok: true, family: normalizedCls as V8OracleFamily, inferred: false }
   if (!explicitInput) return { ok: true, family: null, inferred: false }
   const normIn = normalizeV8OracleInputKeys(explicitInput), inf = inferV8OracleFamilyDetailed(normIn)
   if (inf.kind === 'matched') return { ok: true, family: inf.family, inferred: true }
