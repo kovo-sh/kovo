@@ -192,15 +192,33 @@ export function writePinnedOrigin(directory: string, origin: string): void {
   }
 }
 
-function parseHttpsForwardedHost(req: IncomingMessage): { host: string; origin: string } | null {
+function isHttpsForwardedRequest(req: IncomingMessage): boolean {
   const rawProto = req.headers['x-forwarded-proto']
   const firstProto = (Array.isArray(rawProto) ? rawProto[0] : rawProto ?? '').split(',')[0]?.trim().toLowerCase()
-  if (firstProto !== 'https') return null
+  if (firstProto === 'https') return true
+  const rawScheme = req.headers['x-forwarded-scheme']
+  const firstScheme = (Array.isArray(rawScheme) ? rawScheme[0] : rawScheme ?? '').split(',')[0]?.trim().toLowerCase()
+  if (firstScheme === 'https') return true
+  const rawForwarded = req.headers.forwarded
+  const firstForwarded = (Array.isArray(rawForwarded) ? rawForwarded[0] : rawForwarded ?? '').split(',')[0] ?? ''
+  return /(?:^|[;\s])proto\s*=\s*"?https"?(?:$|[;\s])/i.test(firstForwarded)
+}
+
+function isTopLevelDocumentNavigation(req: IncomingMessage): boolean {
+  const mode = (Array.isArray(req.headers['sec-fetch-mode']) ? req.headers['sec-fetch-mode'][0] : req.headers['sec-fetch-mode'] ?? '').trim().toLowerCase()
+  const dest = (Array.isArray(req.headers['sec-fetch-dest']) ? req.headers['sec-fetch-dest'][0] : req.headers['sec-fetch-dest'] ?? '').trim().toLowerCase()
+  return mode === 'navigate' && dest === 'document'
+}
+
+function parseHttpsForwardedHost(req: IncomingMessage): { host: string; origin: string } | null {
+  if (!isHttpsForwardedRequest(req)) return null
   const rawHost = (req.headers.host ?? '').trim().toLowerCase()
   if (!rawHost || !validHostHeaderRegex.test(rawHost)) return null
+  const normalizedHost = rawHost.endsWith(':443') ? rawHost.slice(0, -4) : rawHost
+  if (!normalizedHost) return null
   try {
-    const parsed = new URL(`https://${rawHost}`)
-    if (parsed.protocol !== 'https:' || parsed.host !== rawHost || isLoopbackOrigin(parsed.origin)) return null
+    const parsed = new URL(`https://${normalizedHost}`)
+    if (parsed.protocol !== 'https:' || parsed.host !== normalizedHost || isLoopbackOrigin(parsed.origin)) return null
     return { host: parsed.host, origin: parsed.origin }
   } catch {
     return null
@@ -534,6 +552,10 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
   async function serve(req: IncomingMessage, res: ServerResponse) {
     const hostKey = (req.headers.host ?? '').trim().toLowerCase()
     let origin = origins.get(hostKey)
+    if (!origin && hostKey.endsWith(':443')) {
+      const candidate = origins.get(hostKey.slice(0, -4))
+      if (candidate?.startsWith('https://')) origin = candidate
+    }
     const method = req.method ?? 'GET'
     const readOnly = method === 'GET' || method === 'HEAD'
     res.setHeader('X-Content-Type-Options', 'nosniff')
@@ -543,7 +565,7 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
     if (!origin) {
       // Zero-config TOFU HTTPS host pinning: only active while bootstrap is unconsumed, no explicit
       // KOVO_PUBLIC_ORIGIN is configured, and the request arrived over an HTTPS reverse proxy
-      // (X-Forwarded-Proto: https). Plain HTTP unknown hosts always fail closed with 421.
+      // (X-Forwarded-Proto: https / Forwarded: proto=https). Plain HTTP unknown hosts fail closed with 421.
       const httpsCandidate = !explicitPublicOrigin && !bootstrapConsumed && method === 'GET'
         ? parseHttpsForwardedHost(req)
         : null
@@ -570,7 +592,10 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
         res.writeHead(303, { location: candidateUrl.pathname + (candidateUrl.search || '') })
         return res.end()
       }
-      if (candidateUrl.pathname === '/' && isAllowedSecFetchSite(req.headers['sec-fetch-site'], true)) {
+      if (
+        candidateUrl.pathname === '/'
+        && (isAllowedSecFetchSite(req.headers['sec-fetch-site'], true) || isTopLevelDocumentNavigation(req))
+      ) {
         maybeRemindBootstrap(httpsCandidate.origin)
         return rejectSession(res, { bootstrapActive: true, hostHint: httpsCandidate.origin })
       }

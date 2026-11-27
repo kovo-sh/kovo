@@ -202,3 +202,73 @@ test('explicit KOVO_PUBLIC_ORIGIN disables TOFU auto-pinning and failed bootstra
   assert.match(banner, /Token\s+: [a-f0-9]{64}/)
   assert.match(banner, /docker compose exec kovo cat \/data\/bootstrap/)
 })
+
+test('TOFU allows cross-site top-level document navigation, :443 default port, and RFC 7239 Forwarded while blocking cross-site CORS/iframes', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-tofu-nav-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+
+  const srv = await startTestServer(dir)
+  t.after(() => srv.close())
+
+  // Cross-site top-level browser navigation (e.g. clicking link from exe.dev / SSO redirect) -> 401 sign-in form
+  const navRes = await sendRaw(srv.port, {
+    path: '/',
+    headers: {
+      host: 'kovo-test-1.exe.xyz:443',
+      forwarded: 'for=198.51.100.1;proto=https',
+      'sec-fetch-site': 'cross-site',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-dest': 'document',
+    },
+  })
+  assert.equal(navRes.status, 401)
+  assert.match(navRes.body, /<form method="GET" action="\/">/)
+  assert.match(navRes.body, /https:\/\/kovo-test-1\.exe\.xyz/)
+
+  // Cross-site CORS fetch and cross-site iframe MUST still be rejected with 421
+  const corsRes = await sendRaw(srv.port, {
+    path: '/',
+    headers: {
+      host: 'kovo-test-1.exe.xyz',
+      'x-forwarded-proto': 'https',
+      'sec-fetch-site': 'cross-site',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-dest': 'empty',
+    },
+  })
+  assert.equal(corsRes.status, 421)
+
+  const iframeRes = await sendRaw(srv.port, {
+    path: '/',
+    headers: {
+      host: 'kovo-test-1.exe.xyz',
+      'x-forwarded-proto': 'https',
+      'sec-fetch-site': 'cross-site',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-dest': 'iframe',
+    },
+  })
+  assert.equal(iframeRes.status, 421)
+
+  // Bootstrap over :443 + Forwarded: proto=https pins canonical https://kovo-test-1.exe.xyz
+  const bootRes = await sendRaw(srv.port, {
+    path: `/?bootstrap=${srv.local.bootstrapSecret}`,
+    headers: {
+      host: 'kovo-test-1.exe.xyz:443',
+      forwarded: 'for=198.51.100.1;proto=https',
+    },
+  })
+  assert.equal(bootRes.status, 303)
+  assert.equal(readPinnedOrigin(dir), 'https://kovo-test-1.exe.xyz')
+
+  // Subsequent request with Host: kovo-test-1.exe.xyz:443 still resolves the pinned HTTPS origin
+  const appRes = await sendRaw(srv.port, {
+    path: '/',
+    headers: {
+      host: 'kovo-test-1.exe.xyz:443',
+      cookie: `kovo_local=${srv.local.token}`,
+    },
+  })
+  assert.equal(appRes.status, 200)
+  assert.equal(appRes.body, 'ok-app')
+})
