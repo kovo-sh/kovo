@@ -495,7 +495,7 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
         <div className="mt-3.5 rounded-card border border-line bg-sunk">
           <EmptyState
             title="No hosts in scope yet"
-            description="Add a starting host or import a DNS export so Kovo Hunter knows what belongs to this project."
+            description="Add a starting host or import a DNS export so Kovo knows what belongs to this project."
             action={
               <Button
                 type="button"

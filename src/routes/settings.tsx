@@ -836,7 +836,7 @@ function SettingsWorkbenchPage() {
                 className="max-w-[560px] gap-3.5 px-6 py-10 [&>[data-slot=empty-state-icon]]:h-auto [&>[data-slot=empty-state-icon]]:w-auto [&>[data-slot=empty-state-icon]>svg]:h-auto [&>[data-slot=empty-state-icon]>svg]:w-auto"
                 icon={<ModelProfilesEmptyIllustration />}
                 title="No model profiles configured"
-                description="Connect OpenRouter or any OpenAI / Anthropic compatible provider so Kovo Hunter can map attack surfaces, investigate security issues, and verify findings."
+                description="Connect OpenRouter or any OpenAI / Anthropic compatible provider so Kovo can map attack surfaces, investigate security issues, and verify findings."
                 action={(
                   <Button type="button" variant="default" onClick={openCreate}>
                     Add model profile

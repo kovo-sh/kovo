@@ -748,7 +748,7 @@ export function ProjectGuardrailsTab({ data }: Props) {
             <EmptyState
               icon={<GuardrailsEmptyIllustration />}
               title="Write requests are blocked by default"
-              description="Kovo Hunter will not send state-changing requests unless you explicitly approve a staging or test-account endpoint here."
+              description="Kovo will not send state-changing requests unless you explicitly approve a staging or test-account endpoint here."
               className="max-w-[440px] py-9 [&_[data-slot=empty-state-icon]]:size-auto [&_[data-slot=empty-state-icon]>svg]:h-[88px] [&_[data-slot=empty-state-icon]>svg]:w-[180px]"
               action={
                 !addRuleOpen ? (

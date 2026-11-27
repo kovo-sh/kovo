@@ -325,7 +325,7 @@ export function GithubInstallBanner({
             <span>
               {loading
                 ? 'Checking installed accounts & organizations…'
-                : 'Choose which personal or organization repositories Kovo Hunter can read.'}
+                : 'Choose which personal or organization repositories Kovo can read.'}
             </span>
           </span>
         </div>

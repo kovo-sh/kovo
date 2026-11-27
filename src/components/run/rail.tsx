@@ -3,7 +3,7 @@
 // (persisted in localStorage), #4 compact Workspace block above the session/utility footer.
 import { Link } from '@tanstack/react-router'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { KovoHunterMark } from '../brand/KovoHunterMark.tsx'
+import { KovoMark } from '../brand/KovoMark.tsx'
 import { DevicesIcon, DevicesSessionModal } from '../settings/DevicesSessionModal.tsx'
 import { Disclosure, DisclosureContent, DisclosureTrigger } from '../ui/disclosure.tsx'
 import { useRun } from './data.tsx'
@@ -236,8 +236,8 @@ export function Rail() {
   return <>
     <aside className="flex min-h-0 flex-col border-r border-line bg-rail" aria-label="Run navigation">
       <div className="flex h-12 flex-none items-center gap-[9px] pl-4 pr-3.5 text-[13px] font-normal tracking-[-0.003em] text-fg">
-        <KovoHunterMark />
-        <Link to="/" className="whitespace-nowrap font-semibold tracking-[-0.01em] text-fg" title="All projects">Kovo Hunter</Link>
+        <KovoMark />
+        <Link to="/" className="whitespace-nowrap font-semibold tracking-[-0.01em] text-fg" title="All projects">Kovo</Link>
         <span className="ml-auto text-[12px] text-fg-subtle">Local</span>
       </div>
       <button

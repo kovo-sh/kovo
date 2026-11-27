@@ -412,7 +412,7 @@ function ThreadMessage({ m }: { m: Message }) {
       ? ['Coordinator', 'co', 'C']
       : m.role === 'worker'
         ? [model.workerById.get(m.threadId)?.title ?? 'Worker', '', 'W']
-        : ['Kovo Hunter', '', 'K']
+        : ['Kovo', '', 'K']
   const evidence = (m.evidenceIds ?? []).map(id => model.evidenceById.get(id)).filter(e => !!e)
   return <div className="grid grid-cols-[22px_minmax(0,1fr)] gap-2.5" data-source="thread" data-role={m.role}>
     <Avatar role={who[1]}>
@@ -661,7 +661,7 @@ export function BoardPane() {
             <Avatar role="">K</Avatar>
             <div className="min-w-0">
               <div className="flex items-baseline gap-2 text-[12.5px] font-medium leading-[18px] text-fg">
-                Kovo Hunter<span className="text-[11.5px] font-normal text-fg-subtle">now</span>
+                Kovo<span className="text-[11.5px] font-normal text-fg-subtle">now</span>
               </div>
               <div className="mt-0.5 whitespace-pre-wrap break-words text-[12.5px] leading-[19px] text-fg-subtle">{statusNote}</div>
             </div>

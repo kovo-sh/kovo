@@ -312,12 +312,12 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
     catch { toast.show(errMsg, { tone: 'error' }) }
     finally { setExporting(false) }
   }
-  const exportMd = () => runExport(downloadReportMarkdown, 'text/markdown; charset=utf-8', 'Markdown', 'Kovo Hunter could not export this report. Try again.')
-  const exportSarif = () => runExport(exportSarifAction, 'application/sarif+json; charset=utf-8', 'SARIF 2.1.0', 'Kovo Hunter could not export SARIF 2.1.0 for this report. Try again.')
+  const exportMd = () => runExport(downloadReportMarkdown, 'text/markdown; charset=utf-8', 'Markdown', 'Kovo could not export this report. Try again.')
+  const exportSarif = () => runExport(exportSarifAction, 'application/sarif+json; charset=utf-8', 'SARIF 2.1.0', 'Kovo could not export SARIF 2.1.0 for this report. Try again.')
   const exportText = () => {
     const t = safeReportText
     const lines = [
-      `Kovo Hunter ${rep.partial ? 'partial' : 'complete'} report • Version ${rep.version}`, '',
+      `Kovo ${rep.partial ? 'partial' : 'complete'} report • Version ${rep.version}`, '',
       verdict.hed, ...(covLine ? [covLine] : []), '', b.goal, '',
       reportEvidenceSource(detail.run.sourceMode, b.selectedChecks, b.capabilityTier),
       `Testing mode: ${modeName}`, `Scope revision ${b.scopeRevision} · Goal revision ${b.goalRevision}`,
@@ -345,7 +345,7 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
         ...(Array.isArray(c.checks) ? c.checks : []).flatMap(ch => [`  ${t(ch.title)} · ${checkLabels[ch.status] ?? ch.status}`, ...(ch.status === 'untested' ? [] : [`    Observed: ${t(ch.observed, 'Unavailable')}`]), `    Expected: ${t(ch.expected)}`, `    ${t(ch.reason)}`])]),
       '', 'Coverage gaps', ...b.gaps,
     ]
-    download(lines.join('\n'), `kovo-hunter-report-${rep.version}.txt`, 'text/plain')
+    download(lines.join('\n'), `kovo-report-${rep.version}.txt`, 'text/plain')
     toast.show('Exported plain text', { icon: 'download' })
   }
   const patch = async (f: ReportFinding) => {
@@ -355,7 +355,7 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
       await refresh()
       toast.show('Verified patch generated', { icon: 'check', sub: f.title })
     } catch (e) {
-      toast.show(e instanceof Error ? e.message : 'Kovo Hunter could not generate a verified patch.', { tone: 'error' })
+      toast.show(e instanceof Error ? e.message : 'Kovo could not generate a verified patch.', { tone: 'error' })
     } finally {
       setPatching(null)
     }
@@ -653,7 +653,7 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
 
     <h2 className={H2}>Methodology and limitations</h2>
     <p className={DOC_P}>{reportEvidenceSource(detail.run.sourceMode, b.selectedChecks, b.capabilityTier)}{reportPlanLabel(b.selectedChecks) ? ' ' + reportPlanLabel(b.selectedChecks) : ''}</p>
-    <p className={DOC_P}>Kovo Hunter evaluated only the approved hosts, testing mode ({modeName}), test accounts, and recorded evidence in this report. AI observations and version matches only create hypotheses; every confirmed finding requires deterministic automated replay verification against a clean control check.</p>
+    <p className={DOC_P}>Kovo evaluated only the approved hosts, testing mode ({modeName}), test accounts, and recorded evidence in this report. AI observations and version matches only create hypotheses; every confirmed finding requires deterministic automated replay verification against a clean control check.</p>
     <p className={cn(DOC_P, 'text-fg-subtle')}>Inconclusive, ruled-out, not-applicable and untested categories remain visible rather than counting as passes. This evidence-led review does not guarantee that no other vulnerability exists.</p>
   </article></div>
 }

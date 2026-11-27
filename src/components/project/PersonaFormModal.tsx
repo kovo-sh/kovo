@@ -495,7 +495,7 @@ export function PersonaFormModal({
             closeLiveStream()
             activeCaptureIdRef.current = null
             setActiveCapture(null)
-            setCaptureError('Local session expired — open the Kovo Hunter startup bootstrap URL to sign back in.')
+            setCaptureError('Local session expired — open the Kovo startup bootstrap URL to sign back in.')
             return
           }
           if (es.readyState === EventSource.CLOSED) {
@@ -795,7 +795,7 @@ export function PersonaFormModal({
         closeLiveStream()
         activeCaptureIdRef.current = null
         setActiveCapture(null)
-        setCaptureError('Local session expired — open the Kovo Hunter startup bootstrap URL to sign back in.')
+        setCaptureError('Local session expired — open the Kovo startup bootstrap URL to sign back in.')
         return
       }
       if (res.status === 404) {

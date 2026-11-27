@@ -1,6 +1,6 @@
 import { Link, useRouter } from '@tanstack/react-router'
 import { useState } from 'react'
-import { KovoHunterMark } from './brand/KovoHunterMark.tsx'
+import { KovoMark } from './brand/KovoMark.tsx'
 
 export const timeText = (value: number) => new Date(value).toLocaleString(undefined, {
   month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
@@ -70,7 +70,7 @@ export function useAction(refresh?: () => Promise<void>) {
       else await router.invalidate()
       await onSuccess?.(result)
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : 'Kovo Hunter could not complete the action.')
+      setError(failure instanceof Error ? failure.message : 'Kovo could not complete the action.')
     } finally {
       setPending(false)
     }
@@ -83,9 +83,9 @@ export function FormError({ error }: { error: string }) {
 }
 
 export function Brand() {
-  return <Link className="brand" to="/" aria-label="Kovo Hunter workspace">
-    <KovoHunterMark size={20} />
-    <span>Kovo Hunter</span>
+  return <Link className="brand" to="/" aria-label="Kovo workspace">
+    <KovoMark size={20} />
+    <span>Kovo</span>
   </Link>
 }
 

@@ -663,7 +663,7 @@ export function ProjectSourcesTab({ data }: Props) {
           </DisclosureTrigger>
           <DisclosureContent className="grid gap-2.5 pt-2.5">
             <p className="m-0 text-[12px] text-fg-subtle">
-              Kovo Hunter automatically discovers runtime schemas and extracts OpenAPI, GraphQL, and lockfile specs from synced repositories. Use manual upload only when you need to supply an extra schema or lockfile directly.
+              Kovo automatically discovers runtime schemas and extracts OpenAPI, GraphQL, and lockfile specs from synced repositories. Use manual upload only when you need to supply an extra schema or lockfile directly.
             </p>
             <Card className="overflow-hidden border-line">
               <form

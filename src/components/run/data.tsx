@@ -612,7 +612,7 @@ export function RunDataProvider({ initial, children, onError }: {
       await refresh()
       return result
     } catch (failure) {
-      const message = failure instanceof Error ? failure.message : 'Kovo Hunter could not complete the action.'
+      const message = failure instanceof Error ? failure.message : 'Kovo could not complete the action.'
       setError(message)
       onErrorRef.current?.(message)
       if (command.action === 'scope') await refresh()

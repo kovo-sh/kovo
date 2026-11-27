@@ -2,7 +2,7 @@
 // Markup is static and trusted, so it is injected as inner SVG.
 import type { CSSProperties } from 'react'
 import { cn } from '../../lib/cn.ts'
-import { KovoHunterMark } from '../brand/KovoHunterMark.tsx'
+import { KovoMark } from '../brand/KovoMark.tsx'
 
 const P = {
   search: '<circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/>',
@@ -91,7 +91,7 @@ export function Icon({ name, size, className, style, title }: {
   />
 }
 
-/** Kovo Hunter mark (R2-06 crescent bow-and-arrow), used in the rail brand. */
+/** Kovo mark (R2-06 crescent bow-and-arrow), used in the rail brand. */
 export function Mark() {
-  return <KovoHunterMark />
+  return <KovoMark />
 }

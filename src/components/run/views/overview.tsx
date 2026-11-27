@@ -120,7 +120,7 @@ function RunOverview() {
     <div className="max-w-[980px] px-6 pb-14 pt-[22px]">
       {r.status === 'running' && <div className="mb-3.5 flex min-h-9 min-w-0 items-center gap-2.5 rounded-lg bg-accent-soft px-3 py-1.5 text-[12.5px] shadow-[inset_0_0_0_1px_var(--accent-line)]" role="status" aria-live="polite">
         <LiveDot />
-        <span className="flex-none whitespace-nowrap font-medium text-fg">What Kovo Hunter is doing now</span>
+        <span className="flex-none whitespace-nowrap font-medium text-fg">What Kovo is doing now</span>
         <span className="min-w-0 flex-1 truncate text-fg-muted" title={liveSummary}>
           {runningWorkers.length > 0 && <b className="num font-medium text-fg">{plural(runningWorkers.length, 'active worker')} · </b>}
           {liveSummary}
@@ -167,7 +167,7 @@ function RunOverview() {
           {long && <button type="button" className={cn(runBtn({ variant: 'link', size: 'none' }), 'mt-1')} onClick={() => setGoalOpen(!goalOpen)}>{goalOpen ? 'Show less' : 'Show full goal'}</button>}
         </div>
         <div className="min-w-0 border-l border-line px-[18px] pb-3.5 pt-3 max-[1180px]:border-l-0 max-[1180px]:pl-0">
-          <h3 className="m-0 mb-1.5 text-[11.5px] font-medium text-fg-subtle">What Kovo Hunter found</h3>
+          <h3 className="m-0 mb-1.5 text-[11.5px] font-medium text-fg-subtle">What Kovo found</h3>
           <div className="num grid grid-cols-[62px_1fr_26px] items-center gap-x-2 gap-y-[3px] text-[12px]">
             {tally.map(([sev, k]) => [
               <span key={sev + 'l'} className={cn('flex items-center gap-1.5', k ? 'text-fg-muted' : 'text-fg-faint')}><SevGlyph sev={sev} />{SEV_LABEL[sev]}</span>,

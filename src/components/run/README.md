@@ -26,7 +26,7 @@ before adding a view, an inspector or a cross-link.
 - `coordinator.tsx`: the **Board** (v5 swarm message board), shown in the pane when nothing is selected,
   on Overview and Report, or after C / the Board button in any inspector header. It holds the roster,
   pinned Tier 3 approvals, kind and handle filters, and a timeline that merges board posts with the
-  coordinator thread. Coordinator and Kovo Hunter replies are not posted to the board; operator messages
+  coordinator thread. Coordinator and Kovo replies are not posted to the board; operator messages
   are mirrored onto it by the server. Plain text sends `message`; text with @mentions sends `board_post`.
 
 ## Rules that are easy to break

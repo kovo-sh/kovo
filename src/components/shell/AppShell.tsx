@@ -6,7 +6,7 @@ import { cva } from 'class-variance-authority'
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { cn } from '../../lib/cn.ts'
-import { KovoHunterMark } from '../brand/KovoHunterMark.tsx'
+import { KovoMark } from '../brand/KovoMark.tsx'
 import { KbdGroup } from '../run/display.tsx'
 import { runLabel } from '../run/format.ts'
 import { StatusGlyph } from '../run/glyphs.tsx'
@@ -265,9 +265,9 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
     <div className="grid h-screen grid-cols-[232px_minmax(0,1fr)] overflow-hidden bg-bg text-fg max-[720px]:grid-cols-[196px_minmax(0,1fr)] [&_svg]:block [&_svg]:flex-none">
       <aside className="flex min-h-0 flex-col border-r border-line bg-rail" aria-label="Workspace navigation">
         <div className="flex h-12 flex-none items-center gap-[9px] pl-4 pr-3.5">
-          <KovoHunterMark size={18} className="size-[18px] flex-none text-fg" />
+          <KovoMark size={18} className="size-[18px] flex-none text-fg" />
           <Link to="/" className="whitespace-nowrap text-[13px] font-semibold tracking-[-0.01em] text-fg" title="All projects">
-            Kovo Hunter
+            Kovo
           </Link>
           <span className="ml-auto text-[12px] text-fg-subtle">Local</span>
         </div>

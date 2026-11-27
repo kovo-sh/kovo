@@ -353,7 +353,7 @@ function ExchangeInspector({ sel }: InspectorProps) {
             ...(origin ? [['Origin', <span className="font-mono text-[12px]">{host(origin)}</span>, () => links.host(origin)] as [ReactNode, ReactNode, () => void]] : []),
             ...(w ? [['Worker', <><StatusGlyph status={w.status} /><span className="min-w-0 truncate">{w.title}</span><Icon name="workflow" /></>, () => links.worker(w.id)] as [ReactNode, ReactNode, () => void]] : []),
           ]} />
-          <p className="my-1.5 mb-2 flex items-center gap-1.5 text-[12px] leading-[18px] text-fg-subtle">{reason ? ev.message : 'The safety proxy blocked this request before it left Kovo Hunter: the host is outside the approved scope or paused by a safety pause. Nothing was sent.'}</p>
+          <p className="my-1.5 mb-2 flex items-center gap-1.5 text-[12px] leading-[18px] text-fg-subtle">{reason ? ev.message : 'The safety proxy blocked this request before it left Kovo: the host is outside the approved scope or paused by a safety pause. Nothing was sent.'}</p>
           <Section title="Related"><LinkRow icon="activity" onClick={() => links.event(ev.id)}>Open in Activity</LinkRow></Section>
         </>}
       </div></PaneBody>

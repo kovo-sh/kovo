@@ -430,7 +430,7 @@ function RunBanners() {
     {sessionExpired && <div className={wCls} role="alert" aria-label="Local session expired" data-testid="session-expired-banner">
       <Icon name="lock" className="text-warn" />
       <span className="min-w-0 flex-1">
-        <b className="font-medium text-fg">Local session expired.</b> Open the startup bootstrap URL from your Kovo Hunter terminal (or a device pairing link) to sign back in and resume live updates.
+        <b className="font-medium text-fg">Local session expired.</b> Open the startup bootstrap URL from your Kovo terminal (or a device pairing link) to sign back in and resume live updates.
       </span>
       <button type="button" className={runBtn({ variant: 'default', size: 'sm' })} data-testid="session-expired-reload" onClick={() => { if (typeof window !== 'undefined') window.location.reload() }}>
         Reload
@@ -438,7 +438,7 @@ function RunBanners() {
     </div>}
     {connection === 'reconnecting' && !sessionExpired && <div className={`${bCls} bg-sunk`} role="status">
       <Icon name="activity" />
-      <span className="min-w-0 flex-1">Reconnecting to Kovo Hunter… the view keeps the last data it had.</span>
+      <span className="min-w-0 flex-1">Reconnecting to Kovo… the view keeps the last data it had.</span>
     </div>}
   </>
 }
