@@ -74,6 +74,17 @@ function makeGrant(origin: string, port: number): Grant {
     canaryMarkers: [],
     session: { headerType: 'bearer', value: 'dual-member-optd-sdk-secret', adapterUsed: 'static' },
   }
+  const memberUnscoped: ResolvedPersona = {
+    id: 'member_unscoped',
+    handle: 'member_unscoped',
+    roleLabel: 'member',
+    originAllowlist: [origin],
+    authKind: 'bearer',
+    headerName: 'Authorization',
+    secret: 'member-unscoped-optd-sdk-secret',
+    canaryMarkers: [],
+    session: { headerType: 'bearer', value: 'member-unscoped-optd-sdk-secret', adapterUsed: 'static' },
+  }
   return {
     origin,
     canRead: o => { try { return new URL(o).origin === origin } catch { return o === origin } },
@@ -83,7 +94,7 @@ function makeGrant(origin: string, port: number): Grant {
     maxRpsPerOrigin: 300,
     tier: 3,
     isStateChangeApproved: () => true,
-    personas: new Map([['member_a', memberA], ['dual_member', dualMember]]),
+    personas: new Map([['member_a', memberA], ['dual_member', dualMember], ['member_unscoped', memberUnscoped]]),
     secrets: [],
   }
 }
@@ -468,7 +479,7 @@ test('ChainBuilder.build() produces strictly forward-only edges with zero cycles
   assert.ok(edges.some(e => e.kind === 'value_binding' && e.fromHopId === 'hop_2' && e.toHopId === 'hop_3' && e.capabilityHandle === 'cap:hop_2:s2'))
 })
 
-test('live VerifyRpcServer: dual_tenant_abac synthOracleInput auto-populates oracleInput from 401/403/404 control + terminal exchange and confirms', async t => {
+test('live VerifyRpcServer: dual_tenant_abac leaves oracleInput undefined when omitted so host deriveHostDualTenantRawInput/multiHopDualDag runs, and fills refs when caller supplies oracleInput', async t => {
   const { ctx } = await startFixture(t, 'run-optd-sdk-dual-tenant-synth')
 
   // 1) dual_org_cache_bleed: 0 explicit oracleInput + 0 capability edges + preceding 200 readback before 403 control
@@ -482,29 +493,33 @@ test('live VerifyRpcServer: dual_tenant_abac synthOracleInput auto-populates ora
   const s2 = await ch.step('GET /api/v1/reports/export', { hopId: 'step_2', as: 'dual_member', claimedDelta: 'Read tenant-b report after cache bleed.' })
   assert.equal(s2.status, 200)
 
+  // Leaving oracleInput undefined lets host deriveHostDualTenantRawInput confirm cleanly without forging partial dual_org_cache_bleed
   const built = ch.build({ terminalHopId: 'step_2', terminalExchange: s2, claimedImpact: 'Dual-tenant permission cache bleed into tenant-b.' })
-  assert.deepEqual(built.terminalImpact.oracleInput, {
-    mode: 'dual_org_cache_bleed',
-    baselineDeniedControlExchangeId: ctrl.exchangeId,
-    primeActionExchangeId: s1.exchangeId,
-    bledAccessExchangeId: s2.exchangeId,
-  })
+  assert.equal(built.terminalImpact.oracleInput, undefined)
   const proved = await ch.prove({ terminalHopId: 'step_2', terminalExchange: s2, claimedImpact: 'Dual-tenant permission cache bleed into tenant-b.' })
-  assert.equal(proved.confirmed, true, `Expected live dual_tenant_abac cache bleed to confirm without explicit oracleInput: ${JSON.stringify(proved)}`)
+  assert.equal(proved.confirmed, true, `Expected live dual_tenant_abac cache bleed to confirm via host deriveHostDualTenantRawInput: ${JSON.stringify(proved)}`)
 
-  // 2) cross_tenant_export alias triggers the same dual_tenant_abac synthesis
-  const chAlias = ctx.chain('chain-optd-dual-alias', 'cross_tenant_export')
-  chAlias.control(ctrl)
-  chAlias.recordHop({ hopId: 'h1', target: 'POST /api/v1/permissions/prime', exchangeIds: [s1.exchangeId], claimedDelta: 'Prime.' })
-  chAlias.recordHop({ hopId: 'h2', target: 'GET /api/v1/reports/export', exchangeIds: [s2.exchangeId], claimedDelta: 'Read.' })
-  assert.deepEqual(chAlias.build().terminalImpact.oracleInput, {
+  // Explicit primeTenant/targetTenant caller oracleInput infers mode and fills missing exchange refs
+  const builtExplicitBleed = ch.build({ terminalHopId: 'step_2', terminalExchange: s2, oracleInput: { primeTenantId: 'tenant-a', targetTenantId: 'tenant-b' } })
+  assert.deepEqual(builtExplicitBleed.terminalImpact.oracleInput, {
     mode: 'dual_org_cache_bleed',
+    primeTenantId: 'tenant-a',
+    targetTenantId: 'tenant-b',
     baselineDeniedControlExchangeId: ctrl.exchangeId,
     primeActionExchangeId: s1.exchangeId,
     bledAccessExchangeId: s2.exchangeId,
   })
 
-  // 3) cross_org_transfer: auto-synthesizes mode + sourceControlDenied + transferRecord + postTransferReadback + entityId
+  // 2) cross_tenant_* aliases NEVER auto-synthesize dual_tenant_abac oracleInput when oracleFamily and oracleInput are omitted
+  for (const cls of ['cross_tenant_export', 'cross_tenant_read', 'cross_tenant_write', 'cross_tenant_idor'] as const) {
+    const chAlias = ctx.chain(`chain-optd-alias-${cls}`, cls)
+    chAlias.control(ctrl)
+    chAlias.recordHop({ hopId: 'h1', target: 'POST /api/v1/permissions/prime', exchangeIds: [s1.exchangeId], claimedDelta: 'Prime.' })
+    chAlias.recordHop({ hopId: 'h2', target: 'GET /api/v1/reports/export', exchangeIds: [s2.exchangeId], claimedDelta: 'Read.' })
+    assert.equal(chAlias.build().terminalImpact.oracleInput, undefined, `${cls} must not auto-synthesize dual_tenant_abac oracleInput`)
+  }
+
+  // 3) cross_org_transfer: omits oracleInput when caller omits it; fills exchange refs when caller supplies cross_org_transfer/entityId oracleInput
   const chXfer = ctx.chain('chain-optd-dual-xfer', 'dual_tenant_abac')
   const xCtrl = await chXfer.control('GET /api/v1/items/item-77/export', { as: 'dual_member', entityId: 'item-77' })
   assert.equal(xCtrl.status, 403)
@@ -515,7 +530,8 @@ test('live VerifyRpcServer: dual_tenant_abac synthOracleInput auto-populates ora
   const xRb = await chXfer.readback('GET /api/v1/items/item-77/export', { as: 'dual_member', entityId: 'item-77' })
   assert.equal(xRb.status, 200)
 
-  const builtXfer = chXfer.build({ claimedImpact: 'Unauthorized cross-org transfer of item-77.' })
+  assert.equal(chXfer.build({ claimedImpact: 'Unauthorized cross-org transfer of item-77.' }).terminalImpact.oracleInput, undefined)
+  const builtXfer = chXfer.build({ claimedImpact: 'Unauthorized cross-org transfer of item-77.', oracleInput: { mode: 'cross_org_transfer' } })
   assert.deepEqual(builtXfer.terminalImpact.oracleInput, {
     mode: 'cross_org_transfer',
     sourceControlDeniedExchangeId: xCtrl.exchangeId,
@@ -539,10 +555,10 @@ test('live VerifyRpcServer: dual_tenant_abac synthOracleInput auto-populates ora
   })
 })
 
-test('live VerifyRpcServer: dual_tenant_abac multi-hop value_binding chains synthesize oracleInput when oracleFamily is omitted without contaminating broken_access_control', async t => {
+test('live VerifyRpcServer: v8-m2-r3-wb regression — NO missing_tenant_scope on dual_tenant_abac, broken_access_control, bola, or cross_tenant_* multi-hop value_binding chains', async t => {
   const { ctx } = await startFixture(t, 'run-optd-sdk-dual-tenant-vb')
 
-  // 1) dual_tenant_abac + value_binding edge + omitted oracleFamily -> synthesizes dual_org_cache_bleed & confirms live
+  // 1) dual_tenant_abac + value_binding edge + dual_member + omitted oracleInput -> host derives & confirms live
   const chBleed = ctx.chain('chain-optd-dual-vb-bleed', 'dual_tenant_abac')
   const ctrl = await chBleed.control('GET /api/v1/reports/export', { as: 'dual_member' })
   assert.equal(ctrl.status, 403)
@@ -559,54 +575,41 @@ test('live VerifyRpcServer: dual_tenant_abac multi-hop value_binding chains synt
 
   const builtBleed = chBleed.build({ terminalHopId: 'vb_2', terminalExchange: s2, claimedImpact: 'Dual-tenant cache bleed on multi-hop value_binding chain.' })
   assert.ok((builtBleed.causalEdges ?? []).some(e => e.kind === 'value_binding' && e.fromHopId === 'vb_1' && e.toHopId === 'vb_2'))
-  assert.deepEqual(builtBleed.terminalImpact.oracleInput, {
-    mode: 'dual_org_cache_bleed',
-    baselineDeniedControlExchangeId: ctrl.exchangeId,
-    primeActionExchangeId: s1.exchangeId,
-    bledAccessExchangeId: s2.exchangeId,
-  })
+  assert.equal(builtBleed.terminalImpact.oracleInput, undefined)
   const provedBleed = await chBleed.prove({ terminalHopId: 'vb_2', terminalExchange: s2, claimedImpact: 'Dual-tenant cache bleed on multi-hop value_binding chain.' })
   assert.equal(provedBleed.confirmed, true, `Expected live dual_tenant_abac value_binding chain to confirm: ${JSON.stringify(provedBleed)}`)
 
-  // 2) dual_tenant_abac + value_binding edge + post-transfer readback + entityId -> picks cross_org_transfer
-  const chXfer = ctx.chain('chain-optd-dual-vb-xfer', 'dual_tenant_abac')
-  const xCtrl = await chXfer.control('GET /api/v1/items/item-77/export', { as: 'dual_member', entityId: 'item-77' })
-  assert.equal(xCtrl.status, 403)
-  const x1 = await chXfer.step('POST /api/v1/permissions/prime', { hopId: 'xv_1', as: 'dual_member', claimedDelta: 'Mint session.' })
-  const xCap = await chXfer.seal(x1, { jsonPath: '$.sessionTok', kind: 'header_secret' })
-  const x2 = await chXfer.step('POST /api/v1/items/item-77/transfer', {
-    hopId: 'xv_2',
-    as: 'dual_member',
-    entityId: 'item-77',
-    capability: { handle: xCap, target: 'header', headerName: 'x-session-tok' },
-    claimedDelta: 'Transfer item-77 to tenant-a.',
-  })
-  assert.equal(x2.status, 200)
-  const xRb = await chXfer.readback('GET /api/v1/items/item-77/export', { as: 'dual_member', entityId: 'item-77' })
-  assert.equal(xRb.status, 200)
-  const builtXfer = chXfer.build({ claimedImpact: 'Cross-org transfer on value_binding chain.' })
-  assert.ok((builtXfer.causalEdges ?? []).some(e => e.kind === 'value_binding'))
-  assert.deepEqual(builtXfer.terminalImpact.oracleInput, {
-    mode: 'cross_org_transfer',
-    sourceControlDeniedExchangeId: xCtrl.exchangeId,
-    transferRecordExchangeId: x2.exchangeId,
-    postTransferReadbackExchangeId: xRb.exchangeId,
-    entityId: 'item-77',
-  })
+  // 2) Exact M2 R3 WB failure shape: unscoped persona (no tenant in roleLabel) + value_binding chain -> MUST NOT synthesize partial dual_org_cache_bleed or fail missing_tenant_scope!
+  for (const vulnClass of ['dual_tenant_abac', 'broken_access_control', 'bola', 'cross_tenant_read', 'cross_tenant_export'] as const) {
+    const chM2 = ctx.chain(`chain-m2r3-${vulnClass}`, vulnClass)
+    const c = await chM2.control('GET /files/export/tenant-b/ledger.csv', { as: 'member_unscoped' })
+    assert.equal(c.status, 403)
+    const m1 = await chM2.step('/api/v1/exports/mint', { hopId: `m1_${vulnClass}`, method: 'POST', as: 'member_unscoped', jsonBody: { scope: 'tenant-b' } })
+    assert.equal(m1.status, 200)
+    const urlCap = await chM2.seal(m1, { jsonPath: '$.signedUrl', kind: 'signed_url', slot: `s_${vulnClass}` })
+    const m2 = await chM2.step({ path: urlCap }, { hopId: `m2_${vulnClass}`, method: 'GET' })
+    assert.equal(m2.status, 200)
+    const builtM2 = chM2.build({ terminalHopId: `m2_${vulnClass}`, terminalExchange: m2, claimedImpact: `Cross-tenant export read (${vulnClass}) via signed_url capability.` })
+    assert.equal(builtM2.terminalImpact.oracleInput, undefined, `${vulnClass} must leave oracleInput undefined when caller omits it`)
+    const provedM2 = await chM2.prove({ terminalHopId: `m2_${vulnClass}`, terminalExchange: m2, claimedImpact: `Cross-tenant export read (${vulnClass}) via signed_url capability.` })
+    assert.doesNotMatch(provedM2.reason, /missing_tenant_scope/i, `${vulnClass} must never fail missing_tenant_scope: ${JSON.stringify(provedM2)}`)
+    assert.equal(provedM2.confirmed, true, `Expected live ${vulnClass} multi-hop value_binding chain to confirm: ${JSON.stringify(provedM2)}`)
+  }
 
-  // 3) broken_access_control (non-dual_tenant_abac) MUST NOT synthesize dual_tenant_abac oracleInput when oracleFamily is omitted
-  const chBac = ctx.chain('chain-optd-bac-no-dual', 'broken_access_control')
-  chBac.control(ctrl)
-  chBac.recordHop({ hopId: 'b_1', target: 'POST /api/v1/permissions/prime', exchangeIds: [s1.exchangeId], producedCapabilities: [tokCap], claimedDelta: 'Mint.' })
-  chBac.recordHop({ hopId: 'b_2', target: 'GET /api/v1/reports/export', exchangeIds: [s2.exchangeId], consumedCapabilities: [tokCap], claimedDelta: 'Read.' })
-  assert.equal(chBac.build({ terminalHopId: 'b_2', terminalExchange: s2 }).terminalImpact.oracleInput, undefined)
-
-  // 4) cross_tenant_read with value_binding edge + omitted oracleFamily MUST NOT force dual_org_cache_bleed (preserves single-tenant multiHopDualDag)
-  const chRead = ctx.chain('chain-optd-ctr-vb-no-bleed', 'cross_tenant_read')
-  chRead.control(ctrl)
-  chRead.recordHop({ hopId: 'r_1', target: 'POST /api/v1/permissions/prime', exchangeIds: [s1.exchangeId], producedCapabilities: [tokCap], claimedDelta: 'Mint.' })
-  chRead.recordHop({ hopId: 'r_2', target: 'GET /api/v1/reports/export', exchangeIds: [s2.exchangeId], consumedCapabilities: [tokCap], claimedDelta: 'Read.' })
-  assert.equal(chRead.build({ terminalHopId: 'r_2', terminalExchange: s2 }).terminalImpact.oracleInput, undefined)
+  // 3) broken_access_control & bola with EXPLICIT oracleFamily: 'dual_tenant_abac' + omitted oracleInput MUST NOT synthesize partial dual_org_cache_bleed or fail missing_tenant_scope
+  for (const vulnClass of ['broken_access_control', 'bola'] as const) {
+    const chExp = ctx.chain(`chain-m2r3-explicit-${vulnClass}`, vulnClass)
+    const c = await chExp.control('GET /files/export/tenant-b/ledger.csv', { as: 'dual_member' })
+    assert.equal(c.status, 403)
+    const m1 = await chExp.step('/api/v1/exports/mint', { hopId: `e1_${vulnClass}`, method: 'POST', as: 'dual_member', jsonBody: { scope: 'tenant-b' } })
+    const urlCap = await chExp.seal(m1, { jsonPath: '$.signedUrl', kind: 'signed_url', slot: `se_${vulnClass}` })
+    const m2 = await chExp.step({ path: urlCap }, { hopId: `e2_${vulnClass}`, method: 'GET' })
+    const builtExp = chExp.build({ terminalHopId: `e2_${vulnClass}`, terminalExchange: m2, oracleFamily: 'dual_tenant_abac', claimedImpact: `Cross-tenant ${vulnClass} with explicit dual_tenant_abac family.` })
+    assert.equal(builtExp.terminalImpact.oracleInput, undefined)
+    const provedExp = await chExp.prove({ terminalHopId: `e2_${vulnClass}`, terminalExchange: m2, oracleFamily: 'dual_tenant_abac', claimedImpact: `Cross-tenant ${vulnClass} with explicit dual_tenant_abac family.` })
+    assert.doesNotMatch(provedExp.reason, /missing_tenant_scope/i, `explicit dual_tenant_abac on ${vulnClass} must not fail missing_tenant_scope: ${JSON.stringify(provedExp)}`)
+    assert.equal(provedExp.confirmed, true, `Expected explicit dual_tenant_abac on ${vulnClass} to confirm via host derivation / multiHopDualDag: ${JSON.stringify(provedExp)}`)
+  }
 })
 
 test('ChainBuilder and normalizeCompositeReceipt normalize hyphenated/whitespace terminalVulnClass to canonical snake_case', async t => {
@@ -822,7 +825,7 @@ test('live VerifyRpcServer: ChainBuilder prunes dangling side-branch hops (warm-
   // Disconnected 2-hop chain with 0 edges into terminalHopId MUST NOT collapse to 1 hop!
   const chDisc = ctx.chain('chain-optd-disconnected', 'cross_tenant_read')
   chDisc.control(ctrl)
-  const d1 = await chDisc.step('POST /api/v1/cache/warm', { hopId: 'disc_1', as: 'member_a', claimedDelta: 'Unlinked hop 1.' })
+  const d1 = await chDisc.step('GET /api/v1/orders/ord-1', { hopId: 'disc_1', as: 'member_a', claimedDelta: 'Unlinked read hop 1.' })
   const d2 = await chDisc.step('GET /api/v1/cache/content', { hopId: 'disc_2', capability: fwdCap, claimedDelta: 'Unlinked hop 2.' })
   assert.equal(d1.status, 200)
   assert.equal(d2.status, 200)
