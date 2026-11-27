@@ -25,7 +25,7 @@ docker compose up --build
 
 - `KOVO_PORT` (default `8000`): host port published to `127.0.0.1:${KOVO_PORT}` (set before `docker compose up`, e.g. `KOVO_PORT=8080 docker compose up`).
 - `KOVO_VERSION` (default `latest`): image tag for `ghcr.io/kovo-sh/kovo`.
-- `KOVO_PUBLIC_ORIGIN`: optional single HTTPS origin if terminating TLS behind a local reverse proxy.
+- `KOVO_PUBLIC_ORIGIN`: optional static HTTPS origin override if terminating TLS behind a reverse proxy. When omitted, opening your HTTPS proxy URL (`X-Forwarded-Proto: https`) and signing in with the one-time setup token automatically pins that single origin in `/data/pinned-origin` (mode `0600`) across restarts.
 
 ## GHCR images & tags
 
