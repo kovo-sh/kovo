@@ -21,6 +21,7 @@
 #   --skip-ci-check          Skip querying GitHub Actions verify.yml status via gh
 #   --skip-kernel-review     Skip independent kernel review lane check (unit tests only)
 #   --no-ff                  Create a merge commit even if fast-forward is possible
+#   --full                   Force full gate (disables narrow-diff scoping via KOVO_GATE_FULL=1)
 #   --json                   Emit machine-readable JSON summary to stdout
 #   -h, --help               Show usage
 #
@@ -29,6 +30,9 @@
 #   KOVO_MERGE_GATE_CMD      Override default gate command
 #   KOVO_MERGE_SKIP_CI_CHECK Set to 1 to skip GitHub Actions verify.yml check
 #   KOVO_MERGE_SKIP_KERNEL_REVIEW Set to 1 to skip kernel review lane check (unit tests only)
+#   KOVO_GATE_FULL           Set to 1 to force full gate (disables narrow-diff scoping)
+#   KOVO_TSC_CACHE_DIR       Host seed cache dir for incremental tsc (default: $HOME/.cache/kovo)
+#   KOVO_TSC_CACHE_FILE      Host seed cache file override (default: $KOVO_TSC_CACHE_DIR/main.tsbuildinfo)
 #   KOVO_GH_BIN              Override gh CLI binary (default: gh)
 #   KOVO_TMPDIR              Preferred temp root when TMPDIR is unset/empty (default: $HOME/guardian-bench-tmp if writable)
 set -euo pipefail
@@ -42,6 +46,7 @@ SET_RED_LOCK=0
 SET_RED_REASON=""
 SKIP_CI_CHECK="${KOVO_MERGE_SKIP_CI_CHECK:-0}"
 SKIP_KERNEL_REVIEW="${KOVO_MERGE_SKIP_KERNEL_REVIEW:-0}"
+FORCE_FULL_GATE="${KOVO_GATE_FULL:-0}"
 NO_FF=0
 JSON_OUT=0
 GATE_CMD="${KOVO_MERGE_GATE_CMD:-bash scripts/worker-gate.sh}"
@@ -87,12 +92,16 @@ while [[ $# -gt 0 ]]; do
       NO_FF=1
       shift
       ;;
+    --full)
+      FORCE_FULL_GATE=1
+      shift
+      ;;
     --json)
       JSON_OUT=1
       shift
       ;;
     -h|--help)
-      sed -n '2,32p' "$0"
+      sed -n '2,36p' "$0"
       exit 0
       ;;
     -*)
@@ -374,7 +383,11 @@ if (( JSON_OUT == 1 )); then
   (
     cd "$WORKTREE_DIR"
     export KOVO_CONTRACT_BASE="$BASE_SHA"
+    export KOVO_GATE_BASE_REF="$BASE_SHA"
     export KOVO_MERGE_STREAM_BASE="$BASE_REF"
+    if [[ "$FORCE_FULL_GATE" == "1" ]]; then
+      export KOVO_GATE_FULL=1
+    fi
     bash -c "$GATE_CMD"
   ) >&2
   gate_rc=$?
@@ -384,7 +397,11 @@ else
   (
     cd "$WORKTREE_DIR"
     export KOVO_CONTRACT_BASE="$BASE_SHA"
+    export KOVO_GATE_BASE_REF="$BASE_SHA"
     export KOVO_MERGE_STREAM_BASE="$BASE_REF"
+    if [[ "$FORCE_FULL_GATE" == "1" ]]; then
+      export KOVO_GATE_FULL=1
+    fi
     bash -c "$GATE_CMD"
   )
   gate_rc=$?
@@ -497,6 +514,24 @@ if [[ "$MERGED_SHA" != "$BASE_SHA" ]]; then
     fi
   else
     git -C "$REPO_ROOT" update-ref -m "merge-stream: Fast-forward ${STREAM_REF:-$BASE_REF}" "refs/heads/${BASE_REF}" "$MERGED_SHA" "$BASE_SHA"
+  fi
+fi
+
+# 6.5 Atomically update host incremental `tsc` seed cache AFTER PASS + fast-forward
+#     so subsequent worktrees and merge-stream runs start warm from latest base.
+if [[ -f "${WORKTREE_DIR}/.kovo/tsc.tsbuildinfo" ]]; then
+  if [[ "$BASE_REF" == "main" || -n "${KOVO_TSC_CACHE_FILE:-}" ]]; then
+    tsc_cache_dir="${KOVO_TSC_CACHE_DIR:-${HOME}/.cache/kovo}"
+    tsc_cache_file="${KOVO_TSC_CACHE_FILE:-${tsc_cache_dir}/main.tsbuildinfo}"
+    if mkdir -p "$(dirname "$tsc_cache_file")" 2>/dev/null; then
+      tsc_cache_tmp="${tsc_cache_file}.tmp.$$"
+      if cp "${WORKTREE_DIR}/.kovo/tsc.tsbuildinfo" "$tsc_cache_tmp" 2>/dev/null \
+         && mv -f "$tsc_cache_tmp" "$tsc_cache_file" 2>/dev/null; then
+        :
+      else
+        rm -f "$tsc_cache_tmp" 2>/dev/null || true
+      fi
+    fi
   fi
 fi
 
