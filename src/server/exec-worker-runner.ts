@@ -57,7 +57,7 @@ import { resolveRunSafetyBudgets } from './run-safety-budgets.ts'
 import { brokerExchanges, type ChainStepTerminalStatus } from './schema.ts'
 import type { Assignment, BoardMessageRow, ChainStep, Run } from './store.ts'
 import { probeDifferential, probeSurface } from './surface-engine.ts'
-import { isDecoupledProofPipelineEnabled, prepareDecoupledExploiterSession } from './exploiter-tools.ts'
+import { isDecoupledOrPtcExploiterEnabled, prepareExploiterSession } from './ptc-exploiter.ts'
 import type { RecordedRequestExchange } from './trace-proof-compiler.ts'
 import { recordProviderUsageTelemetry } from './token-telemetry.ts'
 import { buildWarmPoolPolicy, type WorkerBackend } from './worker-backend.ts'
@@ -2573,7 +2573,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         skills: step.skills,
       })
       const specialistConfig = resolveSpecialistProfile(specialistProfileId)
-      const decoupledPipeline = isDecoupledProofPipelineEnabled()
+      const decoupledPipeline = isDecoupledOrPtcExploiterEnabled()
       const rawScopedHandlers = decoupledPipeline ? handlers : filterHandlersForSpecialist(handlers, specialistConfig)
       const scopedHandlers: WorkerToolHandlers = {}
       for (const [toolName, handlerFn] of Object.entries(rawScopedHandlers)) {
@@ -2792,8 +2792,8 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       const baseLlmHooks = llmRunHooks(this.storage, run.id)
       const allPublicOrigins = [...new Set([...targetOrigins, ...permittedAtAdmission])]
       const runAllowWebSearch = (run as { allowWebSearch?: boolean }).allowWebSearch
-      const decoupledSession = decoupledPipeline ? prepareDecoupledExploiterSession({
-        handlers, storage: this.storage, runId: run.id, assignmentId: job.assignment.id,
+      const decoupledSession = decoupledPipeline ? await prepareExploiterSession({
+        handlers, storage: this.storage, runId: run.id, assignmentId: job.assignment.id, workerSession: session,
         ...(runAllowWebSearch !== undefined ? { runAllowWebSearch } : {}),
         publicOrigins: allPublicOrigins, personasPub, recordedExchanges, mountedRepos,
         userPromptInput: {
@@ -2843,7 +2843,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             specsSummary: stagedSpecs, mountedRepos, preInjectedSkills, alreadyConfirmed: confirmedRefs, unconfirmedHardSurface, detLeads,
             ...(assignmentBrief ? { assignmentBrief } : {}),
           }),
-          ...(decoupledSession ?? {}),
+          ...(decoupledSession?.session ?? {}),
           signal: sessionRotateController.signal,
           budget,
           maxTurns: budget.maxTurns,
@@ -2999,7 +2999,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           throw err
         }
       } finally {
-        clearSupervisionTimers()
+        clearSupervisionTimers(); await decoupledSession?.close?.().catch(() => undefined)
         onProofCallEnter = undefined
         onProofCallExit = undefined
         job.controller.signal.removeEventListener('abort', onOuterJobAbort)

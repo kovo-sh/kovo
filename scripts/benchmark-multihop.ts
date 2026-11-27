@@ -2862,15 +2862,17 @@ export function resolveMultihopWorkerConcurrency(
 /**
  * Construct the per-cell environment for multihop-saas benchmark runs:
  * - Always sets `KOVO_BENCH_MODE=1` to guarantee external web search stays disabled.
- * - Cleanly forwards `KOVO_DECOUPLED_PROOF_PIPELINE` when set so A/B runs are tracked in
- *   `effectiveConfig` and `effectiveConfigHash`.
+ * - Cleanly forwards `KOVO_DECOUPLED_PROOF_PIPELINE` and `KOVO_EXPLOITER_PTC` when set so A/B runs
+ *   are tracked in `effectiveConfig` and `effectiveConfigHash`.
  */
 export function buildMultihopCellEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const decoupled = baseEnv.KOVO_DECOUPLED_PROOF_PIPELINE?.trim()
+  const exploiterPtc = baseEnv.KOVO_EXPLOITER_PTC?.trim()
   return {
     ...baseEnv,
     KOVO_BENCH_MODE: '1',
     ...(decoupled ? { KOVO_DECOUPLED_PROOF_PIPELINE: decoupled } : {}),
+    ...(exploiterPtc ? { KOVO_EXPLOITER_PTC: exploiterPtc } : {}),
   }
 }
 
@@ -3449,6 +3451,9 @@ export async function runCell(
         allowWebSearch: false,
         ...(cellEnv.KOVO_DECOUPLED_PROOF_PIPELINE !== undefined
           ? { decoupledProofPipeline: cellEnv.KOVO_DECOUPLED_PROOF_PIPELINE }
+          : {}),
+        ...(cellEnv.KOVO_EXPLOITER_PTC !== undefined
+          ? { exploiterPtc: cellEnv.KOVO_EXPLOITER_PTC }
           : {}),
       },
     })
