@@ -38,7 +38,8 @@ Tag conventions:
 
 | Trigger | Tag(s) |
 | --- | --- |
-| Release tag `vX.Y.Z` | `vX.Y.Z`, `X.Y`, `latest` (non-prerelease) |
+| Approved release (`release.yml`, `vX.Y.Z`) | `vX.Y.Z`, `X.Y`, `latest` (non-prerelease, unless `publish_latest=false`) |
+| Approved prerelease (`release.yml`, `vX.Y.Z-rc.1`) | `vX.Y.Z-rc.1` |
 | Push to `main` | `edge`, `sha-<7-char>` |
 
 ## `docker-socket-proxy` security model
@@ -70,11 +71,18 @@ docker build -t kovo:local --build-arg KOVO_WORKER_IMAGE=kovo-worker:v4 .
 newgrp docker -c 'bash scripts/docker-compose-smoke.sh'
 ```
 
-## Releasing a versioned tag
+## Releasing a versioned tag (human-approved)
 
-Pushing a `v*` tag builds and publishes multi-arch `kovo` and `kovo-worker` images, updates `latest` (for non-prerelease tags), and attaches provenance attestations:
+Versioned releases are triggered via [`.github/workflows/release.yml`](../.github/workflows/release.yml) and gated by the GitHub **`release`** Protected Environment (Settings → Environments → `release` → Required reviewers). Direct `git push origin v*` tag pushes do **not** publish versioned container images.
 
-```sh
-git tag v0.8.0
-git push origin v0.8.0
-```
+1. Kick off the release workflow from the GitHub Actions UI (**Release Kovo → Run workflow**) or via CLI:
+
+   ```sh
+   gh workflow run release.yml -f version=v0.8.0
+   # Optional: target a specific commit on main or skip updating :latest
+   gh workflow run release.yml -f version=v0.8.0-rc.1 -f ref=main -f publish_latest=false
+   ```
+
+2. The **`prepare`** job validates the semver string, confirms the commit is on `main`, checks that `Verify Kovo` passed on that exact SHA, ensures the tag does not already exist, and posts a release preview in the workflow summary.
+3. The **`approve`** job pauses on the `release` environment until a required reviewer clicks **Review deployments → Approve and deploy**.
+4. Once approved, the workflow builds and publishes multi-arch `kovo` and `kovo-worker` images with SBOMs and provenance attestations, pushes the annotated `vX.Y.Z` git tag, and creates the GitHub Release with the published manifest digests.

@@ -3,9 +3,30 @@ name: Publish Docker Images
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
+  workflow_call:
+    inputs:
+      release_tag:
+        description: 'Semver release tag to publish (e.g. v0.8.0 or v0.8.0-rc.1)'
+        required: true
+        type: string
+      ref:
+        description: 'Git commit SHA to checkout and build'
+        required: true
+        type: string
+      publish_latest:
+        description: 'Whether to also tag and push :latest for non-prerelease tags'
+        required: false
+        default: true
+        type: boolean
+    outputs:
+      worker_digest:
+        description: 'Published multi-arch manifest digest for kovo-worker'
+        value: ${{ jobs.merge-manifests.outputs.worker_digest }}
+      kovo_digest:
+        description: 'Published multi-arch manifest digest for kovo'
+        value: ${{ jobs.merge-manifests.outputs.kovo_digest }}
 
 permissions:
   contents: read
@@ -39,7 +60,9 @@ jobs:
         run: |
           set -euo pipefail
           owner="$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          worker_source_hash="$(git rev-parse --verify HEAD:worker)"
           echo "owner=${owner}" >> "$GITHUB_OUTPUT"
+          echo "worker_source_hash=${worker_source_hash}" >> "$GITHUB_OUTPUT"
           echo "worker_image=ghcr.io/${owner}/kovo-worker:pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
           echo "kovo_image=ghcr.io/${owner}/kovo:pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
 
@@ -54,6 +77,8 @@ jobs:
           platforms: linux/amd64
           push: false
           load: true
+          build-args: |
+            KOVO_WORKER_SOURCE_HASH=${{ steps.prep.outputs.worker_source_hash }}
           tags: ${{ steps.prep.outputs.worker_image }}
           cache-from: type=gha,scope=kovo-worker-amd64
           cache-to: type=gha,mode=max,scope=kovo-worker-amd64
@@ -127,13 +152,57 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref || '' }}
 
-      - name: Prepare owner
+      - name: Prepare owner, labels, and worker source hash
         id: prep
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_PUBLISH_LATEST: ${{ inputs.publish_latest }}
         run: |
           set -euo pipefail
           owner="$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
-          echo "owner=${owner}" >> "$GITHUB_OUTPUT"
+          git_sha="$(git rev-parse HEAD)"
+          short_sha="${git_sha:0:7}"
+          worker_source_hash="$(git rev-parse --verify HEAD:worker)"
+          is_release="false"
+          release_tag="unused"
+          minor_tag="unused"
+          enable_minor="false"
+          enable_latest="false"
+          oci_version="sha-${short_sha}"
+
+          if [[ -n "$INPUT_RELEASE_TAG" ]]; then
+            if [[ ! "$INPUT_RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+              echo "Invalid release_tag: ${INPUT_RELEASE_TAG}" >&2
+              exit 1
+            fi
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+            prerelease="${BASH_REMATCH[4]}"
+            is_release="true"
+            release_tag="$INPUT_RELEASE_TAG"
+            oci_version="$INPUT_RELEASE_TAG"
+            if [[ -z "$prerelease" ]]; then
+              minor_tag="${major}.${minor}"
+              enable_minor="true"
+              if [[ "$INPUT_PUBLISH_LATEST" == "true" ]]; then
+                enable_latest="true"
+              fi
+            fi
+          fi
+
+          {
+            echo "owner=${owner}"
+            echo "git_sha=${git_sha}"
+            echo "oci_version=${oci_version}"
+            echo "worker_source_hash=${worker_source_hash}"
+            echo "is_release=${is_release}"
+            echo "release_tag=${release_tag}"
+            echo "minor_tag=${minor_tag}"
+            echo "enable_minor=${enable_minor}"
+            echo "enable_latest=${enable_latest}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -150,12 +219,15 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-worker
+          labels: |
+            org.opencontainers.image.revision=${{ steps.prep.outputs.git_sha }}
+            org.opencontainers.image.version=${{ steps.prep.outputs.oci_version }}
           tags: |
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
-            type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern=v{{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+            type=raw,value=edge,enable=${{ steps.prep.outputs.is_release != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=short,enable=${{ steps.prep.outputs.is_release != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ steps.prep.outputs.release_tag }},enable=${{ steps.prep.outputs.is_release == 'true' }}
+            type=raw,value=${{ steps.prep.outputs.minor_tag }},enable=${{ steps.prep.outputs.enable_minor == 'true' }}
+            type=raw,value=latest,enable=${{ steps.prep.outputs.enable_latest == 'true' }}
 
       - name: Build and push kovo-worker (${{ matrix.platform }}) by digest
         id: build
@@ -164,6 +236,8 @@ jobs:
           context: ./worker
           file: ./worker/Dockerfile
           platforms: ${{ matrix.platform }}
+          build-args: |
+            KOVO_WORKER_SOURCE_HASH=${{ steps.prep.outputs.worker_source_hash }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-worker,push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=kovo-worker-${{ matrix.arch }}
@@ -213,19 +287,58 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref || '' }}
 
-      - name: Prepare owner and worker image reference
+      - name: Prepare owner, labels, and worker image reference
         id: prep
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_PUBLISH_LATEST: ${{ inputs.publish_latest }}
         run: |
           set -euo pipefail
           owner="$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
-          short_sha="${GITHUB_SHA::7}"
-          echo "owner=${owner}" >> "$GITHUB_OUTPUT"
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "worker_image=ghcr.io/${owner}/kovo-worker:${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "worker_image=ghcr.io/${owner}/kovo-worker:sha-${short_sha}" >> "$GITHUB_OUTPUT"
+          git_sha="$(git rev-parse HEAD)"
+          short_sha="${git_sha:0:7}"
+          is_release="false"
+          release_tag="unused"
+          minor_tag="unused"
+          enable_minor="false"
+          enable_latest="false"
+          oci_version="sha-${short_sha}"
+          worker_image="ghcr.io/${owner}/kovo-worker:sha-${short_sha}"
+
+          if [[ -n "$INPUT_RELEASE_TAG" ]]; then
+            if [[ ! "$INPUT_RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+              echo "Invalid release_tag: ${INPUT_RELEASE_TAG}" >&2
+              exit 1
+            fi
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+            prerelease="${BASH_REMATCH[4]}"
+            is_release="true"
+            release_tag="$INPUT_RELEASE_TAG"
+            oci_version="$INPUT_RELEASE_TAG"
+            worker_image="ghcr.io/${owner}/kovo-worker:${INPUT_RELEASE_TAG}"
+            if [[ -z "$prerelease" ]]; then
+              minor_tag="${major}.${minor}"
+              enable_minor="true"
+              if [[ "$INPUT_PUBLISH_LATEST" == "true" ]]; then
+                enable_latest="true"
+              fi
+            fi
           fi
+
+          {
+            echo "owner=${owner}"
+            echo "git_sha=${git_sha}"
+            echo "oci_version=${oci_version}"
+            echo "worker_image=${worker_image}"
+            echo "is_release=${is_release}"
+            echo "release_tag=${release_tag}"
+            echo "minor_tag=${minor_tag}"
+            echo "enable_minor=${enable_minor}"
+            echo "enable_latest=${enable_latest}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -242,12 +355,15 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo
+          labels: |
+            org.opencontainers.image.revision=${{ steps.prep.outputs.git_sha }}
+            org.opencontainers.image.version=${{ steps.prep.outputs.oci_version }}
           tags: |
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
-            type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern=v{{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+            type=raw,value=edge,enable=${{ steps.prep.outputs.is_release != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=short,enable=${{ steps.prep.outputs.is_release != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ steps.prep.outputs.release_tag }},enable=${{ steps.prep.outputs.is_release == 'true' }}
+            type=raw,value=${{ steps.prep.outputs.minor_tag }},enable=${{ steps.prep.outputs.enable_minor == 'true' }}
+            type=raw,value=latest,enable=${{ steps.prep.outputs.enable_latest == 'true' }}
 
       - name: Build and push kovo (${{ matrix.platform }}) by digest
         id: build
@@ -286,13 +402,51 @@ jobs:
     needs: [build-worker, build-kovo]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      worker_digest: ${{ steps.merge-worker.outputs.digest }}
+      kovo_digest: ${{ steps.merge-kovo.outputs.digest }}
     steps:
-      - name: Prepare owner
+      - name: Prepare owner and release tags
         id: prep
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_PUBLISH_LATEST: ${{ inputs.publish_latest }}
         run: |
           set -euo pipefail
           owner="$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
-          echo "owner=${owner}" >> "$GITHUB_OUTPUT"
+          is_release="false"
+          release_tag="unused"
+          minor_tag="unused"
+          enable_minor="false"
+          enable_latest="false"
+
+          if [[ -n "$INPUT_RELEASE_TAG" ]]; then
+            if [[ ! "$INPUT_RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+              echo "Invalid release_tag: ${INPUT_RELEASE_TAG}" >&2
+              exit 1
+            fi
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+            prerelease="${BASH_REMATCH[4]}"
+            is_release="true"
+            release_tag="$INPUT_RELEASE_TAG"
+            if [[ -z "$prerelease" ]]; then
+              minor_tag="${major}.${minor}"
+              enable_minor="true"
+              if [[ "$INPUT_PUBLISH_LATEST" == "true" ]]; then
+                enable_latest="true"
+              fi
+            fi
+          fi
+
+          {
+            echo "owner=${owner}"
+            echo "is_release=${is_release}"
+            echo "release_tag=${release_tag}"
+            echo "minor_tag=${minor_tag}"
+            echo "enable_minor=${enable_minor}"
+            echo "enable_latest=${enable_latest}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Download kovo-worker digests
         uses: actions/download-artifact@v4
@@ -324,11 +478,11 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-worker
           tags: |
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
-            type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern=v{{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+            type=raw,value=edge,enable=${{ steps.prep.outputs.is_release != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=short,enable=${{ steps.prep.outputs.is_release != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ steps.prep.outputs.release_tag }},enable=${{ steps.prep.outputs.is_release == 'true' }}
+            type=raw,value=${{ steps.prep.outputs.minor_tag }},enable=${{ steps.prep.outputs.enable_minor == 'true' }}
+            type=raw,value=latest,enable=${{ steps.prep.outputs.enable_latest == 'true' }}
 
       - name: Create and push kovo-worker multi-arch manifest
         id: merge-worker
@@ -368,11 +522,11 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo
           tags: |
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
-            type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern=v{{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+            type=raw,value=edge,enable=${{ steps.prep.outputs.is_release != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=short,enable=${{ steps.prep.outputs.is_release != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ steps.prep.outputs.release_tag }},enable=${{ steps.prep.outputs.is_release == 'true' }}
+            type=raw,value=${{ steps.prep.outputs.minor_tag }},enable=${{ steps.prep.outputs.enable_minor == 'true' }}
+            type=raw,value=latest,enable=${{ steps.prep.outputs.enable_latest == 'true' }}
 
       - name: Create and push kovo multi-arch manifest
         id: merge-kovo

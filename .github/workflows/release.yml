@@ -1,0 +1,307 @@
+name: Release Kovo
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semver release tag to create and publish (e.g. v0.8.0 or v0.8.0-rc.1)'
+        required: true
+        type: string
+      ref:
+        description: 'Branch or commit SHA on main to release (default: main)'
+        required: false
+        default: 'main'
+        type: string
+      publish_latest:
+        description: 'Also update :latest tag and mark GitHub Release as latest (forced false for prereleases)'
+        required: false
+        default: true
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate release candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+      sha: ${{ steps.validate.outputs.sha }}
+      short_sha: ${{ steps.validate.outputs.short_sha }}
+      is_prerelease: ${{ steps.validate.outputs.is_prerelease }}
+      publish_latest: ${{ steps.validate.outputs.publish_latest }}
+      minor_tag: ${{ steps.validate.outputs.minor_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate version, commit ancestry, tag uniqueness, and Verify Kovo CI
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_PUBLISH_LATEST: ${{ inputs.publish_latest }}
+        run: |
+          set -euo pipefail
+
+          version="$(printf '%s' "$INPUT_VERSION" | xargs)"
+          ref="$(printf '%s' "$INPUT_REF" | xargs)"
+          [[ -n "$ref" ]] || ref="main"
+
+          if [[ ! "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "::error::Invalid version '${version}'. Expected strict semver with leading 'v' (e.g. v0.8.0 or v0.8.0-rc.1)."
+            exit 1
+          fi
+
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          prerelease="${BASH_REMATCH[4]}"
+
+          if [[ -n "$prerelease" ]]; then
+            is_prerelease="true"
+            publish_latest="false"
+            minor_tag=""
+          else
+            is_prerelease="false"
+            minor_tag="${major}.${minor}"
+            if [[ "$INPUT_PUBLISH_LATEST" == "true" ]]; then
+              publish_latest="true"
+            else
+              publish_latest="false"
+            fi
+          fi
+
+          git fetch --tags --prune origin
+
+          if [[ "$ref" != refs/* ]] && git rev-parse --verify "refs/remotes/origin/${ref}^{commit}" >/dev/null 2>&1; then
+            sha="$(git rev-parse --verify "refs/remotes/origin/${ref}^{commit}")"
+          elif git rev-parse --verify "${ref}^{commit}" >/dev/null 2>&1; then
+            sha="$(git rev-parse --verify "${ref}^{commit}")"
+          else
+            echo "::error::Unable to resolve ref '${ref}' to a commit."
+            exit 1
+          fi
+          short_sha="${sha:0:7}"
+
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo "::error::Commit ${sha} (from ref '${ref}') is not an ancestor of origin/main. Only commits merged to main can be released."
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${version}" >/dev/null 2>&1 \
+            || git ls-remote --exit-code --tags origin "refs/tags/${version}" >/dev/null 2>&1; then
+            echo "::error::Tag '${version}' already exists on origin. Choose a new semver version."
+            exit 1
+          fi
+
+          verify_url="$(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/verify.yml/runs?head_sha=${sha}&per_page=20" \
+              --jq '[.workflow_runs[] | select(.status == "completed" and .conclusion == "success")] | .[0].html_url // ""'
+          )"
+          if [[ -z "$verify_url" ]]; then
+            echo "::error::No successful 'Verify Kovo' (verify.yml) run found for commit ${sha}. Wait for main CI to turn green before releasing."
+            exit 1
+          fi
+
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          subject="$(git show -s --format='%s' "$sha")"
+          author="$(git show -s --format='%an <%ae>' "$sha")"
+          prev_tag="$(git describe --tags --abbrev=0 --match 'v*' "$sha" 2>/dev/null || true)"
+
+          tags_list="\`${version}\`"
+          if [[ -n "$minor_tag" ]]; then
+            tags_list="${tags_list}, \`${minor_tag}\`"
+          fi
+          if [[ "$publish_latest" == "true" ]]; then
+            tags_list="${tags_list}, \`latest\`"
+          fi
+
+          {
+            echo "## Release candidate ready for approval: \`${version}\`"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Version | \`${version}\` |"
+            echo "| Prerelease | \`${is_prerelease}\` |"
+            echo "| Updates \`:latest\` | \`${publish_latest}\` |"
+            echo "| Commit | \`${sha}\` (\`${short_sha}\`) |"
+            echo "| Subject | ${subject} |"
+            echo "| Author | ${author} |"
+            echo "| Verify Kovo CI | [Passing run](${verify_url}) |"
+            echo "| Container tags | ${tags_list} |"
+            echo "| Images | \`ghcr.io/${owner}/kovo\`, \`ghcr.io/${owner}/kovo-worker\` |"
+            echo ""
+            if [[ -n "$prev_tag" ]]; then
+              echo "### Commits since \`${prev_tag}\`"
+              echo '```text'
+              git log --oneline "${prev_tag}..${sha}" | head -n 50
+              echo '```'
+            else
+              echo "### Recent commits (initial release)"
+              echo '```text'
+              git log --oneline -n 20 "$sha"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "version=${version}"
+            echo "sha=${sha}"
+            echo "short_sha=${short_sha}"
+            echo "is_prerelease=${is_prerelease}"
+            echo "publish_latest=${publish_latest}"
+            echo "minor_tag=${minor_tag}"
+          } >> "$GITHUB_OUTPUT"
+
+  approve:
+    name: Human release approval
+    needs: [prepare]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Record approval
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          PUBLISH_LATEST: ${{ needs.prepare.outputs.publish_latest }}
+        run: |
+          set -euo pipefail
+          echo "Release ${RELEASE_VERSION} (${RELEASE_SHA}) approved via protected 'release' environment."
+          {
+            echo "## Approval granted"
+            echo ""
+            echo "- **Version:** \`${RELEASE_VERSION}\`"
+            echo "- **Commit:** \`${RELEASE_SHA}\`"
+            echo "- **Updates \`:latest\`:** \`${PUBLISH_LATEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-containers:
+    name: Build & publish multi-arch containers
+    needs: [prepare, approve]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      release_tag: ${{ needs.prepare.outputs.version }}
+      ref: ${{ needs.prepare.outputs.sha }}
+      publish_latest: ${{ needs.prepare.outputs.publish_latest == 'true' }}
+
+  tag-and-release:
+    name: Push git tag & publish GitHub Release
+    needs: [prepare, approve, publish-containers]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Create and push git tag
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+
+          existing_sha="$(git rev-list -n 1 "refs/tags/${RELEASE_VERSION}" 2>/dev/null || true)"
+          if [[ -n "$existing_sha" ]]; then
+            if [[ "$existing_sha" == "$RELEASE_SHA" ]]; then
+              echo "Tag ${RELEASE_VERSION} already points to ${RELEASE_SHA}; continuing."
+              exit 0
+            fi
+            echo "::error::Tag ${RELEASE_VERSION} already exists and points to ${existing_sha} (expected ${RELEASE_SHA})."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$RELEASE_VERSION" "$RELEASE_SHA" -m "Release ${RELEASE_VERSION}"
+          git push origin "refs/tags/${RELEASE_VERSION}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          IS_PRERELEASE: ${{ needs.prepare.outputs.is_prerelease }}
+          PUBLISH_LATEST: ${{ needs.prepare.outputs.publish_latest }}
+          KOVO_DIGEST: ${{ needs.publish-containers.outputs.kovo_digest }}
+          WORKER_DIGEST: ${{ needs.publish-containers.outputs.worker_digest }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+
+          if gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
+            release_url="$(gh release view "$RELEASE_VERSION" --json url --jq .url)"
+            echo "GitHub Release ${RELEASE_VERSION} already exists: ${release_url}"
+            exit 0
+          fi
+
+          cat > /tmp/release-notes.md <<EOF
+          ## Container Images
+
+          Multi-arch (\`linux/amd64\`, \`linux/arm64\`) images published to GHCR with SBOMs and build provenance attestations:
+
+          | Image | Reference | Multi-arch Manifest Digest |
+          | --- | --- | --- |
+          | \`kovo\` | \`ghcr.io/${owner}/kovo:${RELEASE_VERSION}\` | \`${KOVO_DIGEST}\` |
+          | \`kovo-worker\` | \`ghcr.io/${owner}/kovo-worker:${RELEASE_VERSION}\` | \`${WORKER_DIGEST}\` |
+
+          ### Quick start
+
+          \`\`\`sh
+          KOVO_VERSION=${RELEASE_VERSION} docker compose pull
+          KOVO_VERSION=${RELEASE_VERSION} docker compose up
+          \`\`\`
+
+          ---
+          EOF
+
+          ARGS=(
+            "$RELEASE_VERSION"
+            --verify-tag
+            --title "$RELEASE_VERSION"
+            --notes-file /tmp/release-notes.md
+            --generate-notes
+          )
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            ARGS+=(--prerelease --latest=false)
+          elif [[ "$PUBLISH_LATEST" == "true" ]]; then
+            ARGS+=(--latest=true)
+          else
+            ARGS+=(--latest=false)
+          fi
+
+          release_url="$(gh release create "${ARGS[@]}")"
+          echo "Published GitHub Release: ${release_url}"
+          {
+            echo "## Release published: \`${RELEASE_VERSION}\`"
+            echo ""
+            echo "- **GitHub Release:** ${release_url}"
+            echo "- **Commit:** \`${RELEASE_SHA}\`"
+            echo "- **kovo digest:** \`${KOVO_DIGEST}\`"
+            echo "- **kovo-worker digest:** \`${WORKER_DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
