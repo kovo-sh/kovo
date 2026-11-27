@@ -97,6 +97,8 @@ import { isSensitiveRepoEntry, isSensitiveRepoRelativePath } from './safety-prim
 import { canaries, findings, type ReplayProofReceiptRow } from './schema.ts'
 
 export { isSensitiveRepoEntry, isSensitiveRepoRelativePath }
+import { classifyCompositeChainOverlap, compositeChainOriginsEquivalent, compositeChainRichnessScore, extractCompositeChainDedupSignature, extractRowCompositeSignature, isGenericSharedAuthOrUtilityEndpoint, matchSubstantialUpstreamCompositeOverlap, sortChainDuplicateRows, type CompositeChainDedupSignature } from './store-findings.ts'
+export { isGenericSharedAuthOrUtilityEndpoint }
 import {
   assessmentAssignments,
   InvariantError,
@@ -1095,16 +1097,6 @@ function extractExistingFindingEndpointsForSupersession(
   const compVer = (ev?.compositeVerification ?? proofReceiptObj?.compositeVerification) as CompositeReceiptVerification | undefined
   const fallback = parseSupersessionEndpoint(row.finding.origin, null, ev?.terminalEndpoint ?? compVer?.terminalEndpoint)
   return fallback ? [fallback] : []
-}
-
-const SHARED_AUTH_UTILITY_ROUTE_RE =
-  /^(?:\/(?:api|v\d+)(?:\/v\d+)?)?(?:\/(?:login|logout|me|health|healthz|token|session)|\/oauth\/token|\/auth(?:\/.*)?)$/i
-
-export function isGenericSharedAuthOrUtilityEndpoint(normalizedEndpoint: string): boolean {
-  const trimmed = normalizedEndpoint.trim()
-  if (!trimmed) return false
-  const clean = trimmed.length > 1 ? trimmed.replace(/\/+$/, '') : trimmed
-  return SHARED_AUTH_UTILITY_ROUTE_RE.test(clean)
 }
 
 function supersessionEndpointsMatchExact(
@@ -2703,6 +2695,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         })
       : null
     const fingerprintHash = computedFingerprint?.hash
+    const incomingCompositeSig = cleanCompositeBundle ? extractCompositeChainDedupSignature({ origin, compositeReceipt: cleanCompositeBundle.receipt, compositeVerification: cleanCompositeBundle.verification, hostExchanges: hostExchangeById }) : null
     const primaryDup = this.storage.findDuplicateChainFinding(run.id, run.goalRevision, {
       origin,
       cwe: attribution.cwe,
@@ -2711,6 +2704,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       ...(proofTarget.endpoint ? { endpoint: proofTarget.endpoint } : {}),
       ...(proofTarget.method ? { method: proofTarget.method } : {}),
       ...(fingerprintHash ? { fingerprintHash } : {}),
+      ...(incomingCompositeSig ? { compositeSignature: incomingCompositeSig } : {}),
     })
     const existingDup = primaryDup ?? this.findCorroboratingAgentProofFinding(run, {
       origin,
@@ -2719,6 +2713,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       normalizedEndpoint: proofTarget.normalizedEndpoint,
       method: proofTarget.method,
       terminalOracleFamily: proofTarget.terminalOracleFamily,
+      compositeSignature: incomingCompositeSig,
     })
     const findingId = existingDup?.id ?? randomUUID()
     const effectiveFingerprintHash = existingDup?.fingerprintHash ?? existingDup?.finding.fingerprintHash ?? fingerprintHash
@@ -2727,12 +2722,9 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       ? this.storage.listReplaySpecsForFinding(run.id, existingDup.id).find(s => s.id === existingCanonicalSpecId)
       : undefined
     const existingHasComposite = Boolean(existingDup && existingRowHasCompositeProof(existingDup, existingSpecRow))
-    const reuseExistingConfirmedSpec = Boolean(
-      existingDup
-      && existingDup.finding.status === 'confirmed'
-      && existingCanonicalSpecId
-      && (!cleanCompositeBundle || existingHasComposite),
-    )
+    const incomingUpgradesComposite = Boolean(
+      cleanCompositeBundle && existingDup && compositeChainRichnessScore(incomingCompositeSig) > compositeChainRichnessScore(extractRowCompositeSignature(existingDup, existingSpecRow)))
+    const reuseExistingConfirmedSpec = Boolean(existingDup && existingDup.finding.status === 'confirmed' && existingCanonicalSpecId && (!cleanCompositeBundle || (existingHasComposite && !incomingUpgradesComposite)))
 
     let canonicalSpecId: string
     if (reuseExistingConfirmedSpec) {
@@ -2814,8 +2806,8 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
           findingKind: 'multi_step_chain',
           ...(effectiveFingerprintHash ? { fingerprintHash: effectiveFingerprintHash } : {}),
           replaySpecId: canonicalSpecId,
-          exchangeIds: incomingExchangeIds,
-          evidenceIds: [artifact.id],
+          exchangeIds: existingDup ? [...new Set([...(existingDup.finding.exchangeIds ?? []), ...incomingExchangeIds])] : incomingExchangeIds,
+          evidenceIds: existingDup ? [...new Set([...existingDup.finding.evidenceIds, artifact.id])] : [artifact.id],
           ...(cleanCompositeBundle ? {
             evidence: {
               compositeReceipt: cleanCompositeBundle.receipt,
@@ -2924,11 +2916,10 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     const allSpecs = this.storage.listReplaySpecs(run.id)
     const specById = new Map(allSpecs.map(s => [s.id, s]))
     const specByFindingId = new Map<string, ReplaySpecRow>()
-    for (const spec of allSpecs) {
-      if (!specByFindingId.has(spec.findingId)) specByFindingId.set(spec.findingId, spec)
-    }
+    for (const spec of allSpecs) if (!specByFindingId.has(spec.findingId)) specByFindingId.set(spec.findingId, spec)
 
     const compositeOracleFamily = verification?.terminalOracleFamily ?? receipt.terminalImpact?.oracleFamily ?? null
+    const upstreamNonGeneric = upstreamEndpoints.filter(up => !isGenericSharedAuthOrUtilityEndpoint(up.normalizedEndpoint))
     const supersededIds: string[] = []
     for (const row of rows) {
       if (row.id === newFindingId) continue
@@ -2949,31 +2940,39 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         }
       }
 
-      // 1) Require verified signed upstream transcript match with exact origin & explicit HTTP method
-      // (or direct signed exchangeId overlap when endpoint metadata is absent).
-      const matchedUpstreamSpecs: SupersessionEndpointSpec[] = []
-      if (earlierEndpoints.length > 0) {
-        if (!isEndpointSubsetOfUpstream(earlierEndpoints, upstreamEndpoints)) continue
-        for (const ep of earlierEndpoints) {
-          if (isGenericSharedAuthOrUtilityEndpoint(ep.normalizedEndpoint)) continue
-          for (const up of upstreamEndpoints) {
-            if (supersessionEndpointsMatchExact(ep, up)) matchedUpstreamSpecs.push(up)
-          }
-        }
-      } else if (directMatchedUpstream.length > 0) {
-        matchedUpstreamSpecs.push(...directMatchedUpstream)
-      } else {
-        continue
-      }
-      if (!matchedUpstreamSpecs.length) continue
-
-      // 2) Require matching vulnClass/CWE (or an explicitly declared precondition class on the matched upstream hop).
       const findingObj = row.finding as Finding & { evidence?: Record<string, unknown> }
       const ev = findingObj.evidence && typeof findingObj.evidence === 'object' ? findingObj.evidence : undefined
       const proofReceiptObj = linkedSpec?.proofReceipt && typeof linkedSpec.proofReceipt === 'object'
         ? linkedSpec.proofReceipt as unknown as Record<string, unknown>
         : undefined
       const earlierCompReceipt = (ev?.compositeReceipt ?? proofReceiptObj?.compositeReceipt) as CompositeProofReceipt | undefined
+
+      // 1) Require verified signed upstream transcript match with exact origin & explicit HTTP method
+      // (or direct signed exchangeId overlap when endpoint metadata is absent).
+      const matchedUpstreamSpecs: SupersessionEndpointSpec[] = []
+      if (earlierEndpoints.length > 0 && isEndpointSubsetOfUpstream(earlierEndpoints, upstreamEndpoints)) {
+        for (const ep of earlierEndpoints) {
+          if (isGenericSharedAuthOrUtilityEndpoint(ep.normalizedEndpoint)) continue
+          for (const up of upstreamEndpoints) {
+            if (supersessionEndpointsMatchExact(ep, up)) matchedUpstreamSpecs.push(up)
+          }
+        }
+      } else if (earlierEndpoints.length === 0 && directMatchedUpstream.length > 0) {
+        matchedUpstreamSpecs.push(...directMatchedUpstream)
+      } else {
+        matchedUpstreamSpecs.push(...matchSubstantialUpstreamCompositeOverlap({
+          earlierCompReceipt,
+          incomingHopCount: receipt.hops.length,
+          earlierOrigin: row.finding.origin,
+          earlierEndpoints,
+          upstreamNonGeneric,
+          endpointsMatchExact: supersessionEndpointsMatchExact,
+        }))
+      }
+      if (!matchedUpstreamSpecs.length) continue
+
+      // 2) Always require matching vulnClass/CWE (or an explicitly declared precondition class on
+      // the matched upstream hop) so distinct-class findings are never hidden behind a deeper chain.
       const earlierVulnClass = earlierCompReceipt?.terminalVulnClass
         ?? linkedSpec?.proofReceipt?.receipt?.vulnClass
         ?? persistedAgentScriptOf(linkedSpec?.spec)?.envelope.vulnClass
@@ -3006,15 +3005,13 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
   private findCorroboratingAgentProofFinding(
     run: Run,
     candidate: {
-      origin: string
-      cwe: string
-      category: TaxonomyCategory
-      normalizedEndpoint: string | null
-      method: string | null
-      terminalOracleFamily: string | null
+      origin: string; cwe: string; category: TaxonomyCategory
+      normalizedEndpoint: string | null; method: string | null; terminalOracleFamily: string | null
+      compositeSignature?: CompositeChainDedupSignature | null
     },
   ): typeof findings.$inferSelect | undefined {
-    if (!candidate.normalizedEndpoint) return undefined
+    const hasCompositeSig = Boolean(candidate.compositeSignature && candidate.compositeSignature.hopCount >= 2)
+    if (!candidate.normalizedEndpoint && !hasCompositeSig) return undefined
     const rows = this.storage.db.select().from(findings).where(and(
       eq(findings.runId, run.id),
       eq(findings.goalRevision, run.goalRevision),
@@ -3029,24 +3026,27 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       if (!specByFindingId.has(spec.findingId)) specByFindingId.set(spec.findingId, spec)
     }
 
+    const sigByRowId = new Map<string, CompositeChainDedupSignature | null>()
     const matches = rows.filter(row => {
-      const linkedSpec = (row.replaySpecId ? specById.get(row.replaySpecId) : undefined)
-        ?? specByFindingId.get(row.id)
+      if (row.supersededByFindingId || row.finding.supersededByFindingId) return false
+      const linkedSpec = (row.replaySpecId ? specById.get(row.replaySpecId) : undefined) ?? specByFindingId.get(row.id)
       const meta = extractExistingFindingTargetMeta(row, linkedSpec)
-      if (!meta.normalizedEndpoint || meta.normalizedEndpoint !== candidate.normalizedEndpoint) return false
-      if (!methodsCompatibleForAgentProofDedupe(candidate.method, meta.method)) return false
-      if (!vulnClassesEquivalentForAgentProofDedupe(
-        candidate,
-        { cwe: row.finding.cwe, category: row.finding.category, terminalOracleFamily: meta.terminalOracleFamily },
-      )) return false
       const existingOrigins = [row.finding.origin, ...(row.sourceOrigins ?? [])]
-      return existingOrigins.some(existingOrigin =>
-        originsEquivalentForAgentProofDedupe(candidate.origin, existingOrigin, candidate.normalizedEndpoint!),
-      )
+      const vulnEquiv = vulnClassesEquivalentForAgentProofDedupe(candidate, { cwe: row.finding.cwe, category: row.finding.category, terminalOracleFamily: meta.terminalOracleFamily })
+      const existingSig = hasCompositeSig ? extractRowCompositeSignature(row, linkedSpec) : null
+      if (hasCompositeSig) sigByRowId.set(row.id, existingSig)
+      const bothMultiHopComposite = Boolean(hasCompositeSig && existingSig && existingSig.hopCount >= 2)
+      if (!bothMultiHopComposite && candidate.normalizedEndpoint && meta.normalizedEndpoint === candidate.normalizedEndpoint && methodsCompatibleForAgentProofDedupe(candidate.method, meta.method) && vulnEquiv) {
+        return existingOrigins.some(existingOrigin => originsEquivalentForAgentProofDedupe(candidate.origin, existingOrigin, candidate.normalizedEndpoint!))
+      }
+      if (bothMultiHopComposite && candidate.compositeSignature && existingSig) {
+        const originsEquivalent = existingOrigins.some(existingOrigin => compositeChainOriginsEquivalent(candidate.origin, existingOrigin))
+        return classifyCompositeChainOverlap(candidate.compositeSignature, existingSig, { originsEquivalent, vulnClassesEquivalent: vulnEquiv }) === 'collapse_in_place'
+      }
+      return false
     })
     if (!matches.length) return undefined
-    matches.sort((a, b) => FINDING_STATUS_PRIORITY[a.finding.status] - FINDING_STATUS_PRIORITY[b.finding.status])
-    return matches[0]
+    return sortChainDuplicateRows(matches, FINDING_STATUS_PRIORITY, r => sigByRowId.get(r.id) ?? extractRowCompositeSignature(r, (r.replaySpecId ? specById.get(r.replaySpecId) : undefined) ?? specByFindingId.get(r.id)))[0]
   }
 
 
