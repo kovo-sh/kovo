@@ -29,7 +29,7 @@ import {
   VERIFY_RPC_TOKEN_ENV,
   VerifyRpcServer,
 } from '../src/server/verify-rpc.ts'
-import { VerifyContext } from '../worker/kovo_verify/kovo_verify.ts'
+import { normalizeCompositeReceipt, VerifyContext } from '../worker/kovo_verify/kovo_verify.ts'
 
 process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
@@ -563,4 +563,179 @@ test('live VerifyRpcServer: dual_tenant_abac multi-hop value_binding chains synt
   chRead.recordHop({ hopId: 'r_1', target: 'POST /api/v1/permissions/prime', exchangeIds: [s1.exchangeId], producedCapabilities: [tokCap], claimedDelta: 'Mint.' })
   chRead.recordHop({ hopId: 'r_2', target: 'GET /api/v1/reports/export', exchangeIds: [s2.exchangeId], consumedCapabilities: [tokCap], claimedDelta: 'Read.' })
   assert.equal(chRead.build({ terminalHopId: 'r_2', terminalExchange: s2 }).terminalImpact.oracleInput, undefined)
+})
+
+test('ChainBuilder and normalizeCompositeReceipt normalize hyphenated/whitespace terminalVulnClass to canonical snake_case', async t => {
+  const { origin, ctx } = await startFixture(t, 'run-optd-sdk-vuln-norm')
+
+  for (const [raw, expected] of [
+    ['broken-access-control', 'broken_access_control'],
+    ['Privilege-Escalation', 'privilege_escalation'],
+    ['  dual-tenant-abac  ', 'dual_tenant_abac'],
+    ['economic conservation', 'economic_conservation'],
+    ['over-refund', 'over_refund'],
+  ] as const) {
+    const ch = ctx.chain(`norm-${expected}`, raw)
+    assert.equal(ch.terminalVulnClass, expected)
+    ch.recordHop({ hopId: 'hop_1', target: 'GET /api/v1/reports/export', exchangeIds: ['ex_1'], claimedDelta: 'Probe.' })
+    assert.equal(ch.build().terminalVulnClass, expected)
+
+    const normDirect = normalizeCompositeReceipt({
+      chainId: `norm-direct-${expected}`,
+      terminalVulnClass: raw,
+      hops: [{ hopId: 'hop_1', target: 'GET /api/v1/reports/export', exchangeIds: ['ex_1'], claimedDelta: 'Probe.' }],
+      terminalImpact: { terminalHopId: 'hop_1' },
+    }, origin).receipt as Record<string, unknown>
+    assert.equal(normDirect.terminalVulnClass, expected)
+
+    const normWrapped = normalizeCompositeReceipt({
+      receipt: { chainId: `norm-wrap-${expected}`, terminalVulnClass: raw, hops: [] },
+    }, origin).receipt as Record<string, unknown>
+    assert.equal(normWrapped.terminalVulnClass, expected)
+  }
+
+  // Live VerifyRpcServer confirmation with hyphenated "dual-tenant-abac"
+  const chLive = ctx.chain('chain-optd-hyphen-live', 'dual-tenant-abac')
+  const ctrl = await chLive.control('GET /api/v1/reports/export', { as: 'dual_member' })
+  assert.equal(ctrl.status, 403)
+  await chLive.step('POST /api/v1/permissions/prime', { hopId: 'step_1', as: 'dual_member', claimedDelta: 'Prime cache.' })
+  const s2 = await chLive.step('GET /api/v1/reports/export', { hopId: 'step_2', as: 'dual_member', claimedDelta: 'Read tenant-b.' })
+  assert.equal(s2.status, 200)
+  const proved = await chLive.prove({ terminalHopId: 'step_2', terminalExchange: s2, claimedImpact: 'Hyphenated dual-tenant-abac confirmed.' })
+  assert.equal(proved.confirmed, true, `Expected hyphenated dual-tenant-abac to confirm: ${JSON.stringify(proved)}`)
+})
+
+test('live VerifyRpcServer: ch.race hopId alignment (explicit hopId, 3-arg hopId+target+opts, value_binding auto-edge, and terminalHopId "race" alias)', async t => {
+  // 1) Auto-named ch.race after hop_1 + ch.seal -> ch.prove({ terminalHopId: "race" }) resolves to race hop and auto-binds value_binding!
+  const { ctx: ctx1 } = await startFixture(t, 'run-optd-sdk-race-alias')
+  const ch1 = ctx1.chain('chain-optd-race-alias', 'economic-conservation')
+  const pre1 = await ch1.readback('GET /api/v1/orders/ord-1', { as: 'member_a' })
+  assert.equal(pre1.status, 200)
+  const s1 = await ch1.step('POST /api/v1/permissions/prime', { hopId: 'hop_1', as: 'member_a', claimedDelta: 'Mint session token.' })
+  const tok1 = await ch1.seal(s1, { jsonPath: '$.sessionTok', kind: 'header_secret' })
+  const burst1 = await ch1.race({
+    request: {
+      method: 'POST',
+      path: '/api/v1/orders/ord-1/refund',
+      as: 'member_a',
+      capability: { handle: tok1, target: 'header', headerName: 'x-session-tok' },
+      body: { amount: 60 },
+    },
+    concurrency: 3,
+  })
+  assert.equal(burst1.results.length, 3)
+  const post1 = await ch1.readback('GET /api/v1/orders/ord-1', { as: 'member_a' })
+  assert.equal(post1.status, 200)
+
+  const built1 = ch1.build({ terminalHopId: 'race', claimedImpact: 'Auto-named race hop matched by terminalHopId="race".' })
+  assert.equal(built1.terminalVulnClass, 'economic_conservation')
+  assert.deepEqual(built1.hops.map(h => h.hopId), ['hop_1', 'hop_2'])
+  assert.equal(built1.terminalImpact.terminalHopId, 'hop_2')
+  assert.ok(built1.hops[1]!.consumedCapabilities?.includes(tok1), `Expected race hop consumedCapabilities to include ${tok1}`)
+  assert.ok((built1.causalEdges ?? []).some(e => e.kind === 'value_binding' && e.fromHopId === 'hop_1' && e.toHopId === 'hop_2' && e.capabilityHandle === tok1))
+  const proved1 = await ch1.prove({ terminalHopId: 'race', claimedImpact: 'Auto-named race hop matched by terminalHopId="race".' })
+  assert.equal(proved1.confirmed, true, `Expected live ch.race + terminalHopId="race" to confirm: ${JSON.stringify(proved1)}`)
+
+  // 2) 3-arg ch.race("race", target, opts) registers hopId="race", consumedCapabilities, and value_binding hop_1 -> race
+  const { ctx: ctx2 } = await startFixture(t, 'run-optd-sdk-race-3arg')
+  const ch2 = ctx2.chain('chain-optd-race-3arg', 'economic_conservation')
+  await ch2.readback('GET /api/v1/orders/ord-1', { as: 'member_a' })
+  const m2 = await ch2.step('POST /api/v1/permissions/prime', { hopId: 'hop_1', as: 'member_a', claimedDelta: 'Mint session token.' })
+  const tok2 = await ch2.seal(m2, { jsonPath: '$.sessionTok', kind: 'header_secret' })
+  const burst2 = await ch2.race('race', '/api/v1/orders/ord-1/refund', {
+    method: 'POST',
+    as: 'member_a',
+    capability: { handle: tok2, target: 'header', headerName: 'x-session-tok' },
+    body: { amount: 60 },
+    concurrency: 3,
+  })
+  assert.equal(burst2.results.length, 3)
+  await ch2.readback('GET /api/v1/orders/ord-1', { as: 'member_a' })
+
+  const built2 = ch2.build({ terminalHopId: 'race', claimedImpact: '3-arg ch.race("race", target, opts) confirmed.' })
+  assert.deepEqual(built2.hops.map(h => h.hopId), ['hop_1', 'race'])
+  assert.equal(built2.terminalImpact.terminalHopId, 'race')
+  assert.equal(built2.hops[1]!.exchangeIds?.length, 3)
+  assert.ok(built2.hops[1]!.consumedCapabilities?.includes(tok2))
+  assert.ok((built2.causalEdges ?? []).some(e => e.kind === 'value_binding' && e.fromHopId === 'hop_1' && e.toHopId === 'race' && e.capabilityHandle === tok2))
+  const proved2 = await ch2.prove({ terminalHopId: 'race', claimedImpact: '3-arg ch.race("race", target, opts) confirmed.' })
+  assert.equal(proved2.confirmed, true, `Expected live 3-arg ch.race("race", target, opts) to confirm: ${JSON.stringify(proved2)}`)
+})
+
+test('live VerifyRpcServer: compiled trace with repeated concurrent refund POSTs compiles to ch.race + pre/post ch.readback and confirms end-to-end', async t => {
+  const { origin, ctx } = await startFixture(t, 'run-optd-compiler-race-e2e')
+
+  const recorded: RecordedRequestExchange[] = [
+    {
+      exchangeId: 'rec_r1',
+      origin,
+      method: 'POST',
+      pathAndQuery: '/api/v1/orders/ord-1/refund',
+      persona: 'member_a',
+      requestHeaders: { 'Idempotency-Key': 'idem-refund-1' },
+      requestJson: { amount: 60 },
+      status: 200,
+      responseJson: { ok: true, refunded: 60, refundedTotal: 60 },
+      timestampMs: 100,
+    },
+    {
+      exchangeId: 'rec_r2',
+      origin,
+      method: 'POST',
+      pathAndQuery: '/api/v1/orders/ord-1/refund',
+      persona: 'member_a',
+      requestHeaders: { 'Idempotency-Key': 'idem-refund-1' },
+      requestJson: { amount: 60 },
+      status: 200,
+      responseJson: { ok: true, refunded: 60, refundedTotal: 120 },
+      timestampMs: 101,
+    },
+    {
+      exchangeId: 'rec_r3',
+      origin,
+      method: 'POST',
+      pathAndQuery: '/api/v1/orders/ord-1/refund',
+      persona: 'member_a',
+      requestHeaders: { 'Idempotency-Key': 'idem-refund-1' },
+      requestJson: { amount: 60 },
+      status: 200,
+      responseJson: { ok: true, refunded: 60, refundedTotal: 180 },
+      timestampMs: 102,
+    },
+    {
+      exchangeId: 'rec_rb',
+      origin,
+      method: 'GET',
+      pathAndQuery: '/api/v1/orders/ord-1',
+      persona: 'member_a',
+      status: 200,
+      responseJson: { orderId: 'ord-1', paidAmount: 100, refundedTotal: 180 },
+      timestampMs: 200,
+    },
+  ]
+
+  const compiled = compileTraceToKovoVerifyScript({
+    submission: {
+      title: 'Concurrent over-refund via race burst',
+      vulnClass: 'over_refund',
+      oracleFamily: 'economic_conservation',
+      exchangeIds: ['rec_r1', 'rec_r2', 'rec_r3', 'rec_rb'],
+      terminalExchangeId: 'rec_r3',
+      readbackExchangeId: 'rec_rb',
+      attackerPersona: 'member_a',
+    },
+    exchanges: recorded,
+    runOrigin: origin,
+  })
+  assert.equal(compiled.ok, true)
+  assert.ok(compiled.script)
+  assert.match(compiled.script, /ch\.race\(/)
+  assert.match(compiled.script, /concurrency:\s*3\b/)
+  assert.match(compiled.script, /"Idempotency-Key":\s*"idem-refund-1"/)
+
+  const rewritten = compiled.script.replace(/^export default\s+/, 'return ')
+  new Script(`(function(){ ${rewritten} })`)
+  const runCompiled = (new Function(rewritten) as () => (c: VerifyContext) => Promise<{ claims: Array<{ kind: string }> }>)()
+  const out = await runCompiled(ctx)
+  assert.ok(out.claims.some(c => c.kind === 'composite_receipt'), `Expected live compiled ch.race script to confirm: ${JSON.stringify(out)}`)
 })

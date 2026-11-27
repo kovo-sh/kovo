@@ -59,7 +59,7 @@ const VULN_ALIASES: Readonly<Record<string, string>> = Object.fromEntries(([
   ['bfla', 'broken_function_level_authorization'],
   ['broken_access_control', 'bac access_control_bypass unauthorized_access'],
   ['temporal_revocation', 'revoked_token revoked_session stale_token token_revocation_bypass session_revocation_bypass'],
-  ['economic_conservation', 'balance_conservation overcredit double_credit negative_balance coupon_reuse'],
+  ['economic_conservation', 'balance_conservation overcredit double_credit negative_balance coupon_reuse over_refund'],
   ['cryptographic_scope_replay', 'token_replay hmac_forgery signature_forgery scope_replay scope_escalation jwt_confusion'],
   ['parser_cache_differential', 'cache_bleed web_cache_deception web_cache_poisoning request_smuggling path_confusion'],
   ['cross_surface_pivot', 'cross_surface internal_pivot ssrf_pivot'],
@@ -79,7 +79,8 @@ const UNIQUE_KEY_RE = /^(?:email|e_?mail|username|user_?name|handle|slug|org_?sl
 const EMAIL_VAL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/, SIMPLE_ENTITY_ID_RE = /^[a-zA-Z]{2,20}[_-]\d{2,16}$/
 const REPEATED_CHAR_RE = /^(.)\1+$/, JS_IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/, READ_ONLY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
 const AUTH_QUERY_KEYS = new Set(['sig', 'signature', 'hmac', 'mac', 'token', 'access_token', 'code', 'state', 'nonce', 'ts', 'timestamp', 'expires', 'exp'])
-const ECONOMIC_CONSERVATION_CLASSES = new Set(['economic_conservation', 'conserved_balance', 'ledger_overcredit', 'over_refund', 'double_spend', 'race_condition'])
+const ECONOMIC_CONSERVATION_CLASSES = new Set(['economic_conservation', 'conserved_balance', 'ledger_overcredit', 'over_refund', 'double_spend', 'race_condition', 'race', 'race_double_spend', 'race_burst', 'split_refund_ledger_break'])
+const RACE_MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH'])
 
 const slugifyChainId = (title: string): string => { const s = title.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 42); return s ? `trace_${s}` : 'trace_chain' }
 function normalizeVulnClass(raw: string, oracleFamily: string | undefined, hopCount: number, warnings: string[]) {
@@ -511,6 +512,62 @@ function formatEdgeLine(e: CompiledEdge, plans: readonly StepPlan[]): string {
     ? `  ch.edge({ kind: "value_binding", fromHopId: ${fromHopId}, toHopId: ${toHopId}, capabilityHandle: ${e.capVar} })`
     : `  ch.edge({ kind: "value_binding", fromHopId: ${fromHopId}, toHopId: ${toHopId}, valueDigest: await _sha256(${e.digestVar}) })`
 }
+function collapseTrailingRaceExchanges(
+  causal: RecordedRequestExchange[], terminalIdx: number, explicitTerminal: RecordedRequestExchange | undefined,
+  explicitReadback: RecordedRequestExchange | undefined, submission: ExploitTraceSubmission,
+): { causal: RecordedRequestExchange[]; terminalIdx: number; explicitReadback: RecordedRequestExchange | undefined; raceConcurrency: number } {
+  const prelim = normalizeVulnClass(submission.vulnClass, submission.oracleFamily, causal.length, [])
+  if (prelim.validOracleFamily !== 'economic_conservation' && !ECONOMIC_CONSERVATION_CLASSES.has(prelim.terminalVulnClass)) {
+    return { causal, terminalIdx, explicitReadback, raceConcurrency: 0 }
+  }
+  let list = causal, idx = terminalIdx, rb = explicitReadback
+  if (!rb && !explicitTerminal && list.length >= 3) {
+    const last = list[list.length - 1]!, prev = list[list.length - 2]!
+    if (READ_ONLY_METHODS.has((last.method || 'GET').toUpperCase()) && last.status >= 200 && last.status < 300 && RACE_MUTATING_METHODS.has((prev.method || '').toUpperCase())) {
+      let k = list.length - 2
+      while (k > 0 && matchesControlTarget(list[k - 1]!, prev)) k -= 1
+      if (list.length - 1 - k >= 2) { rb = last; list = list.slice(0, -1); idx = list.length - 1 }
+    }
+  }
+  const term = list[idx]!
+  if (!RACE_MUTATING_METHODS.has((term.method || '').toUpperCase())) return { causal: list, terminalIdx: idx, explicitReadback: rb, raceConcurrency: 0 }
+  let start = idx, end = idx
+  while (start > 0 && matchesControlTarget(list[start - 1]!, term)) start -= 1
+  while (end + 1 < list.length && matchesControlTarget(list[end + 1]!, term)) end += 1
+  const count = end - start + 1
+  if (count < 2) return { causal: list, terminalIdx: idx, explicitReadback: rb, raceConcurrency: 0 }
+  const group = list.slice(start, end + 1), rep = group.find(e => e.status >= 200 && e.status < 300) ?? group[0]!
+  if (!rb && end + 1 < list.length) {
+    const after = list.slice(end + 1).find(e => READ_ONLY_METHODS.has((e.method || 'GET').toUpperCase()) && e.status >= 200 && e.status < 300)
+    if (after) rb = after
+  }
+  return {
+    causal: [...list.slice(0, start), rep, ...list.slice(end + 1).filter(e => e.exchangeId !== rb?.exchangeId)],
+    terminalIdx: start, explicitReadback: rb, raceConcurrency: Math.min(10, count),
+  }
+}
+function formatRaceCall(p: StepPlan, concurrency: number, hasDynPreRb: boolean, runOrigin?: string): string {
+  const reqFields: string[] = [], orig = p.exchange.origin.trim()
+  if (orig && (!runOrigin || orig !== runOrigin.trim())) reqFields.push(`origin: ${JSON.stringify(orig)}`)
+  reqFields.push(`path: ${p.pathExpr}`, `method: ${JSON.stringify((p.exchange.method || 'POST').toUpperCase())}`)
+  if (!p.omitPersona && p.exchange.persona?.trim()) reqFields.push(`as: ${JSON.stringify(p.exchange.persona.trim())}`)
+  if (p.primaryCapability) {
+    const c = [`handle: ${p.primaryCapability.capVar}`, `target: ${JSON.stringify(p.primaryCapability.target)}`]
+    if (p.primaryCapability.headerName) c.push(`headerName: ${JSON.stringify(p.primaryCapability.headerName)}`)
+    if (p.primaryCapability.cookieName) c.push(`cookieName: ${JSON.stringify(p.primaryCapability.cookieName)}`)
+    if (p.primaryCapability.queryParam) c.push(`queryParam: ${JSON.stringify(p.primaryCapability.queryParam)}`)
+    reqFields.push(`capability: { ${c.join(', ')} }`)
+  }
+  if (p.headersExpr) reqFields.push(`headers: ${p.headersExpr}`)
+  if (p.bodyExpr) reqFields.push(`body: ${p.bodyExpr}`)
+  if (p.forceNoFollowRedirects) reqFields.push('followRedirects: false')
+  const raceFields = [
+    `hopId: ${JSON.stringify(p.hopId)}`, `request: { ${reqFields.join(', ')} }`, `concurrency: ${concurrency}`,
+    ...(p.entityIdExpr ? [`entityId: ${p.entityIdExpr}`] : []), ...(hasDynPreRb ? ['baseline: preRb'] : []),
+    `claimedDelta: ${JSON.stringify(`${p.exchange.method.toUpperCase()} ${p.deltaPath}`)}`,
+  ]
+  return `ch.race({ ${raceFields.join(', ')} })`
+}
 
 export function compileTraceToKovoVerifyScript(input: {
   submission: ExploitTraceSubmission; exchanges: RecordedRequestExchange[]; allowedPersonas?: string[]; runOrigin?: string
@@ -525,7 +582,7 @@ export function compileTraceToKovoVerifyScript(input: {
   const byId = new Map(exchanges.map(e => [e.exchangeId, e]))
   const explicitControl = submission.controlExchangeId ? byId.get(submission.controlExchangeId) : undefined
   if (submission.controlExchangeId && !explicitControl) warnings.push(`controlExchangeId "${submission.controlExchangeId}" not found; synthesizing clean control.`)
-  const explicitReadback = submission.readbackExchangeId ? byId.get(submission.readbackExchangeId) : undefined
+  let explicitReadback = submission.readbackExchangeId ? byId.get(submission.readbackExchangeId) : undefined
   if (submission.readbackExchangeId && !explicitReadback) warnings.push(`readbackExchangeId "${submission.readbackExchangeId}" not found in exchanges.`)
   const explicitTerminal = submission.terminalExchangeId ? byId.get(submission.terminalExchangeId) : undefined
   if (submission.terminalExchangeId && !explicitTerminal) return fail(`Terminal exchange "${submission.terminalExchangeId}" not found in recorded exchanges.`, exchanges.length)
@@ -541,7 +598,10 @@ export function compileTraceToKovoVerifyScript(input: {
   if (!causal.length) return fail('No causal exchanges remain to compile.')
 
   let terminalIdx = explicitTerminal ? causal.findIndex(e => e.exchangeId === explicitTerminal.exchangeId) : causal.length - 1
-  const terminalEx = causal[terminalIdx]!, allowedSet = allowedPersonas?.length ? new Set(allowedPersonas) : undefined
+  const collapsed = collapseTrailingRaceExchanges(causal, terminalIdx, explicitTerminal, explicitReadback, submission)
+  causal = collapsed.causal; terminalIdx = collapsed.terminalIdx; explicitReadback = collapsed.explicitReadback
+  const terminalEx = causal[terminalIdx]!, raceConcurrency = collapsed.raceConcurrency
+  const allowedSet = allowedPersonas?.length ? new Set(allowedPersonas) : undefined
   const attackerPersona = (submission.attackerPersona?.trim() || causal[0]?.persona?.trim() || causal.find(e => e.persona?.trim())?.persona?.trim()) || undefined
   if (attackerPersona && allowedSet && !allowedSet.has(attackerPersona)) warnings.push(`Base attackerPersona "${attackerPersona}" is not in allowedPersonas.`)
   const blocked = buildBlockedValues(exchanges, allowedPersonas, attackerPersona, runOrigin)
@@ -614,22 +674,28 @@ export function compileTraceToKovoVerifyScript(input: {
   }
   const planOpts = (p: StepPlan, fallbackPersona?: string, stepMeta?: { hopId: string; claimedDelta: string }, role?: 'control' | 'setup') => formatHttpOpts({ ...(stepMeta ?? {}), method: p.exchange.method || 'GET', persona: p.omitPersona ? undefined : (p.exchange.persona?.trim() || fallbackPersona), headersExpr: p.headersExpr, bodyExpr: p.bodyExpr, followRedirectsFalse: p.forceNoFollowRedirects, capability: p.primaryCapability, ...(role ? { role } : {}), entityIdExpr: p.entityIdExpr })
 
+  const dynPreRb = Boolean(emitBaselineReadback && readbackPlan && raceConcurrency >= 2 && readbackPlan.usesDynamicUrlOrBody)
   if (!skipSynthEconCtrl && ctrlAfterIdx < 0) emitCtrl()
-  if (emitBaselineReadback && readbackPlan) {
+  if (emitBaselineReadback && readbackPlan && !dynPreRb) {
     const rbEx = readbackPlan.exchange
     const rbTarget = formatTarget(rbEx.origin, JSON.stringify(sanitizeControlPath(rbEx.pathAndQuery || '/')), runOrigin)
     const rbOpts = formatHttpOpts({ method: rbEx.method || 'GET', persona: rbEx.persona?.trim() || attackerPersona, headersExpr: sanitizeControlHeaders(rbEx.requestHeaders) })
     lines.push(`  await ch.readback(${rbTarget}, ${rbOpts})`)
   }
   for (let i = 0; i < plans.length; i += 1) {
-    const p = plans[i]!, stepVar = `step_${p.stepNumber}`
+    const p = plans[i]!, stepVar = `step_${p.stepNumber}`, isRaceStep = i === terminalIdx && raceConcurrency >= 2
+    if (isRaceStep && dynPreRb && readbackPlan) {
+      lines.push(`  const preRb = await ctx.http_send(${formatTarget(readbackPlan.exchange.origin, readbackPlan.pathExpr, runOrigin, Boolean(readbackPlan.signedUrlCapVar))}, ${planOpts(readbackPlan, attackerPersona, undefined, 'control')})`)
+    }
     lines.push(
-      `  const ${stepVar} = await ch.step(${formatTarget(p.exchange.origin, p.pathExpr, runOrigin, Boolean(p.signedUrlCapVar))}, ${planOpts(p, undefined, { hopId: p.hopId, claimedDelta: `${p.exchange.method.toUpperCase()} ${p.deltaPath}` })})`,
+      isRaceStep
+        ? `  const ${stepVar} = await ${formatRaceCall(p, raceConcurrency, dynPreRb, runOrigin)}`
+        : `  const ${stepVar} = await ch.step(${formatTarget(p.exchange.origin, p.pathExpr, runOrigin, Boolean(p.signedUrlCapVar))}, ${planOpts(p, undefined, { hopId: p.hopId, claimedDelta: `${p.exchange.method.toUpperCase()} ${p.deltaPath}` })})`,
       ...p.seals.map(s => `  ${formatSealCall(s, stepVar)}`),
       ...p.vars.map(v => `  const ${v.varName} = ${stepJsAccess(v.source.jsAccess, stepVar)}`),
       ...st.edges.filter(e => e.toStepIdx === i).map(e => formatEdgeLine(e, plans)),
     )
-    if (p.exchange.status === 202 && (i < plans.length - 1 || Boolean(readbackPlan))) {
+    if (!isRaceStep && p.exchange.status === 202 && (i < plans.length - 1 || Boolean(readbackPlan))) {
       lines.push(`  if (${stepVar}.status === 202) await new Promise((r) => setTimeout(r, 400))`)
       const pollPlan = asyncPollsByStep.get(i)
       if (pollPlan) lines.push(`  if (${stepVar}.status === 202) await ctx.http_send(${formatTarget(pollPlan.exchange.origin, pollPlan.pathExpr, runOrigin, Boolean(pollPlan.signedUrlCapVar))}, ${planOpts(pollPlan, attackerPersona, undefined, 'setup')})`)
@@ -639,7 +705,7 @@ export function compileTraceToKovoVerifyScript(input: {
   if (readbackPlan) lines.push(`  const rb = await ch.readback(${formatTarget(readbackPlan.exchange.origin, readbackPlan.pathExpr, runOrigin, Boolean(readbackPlan.signedUrlCapVar))}, ${planOpts(readbackPlan, attackerPersona)})`)
 
   const prove = [
-    `terminalHopId: ${JSON.stringify(termPlan.hopId)}`, `terminalExchange: step_${termPlan.stepNumber}`,
+    `terminalHopId: ${JSON.stringify(termPlan.hopId)}`, `terminalExchange: ${raceConcurrency >= 2 ? `step_${termPlan.stepNumber}.results?.[0]` : `step_${termPlan.stepNumber}`}`,
     ...(!skipSynthEconCtrl ? ['control: ctrl'] : []),
     ...(readbackPlan ? ['readback: rb'] : []), ...(validOracleFamily ? [`oracleFamily: ${JSON.stringify(validOracleFamily)}`] : []),
     `claimedImpact: ${JSON.stringify((submission.reproNotes?.trim() || submission.title || terminalVulnClass).slice(0, 240))}`,

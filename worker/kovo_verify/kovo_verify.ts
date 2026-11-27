@@ -98,7 +98,7 @@ export interface ChainBuilderOptions { chainId: string; terminalVulnClass: strin
 export interface ChainHopOptions { surface?: HopSurface; target?: HopTargetInput; method?: string; role?: 'setup' | 'control' | 'probe' | 'cleanup'; arm?: 'setup' | 'control' | 'probe' | 'cleanup'; claimedDelta?: string; entityId?: string; canaryToken?: string; exchangeIds?: string[]; oobEventIds?: string[]; browserTraceIds?: string[]; producedCapabilities?: string[]; consumedCapabilities?: string[]; proofReceipt?: ProofReceiptInput }
 export interface ChainStepOptions extends HttpOptions { hopId?: string; surface?: HopSurface; claimedDelta?: string; canaryToken?: string; proofReceipt?: ProofReceiptInput; producedCapabilities?: string[]; consumedCapabilities?: string[] }
 export type ChainSealSelector = string | (Omit<SealCapabilityInput, 'exchangeId' | 'exchange' | 'slot'> & { slot?: string })
-export interface ChainRaceBurstOptions extends ChainHopOptions { hopId?: string; requests?: Array<RaceRequestInput | HttpTarget>; request?: RaceRequestInput | HttpTarget; count?: number; barrier?: 'auto' | 'h2' | 'http1'; session?: string; readRoute?: HttpTarget; readMethod?: string; readPersona?: string; baseline?: ExchangeRef; readback?: ExchangeRef; correlationIds?: string[] }
+export interface ChainRaceBurstOptions extends ChainHopOptions, Omit<HttpOptions, 'role' | 'arm'> { hopId?: string; requests?: Array<RaceRequestInput | HttpTarget>; request?: RaceRequestInput | HttpTarget; count?: number; concurrency?: number; barrier?: 'auto' | 'h2' | 'http1'; readRoute?: HttpTarget; readMethod?: string; readPersona?: string; baseline?: ExchangeRef; readback?: ExchangeRef; url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; origin?: string }
 export interface StateTransitionEdgeInput { fromHopId: string; toHopId: string; entityId: string; ablationExchange?: ExchangeRef | ExchangeRef[]; ablationExchangeIds?: string[]; mutationKind?: string }
 export interface ChainProveOptions { terminalHopId?: string; claimedImpact?: string; summary?: string; terminalExchange?: ExchangeRef; terminalExchangeId?: string; control?: ExchangeRef | ExchangeRef[]; controlExchanges?: ExchangeRef | ExchangeRef[]; preChainControlExchangeIds?: string[]; readback?: ExchangeRef | ExchangeRef[]; postChainReadbackExchangeIds?: string[]; modeAFailureExchange?: ExchangeRef; modeAFailureExchangeId?: string; oracleFamily?: OracleFamily; oracleInput?: Record<string, unknown>; proofReceipt?: ProofReceiptInput; replayMode?: ReplayMode; benchmarkMode?: boolean }
 interface HopRecorder { hopId: string; target?: HopTargetObject; exchangeIds: string[]; oobEventIds: string[]; browserTraceIds: string[]; producedCapabilities: string[]; consumedCapabilities: string[]; entityId?: string; correlationIds: string[]; controlExCount: number; nonControlExCount: number; capConsumeExchange: Map<string, string>; cryptoConsumptions: Array<{ sourceCapabilityId: string; derivedCapabilityId?: string; alg?: string }>; asyncPolls: Array<{ pollRecordId: string; correlationId?: string; triggerExchangeId?: string }>; onProduce(cap: string, exchangeId?: string): void; onExchange(exchangeId: string, isControl?: boolean): void; onCorrelation(correlationId: string): void }
@@ -258,10 +258,13 @@ function inferValueBindingCap(edge: Record<string, unknown>, hops: unknown[], ca
   if (fromProd.length === 1 && toCons.length === 0) return fromProd[0]
   return fromProd.length === 0 && toCons.length === 1 && !list.some(h => h.hopId !== fromHop.hopId && prodOf(h).includes(toCons[0]!)) ? toCons[0] : undefined
 }
+const normVulnClass = (v: string): string => v.trim().toLowerCase().replace(/[\s-]+/g, '_')
 export function normalizeCompositeReceipt(receipt: unknown, defaultOrigin: string | undefined, capOrigins?: ReadonlyMap<string, string>): Record<string, unknown> {
   const raw = receipt && typeof receipt === 'object' && !Array.isArray(receipt) && 'receipt' in receipt ? (receipt as Record<string, unknown>).receipt : receipt
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { receipt: raw }
-  const { controlExchanges: topCtrl, ...rec } = raw as Record<string, unknown>; if (!Array.isArray(rec.hops)) return { receipt: rec }
+  const { controlExchanges: topCtrl, ...rec } = raw as Record<string, unknown>
+  const tv = typeof rec.terminalVulnClass === 'string' && rec.terminalVulnClass.trim() ? { terminalVulnClass: normVulnClass(rec.terminalVulnClass) } : {}
+  if (!Array.isArray(rec.hops)) return { receipt: { ...rec, ...tv } }
   const toArr = (v: unknown): unknown => v === undefined ? undefined : Array.isArray(v) ? v : [v]
   const hops = rec.hops.map(h => {
     if (!h || typeof h !== 'object' || Array.isArray(h)) return h
@@ -280,29 +283,25 @@ export function normalizeCompositeReceipt(receipt: unknown, defaultOrigin: strin
     const merged: string[] = []; for (const id of [...extractExchangeIds((ti as Record<string, unknown>).preChainControlExchangeIds as ExchangeRef[] | undefined), ...extractExchangeIds(topCtrl as ExchangeRef | ExchangeRef[])]) pushUnique(merged, id)
     if (merged.length) ti = { ...(ti as Record<string, unknown>), preChainControlExchangeIds: merged }
   }
-  return { receipt: { ...rec, hops, ...(causalEdges !== undefined ? { causalEdges } : {}), ...(ti !== undefined ? { terminalImpact: ti } : {}) } }
+  return { receipt: { ...rec, ...tv, hops, ...(causalEdges !== undefined ? { causalEdges } : {}), ...(ti !== undefined ? { terminalImpact: ti } : {}) } }
 }
-
 interface RecordedHop { receipt: HopReceiptInput; isControlOnly: boolean; capConsumeExchange: Map<string, string>; cryptoConsumptions: Array<{ sourceCapabilityId: string; derivedCapabilityId?: string; alg?: string }>; asyncPolls: Array<{ pollRecordId: string; correlationId?: string; triggerExchangeId?: string }> }
-
 export class ChainBuilder {
   private readonly ctx: VerifyContext; readonly chainId: string; readonly terminalVulnClass: string
   private readonly replayMode: ReplayMode; private readonly benchmarkMode?: boolean
   private readonly hops: RecordedHop[] = []; private readonly capProducer = new Map<string, { hopId: string; exchangeId?: string }>()
   private readonly exchangeToHop = new Map<string, string>(); private readonly correlationToHop = new Map<string, string>()
   private readonly explicitEdges: CausalEdgeInput[] = []; private readonly controlIds: string[] = []; private readonly baselineReadbackIds: string[] = []; private readonly readbackIds: string[] = []; private readonly raceActionIds: string[] = []; private readonly exStatus = new Map<string, number>()
-  private hopSeq = 0; private sealSeq = 0
-
+  private hopSeq = 0; private sealSeq = 0; private lastRaceHopId?: string
   constructor(ctx: VerifyContext, opts: ChainBuilderOptions) {
     if (!opts.chainId?.trim()) throw new Error('ChainBuilder requires a non-empty chainId.')
     if (!opts.terminalVulnClass?.trim()) throw new Error('ChainBuilder requires a non-empty terminalVulnClass.')
-    this.ctx = ctx; this.chainId = opts.chainId.trim(); this.terminalVulnClass = opts.terminalVulnClass.trim()
+    this.ctx = ctx; this.chainId = opts.chainId.trim(); this.terminalVulnClass = normVulnClass(opts.terminalVulnClass)
     this.replayMode = opts.replayMode ?? 'fresh_clean_replay'; this.benchmarkMode = opts.benchmarkMode
   }
 
   private nextHopId(): string { let id: string; do { id = `hop_${++this.hopSeq}` } while (this.hops.some(h => h.receipt.hopId === id)); return id }
   private recordRefs(list: string[], ref: ExchangeRef | ExchangeRef[] | undefined): void { for (const x of !ref ? [] : Array.isArray(ref) ? ref : [ref]) { const id = typeof x === 'string' ? x : x?.exchangeId; pushUnique(list, id); if (id && x && typeof x === 'object' && typeof (x as Partial<HttpExchange>).status === 'number') this.exStatus.set(id, (x as Partial<HttpExchange>).status!) } }
-
   control(target: HttpTargetString | HttpTargetObj, opts?: HttpOptions): Promise<HttpExchange>
   control(target: string, opts: HttpOptions): Promise<HttpExchange>
   control(ref: ExchangeRef | ExchangeRef[]): this
@@ -311,7 +310,6 @@ export class ChainBuilder {
     const inlineSess = targetOrRef && typeof targetOrRef === 'object' && !Array.isArray(targetOrRef) && typeof (targetOrRef as HttpOptions).session === 'string' ? (targetOrRef as HttpOptions).session : undefined
     return this.ctx._httpSendDetached(targetOrRef as HttpTarget, { ...(opts ?? {}), role: 'control', arm: 'control', session: opts?.session ?? inlineSess ?? `ctrl_${this.chainId.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 27)}` }).then(ex => { pushUnique(this.controlIds, ex.exchangeId); this.exStatus.set(ex.exchangeId, ex.status); return ex })
   }
-
   readback(target: HttpTargetString | HttpTargetObj, opts?: HttpOptions): Promise<HttpExchange>
   readback(target: string, opts: HttpOptions): Promise<HttpExchange>
   readback(ref: ExchangeRef | ExchangeRef[]): this
@@ -320,7 +318,6 @@ export class ChainBuilder {
     if (!isHttpTargetArg(targetOrRef, opts !== undefined)) { this.recordRefs(dest, targetOrRef as ExchangeRef | ExchangeRef[]); return this }
     return this.ctx._httpSendDetached(targetOrRef as HttpTarget, { ...(opts ?? {}), role: 'control', arm: 'control' }).then(ex => { pushUnique(dest, ex.exchangeId); this.exStatus.set(ex.exchangeId, ex.status); return ex })
   }
-
   step<T = HttpExchange>(hopId: string, fn: () => Promise<T> | T): Promise<T>
   step<T = HttpExchange>(hopId: string, meta: ChainHopOptions, fn: () => Promise<T> | T): Promise<T>
   step(target: HttpTarget, opts?: ChainStepOptions): Promise<HttpExchange>
@@ -331,7 +328,6 @@ export class ChainBuilder {
     return this.hop(hopId?.trim() || this.nextHopId(), { ...(surface ? { surface } : {}), ...(claimedDelta ? { claimedDelta } : {}), ...(canaryToken ? { canaryToken } : {}), ...(proofReceipt ? { proofReceipt } : {}), ...(producedCapabilities ? { producedCapabilities } : {}), ...(consumedCapabilities ? { consumedCapabilities } : {}) }, () => this.ctx.http_send(target, hasRole ? httpOpts : { role: 'probe', ...httpOpts }))
   }
   send(target: HttpTarget, opts?: ChainStepOptions): Promise<HttpExchange> { return this.step(target, opts) }
-
   async seal(exchange: ExchangeRef, selector: ChainSealSelector): Promise<string> {
     const exId = extractExchangeIds(exchange)[0]; if (!exId) throw new Error('chain.seal requires an exchange or exchangeId.')
     const sel: Record<string, unknown> = typeof selector === 'string' ? parseSealSelector(selector) : { ...(selector ?? {}) }
@@ -346,9 +342,17 @@ export class ChainBuilder {
     }
     return res.handle
   }
-
-  race(opts: ChainRaceBurstOptions): Promise<RaceBurstHopResult> { const { hopId, ...rest } = opts; return this.raceBurst(hopId?.trim() || this.nextHopId(), rest) }
-
+  race(opts: ChainRaceBurstOptions): Promise<RaceBurstHopResult>
+  race(hopId: string, opts: ChainRaceBurstOptions): Promise<RaceBurstHopResult>
+  race(hopId: string, target: HttpTarget, opts?: ChainRaceBurstOptions): Promise<RaceBurstHopResult>
+  race(target: HttpTarget, opts: ChainRaceBurstOptions): Promise<RaceBurstHopResult>
+  race(a: ChainRaceBurstOptions | HttpTarget, b?: ChainRaceBurstOptions | HttpTarget, c?: ChainRaceBurstOptions): Promise<RaceBurstHopResult> {
+    const isId = typeof a === 'string' && !isHttpTargetArg(a, false)
+    const [hopId, target, opts]: [string | undefined, HttpTarget | undefined, ChainRaceBurstOptions] = c !== undefined ? [String(a), b as HttpTarget, c] : b === undefined ? [(a as ChainRaceBurstOptions).hopId, undefined, a as ChainRaceBurstOptions] : isId ? (typeof b === 'string' ? [a, b, {}] : [a, undefined, b as ChainRaceBurstOptions]) : [(b as ChainRaceBurstOptions).hopId, a as HttpTarget, b as ChainRaceBurstOptions]
+    const reqObj: RaceRequestInput | HttpTarget | undefined = opts.request !== undefined ? opts.request : target !== undefined ? (typeof target === 'string' ? { ...extractInlineHttpOptions(opts), target } : { ...(target as Record<string, unknown>), ...extractInlineHttpOptions(opts) } as HttpTarget) : (!opts.requests?.length && ['url', 'path', 'pathAndQuery', 'endpoint', 'route', 'target'].some(k => (opts as Record<string, unknown>)[k] !== undefined) ? { ...pickDefined(opts as Record<string, unknown>, ['url', 'path', 'pathAndQuery', 'endpoint', 'route', 'target', 'origin']), ...extractInlineHttpOptions(opts) } as HttpTarget : undefined)
+    const { hopId: _h, target: _t, url: _u, path: _p, pathAndQuery: _pq, endpoint: _ep, route: _rt, origin: _o, ...rest } = opts
+    return this.raceBurst(hopId?.trim() || this.nextHopId(), { ...rest, ...(reqObj !== undefined ? { request: reqObj } : {}) })
+  }
   stateTransition(input: StateTransitionEdgeInput): this {
     const fromHopId = input.fromHopId?.trim(), toHopId = input.toHopId?.trim(), entityId = input.entityId?.trim()
     if (!fromHopId || !toHopId) throw new Error('state_transition_binding requires non-empty fromHopId and toHopId.')
@@ -372,7 +376,6 @@ export class ChainBuilder {
     for (const cap of receipt.producedCapabilities ?? []) if (!this.capProducer.has(cap)) this.capProducer.set(cap, { hopId: receipt.hopId, exchangeId: receipt.exchangeIds?.[0] })
     this.hops.push({ receipt, isControlOnly: (role ?? arm) === 'control', capConsumeExchange: new Map(), cryptoConsumptions: [], asyncPolls: [] }); return this
   }
-
   async hop<T>(hopId: string, fn: () => Promise<T> | T): Promise<T>
   async hop<T>(hopId: string, meta: ChainHopOptions, fn: () => Promise<T> | T): Promise<T>
   async hop<T>(hopId: string, metaOrFn: ChainHopOptions | (() => Promise<T> | T), maybeFn?: () => Promise<T> | T): Promise<T> {
@@ -401,25 +404,23 @@ export class ChainBuilder {
     const isControlOnly = (meta.role ?? meta.arm) === 'control' || (rec.controlExCount > 0 && rec.nonControlExCount === 0 && !rec.producedCapabilities.length && !rec.consumedCapabilities.length && !rec.cryptoConsumptions.length && !rec.asyncPolls.length && !rec.oobEventIds.length && !rec.browserTraceIds.length)
     this.hops.push({ receipt, isControlOnly, capConsumeExchange: rec.capConsumeExchange, cryptoConsumptions: rec.cryptoConsumptions, asyncPolls: rec.asyncPolls }); return out
   }
-
   async raceBurst(hopId: string, opts: ChainRaceBurstOptions): Promise<RaceBurstHopResult> {
     const trimmedId = hopId.trim(); if (!trimmedId) throw new Error('chain.raceBurst requires a non-empty hopId.')
-    const rawReqs = Array.isArray(opts.requests) && opts.requests.length > 0 ? opts.requests : opts.request !== undefined ? Array.from({ length: Math.max(2, Math.min(10, Math.floor(opts.count ?? 4))) }, () => opts.request!) : []
+    const rawReqs = Array.isArray(opts.requests) && opts.requests.length > 0 ? opts.requests : opts.request !== undefined ? Array.from({ length: Math.max(2, Math.min(10, Math.floor(opts.count ?? opts.concurrency ?? 4))) }, () => opts.request!) : []
     if (rawReqs.length < 2 || rawReqs.length > 10) throw new Error('chain.raceBurst requires between 2 and 10 requests (or { request, count }).')
     if (opts.baseline) this.recordRefs(this.baselineReadbackIds, opts.baseline)
     let baseline: HttpExchange | undefined
     if (!opts.baseline && opts.readRoute) { baseline = await this.ctx._httpSendDetached(opts.readRoute, { method: opts.readMethod ?? 'GET', ...(opts.readPersona ? { as: opts.readPersona } : {}), role: 'control', arm: 'control', ...(opts.session ? { session: `${opts.session}-base` } : {}) }); pushUnique(this.baselineReadbackIds, baseline.exchangeId); this.exStatus.set(baseline.exchangeId, baseline.status) }
-    const { hopId: _h, requests: _rq, request: _r, count: _c, barrier, session, readRoute, readMethod, readPersona, baseline: _b, readback: _rb, correlationIds, ...hopMeta } = opts
+    const { hopId: _h, requests: _rq, request: _r, count: _c, concurrency: _cc, barrier, session, readRoute, readMethod, readPersona, baseline: _b, readback: _rb, correlationIds, ...hopMeta } = opts
     const burst = await this.hop(trimmedId, { ...hopMeta, claimedDelta: hopMeta.claimedDelta ?? `Concurrent race burst (${rawReqs.length} requests) on ${trimmedId}.` }, () =>
       this.ctx.race_burst(rawReqs, { ...(barrier ? { barrier } : {}), ...(session ? { session } : {}), ...(opts.entityId ? { entityId: opts.entityId } : {}), ...(correlationIds?.length ? { correlationIds } : {}) }),
     )
-    for (const ex of burst.results) pushUnique(this.raceActionIds, ex.exchangeId)
+    this.lastRaceHopId = trimmedId; for (const ex of burst.results) pushUnique(this.raceActionIds, ex.exchangeId)
     if (opts.readback) this.recordRefs(this.readbackIds, opts.readback)
     let post: HttpExchange | undefined
     if (!opts.readback && readRoute) { post = await this.ctx._httpSendDetached(readRoute, { method: readMethod ?? 'GET', ...(readPersona ? { as: readPersona } : {}), role: 'control', arm: 'control', ...(session ? { session: `${session}-post` } : {}) }); pushUnique(this.readbackIds, post.exchangeId); this.exStatus.set(post.exchangeId, post.status) }
     return { ...burst, ...(baseline ? { baseline } : {}), ...(post ? { post } : {}) }
   }
-
   private synthOracleInput(family: OracleFamily, raw: Record<string, unknown> | undefined, activeHops: RecordedHop[], edges: CausalEdgeInput[], preControl: string[], postReadback: string[], termEx: string | undefined, explicitFamily = false): Record<string, unknown> | undefined {
     const oi: Record<string, unknown> = raw ? { ...raw } : {}
     const fill = (k: string, aliases: readonly string[], v: unknown): void => { if (v !== undefined && aliases.every(a => oi[a] === undefined)) oi[k] = v }
@@ -466,11 +467,11 @@ export class ChainBuilder {
     }
     return Object.keys(oi).length > 0 ? oi : undefined
   }
-
   build(opts: ChainProveOptions = {}): CompositeProofReceiptInput {
     if (this.hops.length === 0) throw new Error(`ChainBuilder "${this.chainId}" has no recorded hops.`)
     const hopIdx = new Map(this.hops.map((h, i) => [h.receipt.hopId, i])), edges: CausalEdgeInput[] = [], seenEdges = new Set<string>()
-    const addEdge = (edge: CausalEdgeInput): void => { const fi = hopIdx.get(edge.fromHopId) ?? -1, ti = hopIdx.get(edge.toHopId) ?? -1; if (fi < 0 || fi >= ti) return; const key = `${edge.fromHopId}->${edge.toHopId}:${edge.kind}`; if (!seenEdges.has(key)) { seenEdges.add(key); edges.push(edge) } }
+    const resHop = (id: string | undefined): string | undefined => { const t = id?.trim(); return !t ? undefined : (!hopIdx.has(t) && t.toLowerCase() === 'race' && this.lastRaceHopId && hopIdx.has(this.lastRaceHopId) ? this.lastRaceHopId : t) }
+    const addEdge = (edge: CausalEdgeInput): void => { const f = resHop(edge.fromHopId) ?? edge.fromHopId, t = resHop(edge.toHopId) ?? edge.toHopId, fi = hopIdx.get(f) ?? -1, ti = hopIdx.get(t) ?? -1; if (fi < 0 || fi >= ti) return; const key = `${f}->${t}:${edge.kind}`; if (!seenEdges.has(key)) { seenEdges.add(key); edges.push(f === edge.fromHopId && t === edge.toHopId ? edge : { ...edge, fromHopId: f, toHopId: t }) } }
     for (const explicit of this.explicitEdges) addEdge(explicit)
     const resolveProducer = (cap: string): { hopId: string; exchangeId?: string } | undefined => {
       const direct = this.capProducer.get(cap); if (direct) return direct
@@ -495,17 +496,16 @@ export class ChainBuilder {
         if (fromHopId && fromHopId !== toHopId && poll.correlationId) addEdge({ kind: 'async_pivot_binding', fromHopId, toHopId, correlationId: poll.correlationId, channel: 'poll_convergence', ...(poll.pollRecordId ? { pollRecordId: poll.pollRecordId } : {}) })
       }
     }
-    const linkedHops = new Set<string>(edges.flatMap(e => [e.fromHopId, e.toHopId]))
-    const controlOnlyHops = this.hops.filter(h => h.isControlOnly && !linkedHops.has(h.receipt.hopId) && h.receipt.hopId !== opts.terminalHopId)
+    const linkedHops = new Set<string>(edges.flatMap(e => [e.fromHopId, e.toHopId])), resolvedTermHopId = resHop(opts.terminalHopId)
+    const controlOnlyHops = this.hops.filter(h => h.isControlOnly && !linkedHops.has(h.receipt.hopId) && h.receipt.hopId !== resolvedTermHopId)
     const activeHops = controlOnlyHops.length < this.hops.length ? this.hops.filter(h => !controlOnlyHops.includes(h)) : this.hops
     const demotedCtrlIds = activeHops.length < this.hops.length ? controlOnlyHops.flatMap(h => h.receipt.exchangeIds ?? []) : []
-    const lastHop = activeHops[activeHops.length - 1]!.receipt, preControl: string[] = [], postReadback: string[] = []
+    const lastHop = activeHops[activeHops.length - 1]!.receipt, termHop = (resolvedTermHopId ? activeHops.find(h => h.receipt.hopId === resolvedTermHopId)?.receipt : undefined) ?? lastHop, preControl: string[] = [], postReadback: string[] = []
     for (const id of [...this.controlIds, ...this.baselineReadbackIds, ...demotedCtrlIds]) pushUnique(preControl, id)
     this.recordRefs(preControl, opts.control); this.recordRefs(preControl, opts.controlExchanges); for (const id of opts.preChainControlExchangeIds ?? []) pushUnique(preControl, id)
     for (const id of this.readbackIds) pushUnique(postReadback, id); this.recordRefs(postReadback, opts.readback); for (const id of opts.postChainReadbackExchangeIds ?? []) pushUnique(postReadback, id)
     const terminalExchangeId = opts.terminalExchangeId ?? extractExchangeIds(opts.terminalExchange)[0], modeAFailureExchangeId = opts.modeAFailureExchangeId ?? extractExchangeIds(opts.modeAFailureExchange)[0]
-    const lastExIds = lastHop.exchangeIds ?? [], resolvedTermEx = terminalExchangeId ?? lastExIds[lastExIds.length - 1]
-    const normCls = this.terminalVulnClass.trim().toLowerCase().replace(/[\s-]+/g, '_')
+    const lastExIds = termHop.exchangeIds ?? [], resolvedTermEx = terminalExchangeId ?? lastExIds[lastExIds.length - 1], normCls = this.terminalVulnClass
     const effFamily: OracleFamily | undefined = opts.oracleFamily ?? (/^(?:economic_conservation|conserved_balance|ledger_overcredit|over_refund|double_spend|race_condition)$/.test(normCls) ? 'economic_conservation' : /^(?:dual_tenant_abac|cross_tenant_(?:export|read|write|idor))$/.test(normCls) ? 'dual_tenant_abac' : undefined)
     const oracleInput = effFamily ? this.synthOracleInput(effFamily, opts.oracleInput, activeHops, edges, preControl, postReadback, resolvedTermEx, Boolean(opts.oracleFamily) || normCls === 'dual_tenant_abac') : (opts.oracleInput ? { ...opts.oracleInput } : undefined)
     return {
@@ -513,14 +513,13 @@ export class ChainBuilder {
       ...(opts.benchmarkMode ?? this.benchmarkMode !== undefined ? { benchmarkMode: opts.benchmarkMode ?? this.benchmarkMode } : {}),
       hops: activeHops.map(h => h.receipt), causalEdges: edges,
       terminalImpact: {
-        terminalHopId: opts.terminalHopId ?? lastHop.hopId, claimedImpact: opts.claimedImpact ?? opts.summary ?? lastHop.claimedDelta,
+        terminalHopId: resolvedTermHopId ?? lastHop.hopId, claimedImpact: opts.claimedImpact ?? opts.summary ?? termHop.claimedDelta,
         ...(terminalExchangeId ? { terminalExchangeId } : {}), ...(preControl.length ? { preChainControlExchangeIds: preControl } : {}),
         ...(postReadback.length ? { postChainReadbackExchangeIds: postReadback } : {}), ...(modeAFailureExchangeId ? { modeAFailureExchangeId } : {}),
         ...(opts.oracleFamily ? { oracleFamily: opts.oracleFamily } : {}), ...(oracleInput ? { oracleInput } : {}), ...(opts.proofReceipt ? { proofReceipt: opts.proofReceipt } : {}),
       },
     }
   }
-
   prove(opts: ChainProveOptions = {}): Promise<CompositeVerificationResult> { return this.ctx.prove_composite(this.build(opts)) }
 }
 
