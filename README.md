@@ -1,124 +1,147 @@
 # Kovo
 
-Local defensive evidence review for websites the operator owns or has permission to assess. See [SPEC.md](SPEC.md) for the v1 design and [VERIFICATION.md](VERIFICATION.md) for the test results.
+**Open-source AI pentester that won't break prod.**
 
-## Run locally
+Self-hosted · Apache 2.0 · [Latest Release](https://github.com/kovo-sh/kovo/releases/latest) · [Docker Guide](docs/DOCKER.md) · [Architecture](ARCHITECTURE.md)
 
-Use Node.js 24.13.1 or newer and a local Linux Docker daemon for evidence workers.
+Catch the real-world vulnerabilities attackers find with ARTEX—backed by **host-enforced guardrails**, not prompts.
+
+> Only assess applications you own or have explicit written authorization to test.
+
+---
+
+## Why Kovo
+
+ARTEX proved autonomous AI agents can run real pentests end to end—but red-team tools are easy to misuse on your own software. Kovo brings that same autonomous depth with host-enforced guardrails, so you never probe third-party hosts, wreck production data, or leak test credentials.
+
+- **Air-gapped workers (`--network=none`)** — Workers run in hardened `--read-only --network=none --cap-drop=ALL` containers (UID `10001`). They cannot open a raw socket. Every outbound request passes through a **Host Request Broker** enforcing your scope allowlist, execution tiers (**Tiers 0–3**, starting read-only), and RPS rate limits.
+- **Opaque persona vault (`0 creds to LLM`)** — Test multi-user and cross-tenant authorization without ever showing cookies, tokens, or JWTs to the model. Sessions stay sealed on the host; the broker injects them and agents only see opaque placeholders like `[redacted:user_b]`.
+- **Code-aware + zero-LLM replay proof (`/repos:ro`, `Verify fix`)** — Mount your repositories read-only (`/repos`) so agents read your actual routes and handlers. Every confirmed finding stores the exact control vs. variant replay assertions—ship your patch and click **Verify fix** to retest against your live app with zero LLM tokens.
+
+### Locked to your apps, by design
+
+1. **Isolated** — Worker containers run with `--network=none` and no secrets; raw sockets die at the container wall.
+2. **Brokered** — Approved requests pass through the Host Request Broker, which swaps persona placeholders for sealed credentials before contacting your app.
+3. **Blocked** — Any request targeting an out-of-scope or third-party host hits the scope wall and never gets a packet.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical design.
+
+---
+
+## Getting started
+
+First pentest in five minutes—run with Docker Compose (recommended) or build from source.
+
+### 1. Start Kovo
+
+#### Option A: Docker Compose (recommended)
+
+Runs Kovo as two unprivileged containers (`kovo` + `docker-socket-proxy`, no `--privileged` and no Docker-in-Docker) using prebuilt multi-arch (`linux/amd64`, `linux/arm64`) images from GHCR:
 
 ```sh
+curl -fsSLO https://raw.githubusercontent.com/kovo-sh/kovo/main/docker-compose.yml
+docker compose pull
+docker compose up
+```
+
+Then open the one-time bootstrap URL printed in the `kovo` logs (for example, `http://127.0.0.1:8000/?bootstrap=...`). Opening it once consumes the secret and sets a local `HttpOnly`, `SameSite=Strict` session cookie (all unauthenticated requests fail closed with `401`).
+
+See [docs/DOCKER.md](docs/DOCKER.md) for `KOVO_PORT`, pinning `KOVO_VERSION`, `KOVO_HOST_SCRATCH_DIR`, and the `docker-socket-proxy` security model.
+
+#### Option B: Run from source
+
+Requires **Node.js 24.13.1+** and a local Docker daemon for isolated `--network=none` worker containers:
+
+```sh
+git clone https://github.com/kovo-sh/kovo.git
+cd kovo
 npm ci
 npm run worker:build
+npx playwright install chromium
 npm run build
 npm start
 ```
 
-Rebuild the local worker image with `npm run worker:build` after updating Kovo to pick up changes to the container runtime.
+Open the one-time `http://127.0.0.1:8000/?bootstrap=...` URL printed on startup (also written to `${KOVO_DATA_DIR:-.kovo}/bootstrap`, mode `0600`). Set `PORT` or `KOVO_DATA_DIR` to customize the port or data directory.
 
-Kovo no longer hands a session cookie to whatever request happens to arrive first. On startup it prints a one-time bootstrap URL (`http://127.0.0.1:8000/?bootstrap=…`) and also writes the secret to `<data-dir>/bootstrap` (mode `0600`). Open that URL once; the secret is consumed, a `HttpOnly`, `SameSite=Strict` local session cookie is set, and every later request without it gets a `401` notice. Use **Model settings** to enter an OpenRouter key, test the DeepSeek Flash preset, and save it. Advanced settings accept OpenAI Responses and Anthropic Messages-compatible providers.
+### 2. Bring your own model
 
-Create a project with the authorized hosts and start a run. Review and approve specific hosts after inventory discovery. The coordinator selects checks for the goal from the available evidence. Runs use supplied records by default. Enable **Read approved public pages during this run** to allow selected HSTS, MIME sniffing protection, and referrer policy checks to collect HTTPS response metadata through the scope broker. The report records the plan, the expected and observed settings, and links each confirmed gap to its verification evidence. [HTTP Strict Transport Security](https://www.rfc-editor.org/rfc/rfc6797.html) · [Fetch Standard](https://fetch.spec.whatwg.org/#x-content-type-options-header) · [Referrer Policy](https://www.w3.org/TR/referrer-policy/#referrer-policy-header-dfn)
+Open **Model settings** in the UI and plug in any **OpenAI-compatible** (Responses API) or **Anthropic** (Messages API) key:
 
-In **Supply prepared evidence**, enter the observed fields for the host. Use `absent` in `contentTypeOptions` or `referrerPolicy` when the header was absent from a captured response. Leave fields out when the source did not record them. If the response record has a UTC timestamp, include it in `recordedAt` so the export shows when the supplied observation was made.
-
-In **Report**, choose a version and open **Export**. **Markdown with evidence** includes sanitized source observations and worker comparisons for offline review. **Plain text** is also available.
-
-Use **Import DNS export** to bring in candidates from a local, self-contained zone file. The preview shows hosts from A, AAAA, and CNAME records and flags aliases to outside the zone. Kovo records host and source information, then puts the imported candidates into the next run's scope review for selection. [DNS master-file syntax](https://www.rfc-editor.org/rfc/rfc1035.html#section-5.1)
-
-For a host found during a run, use **Add candidate** and enter its source. Open the source record from the inventory row, then select the host in **Review scope** and save a new approval to include it in the run.
-
-The server binds to loopback. Set `PORT` to use a different port. Set `KOVO_DATA_DIR` to choose a private data directory. Its default is `.kovo/`.
-
-## Review access policy records
-
-Use **Import access records** on the project. Supply a JSON file for an existing project host with the intended decisions from your policy and the decisions recorded by your authorization tests. The worker matches case IDs and compares the decisions in the local sandbox. A missing recorded decision remains inconclusive. Access policy checks use the supplied records.
-
-```json
-{
-  "origin": "https://portal.example",
-  "recordedAt": "2026-11-17T15:45:00Z",
-  "expected": [
-    { "caseId": "read-summary", "role": "team-viewer", "capability": "read-summary", "decision": "allow" }
-  ],
-  "observed": [
-    { "caseId": "read-summary", "decision": "allow" }
-  ]
-}
-```
-
-Use non-sensitive case, role, and capability labels, unique case IDs in each list, and a UTC timestamp. The importer accepts up to 64 cases. Imports are available to the next discovery. Runs that already captured their inventory keep their saved record.
-
-An expected `deny` case can include `"impactIfAllowed": "sensitive-records"` for access to sensitive records or `"impactIfAllowed": "organization-admin"` for organization-wide administration. A verified unintended grant then rates high or critical, respectively. The finding links to the source policy and explains where the impact rating came from.
-
-## Verify
-
-```sh
-npx playwright install chromium
-npm run check
-npm run test:e2e
-npm run test:boundaries
-```
-
-Playwright runs against the production build with a temporary SQLite database per test. It replays recorded OpenRouter streams and local network fixtures through Kovo's request guards. The verification job uses the same tests on Linux.
-
-Record fresh fixtures explicitly with `npm run fixtures:capture -- responses`, `messages`, or `workflow`. Use `npm run fixtures:capture -- response-referrer --protocol messages` to record one named workflow scene using Messages. Capture uses only synthetic inputs and reads the key from `~/.config/kovo-fixtures/openrouter.key`, with owner-only permissions.
-
-The separate opt-in command `npm run smoke:live -- --live` runs the production browser flow against live OpenRouter and the approved Dyad public home pages. It prints the local report path and data directory. Resume that run with `npm run smoke:live -- --live --resume <data-directory>` if it stops early.
-
-## Smoke battery
-
-`npm run smoke:agentic -- --tier 1` is the fast product-first inner loop: Tier 0 runs the worker gate plus six deterministic over-claim archetypes (all must be dismissed), and Tier 1 runs four parallel agentic cells — paired lift on acme-saas, a rotating second app, a hardened zero-vuln trap (0 confirmations required), and a realism #2/#3/#4 micro-slice. Budget is ~6 minutes and ~$1. Use `--tier 0` for the free pre-commit check, `--dry-run` to plan without model calls, and `--tier 2` to print the full matrix/held-out/endurance commands. See `docs/SMOKE-BATTERY.md`.
-
-## Benchmark reports
-
-Run `npm run benchmark:reports` to replay the Northstar cases through the production app. The output goes to `test-results/report-benchmark/`. The `summary.json` regression scorecard covers the original four report versions. The `comparison-manifest.json` and `comparison-scorecard.json` also cover the same access issue on two approved hosts and a run with verified high and critical access discrepancies. Each report has a shared-input packet and an ordered run recording through the event that saved that version. These files link to the exact report export by digest. Copy the directory to a private workspace before adding Artex results or reader scores.
-
-The saved matched release suite lives in the private `.kovo/artex-matched` workspace. It pairs four assessments against a local Artex instance on the same controlled HTTPS hosts, shared goal, captured inputs, and stopping points. The scorecard in `comparison/scorecard.json` records Kovo's precision, recall, severity, evidence, and paired-reader results next to Artex's, with native reports and event excerpts retained for audit. See `VERIFICATION.md` for the result and `README.md` in that workspace for the reproduction boundary.
-
-To compare independently reviewed Artex reports for the same cases, set `KOVO_ARTEX_REPORT_RESULTS` to a local JSON file outside `test-results/`. Use the scorecard's `suite` value, the Artex `version` and `model`, an `unmatchedConfirmations` count, and a `cases` object keyed by each case ID in the scorecard. Each case takes one of `confirmed`, `met`, `inconclusive`, or `untested`. Use `untested` for unsupported cases. Keep the source reports with the verdicts so the comparison can be audited.
-
-### Compare matched reports
-
-Use the offline scorecard for the release comparison. Keep the input packets, reports, and reviewed recordings in a private local directory. Use `{ "path": "report.md", "sha256": "…" }` for each file reference, with paths relative to the manifest directory and digests from `sha256sum`.
-
-```sh
-npm run --silent compare:reports -- .kovo/comparison/manifest.json > .kovo/comparison/scorecard.json
-```
-
-The manifest has `format` set to `1`, a `suite` name, a `mode` of `assessment` or `report-only`, and a list of `scenarios`. Give each scenario a unique `id` and these fields.
-
-| Field | Contents |
+| Setting | Recommended default |
 | --- | --- |
-| `input` | Reference to JSON containing the shared `goal`, `scope` as HTTPS origins, `stoppingPoint` as `complete` or `interrupted`, and `capturedEvidence`. Set `overlappingObservations` to true for the multi-host case that uses them. Set `heldOut` on the scenario for a case reserved from tuning. |
-| `cases` | The verdicts established before reading the reports. Each entry has an `asset`, an `issue` identifier, and an `expected` verdict. Include `severity` on expected confirmations. |
-| `kovo` and `artex` | Optional results with the tool `version`, `model`, shared `inputSha256`, a `report` file reference, and reviewed `verdicts`. Each verdict has an `asset`, `issue`, and `verdict`. Enter one row per displayed confirmation, including repeats. Include the reported `severity` to compare it with the expected rating. For Kovo confirmations, label the `evidence` as `supported`, `missing`, `unrelated`, or `out-of-scope` after checking the original observation and verification. |
-| `runRecord` inside each product result | For an assessment, reference a JSON record containing `inputSha256`, `reportSha256`, and a `recording` file reference to the saved run. If the native recording uses another format, include an `audit` file reference to a reviewed JSON event excerpt. |
-| `reviews` | Optional paired reviews. Enter a `reader` ID, `kovo` and `artex` answers, and optional `notes`. Each product's answers contain its `reportSha256` and a `tasks` object with grades for the same tasks. Use `coverage` for every report. For scenarios with expected findings, also grade `priority`, `remediation`, `impact`, `evidence`, and `recheck`. Grade each answer as `correct`, `incorrect`, or `unanswered`. |
+| **Provider** | OpenRouter |
+| **Model** | DeepSeek v4.1 Flash (`deepseek/deepseek-v4.1-flash-1017`) |
+| **Also works** | Any OpenAI Responses or Anthropic Messages-compatible endpoint |
 
-Use the same asset and issue identifiers in the expected cases and both sets of verdicts. Mark unsupported checks `untested`. Put pre-adjudicated export exercises in `report-only` mode. The scorecard checks file integrity and uses the recorded judgments to score precision, recall, misses by severity, duplicate findings, and reader tasks. Review the saved artifacts when adjudicating any verdict or evidence link.
+### 3. Launch your first pentest
 
-For an assessment, record the reported severity of every expected high or critical finding. The scorecard fails a verified Kovo recording for a missed finding at either level or a missing or different rating. The accuracy section lists the scenario, asset, issue, expected severity, reported verdict, and reported severity for each failure. This criterion applies as soon as a Kovo recording verifies.
+1. Paste your target website URL.
+2. Review and approve the discovered domains in scope.
+3. Optionally connect read-only GitHub repos (`/repos`) and test accounts in the opaque persona vault.
+4. Launch the run, inspect confirmed replay proofs, and click **Verify fix** after shipping patches.
 
-The accuracy section also lists coverage overclaims. A verified Kovo recording fails if a check labeled untested has a reported result, or a check labeled inconclusive appears as passed or confirmed.
+---
 
-The recording audit uses a string `runId`, the `status` at export, an `approval` object with the final approval's `eventId` and `scope`, and an `events` array in increasing numeric `id` order. Give each event its `kind`. Use `run.created` at the start, `scope.approved` with the approved origins in `scope` for each approval, and `report.complete` or `report.partial` at the chosen report save. Record bounded reads as `broker.allowed` or `broker.observed` with their destination `origin`. Use `complete` for a complete report and `stopped`, `paused`, or `failed` for an interrupted run. Kovo's export records include the `reportVersion` and `reportId`. The scorecard checks the Kovo run and version against the Markdown. Keep the native recording alongside any reviewed excerpt.
+## How it stacks up
 
-A passing release scorecard requires matched run records, representative cases, and paired reader results. Invalid references or a failed criterion exit with an error. A failed comparison still writes the scorecard so the reasons can be reviewed.
+| Dimension | **Kovo** | ARTEX | Strix | Classic DAST (ZAP / Nuclei) |
+| --- | --- | --- | --- | --- |
+| **Safety & guardrails** | Air-gapped worker, host broker, Tiers 0–3, opaque vault | Built for red-teaming; easy to misuse on your own apps | Containerized; operator-managed safety | Rule/template driven; manual auth and scope tuning |
+| **Finding proof** | Zero-LLM replay proof + Verify Fix | Agent-generated PoCs and reports | Agent exploit scripts and PoCs | Signature match; manual false-positive triage |
+| **Code context** | Full read-only `/repos` mounts | Primarily external / black-box | Source + dynamic hybrid | Black-box HTTP only |
+| **Interface** | Self-hosted end-to-end management UI | Self-hosted web UI | CLI-first | Desktop GUI (ZAP) / CLI (Nuclei) |
+| **License** | Apache 2.0 | Open-source / source-available | Apache 2.0 | Apache 2.0 / MIT |
 
-## View the sample run
+---
+
+## FAQ
+
+- **Is Kovo free? What are the restrictions?**
+  100% free and open source under **Apache 2.0**. Unlimited runs across all your apps—you only pay your own LLM provider.
+- **Can it really not break production?**
+  Workers run with `--network=none`, so every request passes through the host broker. You control the domain allowlist, RPS rate limits, and execution tier (Tiers 0–3, starting read-only), and test credentials stay sealed in the host vault—never shown to the LLM.
+- **Enterprise Edition (in development):**
+  SSO, configurable roles and RBAC, and scheduled routine pentest runs with automated email and Slack reports. Contact [will@kovo.sh](mailto:will@kovo.sh?subject=Kovo%20Enterprise).
+
+---
+
+## Built in the open
+
+Built under the [Apache 2.0 License](LICENSE) by **Will Chen** (ex-Google Staff Software Engineer, creator of [Dyad](https://github.com/dyad-sh/dyad) and [Mesop](https://github.com/mesop-dev/mesop)).
+
+---
+
+## Developing Kovo
+
+### Prerequisites & setup
+
+- **Node.js `>= 24.13.1`** and a local **Docker** daemon (`docker` CLI reachable by your shell, e.g. via the `docker` group)
+- Install dependencies, Playwright Chromium, and the local hardened worker image:
 
 ```sh
-KOVO_DATA_DIR=.kovo/sample npm run sample
-KOVO_DATA_DIR=.kovo/sample KOVO_OFFLINE=1 PORT=8002 npm start
+npm ci
+npm run worker:install
+npm run worker:build
+npx playwright install chromium
 ```
 
-Open the path printed by `sample` at http://127.0.0.1:8002 and select **Trace** to see the 34-worker graph. The production sample uses synthetic records in a separate workspace.
-
-## Design prototype
+### Common development & verification commands
 
 ```sh
-npm run demo:build
-PORT=8001 npm run demo
+npm run check                        # TypeScript typecheck (tsc --noEmit)
+npm run build                        # Production Vite/TanStack Start build
+bash scripts/worker-gate.sh          # Fast pre-handoff gate (static ratchets + tsc + fast unit suites)
+bash scripts/docker-smoke.sh         # Verify worker UID 10001 + --network=none bridge handshake
+npm run test:boundaries              # Security boundary & broker tests
+npm run test:e2e                     # Live Chromium E2E UI tests (replays recorded fixtures)
 ```
 
-The design demo uses synthetic records and scripted worker activity. Its data is separate from the production app.
+To verify the full Docker Compose sibling-container stack locally:
+
+```sh
+docker build -t kovo:local --build-arg KOVO_WORKER_IMAGE=kovo-worker:v4 .
+bash scripts/docker-compose-smoke.sh
+```
+
+After editing anything under `worker/`, rebuild the local image with `npm run worker:build`. See [docs/DOCKER.md](docs/DOCKER.md) for the human-approved container release process (`.github/workflows/release.yml`) and [docs/SMOKE-BATTERY.md](docs/SMOKE-BATTERY.md) for the agentic inner-loop smoke battery.
