@@ -34,6 +34,15 @@ export const DEFAULT_PTC_ALLOWED_OPS: ReadonlySet<string> = new Set([
 
 export type PtcDispatchFn = (op: string, args: Record<string, unknown>, signal: AbortSignal) => Promise<unknown>
 
+export interface PtcRpcCallEvent {
+  op: string
+  args: Record<string, unknown>
+  ok: boolean
+  result?: unknown
+  error?: string
+  durationMs: number
+}
+
 export interface PtcRpcServerOptions {
   hostDir: string
   dispatch: PtcDispatchFn
@@ -41,6 +50,7 @@ export interface PtcRpcServerOptions {
   maxCallsPerExec?: number
   maxBodyBytes?: number
   callTimeoutMs?: number
+  onCall?: (event: PtcRpcCallEvent) => void
 }
 
 export const ptcExecRequestSchema = z.object({
@@ -118,6 +128,7 @@ export class PtcRpcServer {
   private readonly maxCallsPerExecValue: number
   private readonly maxBodyBytes: number
   private readonly callTimeoutMs: number
+  private readonly onCall?: (event: PtcRpcCallEvent) => void
   private readonly socketPathValue: string
   private readonly tokenPathValue: string
   private server: Server | null = null
@@ -139,6 +150,7 @@ export class PtcRpcServer {
     this.maxBodyBytes = Math.max(1024, Math.min(Math.floor(Number.isFinite(maxBody) ? maxBody : MAX_PTC_RPC_BODY_BYTES), MAX_PTC_RPC_BODY_BYTES))
     const timeout = options.callTimeoutMs ?? DEFAULT_PTC_CALL_TIMEOUT_MS
     this.callTimeoutMs = Math.max(100, Math.min(Math.floor(Number.isFinite(timeout) ? timeout : DEFAULT_PTC_CALL_TIMEOUT_MS), 120_000))
+    this.onCall = options.onCall
     this.socketPathValue = join(this.hostDirValue, PTC_SOCKET_NAME)
     this.tokenPathValue = join(this.hostDirValue, PTC_TOKEN_NAME)
   }
@@ -249,11 +261,20 @@ export class PtcRpcServer {
     res.once('close', onClose)
     const timer = setTimeout(() => callAbort.abort(new Error('PTC RPC call timed out.')), this.callTimeoutMs)
     timer.unref?.()
+    const dispatchArgs = (record.args as Record<string, unknown> | undefined) ?? {}
+    const startedAt = Date.now()
     try {
-      const result = await this.dispatch(op, (record.args as Record<string, unknown> | undefined) ?? {}, callAbort.signal)
+      const result = await this.dispatch(op, dispatchArgs, callAbort.signal)
+      try {
+        this.onCall?.({ op, args: dispatchArgs, ok: true, result, durationMs: Math.max(0, Date.now() - startedAt) })
+      } catch { /* non-fatal observer */ }
       return reply(200, { ok: true, result })
     } catch (error) {
-      return reply(200, { ok: false, error: this.scrubError(error) })
+      const scrubbed = this.scrubError(error)
+      try {
+        this.onCall?.({ op, args: dispatchArgs, ok: false, error: scrubbed, durationMs: Math.max(0, Date.now() - startedAt) })
+      } catch { /* non-fatal observer */ }
+      return reply(200, { ok: false, error: scrubbed })
     } finally {
       clearTimeout(timer)
       this.serverAbort.signal.removeEventListener('abort', onServerAbort)
