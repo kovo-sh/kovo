@@ -4,6 +4,7 @@
  * TypeScript `kovo_verify` script (`<= 64 KiB`) using `ctx.chain()`. Zero app/route hardcoding.
  */
 import { buildTerminalClassContractMap } from './oracle-spec.ts'
+import { canonicalNonAuthQuery } from './v8-oracle-hydrate.ts'
 
 export interface RecordedRequestExchange {
   exchangeId: string; origin: string; method: string; pathAndQuery: string; persona?: string
@@ -248,15 +249,6 @@ const cleanControlPath = (p?: string): string => {
   const raw = (p ?? '').split(/[?#]/, 1)[0] ?? ''
   const withSlash = raw.startsWith('/') ? raw : `/${raw}`
   return withSlash.replace(/\/+$/, '').toLowerCase() || '/'
-}
-function canonicalNonAuthQuery(p?: string): string {
-  const qIdx = (p ?? '').indexOf('?'); if (qIdx < 0) return ''
-  const pairs: [string, string][] = []
-  for (const [k, v] of new URLSearchParams((p ?? '').slice(qIdx + 1).split('#', 1)[0]!).entries()) {
-    const lk = k.trim().toLowerCase()
-    if (!AUTH_QUERY_KEYS.has(lk)) pairs.push([lk, v.trim()])
-  }
-  return pairs.sort(([a, av], [b, bv]) => (a < b ? -1 : a > b ? 1 : av < bv ? -1 : av > bv ? 1 : 0)).map(([k, v]) => `${k}=${v}`).join('&')
 }
 function matchesControlTarget(ctrlEx: RecordedRequestExchange, refEx: RecordedRequestExchange): boolean {
   const co = normOrigin(ctrlEx.origin), ro = normOrigin(refEx.origin)
