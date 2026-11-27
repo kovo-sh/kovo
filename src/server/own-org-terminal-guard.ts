@@ -1066,3 +1066,616 @@ export function resolveOpaqueDualCacheBleedTarget(params: {
   if (bodyForeign.length === 1) return bodyForeign[0]
   return undefined
 }
+
+// --- R9 Kernel Soundness Helpers: Seal Metadata, Base-Persona Resolution, Balance Minting ---
+
+const SEAL_META_ENDPOINT_HDR = 'x-kovo-seal-endpoint'
+const SEAL_META_METHOD_HDR = 'x-kovo-seal-method'
+const SEAL_META_FIELD_HDR = 'x-kovo-seal-field'
+const SEAL_PSEUDO_PATH_RE = /^\/capability\/seal(?:\/|$)/i
+const SEAL_PSEUDO_METHOD_RE = /^(?:SEAL|SIGN|DERIVE|MINT)$/i
+
+function normalizeSealJsonPathField(raw: string): string {
+  const cleaned = raw
+    .trim()
+    .replace(/^\$\.?/, '')
+    .replace(/\[['"]([^'"]+)['"]\]/g, '.$1')
+    .replace(/\[\d+\]/g, '')
+    .replace(/^\.+|\.+$/g, '')
+    .replace(/\.{2,}/g, '.')
+  return cleaned.slice(0, 64)
+}
+
+/**
+ * R9: Extract non-secret structural producer metadata (`endpoint`, `method`, `fieldName`) for a
+ * `capability.seal` transcript record so downstream ledger sync & frontier synthesis can classify
+ * sealed capabilities without app-specific hardcoding.
+ */
+export function extractSealMetadataHeaders(
+  args: Record<string, unknown>,
+  sourceRequest?: { method?: string | null; pathAndQuery?: string | null } | null,
+  extractedCookie?: string,
+): Record<string, string> {
+  const headers: Record<string, string> = {}
+  const rawEndpoint = (sourceRequest?.pathAndQuery ?? '').split(/[?#]/, 1)[0]?.trim() ?? ''
+  if (rawEndpoint && !SEAL_PSEUDO_PATH_RE.test(rawEndpoint)) headers[SEAL_META_ENDPOINT_HDR] = rawEndpoint.slice(0, 256)
+  const rawMethod = (sourceRequest?.method ?? '').trim().toUpperCase()
+  if (rawMethod && !SEAL_PSEUDO_METHOD_RE.test(rawMethod)) headers[SEAL_META_METHOD_HDR] = rawMethod.slice(0, 16)
+  let field = ''
+  if (typeof args.jsonPath === 'string' && args.jsonPath.trim()) field = normalizeSealJsonPathField(args.jsonPath)
+  else if (typeof args.locationQuery === 'string' && args.locationQuery.trim()) field = args.locationQuery.trim()
+  else if (typeof args.queryParam === 'string' && args.queryParam.trim()) field = args.queryParam.trim()
+  else if (typeof args.header === 'string' && args.header.trim()) field = args.header.trim()
+  else if (typeof args.setCookie === 'string' && args.setCookie.trim()) field = args.setCookie.trim()
+  else if (typeof args.cookie === 'string' && args.cookie.trim()) field = args.cookie.trim()
+  else if (extractedCookie?.trim()) field = extractedCookie.trim()
+  else if (typeof args.defaultCookieName === 'string' && args.defaultCookieName.trim()) field = args.defaultCookieName.trim()
+  else if (typeof args.defaultHeaderName === 'string' && args.defaultHeaderName.trim()) field = args.defaultHeaderName.trim()
+  if (field) headers[SEAL_META_FIELD_HDR] = field.replace(/[\r\n\0]/g, '').slice(0, 64)
+  return headers
+}
+
+export interface CapSyncTranscriptLike {
+  exchangeId: string
+  op: string
+  request?: {
+    origin?: string
+    method?: string
+    pathAndQuery?: string
+    headers?: Record<string, string>
+    personaHandle?: string | null
+    consumedCapabilityId?: string | null
+  }
+}
+
+export interface CapSyncMetaLike {
+  handle: string
+  hopReceiptId: string
+  slot: string
+  derivedFromCapabilityId?: string
+  defaultHeaderName?: string
+  defaultCookieName?: string
+}
+
+export interface CapSyncLedgerLike {
+  getCapability(capId: string): { actorPersona?: string } | null | undefined
+}
+
+/**
+ * R9: Resolve an ephemeral `"cap:..."` handle back to its owning approved base persona so
+ * `CapabilityNode.actorPersona` NEVER stores a `"cap:..."` handle.
+ */
+export function resolveBasePersonaHandle(params: {
+  rawPersona: string | null | undefined
+  defaultPersona: string
+  ledger: CapSyncLedgerLike
+  recordByCapHandle: ReadonlyMap<string, CapSyncTranscriptLike>
+  hostEntryByEmittedCap: ReadonlyMap<string, HydratableEntry>
+  sealedMetaByHandle?: ReadonlyMap<string, CapSyncMetaLike>
+  normalizeCapId?: (handle: string) => string
+  seedCapIds?: readonly (string | null | undefined)[]
+}): string {
+  const safeDefault = params.defaultPersona.trim() && !/^cap:/i.test(params.defaultPersona.trim())
+    ? params.defaultPersona.trim()
+    : 'attacker'
+  const start = params.rawPersona?.trim() ?? ''
+  if (start && !/^cap:/i.test(start)) return start
+
+  const queue: string[] = []
+  const visited = new Set<string>()
+  const pushCap = (h: string | null | undefined) => {
+    const t = h?.trim()
+    if (t && /^cap:/i.test(t) && !visited.has(t)) queue.push(t)
+  }
+  pushCap(start)
+  for (const s of params.seedCapIds ?? []) pushCap(s)
+  while (queue.length > 0 && visited.size < 16) {
+    const cur = queue.shift()!
+    if (visited.has(cur)) continue
+    visited.add(cur)
+    const normCur = params.normalizeCapId ? params.normalizeCapId(cur) : cur
+    const nodeActor = (params.ledger.getCapability(cur)?.actorPersona ?? params.ledger.getCapability(normCur)?.actorPersona)?.trim()
+    if (nodeActor && !/^cap:/i.test(nodeActor)) return nodeActor
+    if (nodeActor) pushCap(nodeActor)
+
+    const rec = params.recordByCapHandle.get(cur)
+    const recActor = rec?.request?.personaHandle?.trim()
+    if (recActor && !/^cap:/i.test(recActor)) return recActor
+    if (recActor) pushCap(recActor)
+    pushCap(rec?.request?.consumedCapabilityId)
+
+    const hostEntry = params.hostEntryByEmittedCap.get(cur)
+    const hostActor = (hostEntry?.actorPersona ?? hostEntry?.step.actor.handle)?.trim()
+    if (hostActor && !/^cap:/i.test(hostActor)) return hostActor
+    if (hostActor) pushCap(hostActor)
+    for (const c of hostEntry?.consumedCapabilities ?? []) pushCap(c)
+
+    const meta = params.sealedMetaByHandle?.get(cur)
+    pushCap(meta?.derivedFromCapabilityId)
+  }
+  return safeDefault
+}
+
+/**
+ * R9: Resolve base `actorPersona` (never `"cap:..."`) and producer metadata (`endpoint`, `method`,
+ * `fieldName`) for a sealed Layer-1 capability persisted into `CapabilityLedger`.
+ */
+export function resolveSealedCapabilitySyncContext(params: {
+  meta: CapSyncMetaLike
+  rec: CapSyncTranscriptLike | undefined
+  defaultPersona: string
+  ledger: CapSyncLedgerLike
+  recordByCapHandle: ReadonlyMap<string, CapSyncTranscriptLike>
+  recordByExchangeId: ReadonlyMap<string, CapSyncTranscriptLike>
+  hostEntryByEmittedCap: ReadonlyMap<string, HydratableEntry>
+  sealedMetaByHandle: ReadonlyMap<string, CapSyncMetaLike>
+  normalizeCapId?: (handle: string) => string
+}): { actorPersona: string; endpoint?: string; method?: string; fieldName?: string } {
+  const { meta, rec, hostEntryByEmittedCap, recordByExchangeId } = params
+  const sourceEntry = hostEntryByEmittedCap.get(meta.handle)
+  const rawPersona = rec?.request?.personaHandle?.trim()
+    || sourceEntry?.actorPersona?.trim()
+    || sourceEntry?.step.actor.handle?.trim()
+    || ''
+  const actorPersona = resolveBasePersonaHandle({
+    rawPersona,
+    defaultPersona: params.defaultPersona,
+    ledger: params.ledger,
+    recordByCapHandle: params.recordByCapHandle,
+    hostEntryByEmittedCap,
+    sealedMetaByHandle: params.sealedMetaByHandle,
+    normalizeCapId: params.normalizeCapId,
+    seedCapIds: [
+      meta.derivedFromCapabilityId,
+      rec?.request?.consumedCapabilityId,
+      ...(sourceEntry?.consumedCapabilities ?? []),
+    ],
+  })
+  const cleanEp = (raw: string | null | undefined): string | undefined => {
+    const p = (raw ?? '').split(/[?#]/, 1)[0]?.trim() ?? ''
+    return p && !SEAL_PSEUDO_PATH_RE.test(p) ? p : undefined
+  }
+  const cleanMeth = (raw: string | null | undefined): string | undefined => {
+    const m = (raw ?? '').trim().toUpperCase()
+    return m && !SEAL_PSEUDO_METHOD_RE.test(m) ? m : undefined
+  }
+  const hopRec = recordByExchangeId.get(meta.hopReceiptId)
+  const recNonSeal = rec && rec.op !== 'capability' && !SEAL_PSEUDO_METHOD_RE.test(rec.request?.method ?? '') ? rec : undefined
+  const hopNonSeal = hopRec && hopRec.op !== 'capability' && !SEAL_PSEUDO_METHOD_RE.test(hopRec.request?.method ?? '') ? hopRec : undefined
+  // R3-05 A1: Only trust host-stamped `x-kovo-seal-*` headers on host `op: 'capability'` SEAL records
+  // (never on worker-controlled `op: 'http'` request headers).
+  const sealHdrs = rec?.op === 'capability' ? rec.request?.headers : undefined
+  const endpoint = cleanEp(sourceEntry?.step.pathAndQuery ?? sourceEntry?.step.route)
+    ?? cleanEp(recNonSeal?.request?.pathAndQuery)
+    ?? cleanEp(sealHdrs?.[SEAL_META_ENDPOINT_HDR])
+    ?? cleanEp(hopNonSeal?.request?.pathAndQuery)
+  const method = cleanMeth(sourceEntry?.step.method)
+    ?? cleanMeth(recNonSeal?.request?.method)
+    ?? cleanMeth(sealHdrs?.[SEAL_META_METHOD_HDR])
+    ?? cleanMeth(hopNonSeal?.request?.method)
+  const rawField = sealHdrs?.[SEAL_META_FIELD_HDR]?.trim()
+    || meta.defaultHeaderName?.trim()
+    || meta.defaultCookieName?.trim()
+    || ''
+  const fieldName = rawField || undefined
+  return {
+    actorPersona,
+    ...(endpoint ? { endpoint } : {}),
+    ...(method ? { method } : {}),
+    ...(fieldName ? { fieldName } : {}),
+  }
+}
+
+const ECON_PLACEHOLDER_RE = /^(?:<scrubbed>|\[redacted\]|\[injected\]|:id|null|undefined|unknown|default|none)$/i
+const ECON_ENTITY_ID_KEYS = new Set([
+  'orderid', 'order_id', 'paymentid', 'payment_id', 'invoiceid', 'invoice_id',
+  'payoutid', 'payout_id', 'depositid', 'deposit_id', 'transactionid', 'transaction_id',
+  'transferid', 'transfer_id', 'checkoutid', 'checkout_id', 'chargeid', 'charge_id',
+  'refundid', 'refund_id', 'settlementid', 'settlement_id', 'entityid', 'entity_id',
+])
+const ECON_ENTITY_CONTAINER_KEYS = new Set([
+  'order', 'payment', 'invoice', 'payout', 'deposit', 'transaction',
+  'transfer', 'checkout', 'charge', 'refund', 'settlement',
+])
+const ECON_ENTITY_PATH_CONTAINER_RE = /^(?:orders?|payments?|invoices?|payouts?|deposits?|transactions?|transfers?|checkouts?|charges?|refunds?|settlements?|captures?|redemptions?|vouchers?|coupons?)$/i
+const ECON_IDENTITY_SKIP_KEYS = new Set(['tenantid', 'tenant_id', 'orgid', 'org_id', 'accountid', 'account_id', 'walletid', 'wallet_id', 'userid', 'user_id'])
+const ECON_NEG_AMOUNT_KEYS = new Set([
+  'amount', 'amountcents', 'amount_cents', 'delta', 'credit', 'credited', 'debit',
+  'deposit', 'deposited', 'depositamount', 'deposit_amount', 'withdraw', 'withdrawal',
+  'withdrawamount', 'withdraw_amount', 'transferamount', 'transfer_amount', 'quantity', 'qty', 'price', 'total',
+])
+const ECON_DEPOSIT_KEYS = ['credited', 'deposited', 'depositamount', 'deposit_amount', 'deposit', 'credit', 'amount', 'amountcents', 'amount_cents', 'delta'] as const
+
+function normalizeEntityToken(v: unknown): string | undefined {
+  if (typeof v !== 'string' && typeof v !== 'number') return undefined
+  const s = String(v).trim()
+  if (s.length < 2 || s.length > 128 || ECON_PLACEHOLDER_RE.test(s)) return undefined
+  return s.toLowerCase()
+}
+
+function lastStaticPathSegment(rawPath: string | null | undefined): string {
+  const base = (rawPath ?? '').split(/[?#]/, 1)[0] ?? ''
+  const segs = base.split('/').filter(Boolean)
+  for (let i = segs.length - 1; i >= 0; i--) {
+    const seg = segs[i]!.trim()
+    if (!seg || OWN_ORG_DYNAMIC_SEG_RE.test(seg) || ECON_PLACEHOLDER_RE.test(seg)) continue
+    return seg
+  }
+  return ''
+}
+
+function isEconomicEntityRoute(rawPath: string | null | undefined): boolean {
+  const base = (rawPath ?? '').split(/[?#]/, 1)[0] ?? ''
+  const segs = base.split('/').filter(Boolean)
+  for (let i = segs.length - 1; i >= 0; i--) {
+    const seg = segs[i]!.trim()
+    if (!seg) continue
+    if (OWN_ORG_DYNAMIC_SEG_RE.test(seg) || ECON_PLACEHOLDER_RE.test(seg)) {
+      const prev = i > 0 ? segs[i - 1]!.trim() : ''
+      return Boolean(prev && ECON_ENTITY_PATH_CONTAINER_RE.test(prev))
+    }
+    if (ECON_ENTITY_PATH_CONTAINER_RE.test(seg)) return true
+  }
+  return false
+}
+
+function extractServerEntityIdFromEntry(entry: HydratableEntry): string | undefined {
+  const rawPath = entry.step.pathAndQuery ?? entry.step.route ?? ''
+  const json = entry.step.json
+  if (json && typeof json === 'object' && !Array.isArray(json)) {
+    const root = json as Record<string, unknown>
+    for (const [k, v] of Object.entries(root)) {
+      if (ECON_ENTITY_ID_KEYS.has(k.toLowerCase())) {
+        const tok = normalizeEntityToken(v)
+        if (tok) return tok
+      }
+    }
+    for (const [k, v] of Object.entries(root)) {
+      if (ECON_ENTITY_CONTAINER_KEYS.has(k.toLowerCase()) && v && typeof v === 'object' && !Array.isArray(v)) {
+        const sub = v as Record<string, unknown>
+        for (const [sk, sv] of Object.entries(sub)) {
+          const slk = sk.toLowerCase()
+          if (slk === 'id' || ECON_ENTITY_ID_KEYS.has(slk)) {
+            const tok = normalizeEntityToken(sv)
+            if (tok) return tok
+          }
+        }
+      }
+    }
+    // R3-05 B1: Only treat bare top-level `id` as an economic entity ID when the route itself is
+    // an economic-entity container (e.g. `POST /v1/orders`), NEVER on wallet/account/user routes.
+    if (ECON_ENTITY_PATH_CONTAINER_RE.test(lastStaticPathSegment(rawPath))) {
+      const skipVals = new Set<string>()
+      for (const [k, v] of Object.entries(root)) {
+        if (ECON_IDENTITY_SKIP_KEYS.has(k.toLowerCase())) {
+          const tok = normalizeEntityToken(v)
+          if (tok) skipVals.add(tok)
+        }
+      }
+      const topId = normalizeEntityToken(root.id)
+      if (topId && !skipVals.has(topId)) return topId
+    }
+  }
+  // R3-05 B1: Path segment fallback applies ONLY when immediately preceded by a known economic
+  // entity container segment (orders/payments/invoices/charges/...) — never wallets/accounts/users.
+  const rawBase = rawPath.split(/[?#]/, 1)[0] ?? ''
+  const segs = rawBase.split('/').filter(Boolean)
+  for (let i = segs.length - 1; i >= 1; i--) {
+    const seg = segs[i]!.trim()
+    const prev = segs[i - 1]!.trim()
+    if (!ECON_ENTITY_PATH_CONTAINER_RE.test(prev)) continue
+    if (!OWN_ORG_DYNAMIC_SEG_RE.test(seg)) continue
+    const tok = normalizeEntityToken(seg)
+    if (tok) return tok
+  }
+  return undefined
+}
+
+function buildEntityKeyResolver(
+  windowEntries: readonly HydratableEntry[],
+  allEntriesById: ReadonlyMap<string, HydratableEntry>,
+): (entry: HydratableEntry) => { key: string; serverBound: boolean } {
+  const authCaps = new Set<string>()
+  for (const e of allEntriesById.values()) {
+    const a = actorOfGuardEntry(e)?.trim()
+    if (a && /^cap:/i.test(a)) authCaps.add(a)
+  }
+  // R3-05 B1: Only treat a window-emitted capability as an economic-entity handle when its
+  // emitter is on an economic-entity route (never wallet/account/user creation handles).
+  const windowEmittedCaps = new Set<string>()
+  for (const e of windowEntries) {
+    if (isHostPseudoOpEntry(e) || stepReadsState(e.step)) continue
+    const st = e.step.status
+    if (typeof st !== 'number' || st < 200 || st >= 300) continue
+    if (!isEconomicEntityRoute(e.step.pathAndQuery ?? e.step.route)) continue
+    for (const cap of e.emittedCapabilities ?? []) {
+      if (cap && !authCaps.has(cap)) windowEmittedCaps.add(cap)
+    }
+  }
+  const parent = new Map<string, string>()
+  const find = (x: string): string => {
+    let cur = x
+    while (parent.has(cur) && parent.get(cur) !== cur) cur = parent.get(cur)!
+    let walk = x
+    while (walk !== cur) { const next = parent.get(walk)!; parent.set(walk, cur); walk = next }
+    return cur
+  }
+  const union = (a: string, b: string) => {
+    const ra = find(a), rb = find(b)
+    if (ra !== rb) parent.set(rb, ra)
+  }
+  for (const cap of windowEmittedCaps) parent.set(cap, cap)
+  for (const e of windowEntries) {
+    if (isHostPseudoOpEntry(e)) continue
+    const linked = [...(e.consumedCapabilities ?? []), ...(e.emittedCapabilities ?? [])].filter(c => windowEmittedCaps.has(c))
+    for (let i = 1; i < linked.length; i++) union(linked[0]!, linked[i]!)
+  }
+  return (entry: HydratableEntry) => {
+    const entId = extractServerEntityIdFromEntry(entry)
+    if (entId) return { key: `ent:${entId}`, serverBound: true }
+    const linkedCap = [...(entry.emittedCapabilities ?? []), ...(entry.consumedCapabilities ?? [])].find(c => windowEmittedCaps.has(c))
+    if (linkedCap) return { key: `cap:${find(linkedCap)}`, serverBound: true }
+    return { key: `ex:${entry.exchangeId}`, serverBound: false }
+  }
+}
+
+function hasNegativeRequestAmount(node: unknown, depth = 0): boolean {
+  if (depth > 3 || !node || typeof node !== 'object') return false
+  if (Array.isArray(node)) return node.slice(0, 32).some(item => hasNegativeRequestAmount(item, depth + 1))
+  for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+    if (ECON_NEG_AMOUNT_KEYS.has(k.toLowerCase()) && typeof v === 'number' && Number.isFinite(v) && v < 0) return true
+    if (v && typeof v === 'object' && depth < 3 && hasNegativeRequestAmount(v, depth + 1)) return true
+  }
+  return false
+}
+
+function sumBalanceMap(map: Readonly<Record<string, number>> | undefined): number | null {
+  if (!map) return null
+  const vals = Object.values(map)
+  if (vals.length === 0) return null
+  let total = 0
+  for (const v of vals) { if (!Number.isFinite(v)) return null; total += v }
+  return total
+}
+
+function computeDeduplicatedDeposits(params: {
+  entries: readonly HydratableEntry[]
+  allEntriesById: ReadonlyMap<string, HydratableEntry>
+  preChainControlExchangeIds?: readonly string[]
+  findNumericField: (root: unknown, keys: readonly string[]) => number | undefined
+  isInternalTransferRequest: (request: unknown) => boolean
+  resolveEntityKey: (e: HydratableEntry) => { key: string; serverBound: boolean }
+}): number {
+  type Bucket = { serverBound: boolean; items: Array<{ entry: HydratableEntry; amt: number }> }
+  const buckets = new Map<string, Bucket>()
+  for (const e of params.entries) {
+    const st = e.step.status
+    if (typeof st !== 'number' || st < 200 || st >= 300 || stepReadsState(e.step) || isHostPseudoOpEntry(e)) continue
+    if (params.isInternalTransferRequest(e.step.requestJson) || isControlDeniedAction(e, params.preChainControlExchangeIds, params.allEntriesById)) continue
+    const amt = params.findNumericField(e.step.json, ECON_DEPOSIT_KEYS) ?? params.findNumericField(e.step.requestJson, ECON_DEPOSIT_KEYS)
+    if (amt !== undefined && amt > 0) {
+      const { key, serverBound } = params.resolveEntityKey(e)
+      const b = buckets.get(key) ?? { serverBound, items: [] }
+      b.items.push({ entry: e, amt })
+      buckets.set(key, b)
+    }
+  }
+  let total = 0
+  for (const b of buckets.values()) {
+    if (!b.serverBound || b.items.length === 1) {
+      for (const it of b.items) total += it.amt
+      continue
+    }
+    // R3-05 B1: Only deduplicate echoed lifecycle/race amounts to `max` when the entity's
+    // authorized total was observed in-window (201 creation, PATCH/PUT lifecycle update, or
+    // multi-route create+capture) OR a concurrent `raceBatchId` burst occurred. Otherwise
+    // (e.g. benign partial captures 30+20 against an order created outside the window), sum
+    // conservatively so split captures never under-count `authorizedDeposits`.
+    const routeFams = new Set(b.items.map(it => `${it.entry.step.method.toUpperCase()}|${routeFamily(it.entry.step.route ?? it.entry.step.pathAndQuery)}`))
+    const hasAuthorizedOriginOrRace = routeFams.size >= 2
+      || b.items.some(it =>
+        it.entry.step.status === 201
+        || it.entry.step.method.toUpperCase() === 'PATCH'
+        || it.entry.step.method.toUpperCase() === 'PUT'
+        || Boolean(it.entry.raceBatchId?.trim()),
+      )
+    if (hasAuthorizedOriginOrRace) {
+      let maxAmt = 0
+      for (const it of b.items) if (it.amt > maxAmt) maxAmt = it.amt
+      total += maxAmt
+    } else {
+      for (const it of b.items) total += it.amt
+    }
+  }
+  return total
+}
+
+function hasConservingBenignControlForBalanceMinting(params: {
+  probeOkActions: readonly HydratableEntry[]
+  actionIds: ReadonlySet<string>
+  baseRec: HostSignedRecord | undefined
+  finRec: HostSignedRecord | undefined
+  entriesById: ReadonlyMap<string, HydratableEntry>
+  tolerance: number
+  findNumericField: (root: unknown, keys: readonly string[]) => number | undefined
+  extractBalanceMap: (rec: HostSignedRecord | undefined) => Record<string, number> | undefined
+  isInternalTransferRequest: (request: unknown) => boolean
+  toRecord: (e: HydratableEntry) => HostSignedRecord
+}): boolean {
+  const { probeOkActions, actionIds, baseRec, finRec, entriesById, tolerance, extractBalanceMap, toRecord } = params
+  const rbFam = routeFamily(baseRec?.route ?? baseRec?.pathAndQuery ?? finRec?.route ?? finRec?.pathAndQuery)
+  const rbActor = baseRec?.actorId?.trim().toLowerCase() ?? ''
+  if (!rbFam || probeOkActions.length === 0) return false
+  const probeRouteActors = new Set<string>()
+  for (const p of probeOkActions) {
+    const pf = routeFamily(p.step.route ?? p.step.pathAndQuery)
+    const pa = actorOfGuardEntry(p)?.trim().toLowerCase() ?? ''
+    if (pf) probeRouteActors.add(`${p.step.method.toUpperCase()}|${pf}|${pa}`)
+  }
+  const allEntries = [...entriesById.values()]
+  const readbacks = allEntries
+    .filter(e => {
+      const st = e.step.status
+      if (typeof st !== 'number' || st < 200 || st >= 300 || !stepReadsState(e.step)) return false
+      if (typeof e.timestampMs !== 'number' || !Number.isFinite(e.timestampMs) || e.timestampMs <= 0) return false
+      if (routeFamily(e.step.route ?? e.step.pathAndQuery) !== rbFam) return false
+      const ea = actorOfGuardEntry(e)?.trim().toLowerCase() ?? ''
+      return !rbActor || !ea || ea === rbActor
+    })
+    .sort(compareChronoAsc)
+  if (readbacks.length < 2) return false
+  const balCache = new Map<string, number | null>()
+  const getBal = (e: HydratableEntry): number | null => {
+    if (!balCache.has(e.exchangeId)) balCache.set(e.exchangeId, sumBalanceMap(extractBalanceMap(toRecord(e))))
+    return balCache.get(e.exchangeId)!
+  }
+  const ctrlActs = allEntries.filter(e => {
+    if (actionIds.has(e.exchangeId) || e.step.arm !== 'control' || stepReadsState(e.step) || isHostPseudoOpEntry(e)) return false
+    const st = e.step.status
+    if (typeof st !== 'number' || st < 200 || st >= 300) return false
+    if (typeof e.timestampMs !== 'number' || !Number.isFinite(e.timestampMs) || e.timestampMs <= 0) return false
+    const cf = routeFamily(e.step.route ?? e.step.pathAndQuery)
+    const ca = actorOfGuardEntry(e)?.trim().toLowerCase() ?? ''
+    return Boolean(cf && probeRouteActors.has(`${e.step.method.toUpperCase()}|${cf}|${ca}`))
+  })
+  for (const ctrl of ctrlActs) {
+    const before = [...readbacks].reverse().find(r => r.exchangeId !== ctrl.exchangeId && isChronoBefore(r, ctrl) && getBal(r) !== null)
+    const after = readbacks.find(r => r.exchangeId !== ctrl.exchangeId && (!before || r.exchangeId !== before.exchangeId) && isChronoBefore(ctrl, r) && getBal(r) !== null)
+    if (!before || !after) continue
+    const bBal = getBal(before), aBal = getBal(after)
+    if (bBal === null || aBal === null) continue
+    const inCtrlWindow = allEntries.filter(e =>
+      e.exchangeId !== before.exchangeId && e.exchangeId !== after.exchangeId
+      && !stepReadsState(e.step) && !isHostPseudoOpEntry(e)
+      && typeof e.step.status === 'number' && e.step.status >= 200 && e.step.status < 300
+      && !isChronoBefore(e, before) && !isChronoBefore(after, e),
+    )
+    if (inCtrlWindow.some(e => e.step.arm === 'probe')) continue
+    const resolveKey = buildEntityKeyResolver(inCtrlWindow, entriesById)
+    const ctrlDeposits = computeDeduplicatedDeposits({
+      entries: inCtrlWindow, allEntriesById: entriesById,
+      findNumericField: params.findNumericField, isInternalTransferRequest: params.isInternalTransferRequest,
+      resolveEntityKey: resolveKey,
+    })
+    const delta = aBal - bBal
+    if (delta >= -tolerance && delta <= ctrlDeposits + tolerance) return true
+  }
+  return false
+}
+
+/**
+ * R9: Sound `balance_minting` hydration:
+ *  (a) Deduplicates `authorizedDeposits` per distinct server-identified entity/order ID (and
+ *      window-emitted non-auth capability lineage) across mutating responses so echoed order
+ *      amounts never inflate `authorizedDeposits` and mask real race overcredits, while distinct
+ *      order IDs and entity-less deposits still sum legitimately.
+ *  (b) Fails closed unless an attacker-induced economic conservation break is host-evidenced:
+ *      (i) concurrent `raceBatchId` multiplicity (`>= 2` same-route race actions with `>= 1` 2xx)
+ *          or duplicate credits (`>= 2` 2xx probe actions on the terminal `(method, routeFamily)`
+ *          sharing a server-identified entity key), OR
+ *      (ii) zero-sum internal transfer minting, negative-amount request tampering, bypassed
+ *           denied control / `derived_crypto_binding` (`cryptoAttestations`), or a same-actor
+ *           conserving benign control on the same route family.
+ */
+export function hydrateBalanceMintingOperands(params: {
+  baseRec: HostSignedRecord | undefined
+  finRec: HostSignedRecord | undefined
+  actRecs: readonly HostSignedRecord[]
+  entriesById: ReadonlyMap<string, HydratableEntry>
+  preChainControlExchangeIds?: readonly string[]
+  tolerance: number
+  findNumericField: (root: unknown, keys: readonly string[]) => number | undefined
+  extractBalanceMap: (rec: HostSignedRecord | undefined) => Record<string, number> | undefined
+  isInternalTransferRequest: (request: unknown) => boolean
+  toRecord: (e: HydratableEntry) => HostSignedRecord
+}): { ok: boolean; authorizedDeposits: number; reason: string } {
+  const { baseRec, finRec, actRecs, entriesById, preChainControlExchangeIds, tolerance } = params
+  const baseEntry = baseRec ? entriesById.get(baseRec.id) : undefined
+  const finEntry = finRec ? entriesById.get(finRec.id) : undefined
+  const baseSeq = typeof baseEntry?.seq === 'number' ? baseEntry.seq : null
+  const finSeq = typeof finEntry?.seq === 'number' ? finEntry.seq : null
+  const baseTs = baseRec?.timestampMs ?? 0
+  const finTs = finRec?.timestampMs ?? Number.POSITIVE_INFINITY
+  const depositEntries = new Map<string, HydratableEntry>()
+  const actionEntries: HydratableEntry[] = []
+  for (const a of actRecs) {
+    const e = entriesById.get(a.id)
+    if (e) { depositEntries.set(e.exchangeId, e); actionEntries.push(e) }
+  }
+  for (const e of entriesById.values()) {
+    if (e.exchangeId === baseRec?.id || e.exchangeId === finRec?.id) continue
+    const st = e.step.status
+    if (typeof st !== 'number' || st < 200 || st >= 300 || stepReadsState(e.step) || isHostPseudoOpEntry(e)) continue
+    const inSeq = baseSeq !== null && finSeq !== null && typeof e.seq === 'number' ? (e.seq >= baseSeq && e.seq <= finSeq) : true
+    const eTs = typeof e.timestampMs === 'number' && Number.isFinite(e.timestampMs) && e.timestampMs > 0 ? e.timestampMs : null
+    const inTs = eTs !== null ? (eTs >= baseTs && eTs <= finTs) : true
+    if (inSeq && inTs) depositEntries.set(e.exchangeId, e)
+  }
+  const windowList = [...depositEntries.values()]
+  const resolveEntityKey = buildEntityKeyResolver(windowList, entriesById)
+  const authorizedDeposits = computeDeduplicatedDeposits({
+    entries: windowList, allEntriesById: entriesById, preChainControlExchangeIds,
+    findNumericField: params.findNumericField, isInternalTransferRequest: params.isInternalTransferRequest,
+    resolveEntityKey,
+  })
+  const probeMutActions = actionEntries.filter(e => e.step.arm === 'probe' && !stepReadsState(e.step) && !isHostPseudoOpEntry(e))
+  const probeOkActions = probeMutActions.filter(e => typeof e.step.status === 'number' && e.step.status >= 200 && e.step.status < 300)
+  if (probeOkActions.length === 0) return { ok: false, authorizedDeposits, reason: 'no_mutating_probe_actions' }
+
+  // (i-a) Concurrent race multiplicity: >= 2 mutating probe actions sharing a raceBatchId on same method+routeFamily with >= 1 2xx.
+  const raceGroups = new Map<string, { total: number; ok: number }>()
+  for (const e of probeMutActions) {
+    const bid = e.raceBatchId?.trim()
+    if (!bid) continue
+    const fam = routeFamily(e.step.route ?? e.step.pathAndQuery)
+    const key = `${bid}|${e.step.method.toUpperCase()}|${fam}`
+    const g = raceGroups.get(key) ?? { total: 0, ok: 0 }
+    g.total += 1
+    if (typeof e.step.status === 'number' && e.step.status >= 200 && e.step.status < 300) g.ok += 1
+    raceGroups.set(key, g)
+  }
+  for (const g of raceGroups.values()) if (g.total >= 2 && g.ok >= 1) return { ok: true, authorizedDeposits, reason: 'race_batch_multiplicity' }
+
+  // (i-b) Duplicate credit/settlement multiplicity on the terminal 2xx action's route + same server-identified entity.
+  const sortedOk = [...probeOkActions].sort(compareChronoAsc)
+  const termAct = sortedOk[sortedOk.length - 1]!
+  const termFam = routeFamily(termAct.step.route ?? termAct.step.pathAndQuery)
+  const termKey = resolveEntityKey(termAct)
+  if (termKey.serverBound) {
+    const dupCount = sortedOk.filter(e =>
+      e.step.method.toUpperCase() === termAct.step.method.toUpperCase()
+      && routeFamily(e.step.route ?? e.step.pathAndQuery) === termFam
+      && resolveEntityKey(e).key === termKey.key,
+    ).length
+    if (dupCount >= 2) return { ok: true, authorizedDeposits, reason: 'duplicate_entity_credit_multiplicity' }
+  }
+
+  // (ii-a/b/c) Zero-sum internal transfer minting, negative-amount tampering, bypassed control, or derived_crypto_binding.
+  for (const e of probeOkActions) {
+    if (params.isInternalTransferRequest(e.step.requestJson)) return { ok: true, authorizedDeposits, reason: 'internal_transfer_minting' }
+    if (hasNegativeRequestAmount(e.step.requestJson)) return { ok: true, authorizedDeposits, reason: 'negative_amount_tampering' }
+    if (isControlDeniedAction(e, preChainControlExchangeIds, entriesById)) return { ok: true, authorizedDeposits, reason: 'control_denied_forged_credit' }
+    if ((e.cryptoAttestations?.length ?? 0) > 0) return { ok: true, authorizedDeposits, reason: 'derived_crypto_forged_credit' }
+  }
+
+  // (ii-d) Same-actor conserving benign control on the same route family.
+  const actionIds = new Set(actionEntries.map(e => e.exchangeId))
+  if (hasConservingBenignControlForBalanceMinting({
+    probeOkActions, actionIds, baseRec, finRec, entriesById, tolerance,
+    findNumericField: params.findNumericField, extractBalanceMap: params.extractBalanceMap,
+    isInternalTransferRequest: params.isInternalTransferRequest, toRecord: params.toRecord,
+  })) {
+    return { ok: true, authorizedDeposits, reason: 'conserving_benign_control_verified' }
+  }
+
+  // R3-05: When the readback delta is already conserved (afterSum <= beforeSum + authorizedDeposits + tolerance),
+  // pass through the real authorizedDeposits so evaluateEconomicConservation rejects with the exact
+  // `balance_ledger_conserved` reason. When delta exceeds deposits without attacker-induced evidence, fail closed.
+  const beforeSum = sumBalanceMap(params.extractBalanceMap(baseRec))
+  const afterSum = sumBalanceMap(params.extractBalanceMap(finRec))
+  if (beforeSum !== null && afterSum !== null && afterSum <= beforeSum + authorizedDeposits + tolerance) {
+    return { ok: true, authorizedDeposits, reason: 'ledger_conserved_passthrough' }
+  }
+
+  return { ok: false, authorizedDeposits, reason: 'unproven_single_capture_without_multiplicity_or_conserving_control' }
+}

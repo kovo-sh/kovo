@@ -14,7 +14,7 @@ import { ROLE_RANK, normalizeRole, parseRoleMemberships, resolvePersonaIdentity,
 import type { ProofReceipt } from './proof-receipt.ts'
 import { deriveRecordAuthzDimension, extractIssuedSignedUrl, extractTenantMarkers, findNonErrorBatchRecord, isJobOrHandleStub, type HostAuthzDimension, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
 import { buildTerminalClassContractMap, resolveTerminalContractKind, type OracleTerminalContractKind } from './oracle-spec.ts'
-import { extractLedgerBalanceMap, isControlDeniedAction, normalizeTerminalVulnClass, resolveEconomicActionRecords, resolveEntityLessReadStateTransition, resolveOpaqueDualCacheBleedTarget, selectAutoEconomicActions } from './own-org-terminal-guard.ts'
+import { extractLedgerBalanceMap, hydrateBalanceMintingOperands, isControlDeniedAction, normalizeTerminalVulnClass, resolveEconomicActionRecords, resolveEntityLessReadStateTransition, resolveOpaqueDualCacheBleedTarget, selectAutoEconomicActions } from './own-org-terminal-guard.ts'
 
 export interface HydratableEntry {
   exchangeId: string; op?: string; seq?: number; timestampMs?: number
@@ -1062,41 +1062,41 @@ export function hydrateV8OracleInput(
       if (hostBefore && hostAfter) {
         out.balancesBefore = hostBefore
         out.balancesAfter = hostAfter
-        const depKeys = ['credited', 'deposited', 'depositamount', 'deposit_amount', 'deposit', 'credit', 'amount', 'amountcents', 'amount_cents', 'delta']
-        // Sum ALL distinct non-transfer 2xx mutating/deposit exchanges across the entire host log
-        // window [baseline, final] (union with cited actions) so workers can neither omit real
-        // deposits nor undercount multiple deposits via Math.max.
-        const baseEntry = baseRec ? idx.entriesById.get(baseRec.id) : undefined
-        const finEntry = finRec ? idx.entriesById.get(finRec.id) : undefined
-        const baseSeq = typeof baseEntry?.seq === 'number' ? baseEntry.seq : null
-        const finSeq = typeof finEntry?.seq === 'number' ? finEntry.seq : null
-        const baseTs = baseRec?.timestampMs ?? 0
-        const finTs = finRec?.timestampMs ?? Number.POSITIVE_INFINITY
-        const depositEntries = new Map<string, HydratableEntry>()
-        for (const a of actRecs) {
-          const e = idx.entriesById.get(a.id)
-          if (e) depositEntries.set(e.exchangeId, e)
+        // R9: Deduplicate authorizedDeposits per distinct server-identified entity/order ID across
+        // mutating responses in [baseline, final] union cited actions, and fail closed unless an
+        // attacker-induced economic conservation break is host-evidenced:
+        //  (i)  concurrent raceBatchId multiplicity (>= 2 same-route race actions with >= 1 2xx)
+        //       or duplicate credits (>= 2 2xx probe actions on the terminal route + same entity),
+        //  (ii) zero-sum internal transfer minting, negative-amount tampering, bypassed control /
+        //       derived_crypto_binding forged credit, or a same-actor conserving benign control.
+        const mintRes = hydrateBalanceMintingOperands({
+          baseRec,
+          finRec,
+          actRecs,
+          entriesById: idx.entriesById,
+          preChainControlExchangeIds: econCtx?.preChainControlExchangeIds,
+          tolerance: typeof out.tolerance === 'number' ? out.tolerance : 1e-6,
+          findNumericField,
+          extractBalanceMap,
+          isInternalTransferRequest,
+          toRecord: e => toOracleRecord(e, fallbackSig),
+        })
+        if (mintRes.ok) {
+          out.authorizedDeposits = mintRes.authorizedDeposits
+          out.authorizedWithdrawals = 0
+        } else {
+          // Leave authorizedDeposits unset so evaluateEconomicConservation fails closed on bare
+          // single benign captures that lack race/duplicate multiplicity or conserving control.
+          out.conservationBreakRejectedReason = mintRes.reason
         }
-        for (const e of idx.entriesById.values()) {
-          if (e.exchangeId === baseRec?.id || e.exchangeId === finRec?.id) continue
-          if (!is2xx(e.step.status) || stepReadsState(e.step)) continue
-          const inSeq = baseSeq !== null && finSeq !== null && typeof e.seq === 'number'
-            ? (e.seq >= baseSeq && e.seq <= finSeq)
-            : true
-          const eTs = isPosTs(e.timestampMs) ? e.timestampMs : null
-          const inTs = eTs !== null ? (eTs >= baseTs && eTs <= finTs) : true
-          if (inSeq && inTs) depositEntries.set(e.exchangeId, e)
-        }
-        let summedDeposits = 0
-        for (const e of depositEntries.values()) {
-          if (!is2xx(e.step.status) || stepReadsState(e.step)) continue
-          // Internal transfers between two ledger accounts do not inject external value.
-          if (isInternalTransferRequest(e.step.requestJson) || isControlDeniedAction(e, econCtx?.preChainControlExchangeIds, idx.entriesById)) continue
-          const amt = findNumericField(e.step.json, depKeys) ?? findNumericField(e.step.requestJson, depKeys)
-          if (amt !== undefined && amt > 0) summedDeposits += amt
-        }
-        out.authorizedDeposits = summedDeposits
-        out.authorizedWithdrawals = 0
+        // Maintain stable hydration operands without leaking untrusted worker deposit scalars
+        // (strictly host-derived balancesBefore/balancesAfter and per-entity deduplicated deposits).
+        //
+        // Note:
+        //  - distinct order/entity IDs and entity-less deposits continue to sum legitimately;
+        //  - echoed order amounts across lifecycle mutations (create/rebind/capture) deduplicate;
+        //  - internal transfers and control-denied forged credits remain excluded from deposits;
+        //  - bare single benign captures without multiplicity or conserving control fail closed.
       }
     } else if (eq === 'underpaid_fulfillment') {
       const hostPaid = findNumericField(finJson, ['paidamount', 'paid_amount', 'paid', 'amountpaid', 'amount_paid', 'chargedamount', 'charged'])
