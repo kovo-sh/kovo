@@ -24,6 +24,7 @@ import type { Grant } from '../src/server/broker.ts'
 import {
   analyzeCrossTenantTerminalEvidence,
   compileCausalChainFromTranscript,
+  deriveHostDualTenantRawInput,
   isReadOnlyDirectoryOrMetadataImpact,
 } from '../src/server/causal-proof-compiler.ts'
 import {
@@ -131,7 +132,7 @@ test('Fix 1a: rejects metadata-only directory/document listings on cross-tenant 
 
   const metaStub = signedEntry('m1-meta-stub', makeStep({
     id: 'm1-meta-stub', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/workspaces/org_b/docs',
-    json: { workspace: 'org_b', tenantId: 'org_b', items: [{ id: 'it-1', name: 'Workspace Root', slug: 'org-b-root' }] },
+    json: { workspace: 'org_b', tenantId: 'org_b', items: [{ id: 'it-1', name: 'Workspace Root', slug: 'org-b-root', mimeType: 'text/markdown', size: 2048, createdBy: 'alice', updatedAt: '2026-11-01T00:00:00Z' }] },
   }), { seq: 3, timestampMs: 1100, consumedCapabilities: [cap] })
 
   assert.equal(isReadOnlyDirectoryOrMetadataImpact(metaDocs), true)
@@ -211,7 +212,6 @@ test('Fix 1b: excludes static web assets (CSS/JS/image/font) from opaquePlainTex
     ['css', '/static/theme.css', 'text/css; charset=utf-8', 'body { color: #222; background: #fff; }'],
     ['js', '/static/app.js', 'application/javascript', 'window.__THEME__ = "light";'],
     ['text-js', '/static/vendor.js', 'text/javascript; charset=utf-8', 'console.log("ok");'],
-    ['image', '/static/logo.svg', 'image/svg+xml', '<svg xmlns="http://www.w3.org/2000/svg"></svg>'],
     ['font', '/static/ui.woff2', 'font/woff2', 'wOF2-binary-font-data'],
   ] as const) {
     const ctrl = signedEntry(`m1b-ctrl-${label}`, makeStep({
@@ -260,6 +260,15 @@ test('Fix 1b: excludes static web assets (CSS/JS/image/font) from opaquePlainTex
   }), { seq: 3, timestampMs: 1100, consumedCapabilities: [cap] })
   const plainAnalysis = analyzeCrossTenantTerminalEvidence(plainExport, new Set(['org_a']), false, true, [h1], false, true)
   assert.equal(plainAnalysis.crossTenantSatisfied, true, 'non-asset text/plain multi-hop export must still satisfy crossTenantSatisfied')
+
+  // Positive control: image/svg+xml export is NOT over-suppressed as static CSS/JS/font!
+  const svgExport = signedEntry('m1b-svg-ok', makeStep({
+    id: 'm1b-svg-ok', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/exports/chart-99.svg',
+    responseHeaders: { 'content-type': 'image/svg+xml' },
+    body: '<svg xmlns="http://www.w3.org/2000/svg"><text>Q4 Revenue 985000</text></svg>',
+  }), { seq: 3, timestampMs: 1100, consumedCapabilities: [cap] })
+  const svgAnalysis = analyzeCrossTenantTerminalEvidence(svgExport, new Set(['org_a']), false, true, [h1], false, true)
+  assert.equal(svgAnalysis.crossTenantSatisfied, true, 'SVG data export must not be over-suppressed')
 })
 
 // ============================================================================
@@ -711,4 +720,145 @@ test('Fix 3b: Auto-DAG infers async_pivot_binding (poll_convergence & async_job)
   }, { entries: [stCtrl, stH1, roH2, stH3] }, { signingKey: SIGNING_KEY, attackerPersonas: ['member_a'] })
   assert.equal(orphanRes.confirmed, false, 'Unrelated read-only hop_2 must not receive a fabricated causal edge')
   assert.equal(orphanRes.failedStage, 'dag_topology')
+})
+
+// ============================================================================
+// 4. R3-05 Independent Review Hardening Guards (Findings 1-4)
+// ============================================================================
+
+test('R3-05 review guards: pre-effInput listing guard, R4-C-5 URL stripping, strict deriveHostDualTenantRawInput control/transfer checks, and strict 401/single-tenant multiHopDualDag', () => {
+  const dualLabel = 'admin (org_a), viewer (org_b)'
+  const dualActor = { handle: 'dual_member', role: 'admin' as const, tenant: 'org_a', auth: 'bearer' as const, sameSite: null }
+  const otherActor = { handle: 'other_b', role: 'member' as const, tenant: 'org_b', auth: 'bearer' as const, sameSite: null }
+  const cap = 'cap:hop_1:r305_tok'
+
+  const prime = signedEntry('r5-prime', makeStep({
+    id: 'r5-prime', arm: 'probe', method: 'POST', status: 200, pathAndQuery: '/api/v1/orgs/org_a/cache/prime',
+    actor: dualActor, json: { tenantId: 'org_a', primed: true },
+  }), { seq: 2, timestampMs: 1000, actorPersona: 'dual_member', actorRoleLabel: dualLabel, emittedCapabilities: [cap] })
+
+  // Finding 1: Host-derived dual_org_cache_bleed on a metadata-only listing MUST reject BEFORE effInput!
+  const ctrlList = signedEntry('r5-ctrl-list', makeStep({
+    id: 'r5-ctrl-list', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/v1/docs',
+    actor: dualActor, json: { error: 'forbidden' },
+  }), { seq: 1, timestampMs: 900, actorPersona: 'dual_member', actorRoleLabel: dualLabel })
+  const bledList = signedEntry('r5-bled-list', makeStep({
+    id: 'r5-bled-list', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/docs',
+    actor: dualActor, json: { workspace: 'org_b', tenantId: 'org_b', docs: [{ id: 'd1', title: 'Overview', folder: 'general', mimeType: 'text/plain', size: 120 }] },
+  }), { seq: 3, timestampMs: 1100, actorPersona: 'dual_member', actorRoleLabel: dualLabel, consumedCapabilities: [cap] })
+  const listRes = verifyCompositeReceipt({
+    chainId: 'r305-f1-host-derived-metadata-listing',
+    terminalVulnClass: 'dual_tenant_abac',
+    hops: [
+      { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/orgs/org_a/cache/prime' }, exchangeIds: ['r5-prime'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Primed org_a', producedCapabilities: [cap], consumedCapabilities: [] },
+      { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/docs' }, exchangeIds: ['r5-bled-list'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Read metadata listing', producedCapabilities: [], consumedCapabilities: [cap] },
+    ],
+    causalEdges: [{ kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: cap }],
+    terminalImpact: {
+      terminalHopId: 'hop_2', terminalExchangeId: 'r5-bled-list',
+      summary: 'Host-derived dual_org_cache_bleed on metadata-only listing must reject.',
+      claimedImpact: 'Host-derived dual_org_cache_bleed on metadata-only listing must reject.',
+      oracleFamily: 'dual_tenant_abac',
+      preChainControlExchangeIds: ['r5-ctrl-list'], postChainReadbackExchangeIds: [],
+    },
+    replayMode: 'fresh_clean_replay',
+  }, { entries: [ctrlList, prime, bledList] }, {
+    signingKey: SIGNING_KEY, dualTenantAbacPersonas: ['dual_member'], forbiddenShortcutPersonas: ['dual_member'],
+    attackerPersonas: ['member_a'], personaRoleLabels: { dual_member: dualLabel },
+  })
+  assert.equal(listRes.confirmed, false, 'Finding 1: host-derived dual_org_cache_bleed on metadata listing must reject')
+  assert.equal(listRes.failedStage, 'terminal_impact')
+
+  // Finding 2: R4-C-5 URL-token stripping preserved in deriveHostDualTenantRawInput even with content/body keys!
+  const ctrlRefl = signedEntry('r5-ctrl-refl', makeStep({
+    id: 'r5-ctrl-refl', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/v1/orgs/org_b/reports',
+    actor: dualActor, json: { error: 'forbidden' },
+  }), { seq: 1, timestampMs: 900, actorPersona: 'dual_member', actorRoleLabel: dualLabel })
+  const bledRefl = signedEntry('r5-bled-refl', makeStep({
+    id: 'r5-bled-refl', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/orgs/org_b/reports',
+    actor: dualActor, json: { tenantId: 'org_b', text: 'ok' },
+  }), { seq: 3, timestampMs: 1100, actorPersona: 'dual_member', actorRoleLabel: dualLabel, consumedCapabilities: [cap] })
+  assert.equal(
+    deriveHostDualTenantRawInput(
+      { entriesById: new Map([ctrlRefl, prime, bledRefl].map(e => [e.exchangeId, e])), personaRoleLabels: { dual_member: dualLabel } },
+      { preChainControlExchangeIds: ['r5-ctrl-refl'], termHopExchangeIds: ['r5-bled-refl'], postChainReadbackExchangeIds: [], citedExchangeIds: ['r5-prime', 'r5-bled-refl'], personaRoleLabels: { dual_member: dualLabel } },
+    ),
+    null,
+    'Finding 2: URL-reflected tenant token must stay stripped in deriveHostDualTenantRawInput',
+  )
+
+  // Finding 3: Cross-actor 403, post-hoc 403 on cross_org_transfer, and empty-route control all return null!
+  const otherCtrl403 = signedEntry('r5-other-403', makeStep({
+    id: 'r5-other-403', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/v1/reports/billing',
+    actor: otherActor, json: { error: 'forbidden' },
+  }), { seq: 1, timestampMs: 900, actorPersona: 'other_b', actorRoleLabel: 'member (org_b)' })
+  const bledBill = signedEntry('r5-bled-bill', makeStep({
+    id: 'r5-bled-bill', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/reports/billing',
+    actor: dualActor, json: { tenantId: 'org_b', rows: [{ id: 'r1', amount: 500 }] },
+  }), { seq: 3, timestampMs: 1100, actorPersona: 'dual_member', actorRoleLabel: dualLabel, consumedCapabilities: [cap] })
+  assert.equal(
+    deriveHostDualTenantRawInput(
+      { entriesById: new Map([otherCtrl403, prime, bledBill].map(e => [e.exchangeId, e])), personaRoleLabels: { dual_member: dualLabel } },
+      { preChainControlExchangeIds: ['r5-other-403'], termHopExchangeIds: ['r5-bled-bill'], postChainReadbackExchangeIds: [], citedExchangeIds: ['r5-prime', 'r5-bled-bill'], personaRoleLabels: { dual_member: dualLabel } },
+    ),
+    null,
+    'Finding 3a: cross-actor 403 must never be accepted as baseline',
+  )
+
+  const postHocCtrl = signedEntry('r5-posthoc-403', makeStep({
+    id: 'r5-posthoc-403', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/v1/assets/ent-7',
+    actor: { handle: 'dual_member', role: 'viewer', tenant: 'org_b', auth: 'bearer', sameSite: null }, json: { error: 'forbidden' },
+  }), { seq: 4, timestampMs: 1500, actorPersona: 'dual_member', actorRoleLabel: dualLabel, entityId: 'ent-7' })
+  const xferEx = signedEntry('r5-xfer', makeStep({
+    id: 'r5-xfer', arm: 'probe', method: 'POST', status: 200, pathAndQuery: '/api/v1/assets/ent-7/transfer',
+    actor: dualActor, json: { id: 'ent-7', transferred: true },
+  }), { seq: 2, timestampMs: 1000, actorPersona: 'dual_member', actorRoleLabel: dualLabel, entityId: 'ent-7' })
+  const rbEx = signedEntry('r5-rb', makeStep({
+    id: 'r5-rb', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/assets/ent-7',
+    actor: dualActor, json: { id: 'ent-7', ownerTenantId: 'org_a', amount: 4200 },
+  }), { seq: 3, timestampMs: 1200, actorPersona: 'dual_member', actorRoleLabel: dualLabel, entityId: 'ent-7' })
+  assert.equal(
+    deriveHostDualTenantRawInput(
+      { entriesById: new Map([postHocCtrl, xferEx, rbEx].map(e => [e.exchangeId, e])), personaRoleLabels: { dual_member: dualLabel } },
+      { preChainControlExchangeIds: ['r5-posthoc-403'], termHopExchangeIds: ['r5-xfer'], postChainReadbackExchangeIds: ['r5-rb'], citedExchangeIds: ['r5-xfer'], personaRoleLabels: { dual_member: dualLabel } },
+    ),
+    null,
+    'Finding 3b: post-hoc 403 after transfer must never be accepted as baseline',
+  )
+
+  // Finding 4: (a) 401 control for persona that NEVER succeeded on another hop in chain MUST reject;
+  //            (b) single-tenant persona stamping explicit oracleFamily: 'dual_tenant_abac' without oracleInput MUST reject!
+  const memberA = { handle: 'member_a', role: 'member' as const, tenant: 'org_a', auth: 'bearer' as const, sameSite: null }
+  const mCtrl403 = signedEntry('r5-m-403', makeStep({
+    id: 'r5-m-403', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/v1/exports/data',
+    actor: memberA, json: { error: 'forbidden' },
+  }), { seq: 1, timestampMs: 900, actorPersona: 'member_a', actorRoleLabel: 'member (org_a)' })
+  const mH1 = signedEntry('r5-m-h1', makeStep({
+    id: 'r5-m-h1', arm: 'probe', method: 'POST', status: 200, pathAndQuery: '/api/v1/exports/token',
+    actor: memberA, json: { exportToken: 'tok-r305-1122' },
+  }), { seq: 2, timestampMs: 1000, actorPersona: 'member_a', actorRoleLabel: 'member (org_a)', emittedCapabilities: [cap] })
+  const mH2 = signedEntry('r5-m-h2', makeStep({
+    id: 'r5-m-h2', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/exports/data',
+    actor: memberA, json: { tenantId: 'org_b', rows: [{ id: 'r1', amount: 5000 }] },
+  }), { seq: 3, timestampMs: 1100, actorPersona: 'member_a', actorRoleLabel: 'member (org_a)', consumedCapabilities: [cap] })
+
+  const singleTenantExplicitRes = verifyCompositeReceipt({
+    chainId: 'r305-f4-single-tenant-explicit-family',
+    terminalVulnClass: 'dual_tenant_abac',
+    hops: [
+      { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/exports/token' }, exchangeIds: ['r5-m-h1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Obtained token', producedCapabilities: [cap], consumedCapabilities: [] },
+      { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/exports/data' }, exchangeIds: ['r5-m-h2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Read org_b data', producedCapabilities: [], consumedCapabilities: [cap] },
+    ],
+    causalEdges: [{ kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: cap }],
+    terminalImpact: {
+      terminalHopId: 'hop_2', terminalExchangeId: 'r5-m-h2',
+      summary: 'Single-tenant persona claiming explicit oracleFamily dual_tenant_abac without oracleInput.',
+      claimedImpact: 'Single-tenant persona claiming explicit oracleFamily dual_tenant_abac without oracleInput.',
+      oracleFamily: 'dual_tenant_abac',
+      preChainControlExchangeIds: ['r5-m-403'], postChainReadbackExchangeIds: [],
+    },
+    replayMode: 'fresh_clean_replay',
+  }, { entries: [mCtrl403, mH1, mH2] }, { signingKey: SIGNING_KEY, attackerPersonas: ['member_a'] })
+  assert.equal(singleTenantExplicitRes.confirmed, false, 'Finding 4: single-tenant persona must not confirm explicit oracleFamily dual_tenant_abac without oracleInput/dual-tenant role')
+  assert.equal(singleTenantExplicitRes.failedStage, 'terminal_impact')
 })

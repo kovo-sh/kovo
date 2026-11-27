@@ -896,9 +896,8 @@ export function hydrateV8OracleInput(
       if (v && v.length >= MIN_TOKEN_LEN) out[k] = v
     }
     const tenantOf = (e: HydratableEntry | undefined): string | null => hostAuthzDim(e).personaTenant || null
-    const hasSubJson = (j: unknown): boolean => Boolean(j && typeof j === 'object' && (Array.isArray(j) ? j.some(x => x && typeof x === 'object') : Object.entries(j as Record<string, unknown>).some(([k, v]) => (/(?:secret|passw|private|credential|api_?key|vault|audit|ledger|balance|amount|payout|settlement|content|body|text|records|rows|entries|invoices)/i.test(k) && v !== null && v !== undefined && v !== '') || (Array.isArray(v) && v.some(x => x && typeof x === 'object' && Object.keys(x as Record<string, unknown>).length >= 2)))))
-    // R3-C-5 + Move-1 + R4-C-5: shared host-attested authz-dimension primitive; strip URL path tokens unless JSON has substantive records.
-    const markersOf = (e: HydratableEntry | undefined): Set<string> => hostAuthzDim(e, undefined, undefined, !hasSubJson(e?.step.json)).responseTenants
+    // R3-C-5 + Move-1 + R4-C-5: shared host-attested authz-dimension primitive, stripping attacker-supplied URL path/query tokens.
+    const markersOf = (e: HydratableEntry | undefined): Set<string> => hostAuthzDim(e, undefined, undefined, true).responseTenants
     const hostKnownTenants = new Set<string>()
     for (const e of idx.entriesById.values()) { const t = tenantOf(e); if (t) hostKnownTenants.add(t); if (e.actorRoleLabel) for (const m of parseRoleMemberships(e.actorRoleLabel)) if (m.tenant) hostKnownTenants.add(m.tenant.trim().toLowerCase()) }
     if (mode === 'cross_org_transfer') {

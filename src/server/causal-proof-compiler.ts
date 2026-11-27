@@ -107,13 +107,16 @@ const DIRECTORY_KEY_ALLOWLIST = new Set([
   'name', 'displayname', 'display_name', 'username', 'handle', 'role', 'roles', 'slug', 'region',
   'plan', 'tier', 'org', 'orgid', 'org_id', 'organization', 'organizationid', 'organization_id',
   'tenant', 'tenantid', 'tenant_id', 'workspace', 'workspaceid', 'workspace_id', 'status',
-  'active', 'createdat', 'created_at', 'updatedat', 'updated_at', 'count', 'total', 'members',
+  'active', 'createdat', 'created_at', 'updatedat', 'updated_at', 'modifiedat', 'modified_at',
+  'createdby', 'created_by', 'updatedby', 'updated_by', 'count', 'total', 'members',
   'users', 'roster', 'directory', 'teams', 'groups', 'orgs', 'organizations', 'metadata', 'profile',
   'title', 'folder', 'folders', 'docs', 'documents', 'items', 'files', 'projects', 'workspaces',
   'category', 'type', 'kind', 'label', 'labels', 'tag', 'tags', 'visibility', 'public', 'shared',
   'parentid', 'parent_id', 'folderid', 'folder_id', 'page', 'limit', 'offset', 'cursor',
-  'nextcursor', 'next_cursor', 'hasmore', 'has_more', 'archived', 'pinned', 'version',
-  'owner', 'ownerid', 'owner_id',
+  'nextcursor', 'next_cursor', 'hasmore', 'has_more', 'archived', 'pinned', 'starred', 'version',
+  'owner', 'ownerid', 'owner_id', 'mimetype', 'mime_type', 'contenttype', 'content_type',
+  'size', 'bytes', 'length', 'description', 'subtitle', 'summary', 'filename', 'file_name',
+  'extension', 'ext', 'etag', 'icon', 'color', 'order', 'position', 'readonly', 'read_only',
 ])
 const DIRECTORY_MARKER_KEYS = new Set([
   'members', 'roster', 'directory', 'users', 'pendingemail', 'pending_email', 'email', 'role', 'roles',
@@ -227,9 +230,9 @@ function extractCsvOrKvTenantMarkers(body: string | undefined): Set<string> {
 }
 
 const STATIC_WEB_ASSET_CT_RE =
-  /^(?:text\/css|application\/(?:x-)?javascript|text\/javascript|application\/ecmascript|text\/ecmascript|image\/|font\/|application\/font-|application\/vnd\.ms-fontobject)/i
+  /^(?:text\/css|application\/(?:x-)?javascript|text\/javascript|application\/ecmascript|text\/ecmascript|font\/|application\/font-|application\/vnd\.ms-fontobject)/i
 const STATIC_WEB_ASSET_EXT_RE =
-  /\.(?:css|js|mjs|map|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|otf|eot)$/i
+  /\.(?:css|js|mjs|woff2?|ttf|otf|eot)$/i
 
 function isStaticWebAssetEntry(entry: HostTranscriptEntry): boolean {
   const rawCt = Object.entries(entry.step.responseHeaders ?? {}).find(([k]) => k.toLowerCase() === 'content-type')?.[1] ?? ''
@@ -331,14 +334,23 @@ export function deriveHostDualTenantRawInput(
 ): Record<string, unknown> | null {
   if (!econCtx) return null
   const capIdx = buildCapOriginIndex(idx.entriesById.values(), ANON_FACT_ACTOR_RE)
+  const isPos = (ts: unknown): ts is number => typeof ts === 'number' && Number.isFinite(ts) && ts > 0
   const resolveActor = (e: HydratableEntry | undefined): string => {
     const a = e ? (e.actorPersona !== undefined ? e.actorPersona : e.step.actor.handle)?.trim() ?? '' : ''
     if (!a || ANON_FACT_ACTOR_RE.test(a)) return ''
     return a.startsWith('cap:') ? (capIdx.emitterActorOf(a)?.actor?.trim() ?? capIdx.actorOf(a)?.trim() ?? '') : a
   }
-  const actorIds = [...econCtx.termHopExchangeIds, ...(econCtx.citedExchangeIds ?? []), ...econCtx.preChainControlExchangeIds]
-    .map(id => resolveActor(idx.entriesById.get(id))).filter(Boolean)
-  const actorId = actorIds[0]
+  const termHopSet = new Set(econCtx.termHopExchangeIds)
+  const termEx = [...econCtx.termHopExchangeIds].reverse()
+    .map(id => idx.entriesById.get(id))
+    .find((e): e is HydratableEntry => Boolean(e && e.step.arm === 'probe' && is2xx(e.step.status) && isPos(e.timestampMs)))
+  const upstreamExecs = (econCtx.citedExchangeIds ?? [])
+    .filter(id => !termHopSet.has(id))
+    .map(id => idx.entriesById.get(id))
+    .filter((e): e is HydratableEntry => Boolean(e && (e.step.arm === 'probe' || e.step.arm === 'setup') && is2xx(e.step.status) && isPos(e.timestampMs)))
+    .sort((a, b) => a.timestampMs! - b.timestampMs!)
+  // Derive actor strictly from host-observed terminal/probe exchanges (never arbitrary control ordering).
+  const actorId = resolveActor(termEx) || upstreamExecs.map(resolveActor).find(Boolean) || ''
   if (!actorId) return null
   const actorLower = actorId.toLowerCase(), rolesByTenant: Record<string, 'viewer' | 'member' | 'admin' | 'owner'> = {}
   const recordRole = (tenant: string | null | undefined, role: 'viewer' | 'member' | 'admin' | 'owner' | null | undefined): void => {
@@ -362,50 +374,44 @@ export function deriveHostDualTenantRawInput(
   const lowTenants = new Set(Object.entries(rolesByTenant).filter(([, r]) => ROLE_RANK[r] < ROLE_RANK.admin).map(([t]) => t))
   if (adminTenants.size === 0) return null
 
-  const isPos = (ts: unknown): ts is number => typeof ts === 'number' && Number.isFinite(ts) && ts > 0
   const dimOf = (e: HydratableEntry | undefined, stripUrl = false) => {
     const personaTenant = ((e ? resolveEntryIdentity(e).tenant : null) ?? '').trim().toLowerCase()
     return deriveRecordAuthzDimension(e ? { route: e.step.route, pathAndQuery: e.step.pathAndQuery, json: e.step.json, body: e.step.body, tenantId: personaTenant || null } : undefined, { personaTenant, stripUrlTokens: stripUrl })
   }
+  const actorSucceededOnOtherHop = upstreamExecs.some(u => resolveActor(u).toLowerCase() === actorLower)
   const preCtrls = econCtx.preChainControlExchangeIds
     .map(id => idx.entriesById.get(id))
     .filter((e): e is HydratableEntry => {
       if (!e || !isPos(e.timestampMs) || (e.step.status !== 401 && e.step.status !== 403)) return false
       const cAct = resolveActor(e).toLowerCase()
-      return e.step.status === 403 || (Boolean(cAct) && cAct === actorLower)
+      if (!cAct || cAct !== actorLower) return false
+      return e.step.status === 403 || actorSucceededOnOtherHop
     })
-  const termHopSet = new Set(econCtx.termHopExchangeIds)
-  const termEx = [...econCtx.termHopExchangeIds].reverse()
-    .map(id => idx.entriesById.get(id))
-    .find((e): e is HydratableEntry => Boolean(e && e.step.arm === 'probe' && is2xx(e.step.status) && isPos(e.timestampMs)))
-  const upstreamExecs = (econCtx.citedExchangeIds ?? [])
-    .filter(id => !termHopSet.has(id))
-    .map(id => idx.entriesById.get(id))
-    .filter((e): e is HydratableEntry => Boolean(e && (e.step.arm === 'probe' || e.step.arm === 'setup') && is2xx(e.step.status) && isPos(e.timestampMs)))
   const postRbs = econCtx.postChainReadbackExchangeIds
     .map(id => idx.entriesById.get(id))
     .filter((e): e is HydratableEntry => Boolean(e && is2xx(e.step.status) && isPos(e.timestampMs) && !isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method, e.step.route ?? e.step.pathAndQuery)))
   const normRt = (e: HydratableEntry): string => cleanExactPath(e.step.route ?? e.step.pathAndQuery)
 
-  // 1. Detect host-observed cross_org_transfer.
+  // 1. Detect host-observed cross_org_transfer (strict pre-transfer same-actor source control + entity binding on all 3).
   const xfer = (termEx && !stepReadsState(termEx.step) ? termEx : [...upstreamExecs].reverse().find(u => !stepReadsState(u.step)))
   const rb = postRbs.find(r => !xfer || (r.exchangeId !== xfer.exchangeId && r.timestampMs! >= xfer.timestampMs!))
     ?? (termEx && xfer && termEx.exchangeId !== xfer.exchangeId && stepReadsState(termEx.step) && termEx.timestampMs! >= xfer.timestampMs! ? termEx : undefined)
-  const srcCtrl = preCtrls.find(c => { const t = dimOf(c).personaTenant; return Boolean(t && lowTenants.has(t)) })
+  const srcCtrl = xfer ? preCtrls.find(c => { const t = dimOf(c).personaTenant; return Boolean(t && lowTenants.has(t) && c.timestampMs! <= xfer.timestampMs!) }) : undefined
   if (xfer && rb && srcCtrl) {
     const ownerTenant = findOwnerTenantField(rb.step.json)
     const srcT = dimOf(srcCtrl).personaTenant
     const eid = xfer.entityId?.trim() || rb.entityId?.trim() || srcCtrl.entityId?.trim() || ''
-    if (ownerTenant && adminTenants.has(ownerTenant) && ownerTenant !== srcT && eid && entryMatchesEntity(rb, eid) && (entryMatchesEntity(xfer, eid) || entryMatchesEntity(srcCtrl, eid))) {
+    if (ownerTenant && adminTenants.has(ownerTenant) && ownerTenant !== srcT && eid && entryMatchesEntity(rb, eid) && entryMatchesEntity(xfer, eid) && entryMatchesEntity(srcCtrl, eid)) {
       return { mode: 'cross_org_transfer', sourceControlDenied: srcCtrl.exchangeId, transferRecord: xfer.exchangeId, postTransferReadback: rb.exchangeId, entityId: eid }
     }
   }
 
-  // 2. Detect host-observed dual_org_cache_bleed.
+  // 2. Detect host-observed dual_org_cache_bleed (strict R4-C-5 URL-token stripping + non-empty exact route match + same-actor baseline).
   if (termEx && !isJobOrHandleStub(termEx.step.json, termEx.step.body, termEx.step.status, termEx.step.method, termEx.step.route ?? termEx.step.pathAndQuery)) {
-    const bledMarkers = dimOf(termEx, !hasSubstantiveJsonRecords(termEx.step.json)).responseTenants
+    const bledMarkers = dimOf(termEx, true).responseTenants
     const foreignTarget = [...bledMarkers].find(t => !adminTenants.has(t))
-    const ctrl = preCtrls.find(c => { const cr = normRt(c), br = normRt(termEx); return !cr || !br || cr === br })
+    const br = normRt(termEx)
+    const ctrl = br ? preCtrls.find(c => { const cr = normRt(c); return Boolean(cr && cr === br) }) : undefined
     const prime = foreignTarget ? upstreamExecs.find(u => {
       if (u.timestampMs! > termEx.timestampMs!) return false
       const d = dimOf(u)

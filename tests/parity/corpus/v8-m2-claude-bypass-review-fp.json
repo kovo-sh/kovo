@@ -1,0 +1,126 @@
+{
+  "id": "v8-m2-claude-bypass-review-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "v8-m2-dual-tenant-derived-cache-bleed-metadata-listing",
+  "description": "Independent review bypass variant: a dual-role persona (admin org_a, viewer org_b) with an upstream own-tenant read, a 403 baseline from a DIFFERENT actor on the org_b route, and a 200 org_b docs metadata listing (allowlisted keys only, zero private payload) MUST NOT confirm dual_tenant_abac via host auto-hydration (deriveHostDualTenantRawInput / multiHopDualDag).",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/causal-proof-compiler.ts",
+      "src/server/v8-oracle-hydrate.ts"
+    ],
+    "classes": [
+      "dual_tenant_abac",
+      "cross_tenant_document_read"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Dual-tenant ABAC claimed from a read-only metadata listing",
+    "impact": "A metadata-only listing returned to a dual-role persona carries no private payload and no proven denial for the acting identity; it cannot confirm dual_tenant_abac.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "dual_tenant_abac"
+  },
+  "freeTextLabel": {
+    "title": "Dual-tenant access bleed claimed from workspace folder metadata listing"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "dual_a",
+      "roleLabel": "admin (org_a); viewer (org_b)",
+      "role": "admin",
+      "tenant": "org_a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-v8m2-dual-a"
+    },
+    {
+      "handle": "other_b",
+      "roleLabel": "member (org_b)",
+      "role": "member",
+      "tenant": "org_b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-v8m2-other-b"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "hop2_ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/workspaces/org_b/docs",
+      "persona": "other_b",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "hop1_ex",
+      "arm": "probe",
+      "role": "setup",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/workspaces/org_a/docs",
+      "persona": "dual_a",
+      "emittedCapabilities": [
+        "cap:hop_1:dual_listing_tok"
+      ],
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"workspace\":\"org_a\",\"docs\":[{\"id\":\"doc-001\",\"title\":\"Welcome\",\"folder\":\"general\"}]}"
+    },
+    {
+      "id": "hop2_prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/workspaces/org_b/docs",
+      "persona": "dual_a",
+      "consumedCapabilities": [
+        "cap:hop_1:dual_listing_tok"
+      ],
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"workspace\":\"org_b\",\"tenantId\":\"org_b\",\"docs\":[{\"id\":\"doc-101\",\"title\":\"Quarterly Overview\",\"folder\":\"general\"},{\"id\":\"doc-102\",\"title\":\"Onboarding Guide\",\"folder\":\"handbook\"}]}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-V8-M2-CLAUDE-BYPASS-REVIEW-FP",
+    "terminalVulnClass": "dual_tenant_abac",
+    "oracleFamily": "",
+    "capabilityToken": "dual_listing_tok",
+    "terminalExchangeId": "hop2_prb",
+    "preChainControlIds": [
+      "hop2_ctl"
+    ],
+    "attackerPersonas": [
+      "dual_a"
+    ],
+    "forbiddenShortcutPersonas": [],
+    "expectedFailedStage": "terminal_impact",
+    "claimedDelta": "Metadata-only org_b listing with a denial control from a different actor must reject; host auto-hydration must not bypass the read-only listing guard or accept a non-actor 403 as the baseline."
+  }
+}
