@@ -49,7 +49,8 @@ export interface ProofWriterResult {
   spendUsd: number
   turns: number
   attempts: number
-  lastRejection?: { rejectedBy?: string; reason?: string; detail?: string }
+  compositeRejectedBy?: string
+  lastRejection?: { rejectedBy?: string; compositeRejectedBy?: string; reason?: string; detail?: string }
   error?: string
 }
 
@@ -91,28 +92,24 @@ const VALID_TERMINAL_CLASSES =
 
 export function buildProofWriterSystemPrompt(): string {
   return [
-    'Proof-Writer Specialist: write/repair a short TS `kovo_verify` script turning candidate exchanges into a Mode-A (`fresh_clean_replay`) confirmed `CompositeProofReceipt`.',
-    '',
-    'ChainBuilder v2 (`ctx.chain()` — Mode A runs twice on clean state):',
+    'Proof-Writer: write/repair a TS `kovo_verify` script producing a Mode-A (`fresh_clean_replay`) confirmed `CompositeProofReceipt`.',
+    'ChainBuilder v2 (`ctx.chain()`, runs twice on clean state):',
     '```ts',
     'const ch = ctx.chain({ chainId: "chain_1", terminalVulnClass: "<class>" })',
-    'const ctrl = await ch.control(target, { as: attacker }) // ALWAYS OUTSIDE any hop',
+    'const ctrl = await ch.control(target, { as: attacker }) // OUTSIDE any hop',
     'const h1 = await ch.step(hop1, { hopId: "hop_1", method: "POST", as: attacker, body: {}, claimedDelta: "..." })',
-    'const cap = await ch.seal(h1, { jsonPath: "$.token", kind: "bearer_token" }) // prefer ch.seal over ctx.seal_capability',
+    'const cap = await ch.seal(h1, { jsonPath: "$.token", kind: "bearer_token" }) // STRING — NEVER cap.handle!',
     'const h2 = await ch.hop("hop_2", { claimedDelta: "..." }, () => ctx.http_send(target, { capability: { handle: cap, target: "bearer" }, role: "probe" }))',
-    'await ch.readback(target, { as: attacker }) // optional readback',
-    'await ch.prove({ terminalHopId: "hop_2", claimedImpact: "..." })',
+    'const urlCap = await ch.seal(h2, { kind: "signed_url", jsonPath: "$.url" }) // NO leading `/`',
+    'const h3 = await ch.hop("hop_3", { claimedDelta: "..." }, () => ctx.http_send({ method: "GET", path: urlCap }))',
+    'await ch.readback(target, { as: attacker })',
+    'await ch.prove({ terminalHopId: "hop_3", claimedImpact: "..." })',
     'return ctx.result({ title: "..." })',
     '```',
-    '',
-    'Helpers: `ch.seal` (`jsonPath|header|setCookie|locationQuery`, `kind: "bearer_token"|"cookie"|"hmac_key"|"jwt"`, never regex; prefer over `ctx.seal_capability`), `ch.race` / `ctx.race_burst`, `ctx.hmac_sign`, `ctx.jwt_sign`, `ctx.await_async`, `ch.stateTransition({ fromHopId, toHopId, entityId, ablationExchange: ctrl })`, `ch.edge({ kind, fromHopId, toHopId, ... })`.',
-    `Valid classes: ${VALID_TERMINAL_CLASSES}. Never use \`cross_tenant_data_access\`.`,
-    '',
-    'Rules:',
-    '1. Every hop MUST connect to `terminalHopId` via a host-attested edge (`ch.seal` + `capability: { handle }`, `ch.stateTransition`, or `ch.edge`). Prune unlinked recon/listing hops instead of leaving orphan `hop_*` nodes.',
-    '2. Run `await ch.control(target, { as: attacker })` BEFORE mutating hops and OUTSIDE any hop.',
-    '3. With `draftScript` + `compilerFailure`, patch the exact failure (`rejectedBy`/`reason`/`detail`/`missingEvidence`) directly.',
-    '4. Keep Mode-A idempotent (extract IDs/tokens at runtime; use `ctx.nonce`). Stop once `kovo_verify` returns `confirmed: true`; call `complete_intent` only if unconfirmable.',
+    '**`ch.seal` returns handle STRING directly — pass `cap`, NEVER write `cap.handle`!** (Legacy `ctx.seal_capability` returned `{ handle }`; no regex.) Selectors: `jsonPath|header|setCookie|locationQuery`; `kind`: `bearer_token|signed_url|cookie|api_token|header_secret|hmac_key|jwt|generic_secret`. Use `body` (not `jsonBody`/`textBody`).',
+    'Helpers: `ch.race`/`ctx.race_burst`, `ctx.hmac_sign`, `ctx.jwt_sign`, `ctx.await_async`, `ch.stateTransition({ fromHopId, toHopId, entityId, ablationExchange })`, `ch.edge`.',
+    `Classes: ${VALID_TERMINAL_CLASSES}. Never \`cross_tenant_data_access\`.`,
+    'Rules: 1. Link every hop to `terminalHopId`; prune orphan `hop_*` hops. 2. Run `ch.control` BEFORE mutations, OUTSIDE any hop. 3. Patch `draftScript` for `compilerFailure` (`rejectedBy`/`reason`/`detail`/`missingEvidence`). 4. Keep Mode-A idempotent (`ctx.nonce`); stop on `confirmed: true`; `complete_intent` only if unconfirmable.',
   ].join('\n')
 }
 
@@ -192,7 +189,7 @@ export function buildProofWriterUserPrompt(input: ProofWriterInput): string {
     const label = input.compilerFailure ? ' (Edit directly to fix the failure above)' : ''
     sections.push(`\n## Draft Script${label}\n\`\`\`ts\n${clampText(input.draftScript, MAX_DRAFT_SCRIPT_CHARS)}\n\`\`\``)
   }
-  sections.push('\n## Action\nCall `kovo_verify` with inline TypeScript (`runtime: "ts"`) using `ChainBuilder` v2 (`ch.control` outside hops, `ch.step`/`ch.hop`, `ch.seal`, `ch.readback`/`ch.race`/`ch.stateTransition`/`ch.edge`). Prune any unlinked recon/listing hops so every hop connects to `terminalHopId`. Stop immediately when `confirmed: true`.')
+  sections.push('\n## Action\nCall `kovo_verify` with inline TypeScript (`runtime: "ts"`) using `ChainBuilder` v2 (`ch.control` outside hops, `ch.step`/`ch.hop`, `ch.seal`, `ch.readback`/`ch.race`/`ch.stateTransition`/`ch.edge`). Remember: **`const cap = await ch.seal(h, { jsonPath, kind })` returns the handle STRING directly — pass `cap` directly, NEVER `cap.handle`!** For `signed_url`, pass `path: urlCap` directly (no leading `/`), and use `body` (not `jsonBody`/`textBody`). Prune any unlinked recon/listing hops so every hop connects to `terminalHopId`. Stop immediately when `confirmed: true`.')
   return sections.join('\n')
 }
 
@@ -239,7 +236,7 @@ export async function runProofWriterSpecialist(deps: ProofWriterDeps, input: Pro
   let budgetExceeded = false
   let beforeCallError: string | undefined
   let completionSummary: string | undefined
-  let lastRejection: { rejectedBy?: string; reason?: string; detail?: string } | undefined
+  let lastRejection: { rejectedBy?: string; compositeRejectedBy?: string; reason?: string; detail?: string } | undefined
 
   const handlers: WorkerToolHandlers = {
     kovo_verify: async (args: KovoVerifyArgs) => {
@@ -257,7 +254,12 @@ export async function runProofWriterSpecialist(deps: ProofWriterDeps, input: Pro
         localAbort.abort(new ProofWriterShortCircuitError())
         return makeToolResult({ confirmed: true, title: verifyTitle, findingId: res.findingId, rejectedBy: null, reason: res.reason ?? 'confirmed', detail: res.detail ?? 'Composite proof confirmed.' })
       }
-      lastRejection = { ...(res.rejectedBy ? { rejectedBy: res.rejectedBy } : {}), ...(res.reason ? { reason: res.reason } : {}), ...(res.detail ? { detail: res.detail } : {}) }
+      lastRejection = {
+        ...(res.rejectedBy ? { rejectedBy: res.rejectedBy } : {}),
+        ...(res.compositeRejectedBy ? { compositeRejectedBy: res.compositeRejectedBy } : {}),
+        ...(res.reason ? { reason: res.reason } : {}),
+        ...(res.detail ? { detail: res.detail } : {}),
+      }
       return makeToolResult({ confirmed: false, title: verifyTitle, rejectedBy: res.rejectedBy ?? null, reason: res.reason ?? 'unconfirmed', detail: res.detail ?? 'Verification did not confirm.', missingEvidence: res.missingEvidence, usageHint: res.usageHint })
     },
     complete_intent: async (completion: IntentCompletion) => {
@@ -312,12 +314,22 @@ export async function runProofWriterSpecialist(deps: ProofWriterDeps, input: Pro
         : sessionResult.status === 'turn_limit' ? `max_turns_reached: ${turns}/${maxTurns}`
         : completionSummary ? `unconfirmed: ${completionSummary}`
         : !lastRejection ? 'unconfirmed: specialist ended without confirming proof' : undefined)
-    return { confirmed: false, spendUsd, turns, attempts, ...(lastRejection ? { lastRejection } : {}), ...(error ? { error } : {}) }
+    return {
+      confirmed: false, spendUsd, turns, attempts,
+      ...(lastRejection?.compositeRejectedBy ? { compositeRejectedBy: lastRejection.compositeRejectedBy } : {}),
+      ...(lastRejection ? { lastRejection } : {}),
+      ...(error ? { error } : {}),
+    }
   } catch (err) {
     if (confirmed) return confirmedResult()
     const error = budgetExceeded || err instanceof ProofWriterBudgetError ? (err instanceof ProofWriterBudgetError ? err.message : budgetMsg())
       : beforeCallError ?? (parentAborted || deps.signal?.aborted ? 'aborted' : formatError(err))
-    return { confirmed: false, spendUsd, turns, attempts, ...(lastRejection ? { lastRejection } : {}), error }
+    return {
+      confirmed: false, spendUsd, turns, attempts,
+      ...(lastRejection?.compositeRejectedBy ? { compositeRejectedBy: lastRejection.compositeRejectedBy } : {}),
+      ...(lastRejection ? { lastRejection } : {}),
+      error,
+    }
   } finally {
     deps.signal?.removeEventListener('abort', onParentAbort)
   }

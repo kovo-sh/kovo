@@ -92,11 +92,23 @@ test('buildProofWriterSystemPrompt is short (<2500 chars), teaches ctx.chain() +
     'draftScript',
     'compilerFailure',
     'confirmed: true',
+    'NEVER cap.handle',
+    'signed_url',
+    'bearer_token',
+    'api_token',
+    'header_secret',
+    'hmac_key',
+    'generic_secret',
+    'path: urlCap',
+    'jsonBody',
   ]) {
     assert.ok(prompt.includes(requiredToken), `system prompt should include ${requiredToken}`)
   }
   assert.match(prompt, /OUTSIDE any hop/i)
   assert.match(prompt, /orphan `hop_\*`/i)
+  assert.match(prompt, /returns handle STRING directly/i)
+  assert.match(prompt, /NEVER write `cap\.handle`/i)
+  assert.match(prompt, /NO leading `\/`/i)
 
   for (const forbiddenReconTool of [
     'request_http',
@@ -169,6 +181,12 @@ test('buildProofWriterUserPrompt caps body previews <= 1500 chars, masks sensiti
   assert.ok(!prompt.includes('A'.repeat(MAX_PROOF_WRITER_BODY_PREVIEW_CHARS + 1)))
   assert.ok(!prompt.includes('B'.repeat(MAX_PROOF_WRITER_BODY_PREVIEW_CHARS + 1)))
   assert.ok(prompt.includes('…[truncated]'))
+
+  // Action section reinforces ch.seal string return (NEVER cap.handle) + signed_url pattern.
+  assert.match(prompt, /returns the handle STRING directly/i)
+  assert.match(prompt, /NEVER `cap\.handle`/i)
+  assert.ok(prompt.includes('signed_url'))
+  assert.ok(prompt.includes('path: urlCap'))
 })
 
 test('runProofWriterSpecialist short-circuits immediately on confirmed: true with minimal toolset only', async () => {
@@ -413,4 +431,29 @@ test('runProofWriterSpecialist respects maxTurns, returns structured lastRejecti
   assert.equal(calledOnPreAbort, false)
   assert.equal(abortRes.confirmed, false)
   assert.equal(abortRes.error, 'aborted')
+
+  // 4. Preserves compositeRejectedBy on both result and lastRejection for downstream Stage 2b handling.
+  const compositeRejRes = await runProofWriterSpecialist(
+    {
+      profiles: [],
+      runKovoVerify: async () => ({
+        confirmed: false,
+        rejectedBy: 'composite_receipt',
+        compositeRejectedBy: 'terminal_impact_unproven',
+        reason: 'composite_stage_rejected',
+        detail: 'Terminal exchange only minted a signed URL.',
+      }),
+      sessionRunner: async opts => {
+        opts.beforeCall?.()
+        opts.onTurn?.(1, opts.maxTurns ?? 6, false)
+        await opts.handlers?.kovo_verify?.({ script: 'await ch.prove({})', runtime: 'ts' }, opts.signal)
+        return makeSessionResult({ turnsUsed: 1 })
+      },
+    },
+    baseInput(),
+  )
+  assert.equal(compositeRejRes.confirmed, false)
+  assert.equal(compositeRejRes.compositeRejectedBy, 'terminal_impact_unproven')
+  assert.equal(compositeRejRes.lastRejection?.compositeRejectedBy, 'terminal_impact_unproven')
+  assert.equal(compositeRejRes.lastRejection?.rejectedBy, 'composite_receipt')
 })
