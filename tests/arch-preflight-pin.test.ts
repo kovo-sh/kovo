@@ -209,6 +209,74 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
       resolveExploiterActingPersona({ personas, step: { title: 'Cache bleed', hypothesis: '[acting_persona=dual_member] Test cache-bleed across orgs', category: 'cache' } }),
       'dual_member',
     )
+
+    // R10 outsider-first persona selection: prefer non-target-tenant low-priv persona over target-tenant insider
+    const tenantLabeledPersonas = [
+      { handle: 'owner_a', roleLabel: 'owner [quanta] (org_a)', originAllowlist: [API_ORIGIN] },
+      { handle: 'member_a', roleLabel: 'member [quanta] (org_a)', originAllowlist: [API_ORIGIN] },
+      { handle: 'member_b', roleLabel: 'member [helix] (org_b)', originAllowlist: [API_ORIGIN] },
+      { handle: 'dual_member', roleLabel: 'memberships=admin:org_a,viewer:org_b', originAllowlist: [API_ORIGIN] },
+    ]
+    assert.equal(
+      resolveExploiterActingPersona({
+        personas: tenantLabeledPersonas,
+        step: { title: 'Invite collision takeover', hypothesis: 'Resolve org_a invite via NFKC email collision to rebind org_a payouts', category: 'broken-access-control' },
+      }),
+      'member_b',
+      'step targeting org_a must select outsider member_b instead of org_a insider member_a',
+    )
+    assert.equal(
+      resolveExploiterActingPersona({
+        personas: tenantLabeledPersonas,
+        step: { title: 'Cross-tenant workspace read', hypothesis: 'Access quanta workspace billing records from outside', category: 'bola' },
+      }),
+      'member_b',
+      'step naming bracketed org label [quanta] must select outsider member_b',
+    )
+    assert.equal(
+      resolveExploiterActingPersona({
+        personas: personas,
+        step: { title: 'Cross-tenant org_a read', hypothesis: 'Read org_a invoice ledger via horizontal bypass', category: 'bola' },
+      }),
+      'member_b',
+      'handle-suffix tenant inference must also select outsider member_b when targeting org_a',
+    )
+    assert.equal(
+      resolveExploiterActingPersona({
+        personas: tenantLabeledPersonas,
+        step: { title: 'Cross-tenant org_b read', hypothesis: 'Read org_b invoice ledger via horizontal bypass', category: 'bola' },
+      }),
+      'member_a',
+      'step targeting org_b keeps outsider member_a',
+    )
+    assert.equal(
+      resolveExploiterActingPersona({
+        personas: tenantLabeledPersonas,
+        step: { title: 'Explicit outsider flow', hypothesis: 'As org_b outsider, hijack org_a invite to take over account', category: 'auth' },
+      }),
+      'member_b',
+      'explicit actor tenant ("as org_b") targeting org_a selects member_b',
+    )
+    assert.equal(
+      resolveExploiterActingPersona({
+        personas: tenantLabeledPersonas,
+        step: { title: 'Invite resolve collision', hypothesis: 'Probe /invites/resolve NFKC email collision to mint cross-tenant session', category: 'auth' },
+      }),
+      'member_b',
+      'invite/resolve entry flow without named target tenant avoids forcing primary-tenant insider member_a',
+    )
+    const explicitTenantFieldPersonas = [
+      { handle: 'alice', roleLabel: 'member', tenant: 'tenant_alpha', originAllowlist: [API_ORIGIN] },
+      { handle: 'bob', roleLabel: 'member', tenant: 'tenant_beta', originAllowlist: [API_ORIGIN] },
+    ]
+    assert.equal(
+      resolveExploiterActingPersona({
+        personas: explicitTenantFieldPersonas,
+        step: { title: 'Tenant alpha takeover', hypothesis: 'Redeem invite for tenant_alpha resource', category: 'auth' },
+      }),
+      'bob',
+      'explicit tenant field must pick outsider bob over tenant_alpha insider alice',
+    )
   })
 
   test('20-call run-scale mixed sequence: enforces actingPersona pin, allows cap: handles, control arm tagging, read-only victim_setup, and blocks mutating victim_setup', async () => {
@@ -279,7 +347,7 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
       { label: 'pinned explicit attacker', args: { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/items', persona: 'member_a', purpose: 'attacker' } },
       { label: 'pinned batch', args: { mode: 'batch', requests: [{ origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/a', persona: 'member_a' }, { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/b', persona: 'member_a' }] } },
       // 4-8: non-pinned personas blocked on attacker arm in <1ms
-      { label: 'block member_b', args: { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/items/2', persona: 'member_b' }, expectError: /persona_pin_violation.*actingPersona "member_a".*\{\s*capability:\s*cap\.handle\s*\}/ },
+      { label: 'block member_b', args: { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/items/2', persona: 'member_b' }, expectError: /persona_pin_violation.*actingPersona "member_a".*\{\s*capability:\s*cap\.handle\s*\}.*outsider.*unauthenticated/ },
       { label: 'block dual_member', args: { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/cache/prime', persona: 'dual_member' }, expectError: /persona_pin_violation.*actingPersona "member_a"/ },
       { label: 'block owner_a', args: { origin: API_ORIGIN, method: 'DELETE', pathAndQuery: '/v1/items/9', persona: 'owner_a' }, expectError: /persona_pin_violation.*actingPersona "member_a"/ },
       { label: 'block batch with member_b', args: { mode: 'batch', requests: [{ origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/ok', persona: 'member_a' }, { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/bad', persona: 'member_b' }] }, expectError: /persona_pin_violation/ },
@@ -419,6 +487,10 @@ describe('Move B: <1ms Pre-Flight Rejection, Negative-Edge Recording, and Litera
         exchangeId: 'ex-ok', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/vault/data',
         persona: 'member_a', status: 200, responseBody: '{"secret":"ok"}', timestampMs: 140,
       }],
+      ['ex-post-ledger-ok', {
+        exchangeId: 'ex-post-ledger-ok', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/admin/ledger',
+        persona: 'member_a', status: 200, responseBody: '{"written":true}', timestampMs: 145,
+      }],
     ])
     const negEdges: PreflightNegativeEdge[] = []
     let dockerVerifyCalls = 0
@@ -485,11 +557,13 @@ describe('Move B: <1ms Pre-Flight Rejection, Negative-Edge Recording, and Litera
     assert.equal(ctrlAllowedRes.confirmed, true)
     assert.equal(dockerVerifyCalls, 2)
 
-    // 1e. Regression C exemption: hmac_sign, ch.seal, cap:, await_async, ch.race are NOT blocked by prior exploratory 403 on GET /v1/admin/ledger!
+    // 1e. Regression C exemption: hmac_sign, jwt_sign, terminal capability:/authMutation:, await_async, ch.race are NOT blocked by prior exploratory 403 on GET /v1/admin/ledger!
     const exemptScripts = [
       `const ch = ctx.chain('e1', 'forged_settlement'); const sig = await ctx.hmac_sign({ secretHandle: 'cap:hop_1:k', payload: '{}', alg: 'sha256' }); await ch.step('GET /v1/admin/ledger', { headers: { 'x-signature': sig.signature } }); return await ch.prove({ claimedImpact: 'signed read' })`,
+      `const ch = ctx.chain('e1b', 'auth_bypass'); const tok = await ctx.jwt_sign({ secretHandle: 'cap:hop_1:k', payload: { role: 'admin' }, alg: 'HS256' }); await ch.step('GET /v1/admin/ledger', { headers: { Authorization: 'Bearer ' + tok.token } }); return await ch.prove({ claimedImpact: 'forged jwt read' })`,
       `const ch = ctx.chain('e2', 'privilege_escalation'); const h1 = await ch.step('POST /oauth/token', { as: 'member_a' }); const cap = await ch.seal(h1, 'access_token'); await ch.step('GET /v1/admin/ledger', { capability: cap }); return await ch.prove({ claimedImpact: 'sealed read' })`,
       `const ch = ctx.chain('e3', 'bfla'); await ch.step('GET /v1/admin/ledger', { capability: 'cap:hop_1:tok' }); return await ch.prove({ claimedImpact: 'cap read' })`,
+      `const ch = ctx.chain('e3b', 'auth_bypass'); await ch.step('GET /v1/admin/ledger', { as: 'member_a', authMutation: { kind: 'alg_none' } }); return await ch.prove({ claimedImpact: 'alg_none bypass' })`,
       `const ch = ctx.chain('e4', 'economic_conservation'); await ch.race({ request: { method: 'GET', path: '/v1/admin/ledger', as: 'member_a' }, count: 6 }); return await ch.prove({ claimedImpact: 'race read' })`,
       `const ch = ctx.chain('e5', 'cross_surface_pivot'); await ctx.await_async({ pollRequest: { path: '/v1/admin/ledger', as: 'member_a' }, matchPredicate: { status: 200 } }); await ch.step('GET /v1/admin/ledger', { as: 'member_a' }); return await ch.prove({ claimedImpact: 'async read' })`,
     ]
@@ -498,6 +572,63 @@ describe('Move B: <1ms Pre-Flight Rejection, Negative-Edge Recording, and Litera
       assert.equal(res.confirmed, true, `exempt script must NOT be blocked by prior exploratory 403: ${script.slice(0, 60)}`)
     }
     assert.equal(dockerVerifyCalls, 2 + exemptScripts.length)
+
+    // 1f. R10 Move 3: plain ch.seal script whose terminal step uses plain persona auth (NOT capability:/authMutation:) on a non-2xx route IS rejected host-side in <5ms
+    const beforeMove3 = dockerVerifyCalls
+    const tSeal = performance.now()
+    const sealPlainRes = JSON.parse(extractText(await kvTool.execute({
+      title: 'Sealed hop1 but plain persona terminal 403',
+      script: `const ch = ctx.chain('m3-1', 'bfla'); const h1 = await ch.step('POST /oauth/token', { as: 'member_a' }); const cap = await ch.seal(h1, 'access_token'); await ch.step('GET /v1/admin/ledger', { as: 'member_a' }); return await ch.prove({ claimedImpact: 'plain read' })`,
+    }, {} as never, { abortSignal: new AbortController().signal } as never))) as { ok: boolean; rejectedBy: string }
+    assert.ok(performance.now() - tSeal < 5)
+    assert.equal(sealPlainRes.ok, false)
+    assert.equal(sealPlainRes.rejectedBy, 'terminal_exchange_not_succeeding')
+    assert.equal(dockerVerifyCalls, beforeMove3, 'ch.seal without terminal capability: must not bypass non-2xx preflight')
+
+    // 1g. R10 Move 3: script with zero proof-submission calls is rejected host-side in <5ms with actionable hint
+    const tNoProve = performance.now()
+    const noProveRes = JSON.parse(extractText(await kvTool.execute({
+      title: 'Missing ch.prove call',
+      script: `const ch = ctx.chain('m3-2', 'bfla'); const h1 = await ch.step('GET /v1/vault/data', { as: 'member_a' }); return ctx.result({ title: 'no prove', data: h1.json })`,
+    }, {} as never, { abortSignal: new AbortController().signal } as never))) as { ok: boolean; rejectedBy: string; error?: string }
+    assert.ok(performance.now() - tNoProve < 5)
+    assert.equal(noProveRes.ok, false)
+    assert.equal(noProveRes.rejectedBy, 'missing_proof_call')
+    assert.match(noProveRes.error ?? '', /ch\.prove\(\.\.\.\).*http/i)
+    assert.equal(dockerVerifyCalls, beforeMove3, 'missing proof call must not launch Docker')
+
+    // 1h. R10 Move 3: invalid or empty authMutation.kind rejected host-side in <5ms with valid kinds + { capability: cap } hint
+    for (const badMut of [`{ kind: '' }`, `{ kind: 'bearer' }`, `{}`]) {
+      const tMut = performance.now()
+      const mutRes = JSON.parse(extractText(await kvTool.execute({
+        title: `Bad authMutation ${badMut}`,
+        script: `const ch = ctx.chain('m3-3', 'auth_bypass'); await ch.step('GET /v1/vault/data', { as: 'member_a', authMutation: ${badMut} }); return await ch.prove({ claimedImpact: 'mut' })`,
+      }, {} as never, { abortSignal: new AbortController().signal } as never))) as { ok: boolean; rejectedBy: string; error?: string }
+      assert.ok(performance.now() - tMut < 5)
+      assert.equal(mutRes.ok, false)
+      assert.equal(mutRes.rejectedBy, 'invalid_auth_mutation')
+      assert.match(mutRes.error ?? '', /alg_none.*\{\s*capability:\s*cap\s*\}/i)
+    }
+    assert.equal(dockerVerifyCalls, beforeMove3, 'invalid authMutation must not launch Docker')
+
+    // 1i. R10 Move 3: unprobed literal terminal route is steered to fast http tool in <5ms, while dynamic ${...} terminal route is allowed
+    const tUnprobed = performance.now()
+    const unprobedRes = JSON.parse(extractText(await kvTool.execute({
+      title: 'Unprobed literal route',
+      script: `const ch = ctx.chain('m3-4', 'bfla'); await ch.step('POST /v1/never-probed-endpoint', { as: 'member_a' }); return await ch.prove({ claimedImpact: 'unprobed write' })`,
+    }, {} as never, { abortSignal: new AbortController().signal } as never))) as { ok: boolean; rejectedBy: string; error?: string }
+    assert.ok(performance.now() - tUnprobed < 5)
+    assert.equal(unprobedRes.ok, false)
+    assert.equal(unprobedRes.rejectedBy, 'terminal_route_unprobed')
+    assert.match(unprobedRes.error ?? '', /0 recorded http exchanges.*http/i)
+    assert.equal(dockerVerifyCalls, beforeMove3, 'unprobed literal terminal route must not launch Docker')
+
+    const dynRes = JSON.parse(extractText(await kvTool.execute({
+      title: 'Dynamic template terminal route',
+      script: 'const ch = ctx.chain("m3-5", "bola"); const h1 = await ch.step("GET /v1/vault/data", { as: "member_a" }); await ch.step(`/v1/exports/${h1.json.id}`, { as: "member_a" }); return await ch.prove({ claimedImpact: "dyn export" })',
+    }, {} as never, { abortSignal: new AbortController().signal } as never))) as { confirmed: boolean }
+    assert.equal(dynRes.confirmed, true, 'dynamic interpolated terminal route must not be blocked as unprobed')
+    assert.equal(dockerVerifyCalls, beforeMove3 + 1)
 
     // 2. Literal token carry-over in kovo_verify script (pastes SAMPLE_JWT from ex-mint instead of ch.seal) -> rejected in <5ms, 0 Docker calls
     const beforeCarry = dockerVerifyCalls
