@@ -48,7 +48,7 @@ import {
   UntrustedComputeAbortedError,
   type ExtractedHtmlSurface,
 } from './untrusted-compute-pool.ts'
-
+import { runPhase0SiblingVerbPass, type SiblingVerbOriginSnapshot } from './phase0-sibling-verbs.ts'
 export { extractHtmlLinksAndScripts, parseJsonOrYaml, parseYamlLikeDocument }
 import {
   classifySurface,
@@ -4929,7 +4929,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   const browserSemaphore = createPhase0Semaphore(browserConcurrency)
   let hostsDone = 0
   let hostsStarted = 0
-
+  const siblingVerbOrigins = new Map<string, SiblingVerbOriginSnapshot>()
   await runBoundedPool(normalizedOrigins, originConcurrency, async (origin, originIndex) => {
     if (signal.aborted) {
       stoppedReason = 'aborted'
@@ -6913,7 +6913,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     noteTruncation('js_request_params', MAX_JS_REQ_PARAMS_PER_CHUNK, jsReqParamsObserved, origin)
     noteTruncation('js_route_table', MAX_JS_ROUTE_TABLE_PER_CHUNK, jsRouteTableObserved, origin)
     noteTruncation('trpc_procedures', MAX_TRPC_PROCS_PER_CHUNK, trpcProcsObserved, origin)
-
+    siblingVerbOrigins.set(origin, { requestsUsed: originUsed, perOriginCap, halted: originHalted, isSoftNotFound: softNotFoundResponse, idsByCollection, observedConcretePaths: [...navVisited, ...discoveredCandidatePaths], probedKeys: probedPaths, persona: lowPrivOriginPersonas.find(h => !rejectedPersonas.has(h)) })
     hostsDone += 1
     emitPhase0Stage(
       'auth_privileged',
@@ -6921,10 +6921,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       { origin, hostsDone, hostsTotal, force: hostsDone === hostsTotal },
     )
   }, () => signal.aborted)
-
+  const siblingVerbRes = signal.aborted ? null : await runPhase0SiblingVerbPass({ storage, runId, scopeRevision, broker, grant, signal, approvedOrigins: normalizedOrigins, personas: params.personas, originSnapshots: siblingVerbOrigins, requestTimeoutMs, assignmentId: params.assignmentId, onExchange: params.onExchange })
+  if (siblingVerbRes) { requestsUsed += siblingVerbRes.requestsSent; endpointsDiscovered += siblingVerbRes.endpointsDiscovered; paramsDiscovered += siblingVerbRes.paramsDiscovered; siblingEndpoints += siblingVerbRes.endpointsDiscovered; soft404Rejected += siblingVerbRes.soft404Rejected; for (const d of siblingVerbRes.discovered) dynamicPaths.add(d.pathTemplate) }
   if (signal.aborted) stoppedReason = 'aborted'
   readPagedMetrics.sort((a, b) => a.origin.localeCompare(b.origin) || a.phase.localeCompare(b.phase))
-
   // Paged-read accounting: every phase reads to completion, so `truncated` is always false. A
   // non-zero `used` shortfall is a planning filter, never a dropped page.
   for (const metric of readPagedMetrics) {
