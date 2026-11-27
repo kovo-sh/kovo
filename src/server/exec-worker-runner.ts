@@ -2437,10 +2437,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             return trackProofCall(async () => {
             const curRun = this.host.check(job)
             const rawRuntime = args.runtime as string | undefined
-            if (
-              (rawRuntime !== undefined && rawRuntime !== 'ts')
-              || (typeof args.scriptPath === 'string' && /\.py$/i.test(args.scriptPath.trim()))
-            ) {
+            if ((rawRuntime !== undefined && rawRuntime !== 'ts') || (typeof args.scriptPath === 'string' && /\.py$/i.test(args.scriptPath.trim()))) {
               throw new Error(KOVO_VERIFY_TS_ONLY_ERROR)
             }
             const runtime: KovoVerifyRuntime = 'ts'
@@ -2451,6 +2448,9 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
                 : ''
             if (!script) {
               throw new Error('kovo_verify requires `script` (inline) or `scriptPath` (a file in the mounted workspace).')
+            }
+            if (checkpointOnlyGuard.shouldBlockCheckpointOnlyScript(script)) {
+              return checkpointOnlyGuard.buildBlockedOutcome()
             }
             const aliasHits: KovoVerifyAliasKey[] = [
               ...(args.aliasUsed === 'code'

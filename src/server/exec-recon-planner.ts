@@ -4258,7 +4258,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
             origins: [...approvedOrigins],
             budgetRequests: freshRun.budgetRequests,
             reposDir,
-            personas: [...(grant.personas?.keys() ?? [])],
+            personas: sortPersonasLowPrivFirst([...(grant.personas?.values() ?? [])]).map(p => p.handle),
             broker: this.broker,
             browser: phase0Browser,
             canaryBroker: this.canaryBroker,
@@ -5505,7 +5505,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const confirmedOriginPathSet = new Set(input.confirmed.map(ref => `${ref.origin ?? origin} ${normalizeConfirmedRouteTemplate(ref.path)}`))
       const samples = this.storage.listResourceSamples(input.run.id).filter(sample => publicOrigins.includes(sample.origin))
       const routes = selectBriefRoutes(
-        this.storage.listEndpoints(input.run.id, { orderBy: 'risk', limit: publicOrigins.length > 1 ? 120 : 40 }),
+        publicOrigins.length > 1 ? publicOrigins.flatMap(orig => this.storage.listEndpoints(input.run.id, { origin: orig, orderBy: 'risk', limit: 60 })) : this.storage.listEndpoints(input.run.id, { orderBy: 'risk', limit: 40 }),
         {
           publicOrigins,
           targetOrigins: input.targetOrigins,

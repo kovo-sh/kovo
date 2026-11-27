@@ -767,10 +767,10 @@ export interface AssignmentBriefMultiHopContract {
 }
 
 export const MULTIHOP_ATTACKER_ORIGIN_RULE =
-  'Run discovery & attack hops as low-privilege/attacker persona(s) ONLY — NEVER privileged victim/owner/admin shortcuts (negative control only). Shared/dual-tenant persona crossing into non-admin tenant -> dual_tenant_abac/cross_tenant_data_access (not broken_access_control). Ablation = SAME actor as toHop.'
+  'Run discovery & attack hops as low-privilege/attacker persona(s) ONLY — NEVER privileged victim/owner/admin shortcuts (negative control only, passing { arm: "control" }). Shared/dual-tenant persona crossing into non-admin tenant -> dual_tenant_abac (not broken_access_control). Ablation = SAME actor as toHop.'
 
 export const MULTIHOP_CONTINUE_CHAIN_RULE =
-  'Explore with http_request/kovo_http first; NEVER seal-only kovo_verify. Never stop at intermediate invite/token/metadata/role-write hops as broken_access_control — seal (ctx.seal_capability) and chain Hops 3-5 in ONE SAME script to terminal mutation/approval/secret readback as terminalHopId via ctx.chain(...).prove().'
+  'Explore with http_request/kovo_http first; NEVER seal-only kovo_verify. Never submit a proof for reading your own tenant resource or stopping at an intermediate invite/token/metadata/job/export-handle/role-write mint — seal (ctx.seal_capability) and chain Hops 3-5 in ONE SAME script to cross-tenant/unauthorized victim impact on terminalHopId via ctx.chain(...).prove().'
 
 export const RECORD_COVERAGE_BRIEF_GUIDANCE = buildRecordCoverageBriefGuidance()
 
@@ -831,9 +831,9 @@ function detectMultiHopHelperPatterns(input?: AssignmentBriefInput, compact = fa
 
 /** Exact Mode-A TypeScript kovo_verify recipe (<= 18 lines, live SDK parameter names). */
 export const MULTIHOP_MODE_A_TS_RECIPE = [
-  '// Explore via kovo_http first; NEVER seal-only kovo_verify. Run Hop 1..N + ctx.chain(...).prove() / ctx.prove_composite in ONE script.',
-  'const actor = "<attacker_persona>" // low-priv attacker; ablation/control MUST run as SAME actor as toHop',
-  'const ctrl = await ctx.http_send("/api/target", { as: actor, role: "control" })',
+  '// Explore via http_request/kovo_http first; NEVER seal-only kovo_verify. Run Hop 1..N + ctx.chain(...).prove() / ctx.prove_composite in ONE script.',
+  'const actor = "<attacker_persona>" // low-priv attacker; negative control MUST pass { arm: "control" } as SAME actor as toHop',
+  'const ctrl = await ctx.http("/api/target", { as: actor, arm: "control" })',
   'const h1 = await ctx.http_send("/api/hop1", { as: actor, role: "probe" })',
   'const cap = await ctx.seal_capability({ exchange: h1, hopReceiptId: "1", slot: "tok", jsonPath: "$.token" })',
   'const h2 = await ctx.http_send("/api/target", { capability: cap.handle, role: "probe" })',
@@ -846,13 +846,13 @@ export const MULTIHOP_MODE_A_TS_RECIPE = [
   '  ],',
   '  // causalEdges.kind: value_binding | derived_crypto_binding | state_transition_binding (ablation as SAME actor as toHop) | async_pivot_binding',
   '  causalEdges: [{ kind: "value_binding", fromHopId: "hop_1", toHopId: "hop_2", capabilityHandle: cap.handle }],',
-  '  terminalImpact: { terminalHopId: "hop_2", claimedImpact: "Unauthorized terminal access.", preChainControlExchangeIds: [ctrl.exchangeId], postChainReadbackExchangeIds: [h2.exchangeId] },',
+  '  terminalImpact: { terminalHopId: "hop_2", claimedImpact: "Unauthorized cross-tenant/victim terminal impact confirmed.", preChainControlExchangeIds: [ctrl.exchangeId], postChainReadbackExchangeIds: [h2.exchangeId] },',
   '})',
   'return ctx.result({ title: "Multi-hop chain confirmed" })',
 ].join('\n')
 
 const COMPACT_MULTIHOP_MODE_A_RECIPE =
-  'a="<attacker_persona>"; http_send(t,{as:a,role:"control"}); h1=http_send(hop1,{as:a,role:"probe"}); cap=seal_capability({exchange:h1,slot:"tok",jsonPath:"$.token"}); http_send(t,{capability:cap.handle,role:"probe"}); prove_composite({chainId,terminalVulnClass:"<broken_access_control|privilege_escalation|stale_privilege_use|cross_tenant_export|ledger_overcredit|forged_settlement;dual_tenant_abac only w/ctrl>",hops,causalEdges:[value_binding|derived_crypto_binding|state_transition_binding|async_pivot_binding],terminalImpact,replayMode:"fresh_clean_replay"})'
+  'a="<attacker_persona>"; ctx.http(t,{as:a,arm:"control"}); h1=http_send(hop1,{as:a,role:"probe"}); cap=seal_capability({exchange:h1,slot:"tok",jsonPath:"$.token"}); http_send(t,{capability:cap.handle,role:"probe"}); prove_composite({chainId,terminalVulnClass:"<broken_access_control|privilege_escalation|stale_privilege_use|cross_tenant_export|ledger_overcredit|forged_settlement;dual_tenant_abac w/ctrl>",hops,causalEdges:[value_binding|derived_crypto_binding|state_transition_binding|async_pivot_binding],terminalImpact,replayMode:"fresh_clean_replay"})'
 
 function isExplicitMultiHopMission(input: Pick<AssignmentBriefInput, 'missionKind' | 'hopCheckpoint'>): boolean {
   return Boolean(input.hopCheckpoint)
@@ -887,8 +887,8 @@ export function buildMultiHopProofContract(compact = false, input?: AssignmentBr
   const helperPatterns = detectMultiHopHelperPatterns(input, compact)
   if (compact) {
     return {
-      attackerOriginRule: 'Low-privilege only (no victim/owner/admin); non-admin tenant->dual_tenant_abac/cross_tenant_data_access; SAME actor.',
-      continueChainRule: 'kovo_http; ctx.seal_capability Hops 1-2+Hops 3-5->terminalHopId+ctx.chain().prove() in SAME script.',
+      attackerOriginRule: 'Low-priv only (no victim/owner/admin); non-admin tenant->dual_tenant_abac; SAME actor; {arm:"control"}.',
+      continueChainRule: 'kovo_http; no own-tenant/handle stubs; ctx.seal_capability Hops 3-5->terminalHopId+ctx.chain().prove() in SAME script.',
       ...(helperPatterns.length ? { helperPatterns } : {}),
       modeATsRecipe: COMPACT_MULTIHOP_MODE_A_RECIPE,
       hardenedTwinRule: 'Guard holds: no Hop1-2 finding; record_coverage(status="ruled_out", proofGapReason="invariant_enforced_hardened")+complete_intent.',
@@ -1124,9 +1124,9 @@ export function buildAssignmentBriefPacket(
       state.linked.pop()
       continue
     }
-    if (state.routes.length > 1) {
-      state.routes.pop()
-      continue
+    const minRoutes = state.publicOrigins.length > 1 ? Math.min(state.routes.length, state.publicOrigins.length) : 1
+    if (state.routes.length > minRoutes) {
+      state.routes.pop(); continue
     }
     if (state.personas.length > 1) {
       state.personas.pop()

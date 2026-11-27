@@ -110,6 +110,10 @@ import {
   VERIFY_RPC_HEADER,
   VerifyRpcServer,
 } from '../src/server/verify-rpc.ts'
+import {
+  TERMINAL_CLASS_CONTRACT,
+  resolveTerminalContract,
+} from '../src/server/v8-oracle-hydrate.ts'
 import { prepareVerifyScript } from '../src/server/verify-runner.ts'
 import {
   acquireCredentialsDirEnv,
@@ -1658,4 +1662,82 @@ test('Check 7: R3-15 — record_coverage tool schema, store-findings validation,
   assert.ok(coverageStatusRank('needs_follow_up') > coverageStatusRank('ruled_out'))
   assert.ok(coverageStatusRank('needs_follow_up') > coverageStatusRank('not_applicable'))
   assert.ok(coverageStatusRank('no_issue_found') > coverageStatusRank('unprobed'))
+})
+
+// ---------------------------------------------------------------------------
+// Check 8 — Prompt/Brief/Playbook Terminal Class <-> TERMINAL_CLASS_CONTRACT Canary
+// ---------------------------------------------------------------------------
+test('Check 8: All terminalVulnClass/vulnClass examples in assignment-brief, agent-prompts, and multihop-chains resolve in TERMINAL_CLASS_CONTRACT', () => {
+  const targetFiles = [
+    'src/server/assignment-brief.ts',
+    'src/server/agent-prompts.ts',
+    'src/skills/multihop-chains.md',
+  ] as const
+
+  const checkedClasses = new Set<string>()
+  const invalidCitations: string[] = []
+  const assertClassValid = (source: string, rawClass: string): void => {
+    const cls = rawClass.trim().toLowerCase()
+    if (!cls || cls === 'unknown' || cls === 'other' || cls === 'class') return
+    checkedClasses.add(cls)
+    const ok = Boolean(TERMINAL_CLASS_CONTRACT[cls] || resolveTerminalContract(cls))
+    if (!ok) invalidCitations.push(`${source}: "${cls}"`)
+  }
+
+  for (const relPath of targetFiles) {
+    const text = readFileSync(join(REPO_ROOT, relPath), 'utf8')
+    assert.equal(
+      /\bcross_tenant_data_access\b/i.test(text),
+      false,
+      `${relPath} must never cite invalid unmapped class "cross_tenant_data_access"`,
+    )
+
+    // 1) Extract every `terminalVulnClass: "..."` / `'...'` (including compact pipe-separated lists).
+    for (const match of text.matchAll(/\bterminalVulnClass\s*:\s*['"]([^'"]+)['"]/g)) {
+      const val = (match[1] ?? '').trim()
+      if (!val) continue
+      if (val.includes('|')) {
+        const core = val.replace(/^<|>$/g, '').split(';')[0] ?? ''
+        for (const item of core.split('|')) {
+          if (/^[a-z][a-z0-9_-]{2,}$/i.test(item.trim())) assertClassValid(relPath, item)
+        }
+      } else if (/^[a-z][a-z0-9_-]{2,}$/i.test(val)) {
+        assertClassValid(relPath, val)
+      }
+    }
+
+    // 2) Extract `dual-tenant` -> class citations (catches typos like `dual_tenant_abac/cross_tenant_data_access`).
+    for (const match of text.matchAll(/(?:dual-tenant|non-admin\s+tenant|cross-tenant\s+chains)\s*->\s*([a-z0-9_`\/-]+)/gi)) {
+      const rhs = (match[1] ?? '').replace(/`/g, '')
+      for (const token of rhs.split('/')) {
+        if (/^[a-z][a-z0-9_-]{2,}$/i.test(token.trim())) assertClassValid(relPath, token)
+      }
+    }
+
+    // 3) Extract explicit pipe-listed or backticked snake_case class names on lines documenting `terminalVulnClass`.
+    for (const line of text.split(/\r?\n/)) {
+      if (!/terminalVulnClass|Terminal Class Matching Rule/i.test(line)) continue
+      for (const m of line.matchAll(/(?:`|\|)\s*([a-z]+_[a-z0-9_]+)\s*(?:`|\|)/g)) {
+        const token = (m[1] ?? '').trim()
+        if (token.startsWith('prove_') || ['fresh_clean_replay', 'one_shot_transcript', 'value_binding', 'derived_crypto_binding', 'state_transition_binding', 'async_pivot_binding', 'seal_capability', 'http_send', 'hmac_sign', 'jwt_sign', 'await_async', 'actor_low', 'actor_dual'].includes(token)) continue
+        assertClassValid(relPath, token)
+      }
+    }
+  }
+
+  assert.deepEqual(
+    invalidCitations,
+    [],
+    `Unmapped terminalVulnClass/vulnClass example(s) not in TERMINAL_CLASS_CONTRACT: ${invalidCitations.join(', ')}`,
+  )
+  assert.ok(
+    checkedClasses.size >= 8,
+    `Expected >= 8 distinct canonical terminal classes validated, got ${checkedClasses.size}: ${[...checkedClasses].join(', ')}`,
+  )
+
+  // Also verify live checkpoint_only pre-Docker hard-block wiring in exec-worker-runner.ts.
+  const runnerSrc = readFileSync(join(REPO_ROOT, 'src/server/exec-worker-runner.ts'), 'utf8')
+  const blockIdx = runnerSrc.indexOf('checkpointOnlyGuard.shouldBlockCheckpointOnlyScript(script)')
+  const dockerIdx = runnerSrc.indexOf('this.host.verifier.runAgentScriptProof(')
+  assert.ok(blockIdx > 0 && dockerIdx > blockIdx, 'shouldBlockCheckpointOnlyScript must short-circuit before runAgentScriptProof')
 })
