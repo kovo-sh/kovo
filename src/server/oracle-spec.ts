@@ -1659,6 +1659,24 @@ export function resolveTerminalContractKind(cls: string): OracleTerminalContract
   return spec ? spec.terminalContract : null
 }
 
+/**
+ * Resolve the effective composite-receipt terminal contract for a class.
+ * Inbound forged webhook deliveries (`webhook_forgery` / `webhook` with zero OOB events)
+ * verify via the `auth_or_logic` contract (denied control + in-DAG secret provenance + impact)
+ * rather than falsely demanding an outbound OOB callback; outbound blind webhook SSRF with
+ * OOB events still requires `'oob'`.
+ */
+export function resolveCompositeTerminalContract(
+  cls: string,
+  hasOobEvents = false,
+): OracleTerminalContractKind | null {
+  const norm = cls.trim().toLowerCase()
+  if ((norm === 'webhook_forgery' || norm === 'webhook') && !hasOobEvents) {
+    return 'auth_or_logic'
+  }
+  return resolveTerminalContractKind(cls)
+}
+
 /** Derived `IMPACT_CLASS_LABELS` for `oracle-invariants.ts`. */
 export function buildImpactClassLabels(): Record<string, { vulnClass: string; cwe: string; category: string }> {
   const out: Record<string, { vulnClass: string; cwe: string; category: string }> = {}

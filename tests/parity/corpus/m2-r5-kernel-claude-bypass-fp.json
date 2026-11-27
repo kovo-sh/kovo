@@ -1,0 +1,159 @@
+{
+  "id": "m2-r5-kernel-claude-bypass-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "m2-r5-kernel-forged-webhook-guard-bypass-variants",
+  "description": "R3-05 independent-review FP (m2-r5 kernel): a 1-hop webhook delivery whose only denied control is a 403 (not 401) and whose signature rides in a non-legacy header (`webhook-signature`) carries no in-DAG secret provenance (no second hop, no verified causal edge, no derived_crypto_binding). evaluateForgedWebhookProvenanceGuard must fail it closed regardless of the denied-control status in {401,403,404} or the signature-carrier name; the pre-fix guard keyed on 401 + a fixed header list and let this variant confirm. Also covers (reviewer fix) the zero-delta readback guard running before the stub filter so a stub-shaped session readback cannot skip it.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/exec-verify.ts",
+      "src/server/oracle-spec.ts",
+      "src/server/own-org-terminal-guard.ts",
+      "src/server/v8-oracle-families.ts",
+      "src/server/v8-oracle-hydrate.ts"
+    ],
+    "classes": [
+      "cross_tenant_write",
+      "webhook_forgery",
+      "forged_settlement"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-345",
+    "category": "webhook-forgery",
+    "title": "1-hop forged webhook delivery without proven secret provenance",
+    "impact": "A single webhook delivery accepted after a 403-denied control proves nothing about how the signing secret was obtained; terminal impact must stay unproven without a second hop or derived crypto binding.",
+    "claimedImpact": "other",
+    "claimedBoundary": "other",
+    "vulnClass": "cross_tenant_write"
+  },
+  "freeTextLabel": {
+    "title": "Forged webhook delivery credits another tenant without secret provenance"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-m2r5-member-a"
+    },
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-m2r5-member-b"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ex_ctrl_403",
+      "arm": "control",
+      "role": "control",
+      "method": "POST",
+      "pathAndQuery": "/api/v1/webhooks/billing",
+      "persona": "member_a",
+      "requestHeaders": {
+        "content-type": "application/json",
+        "webhook-signature": "v1,invalid"
+      },
+      "requestJson": {
+        "event": "payment.settled",
+        "tenantId": "tenant-b",
+        "amountCents": 50000
+      },
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"invalid_signature\"}"
+    },
+    {
+      "id": "ex_base_b",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/balance",
+      "persona": "member_b",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"tenant\":\"tenant-b\",\"balanceCents\":100000}"
+    },
+    {
+      "id": "ex_probe_200",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/api/v1/webhooks/billing",
+      "persona": "member_a",
+      "requestHeaders": {
+        "content-type": "application/json",
+        "webhook-signature": "v1,guessed"
+      },
+      "requestJson": {
+        "event": "payment.settled",
+        "tenantId": "tenant-b",
+        "amountCents": 50000
+      },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"accepted\":true,\"tenantId\":\"tenant-b\",\"amountCents\":50000}"
+    },
+    {
+      "id": "ex_fin_b",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/balance",
+      "persona": "member_b",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"tenant\":\"tenant-b\",\"balanceCents\":150000}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-M2-R5-KERNEL-CLAUDE-BYPASS-FP",
+    "terminalVulnClass": "cross_tenant_write",
+    "oracleFamily": "",
+    "singleHop": true,
+    "terminalExchangeId": "ex_probe_200",
+    "preChainControlIds": [
+      "ex_ctrl_403",
+      "ex_base_b"
+    ],
+    "attackerPersonas": [
+      "member_a"
+    ],
+    "expectedFailedStage": "terminal_impact",
+    "claimedDelta": "1-hop forged webhook delivery credits tenant-b; no in-DAG secret provenance.",
+    "postChainReadbackIds": [
+      "ex_fin_b"
+    ]
+  }
+}

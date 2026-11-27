@@ -14,7 +14,7 @@ import { ROLE_RANK, normalizeRole, parseRoleMemberships, resolvePersonaIdentity,
 import type { ProofReceipt } from './proof-receipt.ts'
 import { deriveRecordAuthzDimension, extractIssuedSignedUrl, extractTenantMarkers, findNonErrorBatchRecord, isJobOrHandleStub, type HostAuthzDimension, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
 import { buildTerminalClassContractMap, resolveTerminalContractKind, type OracleTerminalContractKind } from './oracle-spec.ts'
-import { normalizeTerminalVulnClass } from './own-org-terminal-guard.ts'
+import { extractLedgerBalanceMap, filterEconomicActionRecords, isControlDeniedAction, normalizeTerminalVulnClass, resolveOpaqueDualCacheBleedTarget } from './own-org-terminal-guard.ts'
 
 export interface HydratableEntry {
   exchangeId: string; seq?: number; timestampMs?: number
@@ -326,7 +326,7 @@ function extractBalanceMap(rec: HostSignedRecord | undefined): Record<string, nu
     }
   }
   const single = findNumericField(json, ['balance', 'balancecents', 'balance_cents', 'availablebalance', 'available_balance', 'walletbalance', 'wallet_balance', 'ledgerbalance', 'ledger_balance', 'credits', 'funds'])
-  return single !== undefined ? { [findStringField(json, ['accountid', 'account_id', 'walletid', 'wallet_id', 'userid', 'user_id', 'id']) ?? 'default']: single } : undefined
+  return single !== undefined ? { [findStringField(json, ['accountid', 'account_id', 'walletid', 'wallet_id', 'userid', 'user_id', 'id']) ?? 'default']: single } : extractLedgerBalanceMap(json)
 }
 
 function collectJsonStringLeaves(node: unknown, out: Set<string>, depth = 0): void {
@@ -702,7 +702,7 @@ export function hydrateV8OracleInput(
       const markers = markersOf(citedEntry('bledAccess'))
       if (primeTenant) out.primeTenantId = primeTenant
       const foreignMarkers = new Set(markers); if (primeTenant) foreignMarkers.delete(primeTenant)
-      if (foreignMarkers.size === 1) out.targetTenantId = [...foreignMarkers][0]
+      if (foreignMarkers.size === 1) out.targetTenantId = [...foreignMarkers][0]; else { const fb = resolveOpaqueDualCacheBleedTarget({ bled, primeTenant, bledMarkers: markers, actor, citedUpstreamMarkers: cited.filter(e => e && e.exchangeId !== bled?.id).map(markersOf), hostKnownTenants }); if (fb) out.targetTenantId = fb }
       if (bled) {
         const target = typeof out.targetTenantId === 'string' ? out.targetTenantId.trim().toLowerCase() : ''
         if (target && markers.has(target)) out.observedTenantId = out.targetTenantId
@@ -1016,7 +1016,7 @@ export function hydrateV8OracleInput(
       if (citedSet && !citedSet.has(a.id)) continue
       actRecs.push(a)
     }
-    if (Array.isArray(out.actions)) out.actions = actRecs
+    if (Array.isArray(out.actions)) out.actions = filterEconomicActionRecords(actRecs, idx.entriesById)
     const baseJson = parseRecJson(baseRec), finJson = parseRecJson(finRec)
     const eq = resolveEconomicEquation(rawInput, baseRec, finRec)
     if (eq) out.equation = eq
@@ -1091,7 +1091,7 @@ export function hydrateV8OracleInput(
         for (const e of depositEntries.values()) {
           if (!is2xx(e.step.status) || stepReadsState(e.step)) continue
           // Internal transfers between two ledger accounts do not inject external value.
-          if (isInternalTransferRequest(e.step.requestJson)) continue
+          if (isInternalTransferRequest(e.step.requestJson) || isControlDeniedAction(e, econCtx?.preChainControlExchangeIds, idx.entriesById)) continue
           const amt = findNumericField(e.step.json, depKeys) ?? findNumericField(e.step.requestJson, depKeys)
           if (amt !== undefined && amt > 0) summedDeposits += amt
         }

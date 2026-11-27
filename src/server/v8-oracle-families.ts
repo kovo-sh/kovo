@@ -232,24 +232,28 @@ function shapeEqual(a: unknown, b: unknown, depth = 0): boolean {
   return ak.length === bk.length && ak.every((k, i) => k === bk[i] && shapeEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k], depth + 1))
 }
 
+const SESSION_TOK_RE = /^(?:token|access_?token|session_?token|id_?token|jwt|bearer_?token|auth_?token)$/i, SESSION_AUTH_RE = /^(?:role|roles|permissions|tenant|tenant_?id|org|org_?id|organization_?id|user_?id|userid|actor_?id)$/i, SESSION_DISQ_RE = /^(?:job_?id|export_?id|task_?id|upload_?id|delivery_?id|webhook_?id|pat_?id|signed_?url|presigned_?url|download_?url|share_?url|export_?url|url|href|link|redirect|redirect_?uri|location)$/i
+function isVerifiedSessionGrant(val: unknown, status?: number | null, method?: string): boolean {
+  if (!method || !/^(?:POST|PUT)$/i.test(method) || status === 202 || (typeof status === 'number' && (status < 200 || status >= 300)) || !val || typeof val !== 'object' || Array.isArray(val)) return false
+  const root = val as Record<string, unknown>, es = Object.entries(root), t = es.length === 1 && es[0]![1] && typeof es[0]![1] === 'object' && !Array.isArray(es[0]![1]) ? (es[0]![1] as Record<string, unknown>) : root
+  let hasTok = false, hasAuth = false
+  for (const [k, v] of Object.entries(t)) { const lk = k.trim().toLowerCase(); if (SESSION_DISQ_RE.test(lk) || ((lk === 'verified' || lk === 'active' || lk === 'ok' || lk === 'success') && v === false) || ((lk === 'revoked' || lk === 'pending' || lk === 'queued') && v === true) || ((lk === 'status' || lk === 'state') && typeof v === 'string' && /^(?:queued|pending|processing|accepted|unverified|denied|failed|error|rejected)$/i.test(v.trim()))) return false; if (SESSION_TOK_RE.test(lk) && typeof v === 'string' && v.trim().length >= 4) hasTok = true; if (SESSION_AUTH_RE.test(lk) && ((typeof v === 'string' && v.trim().length > 0) || (Array.isArray(v) && v.length > 0))) hasAuth = true }
+  return hasTok && hasAuth
+}
 /** Universal structural & differential stub/ack/enqueue detector (language-agnostic). */
-export function isJobOrHandleStub(json: unknown, body?: string, status?: number | null, method?: string, _route?: string | null, baselineJson?: unknown): boolean {
-  let val = json
-  const trimmed = typeof body === 'string' ? body.trim() : ''
+export function isJobOrHandleStub(json: unknown, body?: string, status?: number | null, method?: string, _route?: string | null, baselineJson?: unknown, hasDeniedControl = false): boolean {
+  let val = json; const trimmed = typeof body === 'string' ? body.trim() : ''
   if (val === undefined && trimmed && /^[\[{]/.test(trimmed)) try { val = JSON.parse(trimmed) } catch { val = undefined }
   if (val == null) return Boolean(trimmed && !/[\r\n\s,;]/.test(trimmed) && (trimmed.length <= 32 || URL_OR_PATH_VAL_RE.test(trimmed)))
   if (typeof val !== 'object') return typeof val === 'string' && !/[\r\n\s,;]/.test(val.trim()) && (val.trim().length <= 32 || URL_OR_PATH_VAL_RE.test(val.trim()))
   if (baselineJson !== undefined && shapeEqual(val, baselineJson)) return true
+  if (hasDeniedControl && isVerifiedSessionGrant(val, status, method)) return false
   const acc = emptyScan(); scanStub(val, 0, acc)
   if (acc.substantive) return false
   if (acc.leaves === 0) return true
   if (Boolean(method) && /^(?:POST|PUT)$/i.test(method!) && status !== 202 && !acc.wrapped && acc.actorBy && acc.atTs && !acc.urlOrPath && !acc.tokenOrCode && !acc.httpSt) return false
   if (acc.domainShort > ((status === 202 || acc.urlOrPath || acc.tokenOrCode || acc.statusLog) ? 2 : 1)) return false
-  return status === 202 || acc.urlOrPath || acc.tokenOrCode || acc.statusLog
-    || (status === 201 && (acc.handleId || acc.bool || acc.httpSt || acc.ts))
-    || (acc.wrapped && (acc.handleId || acc.ts || acc.bool || acc.httpSt))
-    || (acc.handleId && (acc.bool || acc.ts || acc.httpSt))
-    || (acc.leaves <= 2 && acc.bool && !acc.tenantScope && acc.domainShort === 0)
+  return status === 202 || acc.urlOrPath || acc.tokenOrCode || acc.statusLog || (status === 201 && (acc.handleId || acc.bool || acc.httpSt || acc.ts)) || (acc.wrapped && (acc.handleId || acc.ts || acc.bool || acc.httpSt)) || (acc.handleId && (acc.bool || acc.ts || acc.httpSt)) || (acc.leaves <= 2 && acc.bool && !acc.tenantScope && acc.domainShort === 0)
 }
 const stubRec = (r: Pick<HostSignedRecord, 'json' | 'body' | 'status' | 'method' | 'route'>): boolean => isJobOrHandleStub(r.json, r.body, r.status, r.method, r.route)
 
@@ -360,7 +364,12 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
 
   if (input.mode === 'dual_org_cache_bleed') {
     const sub = input.mode, prime = normKey(input.primeTenantId), target = normKey(input.targetTenantId), req = input.requiredRole ?? 'admin'
-    if (!prime || !target) return deny(f, 'missing_tenant_scope', sub)
+    if (!prime || !target) {
+      const re = Object.entries(input.actor.rolesByTenant ?? {}).map(([t, r]) => [normKey(t), normalizeRole(r ?? undefined)] as const).filter(([t, r]) => Boolean(t && r))
+      const hi = prime ? hasTenantRoleAtLeast(input.actor, prime, req) : re.some(([, r]) => r !== null && ROLE_RANK[r] >= ROLE_RANK[req])
+      if (new Set(re.map(([t]) => t)).size < 2 || !hi || !re.some(([, r]) => r !== null && ROLE_RANK[r] < ROLE_RANK[req])) return deny(f, 'actor_not_dual_tenant: dual_org_cache_bleed requires a multi-tenant actor with elevated role in primeTenant; for single-tenant cache bleed use parser_cache_differential or omit oracleFamily', sub)
+      return deny(f, 'missing_tenant_scope', sub)
+    }
     if (prime === target) return deny(f, 'same_tenant_not_cache_bleed', sub)
     if (!hasTenantRoleAtLeast(input.actor, prime, req)) return deny(f, 'actor_lacks_prime_tenant_privilege', sub)
     if (hasTenantRoleAtLeast(input.actor, target, req)) return deny(f, 'actor_authorized_in_target_tenant', sub)

@@ -216,6 +216,7 @@ interface ParityCase {
     hop1TargetOverride?: { origin?: string; method?: string; pathAndQuery?: string }
     hop2TargetOverride?: { origin?: string; method?: string; pathAndQuery?: string }
     preChainControlIds?: string[]
+    postChainReadbackIds?: string[]
     terminalExchangeId?: string
     v8OracleInput?: {
       family: V8OracleFamily
@@ -741,7 +742,8 @@ function buildCompositeFixture(c: ParityCase, origin: string): {
     const termExId = comp.terminalExchangeId ?? c.exchanges[c.exchanges.length - 1]!.id
     const termEx = c.exchanges.find(e => e.id === termExId) ?? c.exchanges[c.exchanges.length - 1]!
     const preCtrls = comp.preChainControlIds ?? c.exchanges.filter(e => e.arm === 'control').map(e => e.id)
-    const hopExIds = c.exchanges.filter(e => !preCtrls.includes(e.id)).map(e => e.id)
+    const postRbIds = comp.postChainReadbackIds ?? []
+    const hopExIds = c.exchanges.filter(e => !preCtrls.includes(e.id) && !postRbIds.includes(e.id)).map(e => e.id)
     receipt = {
       chainId: comp.chainId,
       terminalVulnClass: comp.terminalVulnClass,
@@ -769,7 +771,7 @@ function buildCompositeFixture(c: ParityCase, origin: string): {
         claimedImpact: comp.claimedDelta,
         summary: comp.claimedDelta,
         preChainControlExchangeIds: preCtrls,
-        postChainReadbackExchangeIds: [],
+        postChainReadbackExchangeIds: postRbIds,
       },
       replayMode: 'fresh_clean_replay',
     }

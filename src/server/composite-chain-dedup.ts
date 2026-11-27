@@ -389,3 +389,213 @@ export function matchSubstantialUpstreamCompositeOverlap<T extends UpstreamSuper
   }
   return (matchedCount >= 2 || matchedCount * 2 >= earlierNonGeneric.length) ? overlapSpecs : []
 }
+
+const AUTHZ_PRIVESC_CWE_SET = new Set([
+  'CWE-269', 'CWE-284', 'CWE-285', 'CWE-287', 'CWE-639', 'CWE-862', 'CWE-863',
+])
+const AUTHZ_PRIVESC_CLASS_SET = new Set([
+  'broken_access_control', 'bola', 'bfla', 'idor', 'privilege_escalation', 'privesc',
+  'auth_bypass', 'authentication_bypass', 'broken_auth', 'cross_tenant_read',
+  'cross_tenant_write', 'cross_tenant_export', 'cross_tenant_exfiltration',
+  'dual_tenant_abac', 'self_approved_payout', 'stale_privilege_use', 'temporal_revocation',
+])
+const VERSION_SEG_RE = /^(?:api|rest|v\d+)$/i
+const TENANT_SCOPE_SEG_RE = /^(?:orgs?|organizations?|tenants?|workspaces?)$/i
+const PARAM_SEG_RE = /^(?::[a-z0-9_]+|<[^>]+>|\{[^}]+\})$/i
+
+/**
+ * R6: Compatible authz / privilege-escalation / access-control class check for causal-prefix
+ * supersession. Strictly excludes injection/XSS/SSRF/economic classes so distinct-class findings
+ * are never hidden behind a deeper chain.
+ */
+export function isAuthzPrivescClassSupersessionCompatible(
+  earlier: { cwe: string; vulnClass: string },
+  composite: { vulnClasses: readonly string[] },
+): boolean {
+  const norm = (s: string) => s.trim().toLowerCase().replace(/[\s-]+/g, '_')
+  const hasConcreteEarlierCwe = /^CWE-\d{1,5}$/.test(earlier.cwe)
+  if (hasConcreteEarlierCwe && !AUTHZ_PRIVESC_CWE_SET.has(earlier.cwe)) return false
+  const earlierInFamily = (hasConcreteEarlierCwe && AUTHZ_PRIVESC_CWE_SET.has(earlier.cwe))
+    || (Boolean(earlier.vulnClass) && AUTHZ_PRIVESC_CLASS_SET.has(norm(earlier.vulnClass)))
+  if (!earlierInFamily) return false
+  return composite.vulnClasses.some(cls => AUTHZ_PRIVESC_CLASS_SET.has(norm(cls)))
+}
+
+function normalizedResourceFamilyRoot(normalizedEndpoint: string): string | null {
+  const raw = normalizedEndpoint.split('?', 1)[0] ?? ''
+  const segs = raw.split('/').filter(Boolean).map(s => s.toLowerCase())
+  let i = 0
+  while (i < segs.length && VERSION_SEG_RE.test(segs[i]!)) i += 1
+  if (i + 1 < segs.length && TENANT_SCOPE_SEG_RE.test(segs[i]!) && PARAM_SEG_RE.test(segs[i + 1]!)) i += 2
+  const root: string[] = []
+  while (i < segs.length && !PARAM_SEG_RE.test(segs[i]!) && root.length < 2) {
+    root.push(segs[i]!)
+    i += 1
+  }
+  return root.length > 0 ? root.join('/') : null
+}
+
+function extractCompositeTerminalSpec<T extends UpstreamSupersessionEndpointLike>(
+  receipt: RawCompositeReceiptLike | undefined,
+  fallbackOrigin: string,
+  overrideEndpoint?: string | null,
+): T | null {
+  if (!receipt || !Array.isArray(receipt.hops) || receipt.hops.length === 0) return null
+  const termHopId = typeof receipt.terminalImpact?.terminalHopId === 'string'
+    ? receipt.terminalImpact.terminalHopId
+    : null
+  const termHop = (termHopId ? receipt.hops.find(h => h?.hopId === termHopId) : undefined)
+    ?? receipt.hops[receipt.hops.length - 1]
+  const parsedTerm = parseCompositeEndpoint(overrideEndpoint) ?? parseCompositeEndpoint(termHop?.target?.pathAndQuery)
+  if (!parsedTerm) return null
+  const method = parsedTerm.method ?? normalizeCompositeMethod(termHop?.target?.method)
+  const origin = (typeof termHop?.target?.origin === 'string' && termHop.target.origin.trim()) || fallbackOrigin
+  if (!method || !origin) return null
+  return {
+    origin,
+    method,
+    normalizedEndpoint: normalizeEndpointTemplate(parsedTerm.endpoint),
+  } as T
+}
+
+function extractCompositeNonGenericUpstreamFromReceipt<T extends UpstreamSupersessionEndpointLike>(
+  receipt: RawCompositeReceiptLike | undefined,
+  fallbackOrigin: string,
+): T[] {
+  if (!receipt || !Array.isArray(receipt.hops) || receipt.hops.length < 2) return []
+  const termHopId = typeof receipt.terminalImpact?.terminalHopId === 'string'
+    ? receipt.terminalImpact.terminalHopId
+    : null
+  const termHop = (termHopId ? receipt.hops.find(h => h?.hopId === termHopId) : undefined)
+    ?? receipt.hops[receipt.hops.length - 1]
+  const out: T[] = []
+  for (const hop of receipt.hops) {
+    if (hop === termHop) continue
+    const parsed = parseCompositeEndpoint(hop?.target?.pathAndQuery)
+    if (!parsed) continue
+    const method = parsed.method ?? normalizeCompositeMethod(hop?.target?.method)
+    const origin = (typeof hop?.target?.origin === 'string' && hop.target.origin.trim()) || fallbackOrigin
+    const normalizedEndpoint = normalizeEndpointTemplate(parsed.endpoint)
+    if (!method || !origin || isGenericSharedAuthOrUtilityEndpoint(normalizedEndpoint)) continue
+    out.push({ origin, method, normalizedEndpoint } as T)
+  }
+  return out
+}
+
+/**
+ * R6: Generic causal-prefix partial-chain supersession.
+ * Returns matched upstream specs when `winner` strictly dominates `partial` on the exact same
+ * origin: both are >=2-hop composite chains sharing >=1 non-generic upstream causal hop AND the
+ * same terminal resource family root, where `winner` executes a mutating terminal action while
+ * `partial` stops at either a read-only terminal action or a strictly shallower intermediate hop.
+ */
+export function matchCausalPrefixPartialChainSupersession<T extends UpstreamSupersessionEndpointLike>(input: {
+  winnerReceipt: RawCompositeReceiptLike | undefined
+  winnerOrigin: string
+  winnerUpstreamNonGeneric: readonly T[]
+  winnerTerminalEndpoint?: string | null
+  partialReceipt: RawCompositeReceiptLike | undefined
+  partialOrigin: string
+  partialUpstreamNonGeneric?: readonly T[]
+  partialTerminalEndpoint?: string | null
+  endpointsMatchExact: (a: T, b: T) => boolean
+}): T[] {
+  const {
+    winnerReceipt, winnerOrigin, winnerUpstreamNonGeneric, winnerTerminalEndpoint,
+    partialReceipt, partialOrigin, partialUpstreamNonGeneric, partialTerminalEndpoint,
+    endpointsMatchExact,
+  } = input
+  if (
+    !winnerReceipt || !partialReceipt
+    || !Array.isArray(winnerReceipt.hops) || winnerReceipt.hops.length < 2
+    || !Array.isArray(partialReceipt.hops) || partialReceipt.hops.length < 2
+    || !winnerUpstreamNonGeneric.length
+  ) {
+    return []
+  }
+  if (normalizeOrigin(winnerOrigin) !== normalizeOrigin(partialOrigin)) return []
+  const winnerTerm = extractCompositeTerminalSpec<T>(winnerReceipt, winnerOrigin, winnerTerminalEndpoint)
+  const partialTerm = extractCompositeTerminalSpec<T>(partialReceipt, partialOrigin, partialTerminalEndpoint)
+  if (!winnerTerm || !partialTerm) return []
+  if (
+    isGenericSharedAuthOrUtilityEndpoint(winnerTerm.normalizedEndpoint)
+    || isGenericSharedAuthOrUtilityEndpoint(partialTerm.normalizedEndpoint)
+  ) {
+    return []
+  }
+  if (endpointsMatchExact(winnerTerm, partialTerm)) return []
+
+  const winnerMut = Boolean(winnerTerm.method && MUTATING_HTTP_METHODS.has(winnerTerm.method))
+  if (!winnerMut) return []
+  const partialReadOnly = partialTerm.method === 'GET' || partialTerm.method === 'HEAD'
+  const winnerStrictlyDeeper = winnerReceipt.hops.length > partialReceipt.hops.length
+  if (!partialReadOnly && !winnerStrictlyDeeper) return []
+
+  const winnerRoot = normalizedResourceFamilyRoot(winnerTerm.normalizedEndpoint)
+  const partialRoot = normalizedResourceFamilyRoot(partialTerm.normalizedEndpoint)
+  if (!winnerRoot || !partialRoot || winnerRoot !== partialRoot) return []
+
+  const partialUpstream = (partialUpstreamNonGeneric && partialUpstreamNonGeneric.length > 0)
+    ? partialUpstreamNonGeneric
+    : extractCompositeNonGenericUpstreamFromReceipt<T>(partialReceipt, partialOrigin)
+  if (!partialUpstream.length) return []
+
+  const shared: T[] = []
+  for (const pup of partialUpstream) {
+    for (const wup of winnerUpstreamNonGeneric) {
+      if (endpointsMatchExact(pup, wup)) shared.push(wup)
+    }
+  }
+  return shared
+}
+
+/**
+ * R6: Resolve bidirectional causal-prefix / upstream composite supersession between a newly
+ * persisted composite receipt and an existing confirmed finding row.
+ */
+export function resolveCompositeSupersessionMatch<T extends UpstreamSupersessionEndpointLike>(input: {
+  incomingReceipt: RawCompositeReceiptLike
+  incomingOrigin: string
+  incomingTerminalEndpoint?: string | null
+  incomingUpstreamNonGeneric: readonly T[]
+  earlierCompReceipt: RawCompositeReceiptLike | undefined
+  earlierOrigin: string
+  earlierEndpoints: readonly T[]
+  endpointsMatchExact: (a: T, b: T) => boolean
+}): { direction: 'none' | 'incoming_supersedes_earlier' | 'earlier_supersedes_incoming'; matched: T[] } {
+  const sub = matchSubstantialUpstreamCompositeOverlap({
+    earlierCompReceipt: input.earlierCompReceipt,
+    incomingHopCount: input.incomingReceipt.hops?.length ?? 0,
+    earlierOrigin: input.earlierOrigin,
+    earlierEndpoints: input.earlierEndpoints,
+    upstreamNonGeneric: input.incomingUpstreamNonGeneric,
+    endpointsMatchExact: input.endpointsMatchExact,
+  })
+  if (sub.length > 0) return { direction: 'incoming_supersedes_earlier', matched: sub }
+
+  const fwd = matchCausalPrefixPartialChainSupersession({
+    winnerReceipt: input.incomingReceipt,
+    winnerOrigin: input.incomingOrigin,
+    winnerUpstreamNonGeneric: input.incomingUpstreamNonGeneric,
+    winnerTerminalEndpoint: input.incomingTerminalEndpoint,
+    partialReceipt: input.earlierCompReceipt,
+    partialOrigin: input.earlierOrigin,
+    endpointsMatchExact: input.endpointsMatchExact,
+  })
+  if (fwd.length > 0) return { direction: 'incoming_supersedes_earlier', matched: fwd }
+
+  const earlierUpstream = extractCompositeNonGenericUpstreamFromReceipt<T>(input.earlierCompReceipt, input.earlierOrigin)
+  const rev = matchCausalPrefixPartialChainSupersession({
+    winnerReceipt: input.earlierCompReceipt,
+    winnerOrigin: input.earlierOrigin,
+    winnerUpstreamNonGeneric: earlierUpstream,
+    partialReceipt: input.incomingReceipt,
+    partialOrigin: input.incomingOrigin,
+    partialUpstreamNonGeneric: input.incomingUpstreamNonGeneric,
+    partialTerminalEndpoint: input.incomingTerminalEndpoint,
+    endpointsMatchExact: input.endpointsMatchExact,
+  })
+  if (rev.length > 0) return { direction: 'earlier_supersedes_incoming', matched: rev }
+
+  return { direction: 'none', matched: [] }
+}

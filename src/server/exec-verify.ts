@@ -97,7 +97,8 @@ import { isSensitiveRepoEntry, isSensitiveRepoRelativePath } from './safety-prim
 import { canaries, findings, type ReplayProofReceiptRow } from './schema.ts'
 
 export { isSensitiveRepoEntry, isSensitiveRepoRelativePath }
-import { classifyCompositeChainOverlap, compositeChainOriginsEquivalent, compositeChainRichnessScore, extractCompositeChainDedupSignature, extractRowCompositeSignature, isGenericSharedAuthOrUtilityEndpoint, matchSubstantialUpstreamCompositeOverlap, sortChainDuplicateRows, type CompositeChainDedupSignature } from './store-findings.ts'
+import { classifyCompositeChainOverlap, compositeChainOriginsEquivalent, compositeChainRichnessScore, extractCompositeChainDedupSignature, extractRowCompositeSignature, isGenericSharedAuthOrUtilityEndpoint, sortChainDuplicateRows, type CompositeChainDedupSignature } from './store-findings.ts'
+import { isAuthzPrivescClassSupersessionCompatible, resolveCompositeSupersessionMatch } from './composite-chain-dedup.ts'
 export { isGenericSharedAuthOrUtilityEndpoint }
 import {
   assessmentAssignments,
@@ -1179,7 +1180,7 @@ export function isFindingClassSupersessionCompatible(
     const g2 = ORACLE_FAMILY_ALIAS_GROUP[compFamily]
     if (g1 && g2 && g1 === g2) return true
   }
-  return false
+  return isAuthzPrivescClassSupersessionCompatible({ cwe: earlierCwe, vulnClass: earlierVulnClass }, { vulnClasses: allowedClasses })
 }
 
 /**
@@ -2950,6 +2951,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       // 1) Require verified signed upstream transcript match with exact origin & explicit HTTP method
       // (or direct signed exchangeId overlap when endpoint metadata is absent).
       const matchedUpstreamSpecs: SupersessionEndpointSpec[] = []
+      let supersessionDir: 'incoming_supersedes_earlier' | 'earlier_supersedes_incoming' = 'incoming_supersedes_earlier'
       if (earlierEndpoints.length > 0 && isEndpointSubsetOfUpstream(earlierEndpoints, upstreamEndpoints)) {
         for (const ep of earlierEndpoints) {
           if (isGenericSharedAuthOrUtilityEndpoint(ep.normalizedEndpoint)) continue
@@ -2960,19 +2962,15 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       } else if (earlierEndpoints.length === 0 && directMatchedUpstream.length > 0) {
         matchedUpstreamSpecs.push(...directMatchedUpstream)
       } else {
-        matchedUpstreamSpecs.push(...matchSubstantialUpstreamCompositeOverlap({
-          earlierCompReceipt,
-          incomingHopCount: receipt.hops.length,
-          earlierOrigin: row.finding.origin,
-          earlierEndpoints,
-          upstreamNonGeneric,
-          endpointsMatchExact: supersessionEndpointsMatchExact,
-        }))
+        const resSup = resolveCompositeSupersessionMatch({
+          incomingReceipt: receipt, incomingOrigin: upstreamEndpoints[0]?.origin ?? row.finding.origin,
+          incomingTerminalEndpoint: verification?.terminalEndpoint ?? null, incomingUpstreamNonGeneric: upstreamNonGeneric,
+          earlierCompReceipt, earlierOrigin: row.finding.origin, earlierEndpoints, endpointsMatchExact: supersessionEndpointsMatchExact,
+        })
+        if (resSup.direction !== 'none') { supersessionDir = resSup.direction; matchedUpstreamSpecs.push(...resSup.matched) }
       }
       if (!matchedUpstreamSpecs.length) continue
 
-      // 2) Always require matching vulnClass/CWE (or an explicitly declared precondition class on
-      // the matched upstream hop) so distinct-class findings are never hidden behind a deeper chain.
       const earlierVulnClass = earlierCompReceipt?.terminalVulnClass
         ?? linkedSpec?.proofReceipt?.receipt?.vulnClass
         ?? persistedAgentScriptOf(linkedSpec?.spec)?.envelope.vulnClass
@@ -2994,9 +2992,11 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         },
       )) continue
 
-      this.storage.updateProposedFinding(run, row.id, {
-        supersededByFindingId: newFindingId,
-      })
+      if (supersessionDir === 'earlier_supersedes_incoming') {
+        this.storage.updateProposedFinding(run, newFindingId, { supersededByFindingId: row.id })
+        return supersededIds
+      }
+      this.storage.updateProposedFinding(run, row.id, { supersededByFindingId: newFindingId })
       supersededIds.push(row.id)
     }
     return supersededIds
