@@ -254,7 +254,7 @@ test('parseMultihopArgs supports --duration-min, rejects conflicts/invalid input
   assert.match(execCtorMatch[0], /maxDurationMs:\s*args\.maxDurationMs/, 'benchmark-multihop.ts must pass maxDurationMs: args.maxDurationMs into Execution')
 })
 
-test('Execution computes 270s wall-clock on 15m run and 300s on 30m run for multi-hop chain workers', async (t) => {
+test('Execution computes 210s wall-clock cap (185s settlement) on 15m and 30m runs for multi-hop chain workers', async (t) => {
   const llm = await startMockResponsesServer(t, () => ({
     toolCalls: [{
       callId: 'c_done',
@@ -264,8 +264,8 @@ test('Execution computes 270s wall-clock on 15m run and 300s on 30m run for mult
   }))
 
   for (const [durationMin, expectedWallMs, expectedSettleMs] of [
-    [15, 270_000, 245_000],
-    [30, 300_000, 275_000],
+    [15, 210_000, 185_000],
+    [30, 210_000, 185_000],
   ] as const) {
     const { maxDurationMs } = parseMultihopArgs(['--seed', '1', '--duration-min', String(durationMin)])
     const { storage } = makeStore(t)

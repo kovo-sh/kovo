@@ -159,10 +159,10 @@ test('Q31.1: late-wave planner multi-stage steps match isMultiHopChainStep, get 
     assert.equal(matchesMultiHopStepSignal(step), true, `${label}: matchesMultiHopStepSignal must be true`)
     assert.equal(isMultiHopChainStep(step), true, `${label}: isMultiHopChainStep must be true`)
     assert.equal(classifyDispatchLane(step), 'chain', `${label}: must route to chain lane`)
-    assert.equal(resolveWorkerWallClockMs(step, 900_000), 270_000, `${label}: 15m run must get 270s wall-clock`)
-    assert.equal(resolveWorkerWallClockMs(step, 1_800_000), 300_000, `${label}: 30m run must get 300s wall-clock`)
-    assert.equal(resolveWorkerSettlementMs(270_000, true), 245_000)
-    assert.equal(resolveWorkerSettlementMs(300_000, true), 275_000)
+    assert.equal(resolveWorkerWallClockMs(step, 900_000), 210_000, `${label}: 15m run must get 210s wall-clock cap`)
+    assert.equal(resolveWorkerWallClockMs(step, 1_800_000), 210_000, `${label}: 30m run must get 210s wall-clock cap`)
+    assert.equal(resolveWorkerSettlementMs(180_000, true), 155_000)
+    assert.equal(resolveWorkerSettlementMs(210_000, true), 185_000)
 
     const parsed = JSON.parse(workerInvestigationPrompt({
       goal: 'Verify end-to-end cross-service boundary',

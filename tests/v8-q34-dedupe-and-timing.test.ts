@@ -240,9 +240,9 @@ test('Q34.3: edge/prefix/proxy/cross-tenant/async/cache/composite steps get 270s
     assert.equal(isMultiHopChainStep(step), true, `${label}: isMultiHopChainStep must be true`)
     assert.equal(isMultiStepAssignment(step), true, `${label}: isMultiStepAssignment must be true`)
     assert.equal(classifyDispatchLane(step), 'chain', `${label}: must route to chain lane`)
-    assert.equal(resolveWorkerWallClockMs(step, 900_000), 270_000, `${label}: 15m run must get 270s wall-clock`)
-    assert.equal(resolveWorkerWallClockMs(step, 1_800_000), 300_000, `${label}: 30m run must get 300s wall-clock`)
-    assert.equal(resolveWorkerWallClockMs(step, undefined), 240_000, `${label}: default run must get 240s wall-clock`)
+    assert.equal(resolveWorkerWallClockMs(step, 900_000), 210_000, `${label}: 15m run must get 210s wall-clock cap`)
+    assert.equal(resolveWorkerWallClockMs(step, 1_800_000), 210_000, `${label}: 30m run must get 210s wall-clock cap`)
+    assert.equal(resolveWorkerWallClockMs(step, undefined), 210_000, `${label}: default run must get 210s wall-clock`)
 
     const budget = planAssignmentBudget({
       routes: ['/files/export/:id/:id'],
@@ -254,8 +254,8 @@ test('Q34.3: edge/prefix/proxy/cross-tenant/async/cache/composite steps get 270s
       baseWallClockMs: 120_000,
     })
     assert.equal(budget.kind, 'chain')
-    assert.equal(budget.wallClockMs, 270_000)
-    assert.equal(budget.wallClockSettlementMs, resolveWorkerSettlementMs(270_000, true))
+    assert.equal(budget.wallClockMs, 210_000)
+    assert.equal(budget.wallClockSettlementMs, resolveWorkerSettlementMs(210_000, true))
 
     const prompt = JSON.parse(workerInvestigationPrompt({
       goal: 'Verify cross-boundary invariant',
