@@ -1,0 +1,117 @@
+{
+  "id": "v8-m2-kernel-v2-claude-bypass-fp",
+  "side": "fp",
+  "archetype": "v8-m2-kernel-v2-orphan-hop-nonsecret-location-token",
+  "description": "R3-05 independent-review FP: orphan setup hop (harmless preference write) is connected to a stub-only terminal export-status read purely through a low-entropy, non-secret, server-chosen label in a redirect Location header that the later request merely repeats. Host-inferred supplemental causal edges (Location query tokens / logical state transitions) must not manufacture multi-hop causality from non-capability labels or entity-less same-actor pairs, and the stub terminal must still fail closed.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/composite-terminal.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/terminal-oracle-registry.ts"
+    ],
+    "classes": [
+      "bola",
+      "dual_tenant_abac",
+      "authorization"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Multi-hop cross-tenant export stub decoy",
+    "impact": "Terminal hop only polls an export job stub with no data exposure.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Two-hop cross-tenant queued job handle decoy"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    },
+    {
+      "handle": "viewer_a",
+      "roleLabel": "viewer (tenant-a)",
+      "role": "viewer",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-viewer-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "hop1_ex",
+      "arm": "setup",
+      "role": "setup",
+      "method": "POST",
+      "pathAndQuery": "/v1/preferences/notifications",
+      "persona": "member_a",
+      "requestJson": {
+        "digest": "weekly"
+      },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json",
+        "location": "/v1/exports/status?report=ledger2024q3"
+      },
+      "body": "{\"saved\":true}"
+    },
+    {
+      "id": "hop2_ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/exports/status?token=invalid_tok",
+      "persona": "viewer_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "hop2_prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/v1/exports/status?report=ledger2024q3",
+      "persona": "member_a",
+      "status": 202,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"jobId\":\"job_88\",\"status\":\"queued\",\"tenant\":\"tenant-b\"}"
+    }
+  ],
+  "composite": {
+    "chainId": "v8-m2-kernel-v2-claude-bypass",
+    "terminalVulnClass": "bola",
+    "oracleFamily": "dual_tenant_abac",
+    "claimedDelta": "Preference write redirected with a public label; later export status read repeats the label and returns only a queued stub."
+  },
+  "source": "independent_review"
+}
