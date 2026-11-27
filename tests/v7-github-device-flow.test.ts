@@ -160,9 +160,9 @@ test('GitHub App Device Flow end-to-end: start -> pending -> slow_down -> author
   })
 
   try {
-    // Initially env is unset and vault has no clientId
+    // Initially env is unset and vault has no custom clientId (built-in Kovo Security default is active)
     const before = getGithubAuthStatus(dataDir)
-    assert.equal(before.githubDeviceFlowConfigured, false)
+    assert.equal(before.githubDeviceFlowConfigured, true)
     assert.equal(before.clientIdSource, null)
 
     // Start device flow with explicit clientId (persisted to 0600 vault config)

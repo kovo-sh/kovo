@@ -15,8 +15,8 @@ export type GithubDeviceFlowAuthorized = Extract<
 >
 
 export interface UseGithubDeviceFlowOptions {
-  /** Whether the server already has a GitHub App Client ID configured for one-click sign-in. */
-  configured: boolean
+  /** Whether the server has a GitHub App Client ID available for one-click sign-in (true by default via Kovo Security). */
+  configured?: boolean
   /** Block starting or cancelling while another action on the screen is in flight. */
   disabled?: boolean
   /** Called after GitHub approves the sign-in and the account status is refreshed. */
@@ -48,7 +48,7 @@ function clipboardWrite(text: string): Promise<boolean> {
  * one-time code. Consumers own account refresh and notices via `onAuthorized`.
  */
 export function useGithubDeviceFlow({
-  configured,
+  configured = true,
   disabled = false,
   onAuthorized,
   onStart,
@@ -124,6 +124,10 @@ export function useGithubDeviceFlow({
   const start = useCallback(async () => {
     if (starting || disabled) return
     const trimmed = clientId.trim()
+    if (trimmed.length > 0 && trimmed.length < 6) {
+      setError('Enter a valid GitHub App Client ID (at least 6 characters).')
+      return
+    }
     if (!configured && trimmed.length < 6) {
       setError('Enter your GitHub App Client ID to start sign-in.')
       return

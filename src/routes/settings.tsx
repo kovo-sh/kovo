@@ -245,7 +245,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
                 ? 'Authorized with read-only GitHub App access (code and metadata only). Tokens refresh automatically and stay stored privately on your machine.'
                 : status.configured
                   ? 'Connected using a read-only GitHub access token stored privately on your machine.'
-                  : 'Connect a read-only GitHub App with one-time code sign-in and automatic token refresh, stored privately on your machine.'}
+                  : 'Connect the read-only Kovo Security GitHub App with one-time code sign-in and automatic token refresh, stored privately on your machine.'}
             </p>
           </div>
           <div className="flex flex-none items-center gap-1.5 pt-0.5">
@@ -304,53 +304,19 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
           </div>
         )}
 
-        {showConnectPanel && !deviceFlow && (!status.githubDeviceFlowConfigured || reconnecting) && (
+        {showConnectPanel && !deviceFlow && reconnecting && status.githubDeviceFlowConfigured && (
           <div className="flex flex-col gap-2 border-t border-line bg-sunk px-4 pt-3 pb-3.5">
-            {!status.githubDeviceFlowConfigured ? (
-              <>
-                <div className="flex items-center justify-between gap-2.5 text-[12px]">
-                  <strong className="text-fg">GitHub App Client ID</strong>
-                  <span
-                    className="text-fg-subtle"
-                    title="Stored privately on this machine for one-click sign-in"
-                  >
-                    Needed once for one-click GitHub sign-in
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Input
-                    className="flex-1 font-mono text-[12px]!"
-                    type="text"
-                    value={clientIdInput}
-                    onChange={e => setClientIdInput(e.target.value)}
-                    placeholder="Iv23li…"
-                    autoComplete="off"
-                    disabled={startingFlow || savingPat}
-                    aria-label="GitHub App Client ID"
-                  />
-                  <Button
-                    type="button"
-                    variant="default"
-                    disabled={startingFlow || savingPat || clientIdInput.trim().length < 6}
-                    onClick={() => void device.start()}
-                  >
-                    {startingFlow ? 'Starting…' : 'Sign in with GitHub'}
-                  </Button>
-                </div>
-              </>
-            ) : (
-              <div className="flex items-center justify-between gap-2.5 text-[12px]">
-                <span className="text-fg-subtle">Switch to a read-only GitHub App Device Flow session.</span>
-                <Button
-                  type="button"
-                  variant="default"
-                  disabled={startingFlow || savingPat}
-                  onClick={() => void device.start()}
-                >
-                  {startingFlow ? 'Starting…' : 'Sign in with GitHub'}
-                </Button>
-              </div>
-            )}
+            <div className="flex flex-wrap items-center justify-between gap-2.5 text-[12px]">
+              <span className="text-fg-subtle">Switch to a read-only GitHub App Device Flow session.</span>
+              <Button
+                type="button"
+                variant="default"
+                disabled={startingFlow || savingPat}
+                onClick={() => void device.start()}
+              >
+                {startingFlow ? 'Starting…' : 'Sign in with GitHub'}
+              </Button>
+            </div>
           </div>
         )}
 
@@ -402,7 +368,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
         {showConnectPanel && (
           <div className="border-t border-line px-4 py-3">
             <Disclosure>
-              <DisclosureTrigger className="w-full rounded-none bg-transparent px-0 py-0.5 text-[12.5px] font-medium text-fg-muted shadow-none hover:bg-transparent hover:text-fg">
+              <DisclosureTrigger className="h-auto w-full rounded-none bg-transparent px-0 py-0.5 text-[12.5px] font-medium whitespace-normal text-fg-muted shadow-none hover:bg-transparent hover:text-fg">
                 Or connect with a read-only GitHub token
               </DisclosureTrigger>
               <DisclosureContent className="flex flex-col gap-2 pt-2.5">
@@ -440,6 +406,45 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
                     onClick={() => void handleSavePat()}
                   >
                     {savingPat ? 'Saving…' : 'Save token'}
+                  </Button>
+                </div>
+              </DisclosureContent>
+            </Disclosure>
+          </div>
+        )}
+
+        {showConnectPanel && !deviceFlow && (
+          <div className="border-t border-line px-4 py-3">
+            <Disclosure defaultOpen={!status.githubDeviceFlowConfigured}>
+              <DisclosureTrigger className="h-auto w-full rounded-none bg-transparent px-0 py-0.5 text-[12.5px] font-medium whitespace-normal text-fg-muted shadow-none hover:bg-transparent hover:text-fg">
+                Advanced: custom GitHub App / Enterprise
+              </DisclosureTrigger>
+              <DisclosureContent className="flex flex-col gap-2 pt-2.5">
+                <span className="text-[12.5px] leading-[18px] text-fg-muted">
+                  {status.clientIdSource === 'env'
+                    ? 'A custom GitHub App Client ID is active via KOVO_GITHUB_CLIENT_ID. Enter a Client ID below to override it for this sign-in.'
+                    : status.clientIdSource === 'vault'
+                      ? 'A custom GitHub App Client ID is saved on this machine. Enter another Client ID below to switch apps.'
+                      : 'By default, Kovo uses the official Kovo Security GitHub App. Enter a custom Client ID only for GitHub Enterprise Server or custom organization apps.'}
+                </span>
+                <div className="flex items-center gap-2">
+                  <Input
+                    className="flex-1 font-mono text-[12px]!"
+                    type="text"
+                    value={clientIdInput}
+                    onChange={e => setClientIdInput(e.target.value)}
+                    placeholder="Iv23li…"
+                    autoComplete="off"
+                    disabled={startingFlow || savingPat}
+                    aria-label="Custom GitHub App Client ID"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={startingFlow || savingPat || clientIdInput.trim().length < 6}
+                    onClick={() => void device.start()}
+                  >
+                    {startingFlow ? 'Starting…' : 'Sign in with custom App'}
                   </Button>
                 </div>
               </DisclosureContent>

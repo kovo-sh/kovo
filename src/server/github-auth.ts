@@ -41,6 +41,8 @@ export const DEFAULT_GITHUB_PAT_PATH =
 export const DEFAULT_GITHUB_MAX_AUTO_SELECT = 10
 export const DEFAULT_GITHUB_BASE_URL = 'https://github.com'
 export const DEFAULT_GITHUB_API_BASE_URL = 'https://api.github.com'
+export const DEFAULT_KOVO_GITHUB_CLIENT_ID = 'Iv23liqXkHdhMBUVcldr'
+export const DEFAULT_KOVO_GITHUB_APP_SLUG = 'kovo-security'
 const GITHUB_REFRESH_LEEWAY_MS = 5 * 60 * 1000
 const MAX_PENDING_DEVICE_FLOWS = 32
 const repoFullNamePattern = /^[a-zA-Z0-9_.-]{1,100}\/[a-zA-Z0-9_.-]{1,100}$/
@@ -274,7 +276,7 @@ export function resolveGithubAppSlug(dataDir?: string): string | null {
     return normalizeGithubAppSlug(envRaw)
   }
   const vaultConfig = readVaultGithubAppConfig(dataDir)
-  return vaultConfig.appSlug ?? null
+  return vaultConfig.appSlug ?? DEFAULT_KOVO_GITHUB_APP_SLUG
 }
 
 export function githubAppInstallUrl(
@@ -293,18 +295,22 @@ function readVaultGithubClientId(dataDir?: string): string | null {
   if (existsSync(patPath)) {
     try {
       const cred = readGithubVaultCredential(patPath)
-      if (cred.clientId) return validateGithubClientId(cred.clientId)
+      if (cred.clientId) {
+        const validated = validateGithubClientId(cred.clientId)
+        if (validated !== DEFAULT_KOVO_GITHUB_CLIENT_ID) return validated
+      }
     } catch {
       // Fall through to github-app.json
     }
   }
-  return readVaultGithubAppConfig(dataDir).clientId ?? null
+  const appClientId = readVaultGithubAppConfig(dataDir).clientId ?? null
+  return appClientId && appClientId !== DEFAULT_KOVO_GITHUB_CLIENT_ID ? appClientId : null
 }
 
 export function resolveGithubClientId(
   dataDir?: string,
   explicitClientId?: string,
-): { clientId: string | null; source: 'input' | 'env' | 'vault' | null } {
+): { clientId: string | null; source: 'input' | 'env' | 'vault' | 'default' | null } {
   if (typeof explicitClientId === 'string' && explicitClientId.trim()) {
     return { clientId: validateGithubClientId(explicitClientId), source: 'input' }
   }
@@ -320,7 +326,7 @@ export function resolveGithubClientId(
   if (vaultClientId) {
     return { clientId: vaultClientId, source: 'vault' }
   }
-  return { clientId: null, source: null }
+  return { clientId: DEFAULT_KOVO_GITHUB_CLIENT_ID, source: 'default' }
 }
 
 /**
@@ -444,7 +450,7 @@ export function saveGithubVaultCredential(
   const patPath = vaultGithubPatPath(dataDir)
   clearObservedGithubInstallations(patPath)
   writeAtomic0600(patPath, `${JSON.stringify(normalized, null, 2)}\n`)
-  if (normalized.clientId) {
+  if (normalized.clientId && normalized.clientId !== DEFAULT_KOVO_GITHUB_CLIENT_ID) {
     saveGithubClientId(dataDir, normalized.clientId)
   }
   return getGithubAuthStatus(dataDir)
@@ -539,7 +545,12 @@ export function getGithubAuthStatus(
   const readStatusFromPath = (targetPath: string, source: GithubPatSource): GithubAuthStatus => {
     const cred = readGithubVaultCredential(targetPath)
     const effectiveClient = cred.clientId
-      ? { clientId: cred.clientId, source: (clientIdSource ?? 'vault') as 'env' | 'vault' }
+      ? {
+          clientId: cred.clientId,
+          source: cred.clientId === DEFAULT_KOVO_GITHUB_CLIENT_ID
+            ? clientIdSource
+            : ((clientIdSource ?? 'vault') as 'env' | 'vault'),
+        }
       : { clientId: resolvedClient.clientId, source: clientIdSource }
     const observed = observedGithubInstallations.get(resolve(targetPath))
     const observedMatch = observed && observed.tokenFingerprint === fingerprintGithubToken(cred.accessToken)
@@ -806,7 +817,7 @@ export async function startGithubDeviceFlow(
     throw new Error('GitHub App Client ID is required. Set KOVO_GITHUB_CLIENT_ID or enter your GitHub App Client ID.')
   }
   const clientId = resolved.clientId
-  if (input.clientId && input.dataDir) {
+  if (input.clientId && input.dataDir && clientId !== DEFAULT_KOVO_GITHUB_CLIENT_ID) {
     saveGithubClientId(input.dataDir, clientId)
   }
 
