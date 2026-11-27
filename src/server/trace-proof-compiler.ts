@@ -78,7 +78,9 @@ const AUTH_HDR_RE = /^(?:authorization|proxy-authorization|cookie|x-api-key|x-au
 const UNIQUE_KEY_RE = /^(?:email|e_?mail|username|user_?name|handle|slug|org_?slug|tenant_?slug|subdomain|account_?name)$/i
 const EMAIL_VAL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/, SIMPLE_ENTITY_ID_RE = /^[a-zA-Z]{2,20}[_-]\d{2,16}$/
 const REPEATED_CHAR_RE = /^(.)\1+$/, JS_IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/, READ_ONLY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
-const AUTH_QUERY_KEYS = new Set(['sig', 'signature', 'hmac', 'mac', 'token', 'access_token', 'code', 'state', 'nonce', 'ts', 'timestamp', 'expires', 'exp'])
+const SIGNATURE_QUERY_KEYS = new Set(['sig', 'signature', 'hmac', 'x-amz-signature'])
+const INVALID_CONTROL_SIGNATURE = '0'.repeat(16)
+const AUTH_QUERY_KEYS = new Set(['sig', 'signature', 'hmac', 'mac', 'x-amz-signature', 'token', 'jwt', 'access_token', 'code', 'state', 'nonce', 'ts', 'timestamp', 'expires', 'exp'])
 const ECONOMIC_CONSERVATION_CLASSES = new Set(['economic_conservation', 'conserved_balance', 'ledger_overcredit', 'over_refund', 'double_spend', 'race_condition', 'race', 'race_double_spend', 'race_burst', 'split_refund_ledger_break'])
 const RACE_MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH'])
 const HIGH_PRIV_PERSONA_RE = /(?:^|[_-])(?:owner|admin|superadmin|root|system|service)(?:[_-]|$)/i
@@ -300,7 +302,12 @@ function sanitizeControlPath(rawPq: string): string {
   const base = pq.slice(0, qIdx) || '/'
   const hashIdx = pq.indexOf('#', qIdx + 1)
   const rawQuery = hashIdx >= 0 ? pq.slice(qIdx + 1, hashIdx) : pq.slice(qIdx + 1)
-  const kept = [...new URLSearchParams(rawQuery).entries()].filter(([k]) => !AUTH_QUERY_KEYS.has(k.trim().toLowerCase()))
+  const kept: Array<[string, string]> = []
+  for (const [k, v] of new URLSearchParams(rawQuery).entries()) {
+    const lk = k.trim().toLowerCase()
+    if (SIGNATURE_QUERY_KEYS.has(lk)) kept.push([k, INVALID_CONTROL_SIGNATURE])
+    else if (!AUTH_QUERY_KEYS.has(lk)) kept.push([k, v])
+  }
   return kept.length ? `${base}?${new URLSearchParams(kept).toString()}` : base
 }
 const appendEncodedKv = (parts: Array<{ lit?: string; expr?: string }>, pairs: Array<{ k: string; expr?: string; raw?: string }>): void => {
@@ -325,17 +332,16 @@ function addCompiledEdge(st: BindingState, edge: CompiledEdge): void {
   if (idx !== undefined) { const prev = st.edges[idx]!; if (edge.kind === 'value_binding' && edge.capVar && prev.kind === 'value_binding' && !prev.capVar) st.edges[idx] = edge; return }
   st.edgeKeys.set(key, st.edges.length); st.edges.push(edge)
 }
-function bindLeafValue(st: BindingState, plan: StepPlan, src: ExtractedSource, toStepIdx: number, target: string, encode: boolean, preferHandle: boolean): string | undefined {
+function bindLeafValue(st: BindingState, plan: StepPlan, src: ExtractedSource, toStepIdx: number, target: string, encode: boolean): string | undefined {
   const toStep = toStepIdx + 1; plan.usesDynamicUrlOrBody = true; plan.dynamicDepSteps.add(src.stepIdx)
   if (canSealSource(src, st.blocked)) {
     const signedUrl = isSignedUrlSource(src)
-    const prevSealStep = st.sealedValues.get(src.value), s = getOrCreateSeal(st, src, signedUrl ? 'signed_url' : 'generic_secret')
+    const s = getOrCreateSeal(st, src, signedUrl ? 'signed_url' : 'generic_secret')
     addCompiledEdge(st, { kind: 'value_binding', fromStepIdx: src.stepIdx, toStepIdx, capVar: s.varName })
-    if (preferHandle || signedUrl || src.kind !== 'jsonPath' || src.value.trim().length < 8 || (prevSealStep !== undefined && prevSealStep < src.stepIdx)) {
-      plan.hasSealedUrlOrBodyDep = true; st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target }); return s.varName
-    }
-    const v = getOrCreateVar(st, src); plan.boundVars.add(v.varName); st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'var', selector: src.selector, target })
-    return encode ? `encodeURIComponent(String(${v.varName}))` : v.varName
+    plan.hasSealedUrlOrBodyDep = true
+    plan.boundVars.add(s.varName)
+    st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target })
+    return s.varName
   }
   if (src.kind === 'jsonPath') {
     const v = getOrCreateVar(st, src); plan.boundVars.add(v.varName); st.needsSha256 = true
@@ -410,7 +416,7 @@ function bindStepPlan(st: BindingState, plan: StepPlan, toStepIdx: number, maxPr
       if (sIdx > 0) pathParts.push({ lit: '/' }); if (!seg) { deltaSegs.push(''); return }
       let dec = seg; try { dec = decodeURIComponent(seg) } catch { /* raw */ }
       const src = lookup(dec, sIdx > 1) ?? (dec !== seg ? lookup(seg, sIdx > 1) : undefined)
-      const expr = src ? bindLeafValue(st, plan, src, toStepIdx, 'path', true, src.kind !== 'jsonPath' || (isOpaque(src.value, src, st.blocked) && Boolean(src.isSecretKey))) : undefined
+      const expr = src ? bindLeafValue(st, plan, src, toStepIdx, 'path', true) : undefined
       if (expr) { pathParts.push({ expr }); deltaSegs.push(':param') } else { pathParts.push({ lit: seg }); deltaSegs.push(seg) }
     })
     plan.deltaPath = deltaSegs.join('/') || '/'
@@ -426,7 +432,7 @@ function bindStepPlan(st: BindingState, plan: StepPlan, toStepIdx: number, maxPr
           if (!plan.primaryCapability && counts.get(k) === 1) plan.primaryCapability = { capVar: s.varName, target: 'url', queryParam: k }
           else kept.push({ k, expr: s.varName })
           st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target: `query:${k}` })
-        } else { const expr = bindLeafValue(st, plan, src, toStepIdx, `query:${k}`, true, false); kept.push(expr ? { k, expr } : { k, raw: v }) }
+        } else { const expr = bindLeafValue(st, plan, src, toStepIdx, `query:${k}`, true); kept.push(expr ? { k, expr } : { k, raw: v }) }
       }
       if (kept.length) { pathParts.push({ lit: '?' }); appendEncodedKv(pathParts, kept) }
     }
@@ -437,14 +443,14 @@ function bindStepPlan(st: BindingState, plan: StepPlan, toStepIdx: number, maxPr
   if (bodyJson !== undefined) {
     plan.bodyExpr = renderJsonBindings(bodyJson, '', (leaf, fp) => {
       const leafKey = fp.split('.').pop() ?? '', src = lookup(leaf, ID_KEY_RE.test(leafKey)); if (!src) return undefined
-      boundBody.add(fp); return bindLeafValue(st, plan, src, toStepIdx, `body:${fp}`, false, src.kind !== 'jsonPath' || isOpaque(src.value, src, st.blocked, leafKey))
+      boundBody.add(fp); return bindLeafValue(st, plan, src, toStepIdx, `body:${fp}`, false)
     })
     if (/^(?:POST|PUT|PATCH)$/i.test(ex.method)) { const uniq = detectUniqueFields(bodyJson, boundBody); if (uniq.length) st.warnings.push(`Step ${plan.hopId} ${ex.method.toUpperCase()} body has literal unique-creation field(s) [${uniq.join(', ')}]; replay may need fresh values.`) }
   } else if (typeof ex.requestBody === 'string' && ex.requestBody.length > 0) {
     if ((getHeaderCI(ex.requestHeaders, 'content-type') ?? '').toLowerCase().includes('application/x-www-form-urlencoded')) {
       const fp: Array<{ lit?: string; expr?: string }> = []
       const pairs = [...new URLSearchParams(ex.requestBody).entries()].map(([k, v]) => {
-        const src = lookup(v, ID_KEY_RE.test(k)), expr = src ? bindLeafValue(st, plan, src, toStepIdx, `body:${k}`, true, src.kind !== 'jsonPath' || isOpaque(src.value, src, st.blocked, k)) : undefined
+        const src = lookup(v, ID_KEY_RE.test(k)), expr = src ? bindLeafValue(st, plan, src, toStepIdx, `body:${k}`, true) : undefined
         return expr ? { k, expr } : { k, raw: v }
       })
       appendEncodedKv(fp, pairs); plan.bodyExpr = buildTemplate(fp)

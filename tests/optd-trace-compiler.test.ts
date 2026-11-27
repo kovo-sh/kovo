@@ -413,31 +413,33 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
     assert.equal(compiled.terminalVulnClass, 'forged_settlement')
     assert.equal(compiled.controlSynthesized, true)
     assert.ok(compiled.script)
-    assert.doesNotMatch(compiled.script, /order_847291/)
-    assert.ok(compiled.inferredBindings.some(b => b.kind === 'var' && b.selector === 'items[0].id' && b.target === 'path'))
-    assert.ok(compiled.inferredBindings.some(b => b.kind === 'var' && b.selector === 'items[0].id' && b.target === 'query:ref'))
-    assert.ok(compiled.inferredBindings.some(b => b.kind === 'var' && b.selector === 'items[0].id' && b.target === 'body:orderId'))
-    assert.ok(compiled.warnings.some(w => /read-only hop/i.test(w)))
+    for (const line of compiled.script.split('\n').filter(l => l.includes('ch.step('))) {
+      assert.doesNotMatch(line, /order_847291/, 'ch.step must use sealed capability handle instead of literal ID')
+    }
+    assert.doesNotMatch(compiled.script, /encodeURIComponent\(String\(v_/, 'sealed JSON ID must never fall through to encodeURIComponent(String(v_n))')
+    assert.ok(compiled.inferredBindings.some(b => b.kind === 'seal' && b.selector === 'items[0].id' && b.target === 'path'))
+    assert.ok(compiled.inferredBindings.some(b => b.kind === 'seal' && b.selector === 'items[0].id' && b.target === 'query:ref'))
+    assert.ok(compiled.inferredBindings.some(b => b.kind === 'seal' && b.selector === 'items[0].id' && b.target === 'body:orderId'))
     assert.ok(compiled.warnings.some(w => /unique-creation field/i.test(w)))
 
-    // Execute with a DIFFERENT dynamic order ID to prove Attempt 2 replay works without hardcoded IDs!
+    // Execute with a DIFFERENT dynamic order ID to prove Attempt 2 replay works via sealed capability handle!
     const fn = loadCompiledEntrypoint(compiled.script)
     const { ctx, log } = createMockCtx([
+      { status: 403, json: { error: 'denied' } }, // clean baseline control before step_1 (never carries sealed cap)
       { status: 200, json: { items: [{ id: 'order_999999' }] } }, // step_1 read-only lookup
-      { status: 403, json: { error: 'denied' } }, // control placed after step_1 with fresh ID!
-      { status: 200, json: { approved: true } }, // step_2 terminal
+      { status: 200, json: { approved: true } }, // step_2 terminal using sealed handle cap_1
     ])
     await fn(ctx)
 
-    assert.equal(log.httpCalls[0]!.target, '/api/orders')
-    assert.equal(log.httpCalls[1]!.target, '/api/orders/order_999999/approve?ref=order_999999')
-    assert.equal(log.httpCalls[1]!.opts.arm, 'control')
-    assert.equal(log.httpCalls[1]!.opts.role, 'control')
-    assert.equal(log.httpCalls[1]!.opts.session, 'ctrl_clean')
+    assert.equal(log.httpCalls[0]!.target, '/api/orders/order_847291/approve?ref=order_847291')
+    assert.equal(log.httpCalls[0]!.opts.arm, 'control')
+    assert.equal(log.httpCalls[0]!.opts.role, 'control')
+    assert.equal(log.httpCalls[0]!.opts.session, 'ctrl_clean')
     assert.equal(log.controlInsideHop, false)
-    assert.deepEqual(log.httpCalls[1]!.opts.body, { orderId: 'order_999999', email: 'newuser@example.test' })
-    assert.equal(log.httpCalls[2]!.target, '/api/orders/order_999999/approve?ref=order_999999')
-    // Dynamic >=6-char JSON ID must STILL be sealed & wired via explicit value_binding edge!
+    assert.equal(log.httpCalls[1]!.target, '/api/orders')
+    assert.equal(log.httpCalls[2]!.target, '/api/orders/cap:hop_1:cap_1/approve?ref=cap:hop_1:cap_1')
+    assert.deepEqual(log.httpCalls[2]!.opts.body, { orderId: 'cap:hop_1:cap_1', email: 'newuser@example.test' })
+    // Dynamic >=6-char JSON ID must be sealed & wired via explicit value_binding edge!
     assert.equal(log.sealCalls.length, 1)
     assert.equal(log.sealCalls[0]!.jsonPath, 'items[0].id')
     assert.deepEqual(log.edges, [{ kind: 'value_binding', fromHopId: 'step_1', toHopId: 'step_2', capabilityHandle: 'cap:hop_1:cap_1' }])
@@ -638,7 +640,7 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
 
     assert.deepEqual(logExact.hops, ['step_1', 'step_2', 'step_3', 'step_4'])
     assert.equal(logExact.controlInsideHop, false)
-    assert.deepEqual(logExact.httpCalls[0]!.target, { origin: 'https://storage.example.test', path: `/files/export/org_a/report.csv?tenant=org_a&job=${jobId}` })
+    assert.deepEqual(logExact.httpCalls[0]!.target, { origin: 'https://storage.example.test', path: `/files/export/org_a/report.csv?tenant=org_a&sig=0000000000000000&job=${jobId}` })
     assert.equal(logExact.httpCalls[0]!.opts.arm, 'control')
     assert.equal(logExact.httpCalls[0]!.opts.role, 'control')
     assert.equal(logExact.httpCalls[0]!.opts.session, 'ctrl_clean')
@@ -939,9 +941,9 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
     await fn(ctx)
     assert.ok(Date.now() - t0 >= 350, 'Expected compiled script to wait after 202 before downstream consumption')
     assert.deepEqual(log.hops, ['step_1', 'step_2'])
-    assert.equal(log.httpCalls[2]!.target, '/api/v1/jobs/job_live_991122/status')
+    assert.equal(log.httpCalls[2]!.target, '/api/v1/jobs/cap:hop_1:cap_1/status')
     assert.equal(log.httpCalls[2]!.opts.role, 'setup')
-    assert.equal(log.httpCalls[3]!.target, '/api/v1/jobs/job_live_991122/trace')
+    assert.equal(log.httpCalls[3]!.target, '/api/v1/jobs/cap:hop_1:cap_1/trace')
     assertAllHopsReachTerminal(log.hops, log.edges, 'step_2')
   })
 
@@ -997,7 +999,7 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
 
     assert.deepEqual(log.httpCalls[0]!.target, {
       origin: 'https://storage.example.test',
-      path: '/api/exports/download?job=abc&tenant=org_a',
+      path: '/api/exports/download?job=abc&tenant=org_a&sig=0000000000000000',
     })
     assert.equal(log.httpCalls[0]!.opts.arm, 'control')
     assert.equal(log.httpCalls[0]!.opts.as, 'member_b')
@@ -1073,7 +1075,7 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
       ])
       await fn(ctx)
 
-      assert.equal(log.httpCalls[0]!.target, '/api/v1/reports/download?tenant=org_a&format=csv')
+      assert.equal(log.httpCalls[0]!.target, '/api/v1/reports/download?tenant=org_a&format=csv&sig=0000000000000000')
       assert.equal(log.httpCalls[0]!.opts.method, 'GET')
       assert.equal(log.httpCalls[0]!.opts.arm, 'control')
       assert.equal(log.httpCalls[0]!.opts.as, 'member_b')
