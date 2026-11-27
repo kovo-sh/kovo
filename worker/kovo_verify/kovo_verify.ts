@@ -82,6 +82,8 @@ export interface OobHandle { exchangeId: string; token: string; url: string; dns
 export interface OobCheck extends OobHandle { hit: boolean; checkExchangeId?: string; hits: Array<{ protocol: string; token: string; remoteIp?: string; timestamp?: number }> }
 
 export interface HttpOptions { as?: string; persona?: string; session?: string; role?: 'setup' | 'control' | 'probe' | 'cleanup'; arm?: 'setup' | 'control' | 'probe' | 'cleanup'; isControl?: boolean; control?: boolean; method?: string; headers?: Record<string, string>; body?: string | Record<string, unknown> | unknown[]; followRedirects?: boolean; timeoutMs?: number; capability?: string | CapabilityInjectionSpec; capabilityTarget?: 'bearer' | 'header' | 'cookie' | 'url'; capabilityHeaderName?: string; capabilityCookieName?: string; capabilityQueryParam?: string; authMutation?: Record<string, unknown>; entityId?: string; correlationIds?: string[]; evidenceRole?: string; replayAttempt?: 'mode_a' | 'ablation_control' | 'primary' }
+export type HttpTargetString = `/${string}` | `http://${string}` | `https://${string}` | `${'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS'} ${string}`
+export type HttpTargetObj = HttpOptions & { exchangeId?: never; url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; target?: HttpTarget; origin?: string }
 export type HttpTarget = string | (HttpOptions & { url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; target?: HttpTarget; origin?: string })
 export interface Expectations {
   status(exchange: { exchangeId: string }, expected: number | number[], message?: string): StatusClaim; statusNot(exchange: { exchangeId: string }, unexpected: number, message?: string): StatusClaim
@@ -94,7 +96,9 @@ export interface Expectations {
 export type ExchangeRef = string | { exchangeId: string }
 export interface ChainBuilderOptions { chainId: string; terminalVulnClass: string; replayMode?: ReplayMode; benchmarkMode?: boolean }
 export interface ChainHopOptions { surface?: HopSurface; target?: HopTargetInput; method?: string; role?: 'setup' | 'control' | 'probe' | 'cleanup'; arm?: 'setup' | 'control' | 'probe' | 'cleanup'; claimedDelta?: string; entityId?: string; canaryToken?: string; exchangeIds?: string[]; oobEventIds?: string[]; browserTraceIds?: string[]; producedCapabilities?: string[]; consumedCapabilities?: string[]; proofReceipt?: ProofReceiptInput }
-export interface ChainRaceBurstOptions extends ChainHopOptions { requests?: Array<RaceRequestInput | HttpTarget>; request?: RaceRequestInput | HttpTarget; count?: number; barrier?: 'auto' | 'h2' | 'http1'; session?: string; readRoute?: HttpTarget; readMethod?: string; readPersona?: string; baseline?: ExchangeRef; readback?: ExchangeRef; correlationIds?: string[] }
+export interface ChainStepOptions extends HttpOptions { hopId?: string; surface?: HopSurface; claimedDelta?: string; canaryToken?: string; proofReceipt?: ProofReceiptInput; producedCapabilities?: string[]; consumedCapabilities?: string[] }
+export type ChainSealSelector = string | (Omit<SealCapabilityInput, 'exchangeId' | 'exchange' | 'slot'> & { slot?: string })
+export interface ChainRaceBurstOptions extends ChainHopOptions { hopId?: string; requests?: Array<RaceRequestInput | HttpTarget>; request?: RaceRequestInput | HttpTarget; count?: number; barrier?: 'auto' | 'h2' | 'http1'; session?: string; readRoute?: HttpTarget; readMethod?: string; readPersona?: string; baseline?: ExchangeRef; readback?: ExchangeRef; correlationIds?: string[] }
 export interface StateTransitionEdgeInput { fromHopId: string; toHopId: string; entityId: string; ablationExchange?: ExchangeRef | ExchangeRef[]; ablationExchangeIds?: string[]; mutationKind?: string }
 export interface ChainProveOptions { terminalHopId?: string; claimedImpact?: string; summary?: string; terminalExchange?: ExchangeRef; terminalExchangeId?: string; control?: ExchangeRef | ExchangeRef[]; controlExchanges?: ExchangeRef | ExchangeRef[]; preChainControlExchangeIds?: string[]; readback?: ExchangeRef | ExchangeRef[]; postChainReadbackExchangeIds?: string[]; modeAFailureExchange?: ExchangeRef; modeAFailureExchangeId?: string; oracleFamily?: OracleFamily; oracleInput?: Record<string, unknown>; proofReceipt?: ProofReceiptInput; replayMode?: ReplayMode; benchmarkMode?: boolean }
 interface HopRecorder { hopId: string; target?: HopTargetObject; exchangeIds: string[]; oobEventIds: string[]; browserTraceIds: string[]; producedCapabilities: string[]; consumedCapabilities: string[]; entityId?: string; correlationIds: string[]; controlExCount: number; nonControlExCount: number; capConsumeExchange: Map<string, string>; cryptoConsumptions: Array<{ sourceCapabilityId: string; derivedCapabilityId?: string; alg?: string }>; asyncPolls: Array<{ pollRecordId: string; correlationId?: string; triggerExchangeId?: string }>; onProduce(cap: string, exchangeId?: string): void; onExchange(exchangeId: string, isControl?: boolean): void; onCorrelation(correlationId: string): void }
@@ -113,12 +117,9 @@ function sendRpc(transport: RpcTransport, op: string, args: Record<string, unkno
     const req = httpRequest({ socketPath: transport.socketPath, path: '/rpc', method: 'POST', timeout: timeoutMs, headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), 'x-kovo-rpc-token': transport.token, 'x-kovo-verify-nonce': transport.nonce, 'x-kovo-sdk-version': KOVO_VERIFY_SDK_VERSION } }, res => {
       const chunks: Buffer[] = []; let size = 0
       res.on('data', (chunk: Buffer) => { size += chunk.length; if (size > 8 * 1024 * 1024) { res.destroy(); reject(new Error('Verification RPC response exceeded the SDK limit.')); return } chunks.push(chunk) })
-      res.on('end', () => {
-        let body: RpcEnvelope; try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as RpcEnvelope } catch { reject(new Error('Verification RPC returned malformed JSON.')); return }
-        if (!body.ok) reject(new Error(body.error ?? 'Verification RPC call failed.')); else resolve(body.result)
-      })
+      res.on('end', () => { let b: RpcEnvelope; try { b = JSON.parse(Buffer.concat(chunks).toString('utf8')) as RpcEnvelope } catch { reject(new Error('Verification RPC returned malformed JSON.')); return } if (!b.ok) reject(new Error(b.error ?? 'Verification RPC call failed.')); else resolve(b.result) })
     })
-    req.on('timeout', () => { req.destroy(new Error('Verification RPC call timed out.')) }); req.on('error', reject); req.end(payload)
+    req.on('timeout', () => req.destroy(new Error('Verification RPC call timed out.'))); req.on('error', reject); req.end(payload)
   })
 }
 const pushUnique = (list: string[], value: string | undefined | null): void => { const t = typeof value === 'string' ? value.trim() : ''; if (t && !list.includes(t)) list.push(t) }
@@ -129,16 +130,17 @@ function normalizeBodyAndHeaders(rawBody: unknown, rawHeaders?: Record<string, s
   if (rawBody === undefined || rawBody === null) return headers ? { headers } : {}
   return typeof rawBody === 'string' ? { body: rawBody, ...(headers ? { headers } : {}) } : { body: JSON.stringify(rawBody), headers: Object.keys(headers ?? {}).some(k => k.toLowerCase() === 'content-type') ? headers : { 'content-type': 'application/json', ...(headers ?? {}) } }
 }
-function splitTarget(input: HttpTarget, defaultOrigin: string | undefined): { origin?: string; path: string } {
+function splitTarget(input: HttpTarget, defaultOrigin: string | undefined): { origin?: string; path: string; method?: string } {
   if (typeof input === 'string') {
     const trimmed = input.trim(); if (!trimmed) throw new Error('HTTP target path/URL must be non-empty.')
-    if (/^https?:\/\//i.test(trimmed)) { const u = new URL(trimmed); return { origin: u.origin, path: u.pathname + u.search } }
-    return { ...(defaultOrigin ? { origin: defaultOrigin } : {}), path: trimmed.startsWith('/') ? trimmed : `/${trimmed}` }
+    const mp = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(.+)$/i.exec(trimmed), method = mp ? mp[1]!.toUpperCase() : undefined, raw = mp ? mp[2]!.trim() : trimmed
+    if (/^https?:\/\//i.test(raw)) { const u = new URL(raw); return { origin: u.origin, path: u.pathname + u.search, ...(method ? { method } : {}) } }
+    return { ...(defaultOrigin ? { origin: defaultOrigin } : {}), path: raw.startsWith('/') ? raw : `/${raw}`, ...(method ? { method } : {}) }
   }
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('HTTP target requires a path/URL string or an object with { url | path | pathAndQuery | endpoint }.')
   const raw = input.url ?? input.path ?? input.pathAndQuery ?? input.endpoint ?? input.route
-  if (typeof raw === 'string' && raw.trim()) { const res = splitTarget(raw, input.origin ?? defaultOrigin); return { ...(input.origin ? { origin: input.origin } : res.origin ? { origin: res.origin } : {}), path: res.path } }
-  if (input.target !== undefined) { const nested = splitTarget(input.target, input.origin ?? defaultOrigin); return { ...(input.origin ? { origin: input.origin } : nested.origin ? { origin: nested.origin } : {}), path: nested.path } }
+  if (typeof raw === 'string' && raw.trim()) { const res = splitTarget(raw, input.origin ?? defaultOrigin); return { ...(input.origin ? { origin: input.origin } : res.origin ? { origin: res.origin } : {}), path: res.path, ...(res.method ? { method: res.method } : {}) } }
+  if (input.target !== undefined) { const nested = splitTarget(input.target, input.origin ?? defaultOrigin); return { ...(input.origin ? { origin: input.origin } : nested.origin ? { origin: nested.origin } : {}), path: nested.path, ...(nested.method ? { method: nested.method } : {}) } }
   throw new Error('HTTP target requires a path/URL string or an object with { url | path | pathAndQuery | endpoint }.')
 }
 const HTTP_OPT_KEYS = ['session', 'role', 'arm', 'isControl', 'control', 'followRedirects', 'timeoutMs', 'capability', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'authMutation', 'entityId', 'correlationIds', 'evidenceRole', 'replayAttempt'] as const
@@ -148,9 +150,21 @@ function extractInlineHttpOptions(input: unknown): HttpOptions {
   if (typeof r.method === 'string' && r.method.trim()) out.method = r.method.trim().toUpperCase()
   if (r.headers && typeof r.headers === 'object' && !Array.isArray(r.headers)) out.headers = r.headers as Record<string, string>
   if (r.body !== undefined) out.body = r.body as HttpOptions['body']
-  const persona = typeof r.as === 'string' ? r.as : typeof r.persona === 'string' ? r.persona : undefined
-  if (persona) out.as = persona
-  return out
+  const persona = typeof r.as === 'string' ? r.as : typeof r.persona === 'string' ? r.persona : undefined; if (persona) out.as = persona; return out
+}
+function isHttpTargetArg(v: unknown, hasOpts: boolean): boolean {
+  if (Array.isArray(v)) return false
+  if (v && typeof v === 'object') return typeof (v as Record<string, unknown>).exchangeId !== 'string'
+  if (typeof v !== 'string') return false
+  const t = v.trim(); return hasOpts || t.startsWith('/') || /^https?:\/\//i.test(t) || /^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+/i.test(t)
+}
+function parseSealSelector(s: string): Record<string, unknown> {
+  const t = s.trim()
+  if (/^header:/i.test(t)) return { header: t.slice(7).trim() }
+  if (/^(?:set)?cookie:/i.test(t)) return { setCookie: t.replace(/^(?:set)?cookie:/i, '').trim() }
+  if (/^(?:location)?query:/i.test(t)) return { locationQuery: t.replace(/^(?:location)?query:/i, '').trim() }
+  if (/^regex:/i.test(t)) return { regex: t.slice(6).trim() }
+  return { jsonPath: t.startsWith('$') ? t : `$.${t}` }
 }
 function parseJsonSafe(body: unknown): unknown { if (typeof body !== 'string') return null; const c = body.replace(/^\uFEFF/, '').trim(); if (!c) return null; try { return JSON.parse(c) } catch { return null } }
 export function hydrateExchange(raw: HttpExchange): HttpExchange {
@@ -189,19 +203,16 @@ function normalizeAsyncPredicate(raw: AsyncMatchPredicate | undefined, expectSta
   const pred: AsyncMatchPredicate = raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...raw } : {}; if (expectStatus !== undefined && pred.status === undefined) pred.status = expectStatus; return Object.keys(pred).length > 0 ? pred : undefined
 }
 function normalizeHopTarget(rawTarget: unknown, hopMethod: unknown, defaultOrigin: string | undefined): unknown {
-  const fallbackMethod = typeof hopMethod === 'string' && hopMethod.trim() ? hopMethod.trim().toUpperCase() : undefined
+  const fbMethod = typeof hopMethod === 'string' && hopMethod.trim() ? hopMethod.trim().toUpperCase() : undefined
   if (typeof rawTarget === 'string') {
     const trimmed = rawTarget.trim(); if (!trimmed) return rawTarget
-    const prefixed = /^([A-Za-z]{1,10})\s+(.+)$/.exec(trimmed), method = prefixed ? prefixed[1]!.toUpperCase() : fallbackMethod
-    const split = splitTarget(prefixed ? prefixed[2]!.trim() : trimmed, defaultOrigin), origin = split.origin ?? defaultOrigin
+    const pref = /^([A-Za-z]{1,10})\s+(.+)$/.exec(trimmed), method = pref ? pref[1]!.toUpperCase() : fbMethod, split = splitTarget(pref ? pref[2]!.trim() : trimmed, defaultOrigin), origin = split.origin ?? defaultOrigin
     return { ...(origin ? { origin } : {}), ...(method ? { method } : {}), pathAndQuery: split.path }
   }
   if (!rawTarget || typeof rawTarget !== 'object' || Array.isArray(rawTarget)) return rawTarget
-  const t = rawTarget as Record<string, unknown>, rawOrigin = typeof t.origin === 'string' && t.origin.trim() ? t.origin.trim() : undefined
-  const rawMethod = typeof t.method === 'string' && t.method.trim() ? t.method.trim().toUpperCase() : fallbackMethod
+  const t = rawTarget as Record<string, unknown>, rawOrigin = typeof t.origin === 'string' && t.origin.trim() ? t.origin.trim() : undefined, rawMethod = typeof t.method === 'string' && t.method.trim() ? t.method.trim().toUpperCase() : fbMethod
   const rawPath = typeof t.pathAndQuery === 'string' && t.pathAndQuery.trim() ? t.pathAndQuery : typeof t.path === 'string' && t.path.trim() ? t.path : typeof t.url === 'string' && t.url.trim() ? t.url : undefined
-  const split = rawPath !== undefined ? splitTarget(rawPath, rawOrigin ?? defaultOrigin) : undefined, origin = rawOrigin ?? split?.origin ?? defaultOrigin
-  const param = typeof t.param === 'string' && t.param.trim() ? t.param.trim() : undefined
+  const split = rawPath !== undefined ? splitTarget(rawPath, rawOrigin ?? defaultOrigin) : undefined, origin = rawOrigin ?? split?.origin ?? defaultOrigin, param = typeof t.param === 'string' && t.param.trim() ? t.param.trim() : undefined
   return { ...(origin ? { origin } : {}), ...(rawMethod ? { method: rawMethod } : {}), ...(split ? { pathAndQuery: split.path } : {}), ...(param ? { param } : {}) }
 }
 const normExRef = (v: unknown): unknown => (v && typeof v === 'object' && !Array.isArray(v) && typeof (v as Record<string, unknown>).exchangeId === 'string') ? (v as Record<string, unknown>).exchangeId : v
@@ -277,6 +288,7 @@ export class ChainBuilder {
   private readonly hops: RecordedHop[] = []; private readonly capProducer = new Map<string, { hopId: string; exchangeId?: string }>()
   private readonly exchangeToHop = new Map<string, string>(); private readonly correlationToHop = new Map<string, string>()
   private readonly explicitEdges: CausalEdgeInput[] = []; private readonly controlIds: string[] = []; private readonly readbackIds: string[] = []; private readonly raceActionIds: string[] = []
+  private hopSeq = 0; private sealSeq = 0
 
   constructor(ctx: VerifyContext, opts: ChainBuilderOptions) {
     if (!opts.chainId?.trim()) throw new Error('ChainBuilder requires a non-empty chainId.')
@@ -285,20 +297,56 @@ export class ChainBuilder {
     this.replayMode = opts.replayMode ?? 'fresh_clean_replay'; this.benchmarkMode = opts.benchmarkMode
   }
 
-  control(ref: ExchangeRef | ExchangeRef[]): this { for (const id of extractExchangeIds(ref)) pushUnique(this.controlIds, id); return this }
-  readback(ref: ExchangeRef | ExchangeRef[]): this { for (const id of extractExchangeIds(ref)) pushUnique(this.readbackIds, id); return this }
+  private nextHopId(): string { let id: string; do { id = `hop_${++this.hopSeq}` } while (this.hops.some(h => h.receipt.hopId === id)); return id }
+
+  control(target: HttpTargetString | HttpTargetObj, opts?: HttpOptions): Promise<HttpExchange>
+  control(target: string, opts: HttpOptions): Promise<HttpExchange>
+  control(ref: ExchangeRef | ExchangeRef[]): this
+  control(targetOrRef: ExchangeRef | ExchangeRef[] | HttpTarget, opts?: HttpOptions): this | Promise<HttpExchange> {
+    if (!isHttpTargetArg(targetOrRef, opts !== undefined)) { for (const id of extractExchangeIds(targetOrRef as ExchangeRef | ExchangeRef[])) pushUnique(this.controlIds, id); return this }
+    const inlineSess = targetOrRef && typeof targetOrRef === 'object' && !Array.isArray(targetOrRef) && typeof (targetOrRef as HttpOptions).session === 'string' ? (targetOrRef as HttpOptions).session : undefined
+    return this.ctx._httpSendDetached(targetOrRef as HttpTarget, { ...(opts ?? {}), role: 'control', arm: 'control', session: opts?.session ?? inlineSess ?? `ctrl_${this.chainId}` }).then(ex => { pushUnique(this.controlIds, ex.exchangeId); return ex })
+  }
+
+  readback(target: HttpTargetString | HttpTargetObj, opts?: HttpOptions): Promise<HttpExchange>
+  readback(target: string, opts: HttpOptions): Promise<HttpExchange>
+  readback(ref: ExchangeRef | ExchangeRef[]): this
+  readback(targetOrRef: ExchangeRef | ExchangeRef[] | HttpTarget, opts?: HttpOptions): this | Promise<HttpExchange> {
+    if (!isHttpTargetArg(targetOrRef, opts !== undefined)) { for (const id of extractExchangeIds(targetOrRef as ExchangeRef | ExchangeRef[])) pushUnique(this.readbackIds, id); return this }
+    return this.ctx._httpSendDetached(targetOrRef as HttpTarget, { ...(opts ?? {}), role: 'control', arm: 'control' }).then(ex => { pushUnique(this.readbackIds, ex.exchangeId); return ex })
+  }
+
+  step(target: HttpTarget, opts: ChainStepOptions = {}): Promise<HttpExchange> {
+    const { hopId, surface, claimedDelta, canaryToken, proofReceipt, producedCapabilities, consumedCapabilities, ...httpOpts } = opts
+    const inline = extractInlineHttpOptions(target), hasRole = Boolean(httpOpts.role || httpOpts.arm || httpOpts.isControl || httpOpts.control || inline.role || inline.arm || inline.isControl || inline.control)
+    return this.hop(hopId?.trim() || this.nextHopId(), { ...(surface ? { surface } : {}), ...(claimedDelta ? { claimedDelta } : {}), ...(canaryToken ? { canaryToken } : {}), ...(proofReceipt ? { proofReceipt } : {}), ...(producedCapabilities ? { producedCapabilities } : {}), ...(consumedCapabilities ? { consumedCapabilities } : {}) }, () => this.ctx.http_send(target, hasRole ? httpOpts : { role: 'probe', ...httpOpts }))
+  }
+  send(target: HttpTarget, opts?: ChainStepOptions): Promise<HttpExchange> { return this.step(target, opts) }
+
+  async seal(exchange: ExchangeRef, selector: ChainSealSelector): Promise<string> {
+    const exId = extractExchangeIds(exchange)[0]; if (!exId) throw new Error('chain.seal requires an exchange or exchangeId.')
+    const sel: Record<string, unknown> = typeof selector === 'string' ? parseSealSelector(selector) : { ...(selector ?? {}) }
+    const slot = typeof sel.slot === 'string' && sel.slot.trim() ? sel.slot.trim() : `s${++this.sealSeq}`
+    const hopId = (typeof sel.hopReceiptId === 'string' && sel.hopReceiptId.trim()) ? sel.hopReceiptId.trim() : (typeof sel.hopId === 'string' && sel.hopId.trim()) ? sel.hopId.trim() : this.exchangeToHop.get(exId)
+    const res = await this.ctx.seal_capability({ ...(sel as Omit<SealCapabilityInput, 'slot'>), exchangeId: exId, slot, ...(hopId ? { hopReceiptId: hopId } : {}) })
+    const srcEx = res.exchangeId || exId
+    if (hopId && res.handle) {
+      if (!this.capProducer.has(res.handle)) this.capProducer.set(res.handle, { hopId, exchangeId: srcEx })
+      const recHop = this.hops.find(h => h.receipt.hopId === hopId); if (recHop) { recHop.receipt.producedCapabilities ??= []; pushUnique(recHop.receipt.producedCapabilities, res.handle) }
+    }
+    return res.handle
+  }
+
+  race(opts: ChainRaceBurstOptions): Promise<RaceBurstHopResult> { const { hopId, ...rest } = opts; return this.raceBurst(hopId?.trim() || this.nextHopId(), rest) }
 
   stateTransition(input: StateTransitionEdgeInput): this {
     const fromHopId = input.fromHopId?.trim(), toHopId = input.toHopId?.trim(), entityId = input.entityId?.trim()
     if (!fromHopId || !toHopId) throw new Error('state_transition_binding requires non-empty fromHopId and toHopId.')
     if (!entityId) throw new Error('state_transition_binding requires an explicit non-empty entityId (never auto-guessed).')
-    const ablationIds: string[] = []
-    for (const id of [...extractExchangeIds(input.ablationExchange), ...(input.ablationExchangeIds ?? [])]) pushUnique(ablationIds, id)
+    const ablationIds: string[] = []; for (const id of [...extractExchangeIds(input.ablationExchange), ...(input.ablationExchangeIds ?? [])]) pushUnique(ablationIds, id)
     if (ablationIds.length === 0) throw new Error('state_transition_binding requires explicit ablationExchange / ablationExchangeIds (never auto-guessed).')
-    this.explicitEdges.push({ kind: 'state_transition_binding', fromHopId, toHopId, entityId, ablationExchangeIds: ablationIds, ...(input.mutationKind ? { mutationKind: input.mutationKind } : {}) })
-    return this
+    this.explicitEdges.push({ kind: 'state_transition_binding', fromHopId, toHopId, entityId, ablationExchangeIds: ablationIds, ...(input.mutationKind ? { mutationKind: input.mutationKind } : {}) }); return this
   }
-
   edge(edge: CausalEdgeInput): this {
     const norm = normalizeEdgeRecord(edge, this.explicitEdges.length) as CausalEdgeInput
     if (norm.kind === 'state_transition_binding') {
@@ -307,23 +355,19 @@ export class ChainBuilder {
     }
     this.explicitEdges.push(norm); return this
   }
-
   recordHop(hop: HopReceiptInput & { role?: 'setup' | 'control' | 'probe' | 'cleanup'; arm?: 'setup' | 'control' | 'probe' | 'cleanup' }): this {
-    const { role, arm, ...cleanHop } = hop
-    const target = normalizeHopTarget(cleanHop.target, cleanHop.method, this.ctx.targetOrigin || undefined) as HopTargetObject
+    const { role, arm, ...cleanHop } = hop, target = normalizeHopTarget(cleanHop.target, cleanHop.method, this.ctx.targetOrigin || undefined) as HopTargetObject
     const receipt: HopReceiptInput = { ...cleanHop, surface: cleanHop.surface ?? 'http', target, ...(cleanHop.producedCapabilities ? { producedCapabilities: normCapList(cleanHop.producedCapabilities) as string[] } : {}), ...(cleanHop.consumedCapabilities ? { consumedCapabilities: normCapList(cleanHop.consumedCapabilities) as string[] } : {}) }
     for (const exId of receipt.exchangeIds ?? []) this.exchangeToHop.set(exId, receipt.hopId)
     for (const cap of receipt.producedCapabilities ?? []) if (!this.capProducer.has(cap)) this.capProducer.set(cap, { hopId: receipt.hopId, exchangeId: receipt.exchangeIds?.[0] })
-    this.hops.push({ receipt, isControlOnly: (role ?? arm) === 'control', capConsumeExchange: new Map(), cryptoConsumptions: [], asyncPolls: [] })
-    return this
+    this.hops.push({ receipt, isControlOnly: (role ?? arm) === 'control', capConsumeExchange: new Map(), cryptoConsumptions: [], asyncPolls: [] }); return this
   }
 
   async hop<T>(hopId: string, fn: () => Promise<T> | T): Promise<T>
   async hop<T>(hopId: string, meta: ChainHopOptions, fn: () => Promise<T> | T): Promise<T>
   async hop<T>(hopId: string, metaOrFn: ChainHopOptions | (() => Promise<T> | T), maybeFn?: () => Promise<T> | T): Promise<T> {
     const trimmedId = hopId.trim(); if (!trimmedId) throw new Error('chain.hop requires a non-empty hopId.')
-    const meta: ChainHopOptions = typeof metaOrFn === 'function' ? {} : (metaOrFn ?? {})
-    const fn = typeof metaOrFn === 'function' ? metaOrFn : maybeFn
+    const meta: ChainHopOptions = typeof metaOrFn === 'function' ? {} : (metaOrFn ?? {}), fn = typeof metaOrFn === 'function' ? metaOrFn : maybeFn
     if (typeof fn !== 'function') throw new Error(`chain.hop("${trimmedId}") requires a callback function.`)
     const rec: HopRecorder = {
       hopId: trimmedId, exchangeIds: [...(meta.exchangeIds ?? [])], oobEventIds: [...(meta.oobEventIds ?? [])], browserTraceIds: [...(meta.browserTraceIds ?? [])],
@@ -335,8 +379,7 @@ export class ChainBuilder {
     }
     for (const exId of rec.exchangeIds) this.exchangeToHop.set(exId, trimmedId)
     for (const cap of rec.producedCapabilities) if (!this.capProducer.has(cap)) this.capProducer.set(cap, { hopId: trimmedId, exchangeId: rec.exchangeIds[0] })
-    this.ctx._pushHopRecorder(rec)
-    let out: T; try { out = await fn() } finally { this.ctx._popHopRecorder(rec) }
+    this.ctx._pushHopRecorder(rec); let out: T; try { out = await fn() } finally { this.ctx._popHopRecorder(rec) }
     const resolvedTarget = meta.target !== undefined ? normalizeHopTarget(meta.target, meta.method, this.ctx.targetOrigin || undefined) as HopTargetObject : (rec.target ?? { origin: this.ctx.targetOrigin, method: meta.method ?? 'GET', pathAndQuery: '/' })
     const receipt: HopReceiptInput = {
       hopId: trimmedId, surface: meta.surface ?? 'http', target: resolvedTarget, exchangeIds: rec.exchangeIds,
@@ -346,8 +389,7 @@ export class ChainBuilder {
       ...(rec.entityId ? { entityId: rec.entityId } : {}), ...(meta.canaryToken ? { canaryToken: meta.canaryToken } : {}), ...(meta.proofReceipt ? { proofReceipt: meta.proofReceipt } : {}),
     }
     const isControlOnly = (meta.role ?? meta.arm) === 'control' || (rec.controlExCount > 0 && rec.nonControlExCount === 0 && !rec.producedCapabilities.length && !rec.consumedCapabilities.length && !rec.cryptoConsumptions.length && !rec.asyncPolls.length && !rec.oobEventIds.length && !rec.browserTraceIds.length)
-    this.hops.push({ receipt, isControlOnly, capConsumeExchange: rec.capConsumeExchange, cryptoConsumptions: rec.cryptoConsumptions, asyncPolls: rec.asyncPolls })
-    return out
+    this.hops.push({ receipt, isControlOnly, capConsumeExchange: rec.capConsumeExchange, cryptoConsumptions: rec.cryptoConsumptions, asyncPolls: rec.asyncPolls }); return out
   }
 
   async raceBurst(hopId: string, opts: ChainRaceBurstOptions): Promise<RaceBurstHopResult> {
@@ -356,39 +398,68 @@ export class ChainBuilder {
     if (rawReqs.length < 2 || rawReqs.length > 10) throw new Error('chain.raceBurst requires between 2 and 10 requests (or { request, count }).')
     if (opts.baseline) this.control(opts.baseline)
     let baseline: HttpExchange | undefined
-    if (!opts.baseline && opts.readRoute) { baseline = await this.ctx.http_send(opts.readRoute, { method: opts.readMethod ?? 'GET', ...(opts.readPersona ? { as: opts.readPersona } : {}), role: 'control', ...(opts.session ? { session: `${opts.session}-base` } : {}) }); this.control(baseline) }
-    const { requests: _rq, request: _r, count: _c, barrier, session, readRoute, readMethod, readPersona, baseline: _b, readback: _rb, correlationIds, ...hopMeta } = opts
+    if (!opts.baseline && opts.readRoute) { baseline = await this.ctx._httpSendDetached(opts.readRoute, { method: opts.readMethod ?? 'GET', ...(opts.readPersona ? { as: opts.readPersona } : {}), role: 'control', arm: 'control', ...(opts.session ? { session: `${opts.session}-base` } : {}) }); pushUnique(this.controlIds, baseline.exchangeId) }
+    const { hopId: _h, requests: _rq, request: _r, count: _c, barrier, session, readRoute, readMethod, readPersona, baseline: _b, readback: _rb, correlationIds, ...hopMeta } = opts
     const burst = await this.hop(trimmedId, { ...hopMeta, claimedDelta: hopMeta.claimedDelta ?? `Concurrent race burst (${rawReqs.length} requests) on ${trimmedId}.` }, () =>
       this.ctx.race_burst(rawReqs, { ...(barrier ? { barrier } : {}), ...(session ? { session } : {}), ...(opts.entityId ? { entityId: opts.entityId } : {}), ...(correlationIds?.length ? { correlationIds } : {}) }),
     )
     for (const ex of burst.results) pushUnique(this.raceActionIds, ex.exchangeId)
     if (opts.readback) this.readback(opts.readback)
     let post: HttpExchange | undefined
-    if (!opts.readback && readRoute) { post = await this.ctx.http_send(readRoute, { method: readMethod ?? 'GET', ...(readPersona ? { as: readPersona } : {}), role: 'control', ...(session ? { session: `${session}-post` } : {}) }); this.readback(post) }
+    if (!opts.readback && readRoute) { post = await this.ctx._httpSendDetached(readRoute, { method: readMethod ?? 'GET', ...(readPersona ? { as: readPersona } : {}), role: 'control', arm: 'control', ...(session ? { session: `${session}-post` } : {}) }); pushUnique(this.readbackIds, post.exchangeId) }
     return { ...burst, ...(baseline ? { baseline } : {}), ...(post ? { post } : {}) }
+  }
+
+  private synthOracleInput(family: OracleFamily, raw: Record<string, unknown> | undefined, activeHops: RecordedHop[], edges: CausalEdgeInput[], preControl: string[], postReadback: string[], termEx: string | undefined): Record<string, unknown> | undefined {
+    const oi: Record<string, unknown> = raw ? { ...raw } : {}
+    const fill = (k: string, aliases: readonly string[], v: unknown): void => { if (v !== undefined && aliases.every(a => oi[a] === undefined)) oi[k] = v }
+    const firstEx = activeHops[0]?.receipt.exchangeIds?.[0], ctrl = preControl[0], rb = postReadback[0]
+    if (family === 'economic_conservation') {
+      fill('baselineReadbackExchangeId', ['baselineReadback', 'baselineReadbackExchangeId', 'baselineExchangeId'], ctrl)
+      fill('finalReadbackExchangeId', ['finalReadback', 'finalReadbackExchangeId', 'finalExchangeId'], rb)
+      const acts = this.raceActionIds.length > 0 ? [...this.raceActionIds] : activeHops.flatMap(h => h.receipt.exchangeIds ?? []).filter(id => !preControl.includes(id) && !postReadback.includes(id))
+      if (acts.length > 0) fill('actionExchangeIds', ['actions', 'actionExchangeIds', 'actionsExchangeIds'], acts)
+    } else if (family === 'cryptographic_scope_replay') {
+      fill('tamperedSignatureControlExchangeId', ['tamperedSignatureControl', 'tamperedSignatureControlExchangeId', 'tamperedControlExchangeId'], ctrl)
+      if (activeHops.length >= 2 && firstEx && firstEx !== termEx) fill('sourceValidIssuanceExchangeId', ['sourceValidIssuance', 'sourceValidIssuanceExchangeId', 'sourceIssuanceExchangeId'], firstEx)
+      fill('replayedAcceptanceExchangeId', ['replayedAcceptance', 'replayedAcceptanceExchangeId', 'replayedExchangeId'], termEx)
+    } else if (family === 'temporal_revocation' && (activeHops.length >= 4 || (activeHops.length >= 3 && ctrl))) {
+      fill('preRevocationBaselineExchangeId', ['preRevocationBaseline', 'preRevocationBaselineExchangeId'], firstEx)
+      fill('revocationEventExchangeId', ['revocationEvent', 'revocationEventExchangeId'], activeHops[1]?.receipt.exchangeIds?.[0])
+      fill('primaryDeniedCheckExchangeId', ['primaryDeniedCheck', 'primaryDeniedCheckExchangeId'], ctrl ?? activeHops[2]?.receipt.exchangeIds?.[0])
+      fill('secondarySuccessExchangeId', ['secondarySuccess', 'secondarySuccessExchangeId'], termEx)
+    } else if (family === 'parser_cache_differential') {
+      fill('cleanControlExchangeId', ['cleanControl', 'cleanControlExchangeId'], ctrl)
+      const isCache = oi.mode === 'cache_primed' || ['cacheKey', 'victimOrPrimeRequest', 'victimOrPrimeRequestExchangeId', 'victimPrimeExchangeId', 'attackerProbe', 'attackerProbeExchangeId'].some(k => oi[k] !== undefined)
+      if (isCache) { if (activeHops.length >= 2 && firstEx && firstEx !== termEx) fill('victimOrPrimeRequestExchangeId', ['victimOrPrimeRequest', 'victimOrPrimeRequestExchangeId', 'victimPrimeExchangeId'], firstEx); fill('attackerProbeExchangeId', ['attackerProbe', 'attackerProbeExchangeId'], termEx) }
+      else { fill('differentialProbeExchangeId', ['differentialProbe', 'differentialProbeExchangeId'], termEx); fill('postMutationReadbackExchangeId', ['postMutationReadback', 'postMutationReadbackExchangeId'], rb) }
+    } else if (family === 'dual_tenant_abac') {
+      if (oi.mode === 'dual_org_cache_bleed') { fill('baselineDeniedControlExchangeId', ['baselineDeniedControl', 'baselineDeniedControlExchangeId', 'baselineControlExchangeId'], ctrl); if (activeHops.length >= 2 && firstEx && firstEx !== termEx) fill('primeActionExchangeId', ['primeAction', 'primeActionExchangeId'], firstEx); fill('bledAccessExchangeId', ['bledAccess', 'bledAccessExchangeId'], termEx) }
+      else if (oi.mode === 'cross_org_transfer') { fill('sourceControlDeniedExchangeId', ['sourceControlDenied', 'sourceControlDeniedExchangeId', 'sourceControlExchangeId'], ctrl); fill('transferRecordExchangeId', ['transferRecord', 'transferRecordExchangeId', 'transferExchangeId'], termEx); fill('postTransferReadbackExchangeId', ['postTransferReadback', 'postTransferReadbackExchangeId'], rb) }
+      else if (oi.mode === 'batch_partial_authz') { fill('singleForeignControlDeniedExchangeId', ['singleForeignControlDenied', 'singleForeignControlDeniedExchangeId', 'singleForeignControlExchangeId'], ctrl); fill('batchRequestExchangeId', ['batchRequest', 'batchRequestExchangeId'], termEx); fill('postMutationReadbackExchangeId', ['postMutationReadback', 'postMutationReadbackExchangeId'], rb) }
+    } else if (family === 'cross_surface_pivot') {
+      fill('preChainControlDenied', ['preChainControlDenied', 'preChainControlDeniedExchangeId', 'preChainControlExchangeId'], ctrl)
+      if (oi.hops === undefined && activeHops.length >= 2) oi.hops = activeHops.map((h, i) => { const inE = edges.find(e => e.toHopId === h.receipt.hopId); return { surface: h.receipt.surface ?? 'http', role: i === activeHops.length - 1 ? 'terminal_impact' : h.receipt.surface === 'browser' ? 'browser_dom_trace' : h.receipt.surface === 'webhook' ? 'oob_callback' : 'trigger_write', record: i === activeHops.length - 1 ? (termEx ?? h.receipt.exchangeIds?.[0]) : h.receipt.exchangeIds?.[0], ...(inE ? { bindingKind: inE.kind } : {}) } })
+      fill('terminalImpact', ['terminalImpact'], { kind: rb ? 'privileged_mutation' : 'privileged_read', ...(rb ? { postImpactReadback: rb } : {}) })
+    }
+    return Object.keys(oi).length > 0 ? oi : undefined
   }
 
   build(opts: ChainProveOptions = {}): CompositeProofReceiptInput {
     if (this.hops.length === 0) throw new Error(`ChainBuilder "${this.chainId}" has no recorded hops.`)
     const edges: CausalEdgeInput[] = [], seenEdges = new Set<string>()
-    const addEdge = (edge: CausalEdgeInput): void => {
-      if (edge.fromHopId === edge.toHopId) return
-      const key = `${edge.fromHopId}->${edge.toHopId}:${edge.kind}`
-      if (!seenEdges.has(key)) { seenEdges.add(key); edges.push(edge) }
-    }
+    const addEdge = (edge: CausalEdgeInput): void => { if (edge.fromHopId === edge.toHopId) return; const key = `${edge.fromHopId}->${edge.toHopId}:${edge.kind}`; if (!seenEdges.has(key)) { seenEdges.add(key); edges.push(edge) } }
     for (const explicit of this.explicitEdges) addEdge(explicit)
     const resolveProducer = (cap: string): { hopId: string; exchangeId?: string } | undefined => {
       const direct = this.capProducer.get(cap); if (direct) return direct
       const srcEx = this.ctx._capOriginOf(cap), hopId = srcEx ? this.exchangeToHop.get(srcEx) : undefined; if (!hopId) return undefined
-      const prodHop = this.hops.find(h => h.receipt.hopId === hopId)?.receipt
-      if (prodHop) { prodHop.producedCapabilities ??= []; pushUnique(prodHop.producedCapabilities, cap) }
+      const prodHop = this.hops.find(h => h.receipt.hopId === hopId)?.receipt; if (prodHop) { prodHop.producedCapabilities ??= []; pushUnique(prodHop.producedCapabilities, cap) }
       const resolved = { hopId, ...(srcEx ? { exchangeId: srcEx } : {}) }; this.capProducer.set(cap, resolved); return resolved
     }
     for (const hop of this.hops) {
       const toHopId = hop.receipt.hopId, cryptoBound = new Set<string>()
       for (const c of hop.cryptoConsumptions) {
-        const prod = resolveProducer(c.sourceCapabilityId); if (!prod || prod.hopId === toHopId) continue
-        cryptoBound.add(c.sourceCapabilityId)
+        const prod = resolveProducer(c.sourceCapabilityId); if (!prod || prod.hopId === toHopId) continue; cryptoBound.add(c.sourceCapabilityId)
         addEdge({ kind: 'derived_crypto_binding', fromHopId: prod.hopId, toHopId, sourceCapabilityId: c.sourceCapabilityId, ...(c.derivedCapabilityId && /^cap:/.test(c.derivedCapabilityId) ? { derivedCapabilityId: c.derivedCapabilityId } : {}), ...(c.alg ? { alg: c.alg } : {}) })
       }
       for (const cap of hop.receipt.consumedCapabilities ?? []) {
@@ -406,18 +477,13 @@ export class ChainBuilder {
     const controlOnlyHops = this.hops.filter(h => h.isControlOnly && !linkedHops.has(h.receipt.hopId) && h.receipt.hopId !== opts.terminalHopId)
     const activeHops = controlOnlyHops.length < this.hops.length ? this.hops.filter(h => !controlOnlyHops.includes(h)) : this.hops
     const demotedCtrlIds = activeHops.length < this.hops.length ? controlOnlyHops.flatMap(h => h.receipt.exchangeIds ?? []) : []
-    const lastHop = activeHops[activeHops.length - 1]!.receipt
-    const preControl: string[] = [], postReadback: string[] = []
+    const lastHop = activeHops[activeHops.length - 1]!.receipt, preControl: string[] = [], postReadback: string[] = []
     for (const id of [...this.controlIds, ...demotedCtrlIds, ...extractExchangeIds(opts.control), ...extractExchangeIds(opts.controlExchanges), ...(opts.preChainControlExchangeIds ?? [])]) pushUnique(preControl, id)
     for (const id of [...this.readbackIds, ...extractExchangeIds(opts.readback), ...(opts.postChainReadbackExchangeIds ?? [])]) pushUnique(postReadback, id)
-    const terminalExchangeId = opts.terminalExchangeId ?? extractExchangeIds(opts.terminalExchange)[0]
-    const modeAFailureExchangeId = opts.modeAFailureExchangeId ?? extractExchangeIds(opts.modeAFailureExchange)[0]
-    let oracleInput = opts.oracleInput ? { ...opts.oracleInput } : undefined
-    if ((opts.oracleFamily === 'economic_conservation' || this.terminalVulnClass.trim().toLowerCase() === 'economic_conservation') && oracleInput) {
-      if (oracleInput.baselineReadback === undefined && oracleInput.baselineReadbackExchangeId === undefined && oracleInput.baselineExchangeId === undefined && preControl[0]) oracleInput.baselineReadbackExchangeId = preControl[0]
-      if (oracleInput.finalReadback === undefined && oracleInput.finalReadbackExchangeId === undefined && oracleInput.finalExchangeId === undefined && postReadback[0]) oracleInput.finalReadbackExchangeId = postReadback[0]
-      if (oracleInput.actions === undefined && oracleInput.actionExchangeIds === undefined && oracleInput.actionsExchangeIds === undefined && this.raceActionIds.length > 0) oracleInput.actionExchangeIds = [...this.raceActionIds]
-    }
+    const terminalExchangeId = opts.terminalExchangeId ?? extractExchangeIds(opts.terminalExchange)[0], modeAFailureExchangeId = opts.modeAFailureExchangeId ?? extractExchangeIds(opts.modeAFailureExchange)[0]
+    const lastExIds = lastHop.exchangeIds ?? [], resolvedTermEx = terminalExchangeId ?? lastExIds[lastExIds.length - 1]
+    const effFamily: OracleFamily | undefined = opts.oracleFamily ?? (this.terminalVulnClass.trim().toLowerCase() === 'economic_conservation' ? 'economic_conservation' : undefined)
+    const oracleInput = effFamily ? this.synthOracleInput(effFamily, opts.oracleInput, activeHops, edges, preControl, postReadback, resolvedTermEx) : (opts.oracleInput ? { ...opts.oracleInput } : undefined)
     return {
       chainId: this.chainId, terminalVulnClass: this.terminalVulnClass, replayMode: opts.replayMode ?? this.replayMode,
       ...(opts.benchmarkMode ?? this.benchmarkMode !== undefined ? { benchmarkMode: opts.benchmarkMode ?? this.benchmarkMode } : {}),
@@ -483,23 +549,16 @@ export class VerifyContext {
     const target = splitTarget(input, this.defaultOrigin), merged: HttpOptions = { ...extractInlineHttpOptions(input), ...options }
     const { body, headers } = normalizeBodyAndHeaders(merged.body, merged.headers), persona = merged.as ?? merged.persona, capability = normalizeCapabilityInjection(merged.capability)
     const arm = merged.arm ?? (merged.role === 'control' || merged.isControl === true || merged.control === true ? 'control' : undefined), sessionGroupRole = merged.role ?? arm
-    return { args: { ...(target.origin ? { origin: target.origin } : {}), path: target.path, method: (merged.method ?? 'GET').toUpperCase(), ...(headers ? { headers } : {}), ...(body !== undefined ? { body } : {}), ...(persona ? { persona } : {}), ...(sessionGroupRole ? { sessionGroupRole } : {}), ...(arm ? { arm } : {}), ...(capability !== undefined && capability !== '' ? { capability } : {}), ...pickDefined(merged as Record<string, unknown>, ['session', 'followRedirects', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'authMutation', 'entityId', 'evidenceRole', 'replayAttempt']), ...(merged.correlationIds?.length ? { correlationIds: merged.correlationIds } : {}) }, timeoutMs: (merged.timeoutMs ?? 60_000) + 10_000 }
+    return { args: { ...(target.origin ? { origin: target.origin } : {}), path: target.path, method: (merged.method ?? target.method ?? 'GET').toUpperCase(), ...(headers ? { headers } : {}), ...(body !== undefined ? { body } : {}), ...(persona ? { persona } : {}), ...(sessionGroupRole ? { sessionGroupRole } : {}), ...(arm ? { arm } : {}), ...(capability !== undefined && capability !== '' ? { capability } : {}), ...pickDefined(merged as Record<string, unknown>, ['session', 'followRedirects', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'authMutation', 'entityId', 'evidenceRole', 'replayAttempt']), ...(merged.correlationIds?.length ? { correlationIds: merged.correlationIds } : {}) }, timeoutMs: (merged.timeoutMs ?? 60_000) + 10_000 }
   }
 
   private extractExDiag(raw: { status?: unknown; mediaType?: unknown; headers?: unknown; json?: unknown; body?: unknown }): ExSealDiag {
     const status = typeof raw.status === 'number' ? raw.status : 0, sanitizeKey = (k: string): string => k.replace(/[^\w.-]/g, '').slice(0, 32)
-    const keysOf = (v: unknown): string[] => {
-      if (!v || typeof v !== 'object') return []
-      const src = Array.isArray(v) ? (v[0] && typeof v[0] === 'object' && !Array.isArray(v[0]) ? Object.keys(v[0] as Record<string, unknown>).map(k => `[0].${k}`) : ['<array>']) : Object.keys(v as Record<string, unknown>)
-      const out = src.slice(0, 12).map(sanitizeKey).filter(k => Boolean(k) && !/redacted/i.test(k)); if (src.length > 12) out.push('...'); return out
-    }
+    const keysOf = (v: unknown): string[] => { if (!v || typeof v !== 'object') return []; const src = Array.isArray(v) ? (v[0] && typeof v[0] === 'object' && !Array.isArray(v[0]) ? Object.keys(v[0] as Record<string, unknown>).map(k => `[0].${k}`) : ['<array>']) : Object.keys(v as Record<string, unknown>); const out = src.slice(0, 12).map(sanitizeKey).filter(k => Boolean(k) && !/redacted/i.test(k)); if (src.length > 12) out.push('...'); return out }
     let isJson = false, parsedJson: unknown = null
-    if (raw.json !== undefined && raw.json !== null) { isJson = true; parsedJson = raw.json }
-    else if (typeof raw.body === 'string') { const c = raw.body.replace(/^\uFEFF/, '').trim(); if (c) try { parsedJson = JSON.parse(c); isJson = true } catch { isJson = false } }
-    const hdrs: Record<string, string> = {}
-    if (raw.headers && typeof raw.headers === 'object' && !Array.isArray(raw.headers)) for (const [k, v] of Object.entries(raw.headers as Record<string, unknown>)) if (typeof v === 'string') hdrs[k.toLowerCase()] = v
-    const mediaType = (hdrs['content-type'] ?? (typeof raw.mediaType === 'string' ? raw.mediaType : '')).split(';')[0]!.trim().replace(/[^\w./+-]/g, '').slice(0, 64)
-    const loc = (hdrs.location ?? '').trim(), locParams: string[] = []
+    if (raw.json !== undefined && raw.json !== null) { isJson = true; parsedJson = raw.json } else if (typeof raw.body === 'string') { const c = raw.body.replace(/^\uFEFF/, '').trim(); if (c) try { parsedJson = JSON.parse(c); isJson = true } catch { isJson = false } }
+    const hdrs: Record<string, string> = {}; if (raw.headers && typeof raw.headers === 'object' && !Array.isArray(raw.headers)) for (const [k, v] of Object.entries(raw.headers as Record<string, unknown>)) if (typeof v === 'string') hdrs[k.toLowerCase()] = v
+    const mediaType = (hdrs['content-type'] ?? (typeof raw.mediaType === 'string' ? raw.mediaType : '')).split(';')[0]!.trim().replace(/[^\w./+-]/g, '').slice(0, 64), loc = (hdrs.location ?? '').trim(), locParams: string[] = []
     if (loc) try { const u = new URL(loc, 'http://kovo-local.invalid'); for (const k of u.searchParams.keys()) pushUnique(locParams, sanitizeKey(k)); if (u.hash.length > 1) for (const k of new URLSearchParams(u.hash.slice(1)).keys()) pushUnique(locParams, sanitizeKey(k)) } catch { /* ignore */ }
     return { status, mediaType, isJson, parsedJson, topKeys: isJson ? keysOf(parsedJson) : [], headerNames: Object.keys(hdrs).slice(0, 16), hasLocation: loc.length > 0, locationParamNames: locParams.slice(0, 12), hasSetCookie: 'set-cookie' in hdrs }
   }
@@ -512,24 +571,16 @@ export class VerifyContext {
       else { let j = i; while (j < s.length && s[j] !== '.' && s[j] !== '[') j++; segs.push(s.slice(i, j)); i = j }
     }
     let cur: unknown = root
-    for (const seg of segs) {
-      if (cur === null || cur === undefined || typeof cur !== 'object') return { found: false }
-      if (Array.isArray(cur)) { if (!/^\d+$/.test(seg)) return { found: false }; const idx = Number(seg); if (idx < 0 || idx >= cur.length) return { found: false }; cur = cur[idx] }
-      else if (Object.prototype.hasOwnProperty.call(cur, seg)) cur = (cur as Record<string, unknown>)[seg]; else return { found: false }
-    }
+    for (const seg of segs) { if (cur === null || cur === undefined || typeof cur !== 'object') return { found: false }; if (Array.isArray(cur)) { if (!/^\d+$/.test(seg)) return { found: false }; const idx = Number(seg); if (idx < 0 || idx >= cur.length) return { found: false }; cur = cur[idx] } else if (Object.prototype.hasOwnProperty.call(cur, seg)) cur = (cur as Record<string, unknown>)[seg]; else return { found: false } }
     return { found: true, value: cur }
   }
   private diagnoseSealFailure(msg: string, raw: Record<string, unknown>, diag: ExSealDiag | undefined): string {
-    const str = (v: unknown): string => typeof v === 'string' && v.trim() ? v.trim() : '', jp = str(raw.jsonPath), lq = str(raw.locationQuery) || str(raw.queryParam), hdr = str(raw.header), ck = str(raw.setCookie) || str(raw.cookie)
-    const hasVal = (typeof raw.value === 'string' && raw.value.length > 0) || (typeof raw.rawValue === 'string' && raw.rawValue.length > 0)
+    const str = (v: unknown): string => typeof v === 'string' && v.trim() ? v.trim() : '', jp = str(raw.jsonPath), lq = str(raw.locationQuery) || str(raw.queryParam), hdr = str(raw.header), ck = str(raw.setCookie) || str(raw.cookie), hasVal = (typeof raw.value === 'string' && raw.value.length > 0) || (typeof raw.rawValue === 'string' && raw.rawValue.length > 0)
     const cleanKeys = (o: Record<string, unknown>) => Object.keys(o).slice(0, 12).map(k => k.replace(/[^\w.-]/g, '').slice(0, 32)).filter(k => Boolean(k) && !/redacted/i.test(k))
     if (jp && diag) {
       if (!diag.isJson) return `capability.seal: jsonPath "${jp}" requested on non-JSON response (HTTP ${diag.status}, content-type: ${diag.mediaType || 'unknown'}). Verify response status/content-type or use header/setCookie/locationQuery selector.`
       const hit = this.resolveVisibleJsonPath(diag.parsedJson, jp)
-      if (hit.found && hit.value !== null && typeof hit.value === 'object') {
-        if (Array.isArray(hit.value)) { const k0 = hit.value[0] && typeof hit.value[0] === 'object' && !Array.isArray(hit.value[0]) ? cleanKeys(hit.value[0] as Record<string, unknown>) : []; return `capability.seal: jsonPath "${jp}" resolved to array (length=${hit.value.length}${k0.length ? `, [0] subkeys=[${k0.join(', ')}]` : ''}), not a scalar string/number — select a leaf element/field. [status=${diag.status}]` }
-        return `capability.seal: jsonPath "${jp}" resolved to object (subkeys=[${cleanKeys(hit.value as Record<string, unknown>).join(', ')}]), not a scalar string/number — select a leaf field. [status=${diag.status}]`
-      }
+      if (hit.found && hit.value !== null && typeof hit.value === 'object') { if (Array.isArray(hit.value)) { const k0 = hit.value[0] && typeof hit.value[0] === 'object' && !Array.isArray(hit.value[0]) ? cleanKeys(hit.value[0] as Record<string, unknown>) : []; return `capability.seal: jsonPath "${jp}" resolved to array (length=${hit.value.length}${k0.length ? `, [0] subkeys=[${k0.join(', ')}]` : ''}), not a scalar string/number — select a leaf element/field. [status=${diag.status}]` } return `capability.seal: jsonPath "${jp}" resolved to object (subkeys=[${cleanKeys(hit.value as Record<string, unknown>).join(', ')}]), not a scalar string/number — select a leaf field. [status=${diag.status}]` }
       if (hit.found && hit.value !== null && hit.value !== undefined) return `capability.seal: jsonPath "${jp}" extracted value too short (<6 chars) or low entropy; seal an opaque token/id/signature instead [status=${diag.status}]`
       return `${msg} [status=${diag.status}, topKeys=[${diag.topKeys.join(', ')}]]`
     }
@@ -539,96 +590,68 @@ export class VerifyContext {
     if (hasVal) return `capability.seal: value selector not found in host-visible/unredacted transcript (or failed min-length/entropy validation). Use jsonPath / header / setCookie / locationQuery selector on the exchange that minted the value.${diag ? ` [status=${diag.status}, topKeys=[${diag.topKeys.join(', ')}]]` : ''}`
     return diag ? `${msg} [status=${diag.status}, topKeys=[${diag.topKeys.join(', ')}]]` : msg
   }
-  private rememberEx(ex: HttpExchange | null | undefined): void {
-    if (!ex?.exchangeId) return
-    if (this._exMeta.size >= 256) { const first = this._exMeta.keys().next().value; if (first) this._exMeta.delete(first) }
-    this._exMeta.set(ex.exchangeId, this.extractExDiag(ex))
-  }
-  private async sendHttp(op: 'http' | 'http.send', input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {
-    const { args, timeoutMs } = this.buildHttpRpcArgs(input, options)
-    const ex = hydrateExchange(await this.callRpc(op, args, timeoutMs) as HttpExchange)
-    this.rememberEx(ex)
-    const hop = this.activeHop()
+  private rememberEx(ex: HttpExchange | null | undefined): void { if (!ex?.exchangeId) return; if (this._exMeta.size >= 256) { const first = this._exMeta.keys().next().value; if (first) this._exMeta.delete(first) } this._exMeta.set(ex.exchangeId, this.extractExDiag(ex)) }
+  private async sendHttp(op: 'http' | 'http.send', input: HttpTarget, options: HttpOptions = {}, recordHop = true): Promise<HttpExchange> {
+    const { args, timeoutMs } = this.buildHttpRpcArgs(input, options), ex = hydrateExchange(await this.callRpc(op, args, timeoutMs) as HttpExchange); this.rememberEx(ex)
+    const hop = recordHop ? this.activeHop() : undefined
     if (hop) {
       hop.onExchange(ex.exchangeId, args.sessionGroupRole === 'control' || args.arm === 'control')
       if (!hop.target) hop.target = { origin: typeof args.origin === 'string' ? args.origin : this.targetOrigin, method: typeof args.method === 'string' ? args.method : ex.method, pathAndQuery: ex.pathAndQuery || (typeof args.path === 'string' ? args.path : '/') }
-      this.recordExCaps(hop, ex, args.capability)
-      if (!hop.entityId && typeof args.entityId === 'string' && args.entityId.trim()) hop.entityId = args.entityId.trim()
+      this.recordExCaps(hop, ex, args.capability); if (!hop.entityId && typeof args.entityId === 'string' && args.entityId.trim()) hop.entityId = args.entityId.trim()
       if (Array.isArray(args.correlationIds)) for (const cid of args.correlationIds) if (typeof cid === 'string') hop.onCorrelation(cid)
     }
     return ex
   }
-
+  /** @internal */ _httpSendDetached(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> { return this.sendHttp('http.send', input, options, false) }
   http(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> { return this.sendHttp('http', input, options) }
   http_send(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> { return this.sendHttp('http.send', input, options) }
   request(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> { return this.sendHttp('http.send', input, options) }
 
   async race_burst(requests: Array<RaceRequestInput | HttpTarget>, opts: { barrier?: 'auto' | 'h2' | 'http1'; session?: string; entityId?: string; correlationIds?: string[] } = {}): Promise<RaceBurstHopResult> {
     if (!Array.isArray(requests) || requests.length < 2 || requests.length > 10) throw new Error('race_burst requires between 2 and 10 requests.')
-    const built = requests.map((req, i) => {
-      const mergedOpts: HttpOptions = { role: 'probe', session: opts.session ? `${opts.session}-${i}` : `race-${i}`, ...(opts.entityId ? { entityId: opts.entityId } : {}), ...(opts.correlationIds?.length ? { correlationIds: opts.correlationIds } : {}) }
-      return this.buildHttpRpcArgs(req as HttpTarget, mergedOpts)
-    })
+    const built = requests.map((req, i) => this.buildHttpRpcArgs(req as HttpTarget, { role: 'probe', session: opts.session ? `${opts.session}-${i}` : `race-${i}`, ...(opts.entityId ? { entityId: opts.entityId } : {}), ...(opts.correlationIds?.length ? { correlationIds: opts.correlationIds } : {}) }))
     const raw = await this.callRpc('race.burst', { requests: built.map(b => b.args), ...(opts.barrier ? { barrier: opts.barrier } : {}) }, Math.max(40_000, built[0]!.timeoutMs)) as { mode?: 'h2-single-packet' | 'http1-fallback'; fallbackReason?: string | null; raceBatchId?: string; summary?: Record<string, unknown>; results?: HttpExchange[] }
-    const raceBatchId = raw.raceBatchId ?? ''
-    const results = (raw.results ?? []).map(r => { const ex = hydrateExchange({ ...r, ...(raceBatchId && !r.raceBatchId ? { raceBatchId } : {}) }); this.rememberEx(ex); return ex })
+    const raceBatchId = raw.raceBatchId ?? '', results = (raw.results ?? []).map(r => { const ex = hydrateExchange({ ...r, ...(raceBatchId && !r.raceBatchId ? { raceBatchId } : {}) }); this.rememberEx(ex); return ex })
     const hop = this.activeHop()
     if (hop) {
       results.forEach((ex, i) => { hop.onExchange(ex.exchangeId); this.recordExCaps(hop, ex, built[i]?.args.capability) })
       if (!hop.target && built[0]) hop.target = { origin: typeof built[0].args.origin === 'string' ? built[0].args.origin : this.targetOrigin, method: typeof built[0].args.method === 'string' ? built[0].args.method : 'POST', pathAndQuery: results[0]?.pathAndQuery || (typeof built[0].args.path === 'string' ? built[0].args.path : '/') }
-      if (!hop.entityId && opts.entityId?.trim()) hop.entityId = opts.entityId.trim()
-      if (opts.correlationIds) for (const cid of opts.correlationIds) hop.onCorrelation(cid)
+      if (!hop.entityId && opts.entityId?.trim()) hop.entityId = opts.entityId.trim(); if (opts.correlationIds) for (const cid of opts.correlationIds) hop.onCorrelation(cid)
     }
     return { mode: raw.mode ?? 'http1-fallback', fallbackReason: raw.fallbackReason ?? null, raceBatchId, summary: raw.summary ?? {}, results, exchanges: results }
   }
   raceBurst(requests: Array<RaceRequestInput | HttpTarget>, opts?: { barrier?: 'auto' | 'h2' | 'http1'; session?: string; entityId?: string; correlationIds?: string[] }): Promise<RaceBurstHopResult> { return this.race_burst(requests, opts) }
 
   async seal_capability(input: SealCapabilityInput): Promise<SealedCapabilityResult> {
-    const raw = (input && typeof input === 'object' ? input : {}) as unknown as Record<string, unknown>
-    const exchangeId = extractExchangeIds((raw.exchangeId ?? raw.exchange ?? raw.exchange_id ?? raw.sourceExchangeId ?? raw.response) as ExchangeRef | undefined)[0]
+    const raw = (input && typeof input === 'object' ? input : {}) as unknown as Record<string, unknown>, exchangeId = extractExchangeIds((raw.exchangeId ?? raw.exchange ?? raw.exchange_id ?? raw.sourceExchangeId ?? raw.response) as ExchangeRef | undefined)[0]
     if (!exchangeId) throw new Error('seal_capability requires exchangeId (string) or exchange ({ exchangeId }).')
     const activeHop = this.activeHop(), hopReceiptId = (typeof raw.hopReceiptId === 'string' && raw.hopReceiptId.trim()) ? raw.hopReceiptId.trim() : (typeof raw.hopId === 'string' && raw.hopId.trim()) ? raw.hopId.trim() : activeHop?.hopId
     const cookieSel = typeof raw.cookie === 'string' && raw.cookie.trim() ? raw.cookie : typeof raw.setCookie === 'string' && raw.setCookie.trim() ? raw.setCookie : undefined
     let res: SealedCapabilityResult
     try {
-      res = await this.callRpc('capability.seal', {
-        exchangeId, slot: input.slot, ...(hopReceiptId ? { hopReceiptId } : {}), ...(cookieSel ? { cookie: cookieSel } : {}),
-        ...pickDefined(raw, ['jsonPath', 'header', 'setCookie', 'locationQuery', 'queryParam', 'regex', 'kind', 'defaultHeaderName', 'defaultCookieName']),
-        ...(input.value !== undefined ? { value: input.value } : {}), ...(input.ttlMs !== undefined ? { ttlMs: input.ttlMs } : {}), ...(input.allowedOrigins?.length ? { allowedOrigins: input.allowedOrigins } : {}),
-      }, 30_000) as SealedCapabilityResult
+      res = await this.callRpc('capability.seal', { exchangeId, slot: input.slot, ...(hopReceiptId ? { hopReceiptId } : {}), ...(cookieSel ? { cookie: cookieSel } : {}), ...pickDefined(raw, ['jsonPath', 'header', 'setCookie', 'locationQuery', 'queryParam', 'regex', 'kind', 'defaultHeaderName', 'defaultCookieName']), ...(input.value !== undefined ? { value: input.value } : {}), ...(input.ttlMs !== undefined ? { ttlMs: input.ttlMs } : {}), ...(input.allowedOrigins?.length ? { allowedOrigins: input.allowedOrigins } : {}) }, 30_000) as SealedCapabilityResult
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      if (/structured field not found/i.test(msg)) {
-        const diag = this._exMeta.get(exchangeId) ?? (raw.exchange && typeof raw.exchange === 'object' ? this.extractExDiag(raw.exchange as Record<string, unknown>) : undefined)
-        throw new Error(this.diagnoseSealFailure(msg, raw, diag))
-      }
+      if (/structured field not found/i.test(msg)) throw new Error(this.diagnoseSealFailure(msg, raw, this._exMeta.get(exchangeId) ?? (raw.exchange && typeof raw.exchange === 'object' ? this.extractExDiag(raw.exchange as Record<string, unknown>) : undefined)))
       throw err
     }
-    const srcEx = res.exchangeId || exchangeId; if (res.handle && srcEx) this._capOrigins.set(res.handle, srcEx); activeHop?.onProduce(res.handle, srcEx)
-    return res
+    const srcEx = res.exchangeId || exchangeId; if (res.handle && srcEx) this._capOrigins.set(res.handle, srcEx); activeHop?.onProduce(res.handle, srcEx); return res
   }
   sealCapability(input: SealCapabilityInput): Promise<SealedCapabilityResult> { return this.seal_capability(input) }
 
   private recordCrypto(secretHandle: string, exchangeId: string | undefined, derivedHandle: string, alg?: string): void {
-    const hop = this.activeHop()
-    if (!hop) return
-    if (exchangeId) hop.onExchange(exchangeId)
+    const hop = this.activeHop(); if (!hop) return; if (exchangeId) hop.onExchange(exchangeId)
     if (secretHandle) { pushUnique(hop.consumedCapabilities, secretHandle); hop.cryptoConsumptions.push({ sourceCapabilityId: secretHandle, derivedCapabilityId: derivedHandle, alg }) }
     if (/^cap:/.test(derivedHandle)) hop.onProduce(derivedHandle, exchangeId)
   }
-
   async hmac_sign(inputOrSecret: HmacSignInput | Record<string, unknown> | string, payloadArg?: string | Record<string, unknown> | unknown[], opts?: { alg?: string; encoding?: string } | string, encodingArg?: string): Promise<HmacSignResult> {
     const isPos = typeof inputOrSecret === 'string' || (payloadArg !== undefined && inputOrSecret && typeof inputOrSecret === 'object' && !('secretHandle' in inputOrSecret))
-    const r = !isPos && inputOrSecret && typeof inputOrSecret === 'object' ? (inputOrSecret as Partial<HmacSignInput>) : {}
-    const posOpts = isPos ? (typeof opts === 'string' ? { alg: opts } : (opts ?? {})) : {}
-    const secretHandle = resolveCapHandle(isPos ? inputOrSecret : (r.secretHandle ?? ''))
-    const alg = isPos ? posOpts.alg : r.alg, encoding = isPos ? (encodingArg ?? posOpts.encoding) : r.encoding
+    const r = !isPos && inputOrSecret && typeof inputOrSecret === 'object' ? (inputOrSecret as Partial<HmacSignInput>) : {}, posOpts = isPos ? (typeof opts === 'string' ? { alg: opts } : (opts ?? {})) : {}
+    const secretHandle = resolveCapHandle(isPos ? inputOrSecret : (r.secretHandle ?? '')), alg = isPos ? posOpts.alg : r.alg, encoding = isPos ? (encodingArg ?? posOpts.encoding) : r.encoding
     const res = await this.callRpc('crypto.hmacSign', { secretHandle, payload: normalizePayloadStr(isPos ? payloadArg : r.payload), ...(alg ? { alg } : {}), ...(encoding ? { encoding } : {}) }, 30_000) as HmacSignResult
-    const handle = res.handle ?? res.derivedHandle ?? res.signature
-    const out = { ...res, signature: res.signature ?? handle, handle, derivedHandle: res.derivedHandle ?? handle }
+    const handle = res.handle ?? res.derivedHandle ?? res.signature, out = { ...res, signature: res.signature ?? handle, handle, derivedHandle: res.derivedHandle ?? handle }
     if (out.derivedHandle && /^cap:/.test(out.derivedHandle) && out.exchangeId) this._capOrigins.set(out.derivedHandle, out.exchangeId)
-    this.recordCrypto(secretHandle, out.exchangeId, out.derivedHandle, out.attestation?.alg ?? alg)
-    return out
+    this.recordCrypto(secretHandle, out.exchangeId, out.derivedHandle, out.attestation?.alg ?? alg); return out
   }
   hmacSign(...args: Parameters<VerifyContext['hmac_sign']>): Promise<HmacSignResult> { return this.hmac_sign(...args) }
 
@@ -636,81 +659,51 @@ export class VerifyContext {
     const isPos = typeof inputOrSecret === 'string' || (claimsArg !== undefined && inputOrSecret && typeof inputOrSecret === 'object' && !('secretHandle' in inputOrSecret))
     const r: Partial<JwtSignInput> = isPos ? (typeof opts === 'string' ? { alg: opts as JwtSignInput['alg'] } : { ...(opts ?? {}) }) : ((inputOrSecret && typeof inputOrSecret === 'object' ? inputOrSecret : {}) as Partial<JwtSignInput>)
     const secretHandle = resolveCapHandle(isPos ? inputOrSecret : (r.secretHandle ?? ''))
-    const res = await this.callRpc('crypto.jwtSign', {
-      secretHandle, claims: (isPos ? claimsArg : r.claims) ?? {},
-      ...pickDefined(r as Record<string, unknown>, ['alg', 'header', 'hopReceiptId', 'slot']),
-      ...(r.ttlMs !== undefined ? { ttlMs: r.ttlMs } : {}), ...(r.allowedOrigins?.length ? { allowedOrigins: r.allowedOrigins } : {}),
-    }, 30_000) as JwtSignResult
+    const res = await this.callRpc('crypto.jwtSign', { secretHandle, claims: (isPos ? claimsArg : r.claims) ?? {}, ...pickDefined(r as Record<string, unknown>, ['alg', 'header', 'hopReceiptId', 'slot']), ...(r.ttlMs !== undefined ? { ttlMs: r.ttlMs } : {}), ...(r.allowedOrigins?.length ? { allowedOrigins: r.allowedOrigins } : {}) }, 30_000) as JwtSignResult
     const out = { ...res, handle: res.handle ?? res.derivedHandle, token: res.token ?? res.derivedHandle }
     if (out.derivedHandle && out.exchangeId) this._capOrigins.set(out.derivedHandle, out.exchangeId)
-    this.recordCrypto(secretHandle, out.exchangeId, out.derivedHandle, out.attestation?.alg ?? r.alg)
-    return out
+    this.recordCrypto(secretHandle, out.exchangeId, out.derivedHandle, out.attestation?.alg ?? r.alg); return out
   }
   jwtSign(...args: Parameters<VerifyContext['jwt_sign']>): Promise<JwtSignResult> { return this.jwt_sign(...args) }
 
   async await_async(input: AsyncAwaitInput | Record<string, unknown>): Promise<AsyncAwaitResult> {
     const r = (input && typeof input === 'object' ? input : {}) as AsyncAwaitInput
     const { args: pollRequest } = r.pollRequest !== undefined ? this.buildHttpRpcArgs(r.pollRequest, typeof r.pollRequest === 'string' ? extractInlineHttpOptions(r) : {}) : this.buildHttpRpcArgs(r as HttpTarget)
-    const matchPredicate = normalizeAsyncPredicate(r.matchPredicate, r.expectStatus)
-    const triggerExchangeId = typeof r.triggerExchangeId === 'string' ? r.triggerExchangeId : (r.triggerExchangeId && typeof r.triggerExchangeId === 'object' ? r.triggerExchangeId.exchangeId : undefined)
-    const timeoutMs = r.timeoutMs !== undefined ? Number(r.timeoutMs) : undefined
-    const res = await this.callRpc('async.awaitResult', {
-      pollRequest, ...(matchPredicate ? { matchPredicate } : {}), ...(r.profile ? { profile: r.profile } : {}),
-      ...(timeoutMs !== undefined ? { timeoutMs } : {}), ...(r.intervalMs !== undefined ? { intervalMs: Number(r.intervalMs) } : {}),
-      ...(r.maxAttempts !== undefined ? { maxAttempts: Number(r.maxAttempts) } : {}), ...(triggerExchangeId ? { triggerExchangeId } : {}),
-      ...(r.tTriggerMs !== undefined ? { tTriggerMs: Number(r.tTriggerMs) } : {}), ...(r.correlationId ? { correlationId: String(r.correlationId) } : {}),
-      ...(r.correlationIds?.length ? { correlationIds: r.correlationIds } : {}), ...(r.entityId ? { entityId: String(r.entityId) } : {}),
-    }, Math.max((timeoutMs ?? 30_000) + 10_000, 15_000)) as AsyncAwaitResult
-    const out = res && res.exchange ? { ...res, exchange: hydrateExchange(res.exchange) } : res
-    if (out?.exchange) this.rememberEx(out.exchange)
+    const matchPredicate = normalizeAsyncPredicate(r.matchPredicate, r.expectStatus), triggerExchangeId = typeof r.triggerExchangeId === 'string' ? r.triggerExchangeId : (r.triggerExchangeId && typeof r.triggerExchangeId === 'object' ? r.triggerExchangeId.exchangeId : undefined), timeoutMs = r.timeoutMs !== undefined ? Number(r.timeoutMs) : undefined
+    const res = await this.callRpc('async.awaitResult', { pollRequest, ...(matchPredicate ? { matchPredicate } : {}), ...(r.profile ? { profile: r.profile } : {}), ...(timeoutMs !== undefined ? { timeoutMs } : {}), ...(r.intervalMs !== undefined ? { intervalMs: Number(r.intervalMs) } : {}), ...(r.maxAttempts !== undefined ? { maxAttempts: Number(r.maxAttempts) } : {}), ...(triggerExchangeId ? { triggerExchangeId } : {}), ...(r.tTriggerMs !== undefined ? { tTriggerMs: Number(r.tTriggerMs) } : {}), ...(r.correlationId ? { correlationId: String(r.correlationId) } : {}), ...(r.correlationIds?.length ? { correlationIds: r.correlationIds } : {}), ...(r.entityId ? { entityId: String(r.entityId) } : {}) }, Math.max((timeoutMs ?? 30_000) + 10_000, 15_000)) as AsyncAwaitResult
+    const out = res && res.exchange ? { ...res, exchange: hydrateExchange(res.exchange) } : res; if (out?.exchange) this.rememberEx(out.exchange)
     const hop = this.activeHop()
     if (hop) {
-      if (out.exchangeId) hop.onExchange(out.exchangeId)
-      if (out.exchange) this.recordExCaps(hop, out.exchange, pollRequest.capability)
+      if (out.exchangeId) hop.onExchange(out.exchangeId); if (out.exchange) this.recordExCaps(hop, out.exchange, pollRequest.capability)
       if (!hop.target) hop.target = { origin: typeof pollRequest.origin === 'string' ? pollRequest.origin : this.targetOrigin, method: typeof pollRequest.method === 'string' ? pollRequest.method : 'GET', pathAndQuery: out.exchange?.pathAndQuery || (typeof pollRequest.path === 'string' ? pollRequest.path : '/') }
-      const cid = r.correlationId ? String(r.correlationId) : (r.correlationIds?.[0] ? String(r.correlationIds[0]) : undefined)
-      if (cid) hop.onCorrelation(cid)
-      if (!hop.entityId && r.entityId) hop.entityId = String(r.entityId)
+      const cid = r.correlationId ? String(r.correlationId) : (r.correlationIds?.[0] ? String(r.correlationIds[0]) : undefined); if (cid) hop.onCorrelation(cid); if (!hop.entityId && r.entityId) hop.entityId = String(r.entityId)
       if (out.pollRecordId) hop.asyncPolls.push({ pollRecordId: out.pollRecordId, ...(cid ? { correlationId: cid } : {}), ...(triggerExchangeId ? { triggerExchangeId } : {}) })
     }
     return out
   }
   awaitAsync(input: AsyncAwaitInput | Record<string, unknown>): Promise<AsyncAwaitResult> { return this.await_async(input) }
 
-  private recordProofClaims(ok: boolean, claims: readonly VerifyClaim[]): void {
-    if (claims.length) { if (ok) { this._lastFailedClaims = []; this.claims.push(...claims) } else { this._lastFailedClaims = [...claims] } }
-  }
+  private recordProofClaims(ok: boolean, claims: readonly VerifyClaim[]): void { if (claims.length) { if (ok) { this._lastFailedClaims = []; this.claims.push(...claims) } else { this._lastFailedClaims = [...claims] } } }
   async prove_composite(receipt: CompositeProofReceiptInput): Promise<CompositeVerificationResult> {
     const res = await this.callRpc('composite.verify', normalizeCompositeReceipt(receipt, this.defaultOrigin, this._capOrigins), 30_000) as CompositeVerificationResult
-    const confirmed = res.confirmed === true || res.ok === true || res.verified === true
-    if (res.claim) this.recordProofClaims(confirmed, [res.claim])
+    const confirmed = res.confirmed === true || res.ok === true || res.verified === true; if (res.claim) this.recordProofClaims(confirmed, [res.claim])
     return { ...res, confirmed, ok: confirmed, verified: confirmed }
   }
   proveComposite(receipt: CompositeProofReceiptInput): Promise<CompositeVerificationResult> { return this.prove_composite(receipt) }
-
   effectiveClaims(): VerifyClaim[] { return this.claims.length > 0 ? [...this.claims] : [...this._lastFailedClaims] }
-
   async browser(input: HttpTarget, options: { as?: string; waitForSelector?: string; timeoutMs?: number } = {}): Promise<BrowserExchange> {
-    const target = splitTarget(input, this.defaultOrigin)
-    const res = await this.callRpc('browser', { ...(target.origin ? { origin: target.origin } : {}), path: target.path, ...(options.as ? { persona: options.as } : {}), ...(options.waitForSelector ? { waitForSelector: options.waitForSelector } : {}) }, (options.timeoutMs ?? 60_000) + 10_000) as BrowserExchange
-    const hop = this.activeHop()
-    if (hop) { pushUnique(hop.browserTraceIds, res.exchangeId); if (!hop.target) hop.target = { origin: target.origin ?? this.targetOrigin, method: 'GET', pathAndQuery: target.path } }
-    return res
+    const target = splitTarget(input, this.defaultOrigin), res = await this.callRpc('browser', { ...(target.origin ? { origin: target.origin } : {}), path: target.path, ...(options.as ? { persona: options.as } : {}), ...(options.waitForSelector ? { waitForSelector: options.waitForSelector } : {}) }, (options.timeoutMs ?? 60_000) + 10_000) as BrowserExchange
+    const hop = this.activeHop(); if (hop) { pushUnique(hop.browserTraceIds, res.exchangeId); if (!hop.target) hop.target = { origin: target.origin ?? this.targetOrigin, method: 'GET', pathAndQuery: target.path } }; return res
   }
-
   readonly oob = {
     mint: async (label: string, origin?: string): Promise<OobHandle> => { const res = await this.callRpc('oob', { action: 'mint', label, ...(origin ? { origin } : {}) }, 30_000) as OobHandle; pushUnique(this.activeHop()?.oobEventIds ?? [], res.exchangeId); return res },
     check: async (handle: OobHandle): Promise<OobCheck> => { const res = { ...handle, ...(await this.callRpc('oob', { action: 'check', token: handle.token, exchangeId: handle.exchangeId }, 30_000) as OobCheck) }; pushUnique(this.activeHop()?.oobEventIds ?? [], res.checkExchangeId ?? res.exchangeId); return res },
   }
-
-  // -- authoritative host-backed proof helpers (`prove.*`) ----------------
-
   private async callProof<T extends { ok?: boolean; confirmed?: boolean; claim?: VerifyClaim; claims?: VerifyClaim[] }>(op: string, input: unknown, errMsg: string, timeoutMs: number, hydrateKeys?: readonly string[]): Promise<T> {
     if (!input || typeof input !== 'object') throw new Error(errMsg)
     const raw = await this.callRpc(op, normalizeProofCapabilities(input) as Record<string, unknown>, timeoutMs) as Record<string, unknown>, res = (hydrateKeys ? hydrateFields(raw, hydrateKeys) : raw) as unknown as T
     this.recordProofClaims(res.ok !== false && res.confirmed !== false, Array.isArray(res.claims) ? res.claims : res.claim ? [res.claim] : []); return res
   }
-
   prove_access_boundary(input: AccessBoundaryInput | Record<string, unknown>): Promise<AccessBoundaryProof> { return this.callProof<AccessBoundaryProof>('prove.accessBoundary', input, 'prove_access_boundary requires { controlPersona?, probePersona?, route, method?, boundaryClass?, vulnClass?, expectControlDenied? }.', 70_000, ['control', 'probe']) }
   async prove_persisted_mutation(input: PersistedMutationInput | Record<string, unknown>): Promise<PersistedMutationProof> {
     if (!input || typeof input !== 'object') throw new Error('prove_persisted_mutation requires { readRoute, mutation, fieldPath, expectDelta }.')
@@ -724,20 +717,17 @@ export class VerifyContext {
   }
   async prove_boolean_or_timing_diff(input: BooleanOrTimingDiffInput | Record<string, unknown>): Promise<DifferentialProof> {
     const res = await this.callProof<DifferentialProof>('prove.differential', input, 'prove_boolean_or_timing_diff requires { control, variant, mode: "boolean"|"timing", rounds? }.', 120_000)
-    if (res.exchanges) res.exchanges = { control: res.exchanges.control.map(hydrateExchange), variant: res.exchanges.variant.map(hydrateExchange) }
-    return res
+    if (res.exchanges) res.exchanges = { control: res.exchanges.control.map(hydrateExchange), variant: res.exchanges.variant.map(hydrateExchange) }; return res
   }
   async prove_oob_callback(input: OobCallbackInput | Record<string, unknown>): Promise<OobCallbackProof> {
     const raw = input as Record<string, unknown>, timeoutMs = Number(raw.timeoutMs ?? 6_000); let res: OobCallbackProof
     if (typeof raw.inject === 'function') {
       const injectFn = raw.inject as (canary: OobHandle) => Promise<HttpExchange | void> | HttpExchange | void
       const started = await this.callRpc('prove.oob', { phase: 'start', ...(raw.token ? { token: raw.token } : {}), ...(raw.immediateMs !== undefined ? { immediateMs: Number(raw.immediateMs) } : {}), ...(raw.windowMs !== undefined ? { windowMs: Number(raw.windowMs) } : {}) }, 30_000) as { handle: OobHandle; subscription: Record<string, unknown> }
-      let injection: HttpExchange | null = null, injectionError: string | null = null
-      try { injection = (await injectFn(started.handle)) ?? null } catch (err) { injectionError = err instanceof Error ? err.message : 'OOB injection failed.' }
+      let injection: HttpExchange | null = null, injectionError: string | null = null; try { injection = (await injectFn(started.handle)) ?? null } catch (err) { injectionError = err instanceof Error ? err.message : 'OOB injection failed.' }
       res = await this.callRpc('prove.oob', { phase: 'finish', handle: started.handle, subscription: started.subscription, ...(injection ? { injection } : {}), ...(injectionError ? { injectionError } : {}), ...(raw.immediateMs !== undefined ? { immediateMs: Number(raw.immediateMs) } : {}), timeoutMs, ...(raw.message ? { message: raw.message } : {}) }, timeoutMs + 15_000) as OobCallbackProof
     } else { res = await this.callRpc('prove.oob', normalizeProofCapabilities(raw) as Record<string, unknown>, timeoutMs + 20_000) as OobCallbackProof }
-    if (res.claim) this.recordProofClaims(res.ok !== false && res.confirmed !== false, [res.claim])
-    return res
+    if (res.claim) this.recordProofClaims(res.ok !== false && res.confirmed !== false, [res.claim]); return res
   }
   async prove_race_burst(input: RaceBurstInput | Record<string, unknown>): Promise<RaceBurstProof> {
     const raw = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>, reqCount = Array.isArray(raw.requests) ? raw.requests.length : 0
@@ -746,10 +736,7 @@ export class VerifyContext {
     const hop = this.activeHop()
     if (hop) {
       for (const id of res.claim?.exchangeIds ?? res.exchanges?.map(e => e.exchangeId) ?? []) hop.onExchange(id)
-      if (!hop.target && Array.isArray(raw.requests) && raw.requests.length > 0) {
-        const first = raw.requests[0] as RaceRequestInput | HttpTarget
-        try { const t = splitTarget(first as HttpTarget, this.defaultOrigin); hop.target = { origin: t.origin ?? this.targetOrigin, method: typeof first === 'object' && first && 'method' in first && typeof first.method === 'string' ? first.method.toUpperCase() : 'POST', pathAndQuery: t.path } } catch { /* explicit target */ }
-      }
+      if (!hop.target && Array.isArray(raw.requests) && raw.requests.length > 0) { const first = raw.requests[0] as RaceRequestInput | HttpTarget; try { const t = splitTarget(first as HttpTarget, this.defaultOrigin); hop.target = { origin: t.origin ?? this.targetOrigin, method: typeof first === 'object' && first && 'method' in first && typeof first.method === 'string' ? first.method.toUpperCase() : (t.method ?? 'POST'), pathAndQuery: t.path } } catch { /* explicit target */ } }
     }
     return res
   }
