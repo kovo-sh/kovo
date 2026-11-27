@@ -64,7 +64,7 @@ import {
 import { extractCoverageEvidenceMetadata, normalizeOriginForCoverage } from './coverage-category.ts'
 import { extractSpecDedupeFields, normalizeEndpointTemplate } from './dedupe.ts'
 import { normalizeRouteTemplate } from './route-template.ts'
-import { buildWave1UncoveredOriginFallbackSteps, classifyRepoDirTier, materializeGreyBoxDataflowWave1Steps, resolveWave1MultiOriginFallback, selectBalancedRepoSourceCandidates } from './exec-recon-multiorigin.ts'
+import { buildWave1UncoveredOriginFallbackSteps, canonicalPlannerDedupeFamily, classifyRepoDirTier, materializeGreyBoxDataflowWave1Steps, resolveWave1MultiOriginFallback, selectBalancedRepoSourceCandidates } from './exec-recon-multiorigin.ts'
 import { meetsBaseline, type EvidenceReview } from './evidence-checks.ts'
 import {
   CHAIN_CONTINUATION_SKILL_PREFIX,
@@ -513,7 +513,7 @@ export function plannerDedupeTupleKey(origin: string, route: string, categoryOrC
   if (!cleanOrigin || !normRoute || normRoute === '/') return null
   const rawClass = (categoryOrClass ?? '').trim()
   if (!rawClass) return null
-  const family = confirmedCategoryFamily(rawClass)
+  const family = canonicalPlannerDedupeFamily(rawClass, confirmedCategoryFamily)
   if (!family) return null
   return `${cleanOrigin}\u0000${normRoute}\u0000${family}`
 }
@@ -1234,7 +1234,7 @@ export function resolveRepoOriginAffinity(input: RepoOriginAffinityInput): RepoO
     }
   }
 
-  if (liveRoutesByOrigin.size > 0) {
+  if (liveRoutesByOrigin.size > 0 && !(normalizedRepos.length === 1 && parsedOrigins.length > 1)) {
     for (let i = 0; i < normalizedRepos.length; i += 1) {
       if (resolved.has(i)) continue
       const { descriptor, root } = normalizedRepos[i]!
@@ -1257,7 +1257,7 @@ export function resolveRepoOriginAffinity(input: RepoOriginAffinityInput): RepoO
       scores.sort((a, b) => b.score - a.score || b.matched.length - a.matched.length || a.origin.localeCompare(b.origin))
       const top = scores[0]
       const second = scores[1]
-      if (top && (!second || top.score > second.score)) {
+      if (top && (!second || (normalizedRepos.length >= parsedOrigins.length && top.score > second.score))) {
         resolved.set(i, {
           repo: descriptor.repo,
           root,
@@ -3193,17 +3193,9 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       }
 
       // 1. Explicit serviceOrigin on the hypothesis
-      if (hyp.serviceOrigin && approvedOrigins.has(hyp.serviceOrigin)) {
-        pushOrigin(hyp.serviceOrigin)
-      }
+      if (hyp.serviceOrigin && approvedOrigins.has(hyp.serviceOrigin)) pushOrigin(hyp.serviceOrigin)
 
-      // 2. Deterministic repo->origin affinity from hypothesis source location
-      const fileRepoMapping = resolveRepoMappingForFile(hyp.location?.file)
-      if (fileRepoMapping?.origin && fileRepoMapping.confidence !== 'unmapped') {
-        pushOrigin(fileRepoMapping.origin)
-      }
-
-      // 3. Explicit host/origin mention in evidence or summary (critical for trust_boundary_mismatch)
+      // 2. Explicit host/origin mention in evidence or summary (critical for trust_boundary_mismatch)
       const evidenceText = `${hyp.summary} ${hyp.evidence.join(' ')}`
       for (const origin of approvedList) {
         if (resolvedOrigins.includes(origin)) continue
@@ -3213,12 +3205,12 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         } catch { /* ignore */ }
       }
 
-      // 4. Live-route overlap matching (if route(s) match a live endpoint on a unique origin)
+      // 3. Live-route overlap matching BEFORE whole-repo affinity (essential for shared monorepos)
       const candidateRouteRefs = [
         ...(hyp.targetRoute ? [hyp.targetRoute] : []),
         ...extractRouteRefsFromText([...hyp.evidence, ...hyp.preconditions, hyp.summary]),
       ]
-      if (!resolvedOrigins.length && candidateRouteRefs.length > 0) {
+      if ((!resolvedOrigins.length || hyp.kind === 'trust_boundary_mismatch') && candidateRouteRefs.length > 0) {
         const originHits = new Map<string, number>()
         for (const ref of candidateRouteRefs) {
           const norm = normalizeDeclaredRouteForOverlap(ref)
@@ -3226,9 +3218,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           const hits = liveOriginsByRoute.get(norm)
           if (!hits || hits.size === 0) continue
           const weight = hits.size === 1 ? 2 : 1
-          for (const origin of hits) {
-            originHits.set(origin, (originHits.get(origin) ?? 0) + weight)
-          }
+          for (const origin of hits) originHits.set(origin, (originHits.get(origin) ?? 0) + weight)
         }
         const rankedHits = [...originHits.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
         if (rankedHits.length > 0 && (rankedHits.length === 1 || rankedHits[0]![1] > rankedHits[1]![1])) {
@@ -3236,21 +3226,28 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         }
       }
 
+      // 4. Deterministic repo->origin affinity (skip whole-repo single-origin binding on shared monorepos)
+      const isSharedMonorepo = mountedRepos.length > 0 && mountedRepos.length < approvedList.length
+      const fileRepoMapping = resolveRepoMappingForFile(hyp.location?.file)
+      const skipWholeRepoBind = isSharedMonorepo && (mountedRepos.length === 1 || fileRepoMapping?.confidence === 'live_route')
+      if (!resolvedOrigins.length && !skipWholeRepoBind && fileRepoMapping?.origin && fileRepoMapping.confidence !== 'unmapped') {
+        pushOrigin(fileRepoMapping.origin)
+      }
+
       // 5. Repo slug mention inside evidence/summary (when no location.file was attached)
-      if (!resolvedOrigins.length && repoMappings.length > 0) {
+      if (!resolvedOrigins.length && !skipWholeRepoBind && repoMappings.length > 0) {
         const lowerEvidence = evidenceText.toLowerCase()
         for (const mapping of repoMappings) {
           if (!mapping.origin || mapping.confidence === 'unmapped') continue
+          if (isSharedMonorepo && mapping.confidence === 'live_route') continue
           const slug = repoBasenameSlug(mapping.repo)
           if (slug.length >= 3 && (lowerEvidence.includes(`${slug}/`) || lowerEvidence.includes(` ${slug} `))) {
-            pushOrigin(mapping.origin)
-            break
+            pushOrigin(mapping.origin); break
           }
         }
       }
 
-      // 6. Fuzzy path-prefix match + multi-origin fallback (preserve GB/monorepo hypotheses;
-      //    only skip explicitly unmapped mounted repos when multiple repos are mounted).
+      // 6. Fuzzy path-prefix match + multi-origin fallback + cross-service sibling preservation.
       if (!resolvedOrigins.length) {
         const fb = resolveWave1MultiOriginFallback({
           hypEntity: hyp.entity, candidateRouteRefs, approvedList, activeOrigins, storedEndpoints,
@@ -3260,6 +3257,9 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         })
         if (fb.origins.length) { for (const o of fb.origins) pushOrigin(o) }
         else { unmappedCount += 1; if (unmappedHypIds.length < 16) unmappedHypIds.push(hyp.id); continue }
+      }
+      if (hyp.kind === 'trust_boundary_mismatch' && activeOrigins.size > 1 && resolvedOrigins.some(o => activeOrigins.has(o))) {
+        for (const o of approvedList) { if (activeOrigins.has(o)) pushOrigin(o) }
       }
 
       // 7. Quarantine filter: exclude uniform edge-protected / dead origins so they never burn turns.
@@ -5176,70 +5176,70 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       : this.stepMentionedRoutes(candidate).filter(route => route && route !== '/')
     if (!routes.length) return null
 
-    const origins = [...new Set(
-      (candidate.origins ?? candidate.sourceOrigins ?? [])
-        .map(origin => origin.trim())
-        .filter(Boolean),
-    )]
+    const structuredOrigins = (candidate.structuredTargets ?? []).map(t => t.origin.trim()).filter(Boolean)
+    const rawOrigins = candidate.origins ?? candidate.sourceOrigins ?? []
+    const origins = [...new Set((rawOrigins.length > 0 ? rawOrigins : structuredOrigins).map(o => o.trim()).filter(Boolean))]
     const category = candidate.category?.trim() ?? ''
     const hasDepFacts = (candidate.dependsOnFactIds?.length ?? 0) > 0
     const confirmedTuples = buildConfirmedTupleKeySets(confirmed)
-
-    const multiHop = routes.length >= 2
-
-    if (multiHop) {
-      // Multi-hop chain step: only suppress if ALL `(origin, route, classFamily)` tuples are
-      // already composite-confirmed or currently in-flight (never suppress on single-hop-only).
-      if (!origins.length || !category) return null
-      const tuples: string[] = []
-      for (const origin of origins) {
-        for (const route of routes) {
-          const key = plannerDedupeTupleKey(origin, route, category)
-          if (!key) return null
-          tuples.push(key)
-        }
-      }
-      if (!tuples.length) return null
-      if (tuples.every(key => confirmedTuples.composite.has(key))) return 'already_confirmed'
-      if (tuples.every(key => confirmedTuples.composite.has(key) || inFlightTuples.has(key))) return 'in_flight'
-      return null
+    const typedCompositeRoutes = new Set<string>()
+    for (const ref of confirmed) {
+      if (!ref.hasCompositeReceipt || !ref.probeClass?.trim()) continue
+      const origin = ref.origin?.trim(), norm = normalizeConfirmedRouteTemplate(ref.path)
+      if (origin && norm && norm !== '/') typedCompositeRoutes.add(`${origin}\u0000${norm}`)
+    }
+    const isCompositeHit = (origin: string, route: string, cat: string): boolean => {
+      const key = plannerDedupeTupleKey(origin, route, cat)
+      if (key && confirmedTuples.composite.has(key)) return true
+      const routeKey = `${origin}\u0000${route}`
+      return confirmedTuples.compositeRoutes.has(routeKey) && !typedCompositeRoutes.has(routeKey)
     }
 
-    // Single-route step: tuple-scoped `(origin, normalizedRoute, classFamily)` matching.
+    if (routes.length >= 2) {
+      // Multi-hop chain step: suppress if the terminal target route (or every route on a matching
+      // origin) hits a composite-confirmed origin+canonical-family (or untyped composite route).
+      if (!origins.length || !category) return null
+      const terminalRoute = routes[routes.length - 1]!
+      if (origins.some(origin => isCompositeHit(origin, terminalRoute, category))) return 'already_confirmed'
+      if (routes.every(route => origins.some(origin => isCompositeHit(origin, route, category)))) return 'already_confirmed'
+      const allCovered = routes.every(route => origins.some(origin => {
+        if (isCompositeHit(origin, route, category)) return true
+        const key = plannerDedupeTupleKey(origin, route, category)
+        return Boolean(key && inFlightTuples.has(key))
+      }))
+      return allCovered ? 'in_flight' : null
+    }
+
+    // Single-route step: canonical `(origin, normalizedRoute, classFamily)` matching across sibling origins.
+    const singleRoute = routes[0]!
     if (origins.length > 0 && category) {
-      const tuples: string[] = []
-      for (const origin of origins) {
-        const key = plannerDedupeTupleKey(origin, routes[0]!, category)
-        if (!key) return null
-        tuples.push(key)
-      }
-      if (!tuples.length) return null
-      if (!hasDepFacts && tuples.every(key => confirmedTuples.all.has(key))) return 'already_confirmed'
-      if (tuples.every(key => confirmedTuples.composite.has(key))) return 'already_confirmed'
-      if (tuples.every(key =>
-        inFlightTuples.has(key)
-        || (!hasDepFacts && confirmedTuples.all.has(key))
-        || confirmedTuples.composite.has(key))) {
-        return 'in_flight'
-      }
-      return null
+      if (origins.some(origin => isCompositeHit(origin, singleRoute, category))) return 'already_confirmed'
+      if (!hasDepFacts && origins.some(origin => {
+        const key = plannerDedupeTupleKey(origin, singleRoute, category)
+        return Boolean(key && confirmedTuples.all.has(key))
+      })) return 'already_confirmed'
+      const allInFlightOrConfirmed = origins.every(origin => {
+        const key = plannerDedupeTupleKey(origin, singleRoute, category)
+        return Boolean(key) && (inFlightTuples.has(key!)
+          || (!hasDepFacts && confirmedTuples.all.has(key!))
+          || isCompositeHit(origin, singleRoute, category))
+      })
+      return allInFlightOrConfirmed ? 'in_flight' : null
     }
 
     // Legacy direct callers (e.g. stepRepeatsConfirmedWork without origins/category).
     if (hasDepFacts) return null
     if (category) {
-      const targetFamily = confirmedCategoryFamily(category)
+      const targetFamily = canonicalPlannerDedupeFamily(category, confirmedCategoryFamily)
       const matched = confirmed.some(ref =>
-        normalizeConfirmedRouteTemplate(ref.path) === routes[0]
+        normalizeConfirmedRouteTemplate(ref.path) === singleRoute
         && Boolean(ref.probeClass?.trim())
-        && confirmedCategoryFamily(ref.probeClass!.trim()) === targetFamily,
+        && canonicalPlannerDedupeFamily(ref.probeClass!.trim(), confirmedCategoryFamily) === targetFamily,
       )
       return matched ? 'already_confirmed' : null
     }
     const confirmedPaths = buildConfirmedRouteSets(confirmed).paths
-    return routes.every(route => confirmedPaths.has(normalizeConfirmedRouteTemplate(route)))
-      ? 'already_confirmed'
-      : null
+    return routes.every(route => confirmedPaths.has(normalizeConfirmedRouteTemplate(route))) ? 'already_confirmed' : null
   }
 
   /**

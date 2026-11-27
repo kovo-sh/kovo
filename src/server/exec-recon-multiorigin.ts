@@ -7,6 +7,7 @@ export { materializeGreyBoxDataflowWave1Steps }
 
 export interface Wave1OriginFallbackEndpoint {
   origin: string
+  method?: string
   pathTemplate: string
   riskScore?: number
   source?: string
@@ -48,8 +49,9 @@ export interface Wave1SeededStepDraft {
 export interface Wave1UncoveredFallbackInput {
   reachableFinalEntries: readonly ThreatModelSummary[]
   seededSteps: readonly Wave1SeededStepDraft[]
-  existingSteps: readonly Pick<ChainStep, 'status' | 'sourceOrigins'>[]
+  existingSteps: readonly (Pick<ChainStep, 'status' | 'sourceOrigins'> & { title?: string; hypothesis?: string })[]
   discoveredEndpointOrigins: ReadonlySet<string>
+  discoveredEndpoints?: readonly Wave1OriginFallbackEndpoint[]
   finalHostTiers: Record<string, HostTier>
   sourceMounted: boolean
   codeAuditStepsCreated: number
@@ -267,11 +269,21 @@ function classifySourceFileTier(relPath: string): 0 | 1 | 2 {
   return 1
 }
 
+const FLAT_FILE_ROLE_SUFFIX_RE = /(?:[-_.](?:routes?|handlers?|controllers?|middlewares?|helpers?|utils?|models?|schemas?|types?|clients?|workers?|views?|pages?|spec|test|mock|fixture)|[-_.]?\d{2,})+$/i
+
+function deriveFlatServiceStem(fileName: string): string {
+  const noExt = fileName.replace(/\.[^./]+$/, '').toLowerCase()
+  if (!noExt) return fileName.toLowerCase()
+  const stripped = noExt.replace(FLAT_FILE_ROLE_SUFFIX_RE, '').replace(/[-_.]+$/, '')
+  return stripped.length >= 2 ? stripped : noExt
+}
+
 function deriveServiceBranchKey(relPath: string): string {
   const segs = relPath.split('/').filter(Boolean)
   if (segs.length <= 1) return '.'
-  if (SERVICE_CONTAINER_DIRS.has(segs[0]!.toLowerCase()) && segs.length >= 3) {
-    return `${segs[0]!}/${segs[1]!}`
+  if (SERVICE_CONTAINER_DIRS.has(segs[0]!.toLowerCase())) {
+    if (segs.length >= 3) return `${segs[0]!}/${segs[1]!}`
+    return `${segs[0]!}/${deriveFlatServiceStem(segs[1]!)}`
   }
   return segs[0]!
 }
@@ -332,10 +344,86 @@ function parseOriginHostLabel(origin: string): string {
   return origin.replace(/^https?:\/\//i, '').replace(/\/.*$/, '') || origin
 }
 
+const STEP_ROUTE_TOKEN_RE = /(?:^|[\s(`"'[\]:,])(\/[A-Za-z0-9._~:@!$&'*+,;=%/?#-]+)/g
+const GB_DATAFLOW_TITLE_PREFIX = 'GB dataflow chain ('
+
+function extractStepRouteSegmentLists(text: string): string[][] {
+  const out: string[][] = []
+  const seen = new Set<string>()
+  STEP_ROUTE_TOKEN_RE.lastIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = STEP_ROUTE_TOKEN_RE.exec(text)) !== null) {
+    const raw = (match[1] ?? '').replace(/[),.;:'"\]]+$/, '')
+    if (!raw || raw === '/' || raw.startsWith('//')) continue
+    const segs = extractNormalizedSegments(raw, r => r)
+    if (!segs.length) continue
+    const key = segs.join('/')
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(segs)
+  }
+  return out
+}
+
+function stepMatchesOriginEndpoints(stepText: string, originEndpointSegs: readonly (readonly string[])[]): boolean {
+  if (!stepText.trim() || !originEndpointSegs.length) return false
+  const mentioned = extractStepRouteSegmentLists(stepText)
+  if (!mentioned.length) return false
+  for (const candSegs of mentioned) {
+    for (const epSegs of originEndpointSegs) {
+      if (scoreSegmentPrefixMatch(candSegs, epSegs) > 0) return true
+    }
+  }
+  return false
+}
+
+function runHasLive2xxExchanges(storage: Store | undefined, run: Run | undefined): boolean {
+  if (!storage || !run) return false
+  try {
+    const row = storage.client
+      .prepare('SELECT 1 AS ok FROM broker_exchanges WHERE run_id = ? AND status >= 200 AND status < 400 LIMIT 1')
+      .get(run.id) as { ok?: number } | undefined
+    return Boolean(row?.ok)
+  } catch (err) {
+    void err
+    return false
+  }
+}
+
+function collectDiscoveredEndpointsByOrigin(
+  input: Pick<Wave1UncoveredFallbackInput, 'discoveredEndpoints' | 'storage' | 'run'>,
+  reachableOriginSet: ReadonlySet<string>,
+): {
+  byOrigin: Map<string, Wave1OriginFallbackEndpoint[]>
+  segsByOrigin: Map<string, string[][]>
+} {
+  const rawEndpoints: readonly Wave1OriginFallbackEndpoint[] = input.discoveredEndpoints
+    ?? (input.storage && input.run ? input.storage.listEndpoints(input.run.id, { limit: 250 }) : [])
+  const byOrigin = new Map<string, Wave1OriginFallbackEndpoint[]>()
+  for (const ep of rawEndpoints) {
+    const origin = ep.origin.trim()
+    if (!reachableOriginSet.has(origin)) continue
+    const list = byOrigin.get(origin) ?? []
+    list.push(ep)
+    byOrigin.set(origin, list)
+  }
+  const segsByOrigin = new Map<string, string[][]>()
+  for (const [origin, list] of byOrigin.entries()) {
+    list.sort((a, b) => (b.riskScore ?? 0) - (a.riskScore ?? 0) || a.pathTemplate.localeCompare(b.pathTemplate))
+    const segs = list
+      .map(ep => extractNormalizedSegments(ep.pathTemplate, r => r))
+      .filter(s => s.length > 0)
+    if (segs.length) segsByOrigin.set(origin, segs)
+  }
+  return { byOrigin, segsByOrigin }
+}
+
 /**
  * Guarantee every reachable approved origin with discovered endpoints receives Wave-1 coverage
  * even when `codeAuditStepsCreated > 0` or the LLM threat model only seeded steps for a subset
- * of origins. Non-static fallback steps include sibling reachable origins for cross-origin chains.
+ * of origins. Non-static fallback steps include sibling reachable origins for cross-origin chains,
+ * enforce route-verified coverage when endpoints are known, and keep route-verified floors at or
+ * above `whiteBoxCapPriority`.
  */
 export function buildWave1UncoveredOriginFallbackSteps(
   input: Wave1UncoveredFallbackInput,
@@ -360,6 +448,11 @@ export function buildWave1UncoveredOriginFallbackSteps(
   const nonStaticReachableOrigins = reachableFinalEntries
     .filter(e => (finalHostTiers[e.origin] ?? classifyTier(e.origin, e.surfaceTags)) !== 'low_value_static')
     .map(e => e.origin)
+  const { byOrigin: endpointsByOrigin, segsByOrigin: endpointSegsByOrigin } = collectDiscoveredEndpointsByOrigin(
+    input,
+    reachableOriginSet,
+  )
+  const hasLive2xx = runHasLive2xxExchanges(input.storage, input.run)
 
   let gbDataflowSteps: Wave1SeededStepDraft[] = []
   if (!sourceMounted && input.storage && input.run) {
@@ -367,7 +460,7 @@ export function buildWave1UncoveredOriginFallbackSteps(
     gbDataflowSteps = synthesizeGreyBoxDataflowStepsFromStore(input.storage, input.run, {
       activeOrigins: input.activeOrigins ?? reachableOriginSet,
       sourceMounted,
-      maxSteps: 6,
+      maxSteps: hasLive2xx ? 6 : 2,
     }).filter(s => !existingSeedTitles.has(s.title.trim().toLowerCase()))
   }
   const combinedSeededSteps: Wave1SeededStepDraft[] = [...gbDataflowSteps, ...seededSteps]
@@ -379,43 +472,85 @@ export function buildWave1UncoveredOriginFallbackSteps(
       ? [entry.origin]
       : [entry.origin, ...nonStaticReachableOrigins.filter(o => o !== entry.origin)]
     const hostLabel = parseOriginHostLabel(entry.origin)
+    const originEps = endpointsByOrigin.get(entry.origin) ?? []
+    const topRoutes = [...new Set(
+      originEps
+        .filter(ep => ep.pathTemplate && ep.pathTemplate.trim() !== '/')
+        .map(ep => `${(ep.method || 'GET').toUpperCase()} ${ep.pathTemplate}`),
+    )].slice(0, 4)
+    const hasVerifiedRoutes = topRoutes.length > 0
+    const endpointsNote = hasVerifiedRoutes ? ` Endpoints: ${topRoutes.join(', ')}.` : ''
     const siblingNote = stepOrigins.length > 1
       ? ` Cross-origin siblings in scope: ${stepOrigins.slice(1).join(', ')}.`
       : ''
+    const priority = tier === 'low_value_static'
+      ? basePriority
+      : hasVerifiedRoutes
+        ? Math.max(whiteBoxCapPriority, basePriority)
+        : sourceMounted
+          ? Math.min(basePriority, whiteBoxCapPriority - 5)
+          : basePriority
     return {
       title: `Surface & chain investigation · ${hostLabel}`,
-      hypothesis: `Harvest JS/API routes, inspect DNS/TLS/CORS/auth headers, fingerprint stack & CVEs, and verify any candidate vulnerabilities on ${entry.origin} (${entry.surfaceTags.join(', ')}).${siblingNote}`,
+      hypothesis: `Harvest JS/API routes, inspect DNS/TLS/CORS/auth headers, fingerprint stack & CVEs, and verify any candidate vulnerabilities on ${entry.origin} (${entry.surfaceTags.join(', ')}).${endpointsNote}${siblingNote}`,
       category: entry.surfaceTags.includes('auth') ? 'auth-identity'
         : entry.surfaceTags.includes('api') ? 'broken-access-control'
           : entry.surfaceTags.includes('upload') ? 'upload-storage'
             : entry.surfaceTags.includes('llm-proxy') ? 'llm-ai-security'
               : 'misconfig-exposure',
-      priority: sourceMounted ? Math.min(basePriority, whiteBoxCapPriority - 5) : basePriority,
+      priority,
       origins: stepOrigins,
       skills: ['recon-modern-spa', 'cve-runtime-correlation', 'false-positive-elimination'],
     }
   }
 
   const coveredPrimaryOrigins = new Set<string>()
+  const isSpecOnlyGbGuess = (title: string | undefined, fromPreFloorGbBatch: boolean): boolean =>
+    Boolean(title?.startsWith(GB_DATAFLOW_TITLE_PREFIX)) && (fromPreFloorGbBatch || !hasLive2xx)
+
+  const recordStepCoverage = (
+    stepOrigins: readonly string[],
+    title: string | undefined,
+    hypothesis: string | undefined,
+    fromPreFloorGbBatch: boolean,
+  ): void => {
+    if (isSpecOnlyGbGuess(title, fromPreFloorGbBatch)) return
+    const text = `${title ?? ''} ${hypothesis ?? ''}`.trim()
+    const primary = stepOrigins.find(o => reachableOriginSet.has(o))
+    for (const origin of stepOrigins) {
+      if (!reachableOriginSet.has(origin)) continue
+      const originSegs = endpointSegsByOrigin.get(origin)
+      if (originSegs && originSegs.length > 0) {
+        if (stepMatchesOriginEndpoints(text, originSegs)) coveredPrimaryOrigins.add(origin)
+      } else if (origin === primary) {
+        coveredPrimaryOrigins.add(origin)
+      }
+    }
+  }
+
   for (const step of existingSteps) {
     if (step.status === 'canceled' || step.status === 'tainted') continue
-    const primary = step.sourceOrigins[0]
-    if (primary && reachableOriginSet.has(primary)) coveredPrimaryOrigins.add(primary)
+    recordStepCoverage(step.sourceOrigins, step.title, step.hypothesis, false)
   }
-  for (const step of combinedSeededSteps) {
-    const primary = step.origins.find(o => reachableOriginSet.has(o))
-    if (primary) coveredPrimaryOrigins.add(primary)
+  for (const step of gbDataflowSteps) {
+    recordStepCoverage(step.origins, step.title, step.hypothesis, !hasLive2xx)
   }
+  for (const step of seededSteps) {
+    recordStepCoverage(step.origins, step.title, step.hypothesis, false)
+  }
+
+  const hasDiscoveredSurface = (origin: string): boolean =>
+    discoveredEndpointOrigins.has(origin) || (endpointsByOrigin.get(origin)?.length ?? 0) > 0
 
   if (!combinedSeededSteps.length && (!sourceMounted || codeAuditStepsCreated === 0)) {
     const topHosts = reachableFinalEntries.slice(0, Math.min(8, reachableFinalEntries.length))
     const built = topHosts.map((entry, idx) => makeFallbackStep(entry, idx))
-    const uncoveredCount = topHosts.filter(e => discoveredEndpointOrigins.has(e.origin) && !coveredPrimaryOrigins.has(e.origin)).length
+    const uncoveredCount = topHosts.filter(e => hasDiscoveredSurface(e.origin) && !coveredPrimaryOrigins.has(e.origin)).length
     return { seededSteps: built, uncoveredAddedCount: uncoveredCount }
   }
 
   const uncoveredEntries = reachableFinalEntries
-    .filter(entry => discoveredEndpointOrigins.has(entry.origin) && !coveredPrimaryOrigins.has(entry.origin))
+    .filter(entry => hasDiscoveredSurface(entry.origin) && !coveredPrimaryOrigins.has(entry.origin))
     .slice(0, 8)
   if (!uncoveredEntries.length) {
     return { seededSteps: combinedSeededSteps, uncoveredAddedCount: gbDataflowSteps.length }
@@ -425,4 +560,22 @@ export function buildWave1UncoveredOriginFallbackSteps(
     seededSteps: [...combinedSeededSteps, ...appended],
     uncoveredAddedCount: gbDataflowSteps.length + appended.length,
   }
+}
+
+const AUTHZ_CLASS_ALIAS_RE = /(?:access[-_ ]?control|authz|bola|bfla|idor|abac|rbac|cross[-_ ]?tenant|dual[-_ ]?tenant|tenant[-_ ]?(?:isolation|bleed|leak|bypass)|priv(?:ilege)?[-_ ]?esc(?:alation)?|auth[-_ ]?bypass|unauthorized[-_ ]?(?:read|write|access))/i
+
+/**
+ * Canonicalize vulnerability class/category aliases onto a unified planner dedup family so
+ * authz synonyms (`bola`, `bfla`, `idor`, `broken_access_control`, `dual_tenant_abac`,
+ * `cross_tenant_read`, etc.) never bypass already-confirmed suppression while unrelated classes
+ * (`sqli`, `xss`, `ssrf`, etc.) remain strictly distinct.
+ */
+export function canonicalPlannerDedupeFamily(
+  categoryOrClass: string,
+  baseFamily: (raw: string) => string,
+): string {
+  const raw = (categoryOrClass ?? '').trim()
+  if (!raw) return ''
+  if (AUTHZ_CLASS_ALIAS_RE.test(raw)) return 'authz'
+  return baseFamily(raw)
 }
