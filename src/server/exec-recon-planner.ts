@@ -64,6 +64,7 @@ import {
 import { extractCoverageEvidenceMetadata, normalizeOriginForCoverage } from './coverage-category.ts'
 import { extractSpecDedupeFields, normalizeEndpointTemplate } from './dedupe.ts'
 import { normalizeRouteTemplate } from './route-template.ts'
+import { buildWave1UncoveredOriginFallbackSteps, classifyRepoDirTier, resolveWave1MultiOriginFallback, selectBalancedRepoSourceCandidates } from './exec-recon-multiorigin.ts'
 import { meetsBaseline, type EvidenceReview } from './evidence-checks.ts'
 import {
   CHAIN_CONTINUATION_SKILL_PREFIX,
@@ -1504,31 +1505,24 @@ const HOST_HINT_CONFIG_FILES = new Set([
 async function collectBoundedRepoSourceFiles(
   reposDir: string,
   mountedRepos: readonly string[],
-  maxFiles = 160,
-  signal?: AbortSignal,
-): Promise<{
-  files: SourceFileInput[]
-  compose?: string
-  ingress?: string
-  repoDescriptors: RepoAffinityDescriptor[]
-}> {
+  maxFiles = 160, signal?: AbortSignal,
+): Promise<{ files: SourceFileInput[]; compose?: string; ingress?: string; repoDescriptors: RepoAffinityDescriptor[] }> {
   const files: SourceFileInput[] = []
   let compose: string | undefined
   let ingress: string | undefined
   const repoDescriptors: RepoAffinityDescriptor[] = []
   let opsSinceYield = 0
   const maybeYield = async () => {
-    opsSinceYield += 1
-    if (opsSinceYield >= INVARIANT_WALK_YIELD_EVERY) {
-      opsSinceYield = 0
-      await yieldEventLoopTurn()
-    }
+    if (++opsSinceYield >= INVARIANT_WALK_YIELD_EVERY) { opsSinceYield = 0; await yieldEventLoopTurn() }
   }
-  const perRepoCap = mountedRepos.length > 1
-    ? Math.max(16, Math.ceil(maxFiles / mountedRepos.length))
-    : maxFiles
-  for (const mountedRepo of mountedRepos) {
+  for (let repoIdx = 0; repoIdx < mountedRepos.length; repoIdx += 1) {
+    const mountedRepo = mountedRepos[repoIdx]!
     if (signal?.aborted) break
+    const remainingFiles = Math.max(0, maxFiles - files.length)
+    const remainingRepos = Math.max(1, mountedRepos.length - repoIdx)
+    const perRepoCap = mountedRepos.length > 1
+      ? Math.min(remainingFiles, Math.max(16, Math.ceil(remainingFiles / remainingRepos)))
+      : remainingFiles
     const repoRel = mountedRepo.replace(/^\/repos\//, '').replace(/\/+$/, '')
     const repoRoot = repoRel ? join(reposDir, repoRel) : reposDir
     let rootStat
@@ -1537,10 +1531,14 @@ async function collectBoundedRepoSourceFiles(
     let packageName: string | undefined
     let homepage: string | undefined
     const configHosts = new Set<string>()
-    let repoFilesCount = 0
-    const stack = [repoRoot]
-    while (stack.length > 0 && !signal?.aborted) {
-      const dir = stack.pop()!
+    const runtimeQueue: Array<{ dir: string; depth: number; dirTier: 0 | 1 | 2 }> = [{ dir: repoRoot, depth: 0, dirTier: 0 }]
+    const deprioritizedQueue: Array<{ dir: string; depth: number; dirTier: 0 | 1 | 2 }> = []
+    const candidates: Array<{ full: string; relPath: string; depth: number }> = []
+    const maxDirs = Math.max(256, Math.max(perRepoCap, 16) * 8)
+    let dirsVisited = 0
+    while ((runtimeQueue.length > 0 || deprioritizedQueue.length > 0) && dirsVisited < maxDirs && !signal?.aborted) {
+      const { dir, depth, dirTier } = runtimeQueue.length > 0 ? runtimeQueue.shift()! : deprioritizedQueue.shift()!
+      dirsVisited += 1
       let entries: string[]
       try { entries = await readdir(dir) } catch { continue }
       entries.sort()
@@ -1553,7 +1551,11 @@ async function collectBoundedRepoSourceFiles(
         await maybeYield()
         if (signal?.aborted) break
         if (st.isSymbolicLink()) continue
-        if (st.isDirectory()) { stack.push(full); continue }
+        if (st.isDirectory()) {
+          const nextTier = classifyRepoDirTier(entry, dirTier)
+          ;(nextTier === 2 ? deprioritizedQueue : runtimeQueue).push({ dir: full, depth: depth + 1, dirTier: nextTier })
+          continue
+        }
         if (!st.isFile() || st.size > 128 * 1024) continue
         const lower = entry.toLowerCase()
         if (lower === 'docker-compose.yml' || lower === 'docker-compose.yaml' || lower === 'compose.yml' || lower === 'compose.yaml') {
@@ -1561,7 +1563,7 @@ async function collectBoundedRepoSourceFiles(
             const text = await readFile(full, 'utf8')
             compose = compose ? `${compose}\n${text}` : text
             for (const h of extractHostsFromConfigText(text)) configHosts.add(h)
-          } catch { /* ignore */ }
+          } catch { continue }
           continue
         }
         if (lower === 'ingress.yml' || lower === 'ingress.yaml') {
@@ -1569,7 +1571,7 @@ async function collectBoundedRepoSourceFiles(
             const text = await readFile(full, 'utf8')
             ingress = ingress ? `${ingress}\n${text}` : text
             for (const h of extractHostsFromConfigText(text)) configHosts.add(h)
-          } catch { /* ignore */ }
+          } catch { continue }
           continue
         }
         if (lower === 'package.json' && dir === repoRoot && st.size <= 32 * 1024) {
@@ -1579,7 +1581,7 @@ async function collectBoundedRepoSourceFiles(
             if (typeof pkg.name === 'string' && pkg.name.trim()) packageName = pkg.name.trim()
             if (typeof pkg.homepage === 'string' && pkg.homepage.trim()) homepage = pkg.homepage.trim()
             for (const h of extractHostsFromConfigText(raw)) configHosts.add(h)
-          } catch { /* ignore */ }
+          } catch { continue }
           continue
         }
         if (HOST_HINT_CONFIG_FILES.has(lower) && st.size <= 32 * 1024) {
@@ -1588,20 +1590,18 @@ async function collectBoundedRepoSourceFiles(
             if (lower === 'cname') {
               const cnameHost = extractHostCandidate(raw.split(/\r?\n/, 1)[0] ?? '')
               if (cnameHost) configHosts.add(cnameHost)
-            } else {
-              for (const h of extractHostsFromConfigText(raw)) configHosts.add(h)
-            }
-          } catch { /* ignore */ }
+            } else { for (const h of extractHostsFromConfigText(raw)) configHosts.add(h) }
+          } catch { continue }
           continue
         }
-        if (files.length >= maxFiles || repoFilesCount >= perRepoCap) continue
         if (!INVARIANT_SCAN_EXT.has(extname(lower))) continue
-        try {
-          const relPath = relative(repoRoot, full).split(sep).join('/')
-          files.push({ path: repoRel ? `${repoRel}/${relPath}` : relPath, content: await readFile(full, 'utf8') })
-          repoFilesCount += 1
-        } catch { /* ignore */ }
+        candidates.push({ full, relPath: relative(repoRoot, full).split(sep).join('/'), depth })
       }
+    }
+    for (const cand of selectBalancedRepoSourceCandidates(candidates, perRepoCap)) {
+      if (signal?.aborted || files.length >= maxFiles) break
+      await maybeYield()
+      try { files.push({ path: repoRel ? `${repoRel}/${cand.relPath}` : cand.relPath, content: await readFile(cand.full, 'utf8') }) } catch { continue }
     }
     repoDescriptors.push({
       repo: mountedRepo,
@@ -3249,17 +3249,17 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         }
       }
 
-      // 6. Single-origin fallback ONLY when approvedOrigins.size === 1.
-      //    When approvedOrigins.size > 1 and ZERO confident match exists, mark `unmapped` —
-      //    NEVER silently dump unmapped routes onto `approvedList[0]`!
+      // 6. Fuzzy path-prefix match + multi-origin fallback (preserve GB/monorepo hypotheses;
+      //    only skip explicitly unmapped mounted repos when multiple repos are mounted).
       if (!resolvedOrigins.length) {
-        if (approvedList.length === 1) {
-          pushOrigin(approvedList[0]!)
-        } else {
-          unmappedCount += 1
-          if (unmappedHypIds.length < 16) unmappedHypIds.push(hyp.id)
-          continue
-        }
+        const fb = resolveWave1MultiOriginFallback({
+          hypEntity: hyp.entity, candidateRouteRefs, approvedList, activeOrigins, storedEndpoints,
+          staticOnlySources: STATIC_ONLY_ENDPOINT_SOURCES,
+          explicitlyUnmappedMountedRepo: mountedRepos.length > 1 && fileRepoMapping?.confidence === 'unmapped',
+          normalizeRoute: normalizeDeclaredRouteForOverlap, classifyTier: classifyHostTier,
+        })
+        if (fb.origins.length) { for (const o of fb.origins) pushOrigin(o) }
+        else { unmappedCount += 1; if (unmappedHypIds.length < 16) unmappedHypIds.push(hyp.id); continue }
       }
 
       // 7. Quarantine filter: exclude uniform edge-protected / dead origins so they never burn turns.
@@ -4486,30 +4486,30 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
       if (!this.host.authorize(job)) return
 
-      // Ensure at least initial investigation steps exist when Tier >= 1.
-      // When source repos are mounted, delete black-box-first overrides: generic fallback recon
-      // steps never outrank white-box AST/RBAC/dataflow leads (priority capped <= 65).
-      // Never spawn fallback investigation steps onto quarantined (edge-protected/unreachable) hosts.
+      // Ensure every reachable approved origin with discovered endpoints gets Wave-1 coverage
+      // even when codeAuditStepsCreated > 0 or LLM threat model only seeded a subset of origins.
+      // Fallback steps include reachable sibling origins and stay capped below white-box leads.
       const reachableFinalEntries = finalEntries.filter(entry => activeOrigins.has(entry.origin))
-      if (!seededSteps.length && freshRun.capabilityTier > 0 && reachableFinalEntries.length > 0 && (!sourceMounted || codeAuditStepsCreated === 0)) {
-        const topHosts = reachableFinalEntries.slice(0, Math.min(8, reachableFinalEntries.length))
-        seededSteps = topHosts.map((entry, idx) => {
-          const tier = finalHostTiers[entry.origin] ?? classifyHostTier(entry.origin, entry.surfaceTags)
-          const basePriority = tier === 'low_value_static' ? 30 : Math.max(55, 95 - idx * 6)
-          return {
-            title: `Surface & chain investigation · ${new URL(entry.origin).hostname}`,
-            hypothesis: `Harvest JS/API routes, inspect DNS/TLS/CORS/auth headers, fingerprint stack & CVEs, and verify any candidate vulnerabilities on ${entry.origin} (${entry.surfaceTags.join(', ')}).`,
-            category: entry.surfaceTags.includes('auth') ? 'auth-identity'
-              : entry.surfaceTags.includes('api') ? 'broken-access-control'
-                : entry.surfaceTags.includes('upload') ? 'upload-storage'
-                  : entry.surfaceTags.includes('llm-proxy') ? 'llm-ai-security'
-                    : 'misconfig-exposure',
-            priority: sourceMounted ? Math.min(basePriority, WHITEBOX_BLACKBOX_CAP_PRIORITY - 5) : basePriority,
-            origins: [entry.origin],
-            skills: ['recon-modern-spa', 'cve-runtime-correlation', 'false-positive-elimination'],
-          }
-        })
-      }
+      const preFallbackSteps = this.storage.listChainSteps(freshRun.id, freshRun.goalRevision)
+      const discoveredEndpointOrigins = new Set(
+        this.storage.listEndpoints(freshRun.id, { limit: 250 })
+          .filter(ep => activeOrigins.has(ep.origin))
+          .map(ep => ep.origin),
+      )
+      const fallbackResult = buildWave1UncoveredOriginFallbackSteps({
+        reachableFinalEntries,
+        seededSteps,
+        existingSteps: preFallbackSteps,
+        discoveredEndpointOrigins,
+        finalHostTiers,
+        sourceMounted,
+        codeAuditStepsCreated,
+        capabilityTier: freshRun.capabilityTier,
+        whiteBoxCapPriority: WHITEBOX_BLACKBOX_CAP_PRIORITY,
+        classifyTier: classifyHostTier,
+      })
+      seededSteps = fallbackResult.seededSteps
+      const uncoveredFallbackSlots = fallbackResult.uncoveredAddedCount
 
       const prioritizedInitialSteps = prioritizeMountedSourceInitialSteps(
         seededSteps
@@ -4523,7 +4523,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         if (current.status !== 'running' || current.phase !== 'threat_model') return
 
         const existingSteps = this.storage.listChainSteps(current.id, current.goalRevision)
-        const remainingInitialSlots = Math.max(0, 12 - existingSteps.length)
+        const remainingInitialSlots = Math.max(uncoveredFallbackSlots, 12 - existingSteps.length)
         const budgetedSteps = applyCrownJewelStepBudget(
           prioritizedInitialSteps,
           finalHostTiers,
