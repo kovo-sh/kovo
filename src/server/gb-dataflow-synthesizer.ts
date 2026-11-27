@@ -1,4 +1,5 @@
 import { classifyPersonaPrivilege } from './assignment-brief.ts'
+import { materializeCapabilityConsumerFrontierSteps, type FrontierLlmMode } from './capability-consumer-frontier.ts'
 import { resolveRunPersonas } from './persona-vault.ts'
 import { normalizeRouteTemplate } from './route-template.ts'
 import type { ChainStep, Run, Store } from './store.ts'
@@ -495,7 +496,7 @@ export function synthesizeGreyBoxDataflowStepsFromStore(
 /** Idempotently persist Grey-Box dataflow chain steps into `ChainStep` storage for post-floor / Round-1 top-up. */
 export function materializeGreyBoxDataflowWave1Steps(
   storage: Store, run: Run,
-  options: { activeOrigins: ReadonlySet<string>; sourceMounted: boolean; maxSteps?: number; routeStep?: (step: { title: string; hypothesis: string; category: string; skills: string[] }) => ChainStep['specialistProfile'] },
+  options: { activeOrigins: ReadonlySet<string>; sourceMounted: boolean; maxSteps?: number; llmMode?: FrontierLlmMode; routeStep?: (step: { title: string; hypothesis: string; category: string; skills: string[] }) => ChainStep['specialistProfile'] },
 ): ChainStep[] {
   if (options.sourceMounted || run.capabilityTier <= 0) return []
   const maxSteps = Math.max(0, Math.min(12, options.maxSteps ?? DEFAULT_MAX_STEPS))
@@ -504,31 +505,42 @@ export function materializeGreyBoxDataflowWave1Steps(
   const existingLiveCount = existingDataflow.filter(s => s.hypothesis.includes('[dataflow_source=live]')).length
   const remainingLive = Math.max(0, maxSteps - existingLiveCount)
   const remainingSpec = Math.max(0, maxSteps - existingDataflow.length)
-  if (remainingLive <= 0 && remainingSpec <= 0) return []
-  const drafts = synthesizeGreyBoxDataflowStepsFromStore(storage, run, { activeOrigins: options.activeOrigins, sourceMounted: false, maxSteps })
-  const existingTitles = new Set(existingSteps.map(s => s.title.trim().toLowerCase()))
-  const existingLiveTitles = new Set(existingDataflow.filter(s => s.hypothesis.includes('[dataflow_source=live]')).map(s => s.title.trim().toLowerCase()))
   const created: ChainStep[] = []
-  let liveAdded = 0
-  let specAdded = 0
-  for (const draft of drafts) {
-    const isLive = Boolean(draft.fromLive)
-    if (isLive ? liveAdded >= remainingLive : specAdded >= remainingSpec) continue
-    const normTitle = draft.title.trim().toLowerCase()
-    const liveTitle = `${draft.title.slice(0, 173)} [live]`
-    const normLiveTitle = liveTitle.trim().toLowerCase()
-    if (isLive) {
-      if (existingLiveTitles.has(normTitle) || existingLiveTitles.has(normLiveTitle)) continue
-    } else if (existingTitles.has(normTitle)) continue
-    const finalTitle = isLive && existingTitles.has(normTitle) ? liveTitle : draft.title
-    const validOrigins = draft.origins.filter(o => options.activeOrigins.has(o))
-    const assetIds = run.candidates.filter(c => validOrigins.includes(c.origin) && run.approved.includes(c.id)).map(c => c.id)
-    if (!validOrigins.length || !assetIds.length) continue
-    existingTitles.add(finalTitle.trim().toLowerCase())
-    if (isLive) { existingLiveTitles.add(normTitle); existingLiveTitles.add(finalTitle.trim().toLowerCase()); liveAdded += 1 }
-    else specAdded += 1
-    const step = storage.addChainStep(run, { title: finalTitle, hypothesis: draft.hypothesis, category: draft.category, priority: draft.priority, targetAssetIds: assetIds, skills: draft.skills, sourceOrigins: validOrigins, ...(options.routeStep ? { specialistProfile: options.routeStep({ ...draft, title: finalTitle }) } : {}) })
-    created.push(storage.updateChainStep(step.id, { status: 'ready' }))
+  if (remainingLive > 0 || remainingSpec > 0) {
+    const drafts = synthesizeGreyBoxDataflowStepsFromStore(storage, run, { activeOrigins: options.activeOrigins, sourceMounted: false, maxSteps })
+    const existingTitles = new Set(existingSteps.map(s => s.title.trim().toLowerCase()))
+    const existingLiveTitles = new Set(existingDataflow.filter(s => s.hypothesis.includes('[dataflow_source=live]')).map(s => s.title.trim().toLowerCase()))
+    let liveAdded = 0
+    let specAdded = 0
+    for (const draft of drafts) {
+      const isLive = Boolean(draft.fromLive)
+      if (isLive ? liveAdded >= remainingLive : specAdded >= remainingSpec) continue
+      const normTitle = draft.title.trim().toLowerCase()
+      const liveTitle = `${draft.title.slice(0, 173)} [live]`
+      const normLiveTitle = liveTitle.trim().toLowerCase()
+      if (isLive) {
+        if (existingLiveTitles.has(normTitle) || existingLiveTitles.has(normLiveTitle)) continue
+      } else if (existingTitles.has(normTitle)) continue
+      const finalTitle = isLive && existingTitles.has(normTitle) ? liveTitle : draft.title
+      const validOrigins = draft.origins.filter(o => options.activeOrigins.has(o))
+      const assetIds = run.candidates.filter(c => validOrigins.includes(c.origin) && run.approved.includes(c.id)).map(c => c.id)
+      if (!validOrigins.length || !assetIds.length) continue
+      existingTitles.add(finalTitle.trim().toLowerCase())
+      if (isLive) { existingLiveTitles.add(normTitle); existingLiveTitles.add(finalTitle.trim().toLowerCase()); liveAdded += 1 }
+      else specAdded += 1
+      const step = storage.addChainStep(run, { title: finalTitle, hypothesis: draft.hypothesis, category: draft.category, priority: draft.priority, targetAssetIds: assetIds, skills: draft.skills, sourceOrigins: validOrigins, ...(options.routeStep ? { specialistProfile: options.routeStep({ ...draft, title: finalTitle }) } : {}) })
+      created.push(storage.updateChainStep(step.id, { status: 'ready' }))
+    }
+  }
+  if (options.llmMode !== 'deterministic-no-llm') {
+    const frontierSteps = materializeCapabilityConsumerFrontierSteps(storage, run, {
+      activeOrigins: options.activeOrigins,
+      llmMode: options.llmMode,
+      maxSteps: Math.min(6, maxSteps),
+      existingSteps: [...existingSteps, ...created],
+      routeStep: options.routeStep,
+    })
+    created.push(...frontierSteps)
   }
   return created
 }

@@ -47,20 +47,8 @@ import {
   type Grant,
   type PublicObservation,
 } from './broker.ts'
-import {
-  CapabilityLedger,
-  DERIVED_CAPABILITY_HANDLE_RE,
-  computeArtifactDigest,
-  finalizeHopCheckpointBrief,
-  formatDerivedCapabilityHandle,
-  sanitizeCheckpointHandleRef,
-  sanitizeCheckpointText,
-  type AddCapabilityInput,
-  type CapabilityKind,
-  type CapabilitySurface,
-  type HopCheckpointBrief,
-  type HopWorkflowNotebook,
-} from './capability-ledger.ts'
+import { CapabilityLedger, DERIVED_CAPABILITY_HANDLE_RE, computeArtifactDigest, finalizeHopCheckpointBrief, formatDerivedCapabilityHandle, sanitizeCheckpointHandleRef, sanitizeCheckpointText, type AddCapabilityInput, type CapabilityKind, type CapabilitySurface, type HopCheckpointBrief, type HopWorkflowNotebook } from './capability-ledger.ts'
+import { hasAgenticSealedCapabilities, materializeCapabilityConsumerFrontierSteps, type FrontierLlmMode } from './capability-consumer-frontier.ts'
 import { extractCoverageEvidenceMetadata, normalizeOriginForCoverage } from './coverage-category.ts'
 import { extractSpecDedupeFields, normalizeEndpointTemplate } from './dedupe.ts'
 import { normalizeRouteTemplate } from './route-template.ts'
@@ -6627,6 +6615,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       apiDependencies?: readonly CoordinatorApiDependency[]
       sourceMounted?: boolean
       hops?: readonly ChainHop[]
+      llmMode?: FrontierLlmMode
     },
   ): number {
     const existing = snapshot?.existingSteps ?? this.storage.listChainSteps(run.id, run.goalRevision)
@@ -6649,35 +6638,46 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       frontierScheduler: controller.scheduler,
       waveNo: roundNo,
     })
-    if (!hypotheses.length) return 0
-    const existingFacts = snapshot?.existingFacts ?? this.pageAll((offset, limit) =>
-      this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
-    const hopFactById = this.persistChainHopFacts(run, hops, existingFacts)
-    const liveFactIds = new Set<string>([...factIds, ...hopFactById.values()])
-    // Attach persisted chain_hop fact IDs onto parentEvidenceIds so follow-on briefs receive them
-    // while always preserving the originating fact IDs.
-    const enrichedHypotheses = hypotheses.map(hypothesis => {
-      const hopFactIds = (hypothesis.chainHops ?? [])
-        .map(hop => hopFactById.get(hop.hopId))
-        .filter((id): id is string => Boolean(id))
-      return hopFactIds.length
-        ? { ...hypothesis, parentEvidenceIds: [...new Set([...hypothesis.parentEvidenceIds, ...hopFactIds])] }
-        : hypothesis
-    })
-    const plan = coordinator.dispatchInvestigations(chainHypothesisDispatchSteps(enrichedHypotheses), { maxSteps: remaining })
-    const counts = this.persistDispatchPlan(run, plan, liveFactIds)
-    if (funnel) addFunnelCounts(funnel, counts)
-    this.storage.event(run.id, 'chain.round', `Chain round dispatched ${counts.enqueued} hypothesis(es) with ${hops.length} typed hop artifact(s).`, {
-      hypotheses: hypotheses.length, dispatched: counts.enqueued, rejected: plan.rejected.length,
-      crossOrigin: hypotheses.filter(hypothesis => hypothesis.scope === 'cross_origin').length,
-      primitives: [...new Set(hypotheses.flatMap(hypothesis => hypothesis.primitiveKinds))],
-      chainHopCount: hops.length,
-      hopArtifactKinds: [...new Set(hops.map(hop => hop.artifactKind))],
-      maxChainHops: hypotheses.reduce((max, h) => Math.max(max, h.hops), 0),
-    })
-    return counts.enqueued
+    let chainEnqueued = 0
+    if (hypotheses.length) {
+      const existingFacts = snapshot?.existingFacts ?? this.pageAll((offset, limit) =>
+        this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
+      const hopFactById = this.persistChainHopFacts(run, hops, existingFacts)
+      const liveFactIds = new Set<string>([...factIds, ...hopFactById.values()])
+      const enrichedHypotheses = hypotheses.map(hypothesis => {
+        const hopFactIds = (hypothesis.chainHops ?? [])
+          .map(hop => hopFactById.get(hop.hopId))
+          .filter((id): id is string => Boolean(id))
+        return hopFactIds.length
+          ? { ...hypothesis, parentEvidenceIds: [...new Set([...hypothesis.parentEvidenceIds, ...hopFactIds])] }
+          : hypothesis
+      })
+      const plan = coordinator.dispatchInvestigations(chainHypothesisDispatchSteps(enrichedHypotheses), { maxSteps: remaining })
+      const counts = this.persistDispatchPlan(run, plan, liveFactIds)
+      if (funnel) addFunnelCounts(funnel, counts)
+      chainEnqueued = counts.enqueued
+      this.storage.event(run.id, 'chain.round', `Chain round dispatched ${counts.enqueued} hypothesis(es) with ${hops.length} typed hop artifact(s).`, {
+        hypotheses: hypotheses.length, dispatched: counts.enqueued, rejected: plan.rejected.length,
+        crossOrigin: hypotheses.filter(hypothesis => hypothesis.scope === 'cross_origin').length,
+        primitives: [...new Set(hypotheses.flatMap(hypothesis => hypothesis.primitiveKinds))],
+        chainHopCount: hops.length, hopArtifactKinds: [...new Set(hops.map(hop => hop.artifactKind))],
+        maxChainHops: hypotheses.reduce((max, h) => Math.max(max, h.hops), 0),
+      })
+    }
+    const frontierLimit = Math.min(6, Math.max(0, remaining - chainEnqueued))
+    const frontierCreated = frontierLimit > 0 && snapshot?.llmMode !== 'deterministic-no-llm' && hasAgenticSealedCapabilities(ledger)
+      ? materializeCapabilityConsumerFrontierSteps(this.storage, run, {
+        activeOrigins: this.activeApprovedOrigins(run, this.host.approvedOriginsSet(run)),
+        llmMode: snapshot?.llmMode, maxSteps: frontierLimit, existingSteps: chainEnqueued > 0 ? this.storage.listChainSteps(run.id, run.goalRevision) : existing,
+        existingFacts: snapshot?.existingFacts, confirmedRefs: this.alreadyConfirmedRefs(run, 100), routeStep: routeStepToSpecialist,
+      }) : []
+    for (const step of frontierCreated) {
+      const m = /->\s*consumer\s+(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(https?:\/\/[^\s/]+)(\/[^\s[\]]+)/i.exec(step.hypothesis)
+      if (m?.[1] && m?.[2] && m?.[3]) this.registerStepTargets(run.id, step.id, [{ origin: m[2], method: m[1].toUpperCase(), route: m[3], vulnClass: step.category }])
+    }
+    if (frontierCreated.length && funnel) { funnel.planned += frontierCreated.length; funnel.enqueued += frontierCreated.length }
+    return chainEnqueued + frontierCreated.length
   }
-
 
   async runChainPlanner(run: Run, profiles: readonly ResolvedModelProfile[], task: CoordinatorTask) {
     const fresh = this.storage.run(run.id)
@@ -6785,14 +6785,14 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     let chainSteps = 0
     const greyBoxApiDeps = !sourceMounted ? getApiDeps() : []
     const extractedHops = coordinator.extractChainHops(roundNo)
-    if (roundNo >= 2 || extractedHops.length >= 2 || (!sourceMounted && (greyBoxApiDeps.length >= 1 || approvedOrigins.size >= 2))) {
+    if (roundNo >= 2 || extractedHops.length >= 2 || (!sourceMounted && (greyBoxApiDeps.length >= 1 || approvedOrigins.size >= 2)) || (profiles.length > 0 && hasAgenticSealedCapabilities(this.storage.capabilityLedger(updated.id)))) {
       try {
         chainSteps = this.dispatchChainRound(updated, coordinator, dynamicStepBudget, factIds, funnel, {
           existingSteps: stepsBeforeChain,
           existingFacts: initialFacts,
           apiDependencies: !sourceMounted ? greyBoxApiDeps : getApiDeps(),
-          sourceMounted,
-          hops: extractedHops,
+          sourceMounted, hops: extractedHops,
+          llmMode: profiles.length > 0 ? 'agentic' : 'deterministic-no-llm',
         })
         if (chainSteps > 0) {
           invalidateSteps()
