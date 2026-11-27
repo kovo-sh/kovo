@@ -502,6 +502,7 @@ export interface ParsedCapabilityArg {
 }
 
 const INJECT_CAPABILITY_TARGETS = new Set<InjectCapabilityTarget>(['bearer', 'header', 'cookie', 'url'])
+const CAPABILITY_OBJECT_HANDLE_KEYS = ['handle', 'derivedHandle', 'cap_id', 'capabilityHandle', 'capability', 'sealedHandle', 'capId', 'capabilityId'] as const
 
 export function parseCapabilityArg(args: Record<string, unknown>): ParsedCapabilityArg | null {
   const raw = args.capability
@@ -515,9 +516,10 @@ export function parseCapabilityArg(args: Record<string, unknown>): ParsedCapabil
     handle = raw.trim()
   } else {
     const obj = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : null
-    const rawHandle = obj ? (obj.handle ?? obj.derivedHandle ?? obj.cap_id) : undefined
-    if (!obj || typeof rawHandle !== 'string') throw new Error('capability must be a handle string or { handle, target?, headerName?, cookieName?, queryParam? }.')
-    handle = rawHandle.trim()
+    const aliasVals = obj ? CAPABILITY_OBJECT_HANDLE_KEYS.map(k => obj[k]).filter(v => v !== undefined && v !== null) : []
+    const trimmedHandles = aliasVals.every((v): v is string => typeof v === 'string' && v.trim().length > 0) ? [...new Set(aliasVals.map(v => v.trim()))] : []
+    if (!obj || aliasVals.length === 0 || trimmedHandles.length !== 1) throw new Error('capability must be a handle string or { handle, target?, headerName?, cookieName?, queryParam? }.')
+    handle = trimmedHandles[0]!
     targetRaw = obj.target ?? targetRaw
     headerNameRaw = obj.headerName ?? obj.header_name ?? headerNameRaw
     cookieNameRaw = obj.cookieName ?? obj.cookie_name ?? cookieNameRaw

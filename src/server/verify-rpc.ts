@@ -1380,7 +1380,7 @@ export class VerifyRpcServer {
         const { authPlacement, stampedReqMeta } = this.stampPlacement(prep.applied, prep.requestMeta, result.wireCredentialProvenance)
         const batchedReqMeta = { ...stampedReqMeta, raceBatchId } as typeof stampedReqMeta
         const record = this.transcript.record({
-          op: mode.mode === 'h2-single-packet' ? 'http2' : 'http',
+          op: 'race', raceTransport: mode.mode,
           startedAt: started, durationMs: result.durationMs, request: batchedReqMeta, body: result.body,
           ...(prep.applied.brokerRequest.body !== undefined ? { rawRequestBody: this.scrubKernel(prep.applied.brokerRequest.body) } : {}),
           response: { status: result.status, headers: this.kernelSanitizer.sanitizeHttpHeaders(result.respHeaders, 'storage_log'), bodyBytes: result.bodyBytes, bodySha256: result.bodySha256, mediaType: result.mediaType },
@@ -2126,8 +2126,8 @@ export class VerifyRpcServer {
         ?? record.request?.credentialPlacement
         ?? (wireProv ? buildHostAuthPlacement({ wireProvenance: wireProv, requestHeaders: kernelReqHeaders }) : undefined)
       const entry: HostTranscriptEntry = {
-        exchangeId: record.exchangeId,
-        durationMs: record.durationMs,
+        exchangeId: record.exchangeId, seq: record.seq, op: record.op, ...(record.raceTransport ? { raceTransport: record.raceTransport } : {}),
+        startedAt: record.startedAt, endedAt: record.startedAt + Math.max(0, record.durationMs), durationMs: record.durationMs,
         ...(prov?.carrierText ? { carrierText: prov.carrierText } : {}),
         ...(prov?.evidenceRole ? { evidenceRole: prov.evidenceRole } : (record.op === 'crypto' || record.op === 'capability' ? { evidenceRole: `host_${record.op}_op` } : {})),
         ...(explicitPlacement ? { credentialPlacement: explicitPlacement } : {}),
