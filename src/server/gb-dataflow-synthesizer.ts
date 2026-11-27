@@ -1,3 +1,4 @@
+import { classifyPersonaPrivilege } from './assignment-brief.ts'
 import { resolveRunPersonas } from './persona-vault.ts'
 import { normalizeRouteTemplate } from './route-template.ts'
 import type { ChainStep, Run, Store } from './store.ts'
@@ -18,8 +19,8 @@ export interface GbDataflowSynthesizeInput {
   personas?: readonly GbDataflowPersonaInput[]
   sourceMounted?: boolean; mountedRepos?: readonly string[]; maxSteps?: number
 }
-export interface GbDataflowStepDraft { title: string; hypothesis: string; category: string; priority: number; origins: string[]; skills: string[] }
-export interface GbDataflowChainSummary { signature: string; hops: Array<{ origin: string; method: string; pathTemplate: string }>; origins: string[]; fields: string[]; kinds: ProducerTokenKind[]; score: number; hasPersonaAsymmetry: boolean; has202: boolean; step: GbDataflowStepDraft }
+export interface GbDataflowStepDraft { title: string; hypothesis: string; category: string; priority: number; origins: string[]; skills: string[]; fromLive?: boolean }
+export interface GbDataflowChainSummary { signature: string; hops: Array<{ origin: string; method: string; pathTemplate: string }>; origins: string[]; fields: string[]; kinds: ProducerTokenKind[]; score: number; fromLive: boolean; hasPersonaAsymmetry: boolean; has202: boolean; step: GbDataflowStepDraft }
 export interface GbDataflowSynthesizeResult { steps: GbDataflowStepDraft[]; chains: GbDataflowChainSummary[]; nodeCount: number; edgeCount: number }
 
 interface ProducedCap { field: string; kind: ProducerTokenKind; noun: string; fromLive: boolean; targetOrigin?: string; targetNormPath?: string }
@@ -323,24 +324,40 @@ function buildEdges(nodes: readonly EndpointNode[], byId: ReadonlyMap<string, En
   return outgoing
 }
 
+function orderPersonasLowPrivFirst(
+  observed: readonly string[],
+  personas: readonly GbDataflowPersonaInput[],
+): { ordered: string[]; basePersona?: string } {
+  const roleByHandle = new Map<string, string | null | undefined>(personas.map(p => [p.handle, p.roleLabel]))
+  const handles = [...new Set([...observed.filter(p => p && p !== 'anonymous'), ...personas.map(p => p.handle).filter(Boolean)])]
+  handles.sort((a, b) =>
+    classifyPersonaPrivilege(a, roleByHandle.get(a)).rank - classifyPersonaPrivilege(b, roleByHandle.get(b)).rank
+    || a.localeCompare(b),
+  )
+  const basePersona = handles.find(h => !classifyPersonaPrivilege(h, roleByHandle.get(h)).elevated)
+  return { ordered: handles.slice(0, 5), ...(basePersona ? { basePersona } : {}) }
+}
+
 function buildChainDraft(pNodes: readonly EndpointNode[], pEdges: readonly DataflowEdge[], score: number, idx: number, personas: readonly GbDataflowPersonaInput[]): GbDataflowChainSummary {
   const origins = [...new Set(pNodes.map(n => n.origin))]; const hosts = [...new Set(pNodes.map(n => n.host))]
   const fields = [...new Set(pEdges.map(e => e.field))]; const kinds = [...new Set(pEdges.map(e => e.kind))]
+  const fromLive = pEdges.some(e => e.fromLive)
   const hasPersonaAsymmetry = pNodes.some(n => n.personaDiff.hasAsymmetry); const has202 = pNodes.some(n => n.personaDiff.has202); const crossOrigin = origins.length >= 2
   const title = `GB dataflow chain (${pNodes.length}-hop) · ${(hosts.length >= 2 ? hosts.slice(0, 3).join(' -> ') : hosts[0]!)} (${fields.slice(0, 2).join(' -> ')})`.slice(0, 180)
   const hopTrace = pNodes.map((n, i) => `Hop ${i + 1}: ${n.method} ${n.origin}${n.normPath}${pEdges[i] ? ` (yields ${pEdges[i]!.field} [${pEdges[i]!.kind}])` : ''}`).join(' -> ')
   const diffs = pNodes.map(n => n.personaDiff.summary).filter(Boolean)
-  const tags = [`[chain_hops=${pNodes.length}]`, '[lane=chain]', `[api_dependency:${fields.join(',')}]`, ...(crossOrigin ? [`[cross_origin_edge:${origins[0]}->${origins[origins.length - 1]}]`] : []), ...(diffs.length ? [`[persona_diff:${diffs[0]}]`] : [])]
-  const obsPersonas = [...new Set([...pNodes.flatMap(n => [...n.personaDiff.allowed, ...n.personaDiff.denied]).filter(p => p !== 'anonymous'), ...personas.map(p => p.handle)])].slice(0, 5)
-  const hypothesis = `${tags.join(' ')} Producer->consumer multi-hop dataflow chain: ${hopTrace}.${diffs.length ? ` Observed differentials: ${diffs.slice(0, 2).join('; ')}.` : ''}${obsPersonas.length ? ` Relevant personas: ${obsPersonas.join(', ')}.` : ''} Verify control vs variant boundaries end-to-end with kovo_verify, sealing intermediate tokens/handles with capability.seal.`.slice(0, 1400)
+  const tags = [`[chain_hops=${pNodes.length}]`, '[lane=chain]', `[dataflow_source=${fromLive ? 'live' : 'spec'}]`, `[api_dependency:${fields.join(',')}]`, ...(crossOrigin ? [`[cross_origin_edge:${origins[0]}->${origins[origins.length - 1]}]`] : []), ...(diffs.length ? [`[persona_diff:${diffs[0]}]`] : [])]
+  const { ordered: obsPersonas, basePersona } = orderPersonasLowPrivFirst(pNodes.flatMap(n => [...n.personaDiff.allowed, ...n.personaDiff.denied]), personas)
+  const hypothesis = `${tags.join(' ')} Producer->consumer multi-hop dataflow chain: ${hopTrace}.${diffs.length ? ` Observed differentials: ${diffs.slice(0, 2).join('; ')}.` : ''}${basePersona ? ` Base persona: ${basePersona}.` : ''}${obsPersonas.length ? ` Relevant personas: ${obsPersonas.join(', ')}.` : ''} Verify control vs variant boundaries end-to-end with kovo_verify, sealing intermediate tokens/handles with capability.seal.`.slice(0, 1400)
   const category = kinds.includes('signed_url_or_location') && pNodes[pNodes.length - 1]!.acceptsSignedUrl ? 'upload-storage'
     : kinds.includes('credential_token') || kinds.includes('invite_or_grant') ? 'auth-identity' : 'broken-access-control'
   const skills = [...new Set(['multihop-chains', 'chain-primitives', 'api-dependency', 'dataflow-graph', ...(crossOrigin ? ['cross-origin-chain'] : []), ...(hasPersonaAsymmetry ? ['authz-differential'] : [])])]
+  const priority = fromLive ? Math.max(88, Math.min(98, 98 - idx)) : Math.max(76, Math.min(84, 84 - idx))
   return {
     signature: pNodes.map(n => `${n.host}:${n.method}:${n.normPath}`).join('>'),
     hops: pNodes.map(n => ({ origin: n.origin, method: n.method, pathTemplate: n.normPath })),
-    origins, fields, kinds, score, hasPersonaAsymmetry, has202,
-    step: { title, hypothesis, category, priority: Math.max(88, Math.min(98, 98 - idx)), origins, skills },
+    origins, fields, kinds, score, fromLive, hasPersonaAsymmetry, has202,
+    step: { title, hypothesis, category, priority, origins, skills, fromLive },
   }
 }
 
@@ -356,7 +373,7 @@ export function synthesizeGreyBoxDataflowGraph(input: GbDataflowSynthesizeInput)
   const edgeCount = [...outgoing.values()].reduce((acc, l) => acc + l.length, 0)
   if (edgeCount === 0) return { steps: [], chains: [], nodeCount: nodes.length, edgeCount: 0 }
 
-  const candidates: Array<{ nodes: EndpointNode[]; edges: DataflowEdge[]; score: number }> = []
+  const candidates: Array<{ nodes: EndpointNode[]; edges: DataflowEdge[]; score: number; fromLive: boolean }> = []
   const scorePath = (pNodes: readonly EndpointNode[], pEdges: readonly DataflowEdge[]): number => {
     const origins = new Set(pNodes.map(n => n.origin))
     const roles = new Set(pNodes.map(n => n.role).filter(r => r !== 'general'))
@@ -370,7 +387,7 @@ export function synthesizeGreyBoxDataflowGraph(input: GbDataflowSynthesizeInput)
   }
   const dfs = (pNodes: EndpointNode[], pEdges: DataflowEdge[], visited: Set<string>) => {
     if (candidates.length >= 400) return
-    if (pNodes.length >= 2) candidates.push({ nodes: [...pNodes], edges: [...pEdges], score: scorePath(pNodes, pEdges) })
+    if (pNodes.length >= 2) candidates.push({ nodes: [...pNodes], edges: [...pEdges], score: scorePath(pNodes, pEdges), fromLive: pEdges.some(e => e.fromLive) })
     if (pNodes.length >= 4) return
     for (const edge of outgoing.get(pNodes[pNodes.length - 1]!.key) ?? []) {
       if (visited.has(edge.to.key) || pNodes.some(n => n.origin === edge.to.origin && n.normPath === edge.to.normPath)) continue
@@ -382,7 +399,7 @@ export function synthesizeGreyBoxDataflowGraph(input: GbDataflowSynthesizeInput)
   for (const start of nodes.filter(n => (outgoing.get(n.key)?.length ?? 0) > 0).sort((a, b) => (outgoing.get(b.key)![0]!.score - outgoing.get(a.key)![0]!.score) || a.key.localeCompare(b.key)).slice(0, 60)) {
     dfs([start], [], new Set([start.key]))
   }
-  candidates.sort((a, b) => b.score - a.score || b.nodes.length - a.nodes.length || a.nodes.map(n => n.key).join('>').localeCompare(b.nodes.map(n => n.key).join('>')))
+  candidates.sort((a, b) => (Number(b.fromLive) - Number(a.fromLive)) || (b.score - a.score) || (b.nodes.length - a.nodes.length) || a.nodes.map(n => n.key).join('>').localeCompare(b.nodes.map(n => n.key).join('>')))
   const selected: typeof candidates = []; const seenTerminal = new Set<string>()
   for (const cand of candidates) {
     if (selected.length >= maxSteps) break
@@ -409,10 +426,13 @@ export function synthesizeGreyBoxDataflowStepsFromStore(
   const apiDependencies = storage.listApiDependencies(run.id).slice(0, 250)
   let brokerExchanges: GbDataflowExchangeInput[] = []
   try {
-    const rows = storage.client.prepare(`SELECT origin, final_origin AS finalOrigin, method, path_and_query AS pathAndQuery, status, persona_handle AS personaHandle, resp_headers AS respHeaders, body_preview AS bodyPreview FROM broker_exchanges WHERE run_id = ? ORDER BY created_at DESC LIMIT 250`).all(run.id) as unknown as GbDataflowExchangeInput[]
-    brokerExchanges = rows.filter(r => approvedOrigins.has(r.origin))
+    const okRows = storage.client.prepare(`SELECT origin, final_origin AS finalOrigin, method, path_and_query AS pathAndQuery, status, persona_handle AS personaHandle, resp_headers AS respHeaders, body_preview AS bodyPreview FROM broker_exchanges WHERE run_id = ? AND status BETWEEN 200 AND 399 ORDER BY created_at DESC LIMIT 250`).all(run.id) as unknown as GbDataflowExchangeInput[]
+    const deniedRows = storage.client.prepare(`SELECT origin, final_origin AS finalOrigin, method, path_and_query AS pathAndQuery, status, persona_handle AS personaHandle, resp_headers AS respHeaders, body_preview AS bodyPreview FROM broker_exchanges WHERE run_id = ? AND status IN (401, 403) ORDER BY created_at DESC LIMIT 100`).all(run.id) as unknown as GbDataflowExchangeInput[]
+    brokerExchanges = [...okRows, ...deniedRows].filter(r => approvedOrigins.has(r.origin))
   } catch { /* best-effort runtime scan */ }
-  const personas = [...resolveRunPersonas(storage, run.projectId, run.approvedPersonaIds).values()].map(p => ({ handle: p.handle, roleLabel: p.roleLabel }))
+  const personas = [...resolveRunPersonas(storage, run.projectId, run.approvedPersonaIds).values()]
+    .map(p => ({ handle: p.handle, roleLabel: p.roleLabel }))
+    .sort((a, b) => classifyPersonaPrivilege(a.handle, a.roleLabel).rank - classifyPersonaPrivilege(b.handle, b.roleLabel).rank || a.handle.localeCompare(b.handle))
   return synthesizeGreyBoxDataflowGraph({ approvedOrigins, endpoints, endpointParams, apiDependencies, brokerExchanges, personas, sourceMounted: options.sourceMounted, mountedRepos: options.mountedRepos, maxSteps: options.maxSteps ?? DEFAULT_MAX_STEPS }).steps
 }
 
@@ -424,19 +444,34 @@ export function materializeGreyBoxDataflowWave1Steps(
   if (options.sourceMounted || run.capabilityTier <= 0) return []
   const maxSteps = Math.max(0, Math.min(12, options.maxSteps ?? DEFAULT_MAX_STEPS))
   const existingSteps = storage.listChainSteps(run.id, run.goalRevision)
-  const remaining = Math.max(0, maxSteps - existingSteps.filter(s => s.title.startsWith('GB dataflow chain (')).length)
-  if (remaining <= 0) return []
+  const existingDataflow = existingSteps.filter(s => s.title.startsWith('GB dataflow chain ('))
+  const existingLiveCount = existingDataflow.filter(s => s.hypothesis.includes('[dataflow_source=live]')).length
+  const remainingLive = Math.max(0, maxSteps - existingLiveCount)
+  const remainingSpec = Math.max(0, maxSteps - existingDataflow.length)
+  if (remainingLive <= 0 && remainingSpec <= 0) return []
   const drafts = synthesizeGreyBoxDataflowStepsFromStore(storage, run, { activeOrigins: options.activeOrigins, sourceMounted: false, maxSteps })
   const existingTitles = new Set(existingSteps.map(s => s.title.trim().toLowerCase()))
+  const existingLiveTitles = new Set(existingDataflow.filter(s => s.hypothesis.includes('[dataflow_source=live]')).map(s => s.title.trim().toLowerCase()))
   const created: ChainStep[] = []
+  let liveAdded = 0
+  let specAdded = 0
   for (const draft of drafts) {
-    if (created.length >= remaining) break
-    if (existingTitles.has(draft.title.trim().toLowerCase())) continue
+    const isLive = Boolean(draft.fromLive)
+    if (isLive ? liveAdded >= remainingLive : specAdded >= remainingSpec) continue
+    const normTitle = draft.title.trim().toLowerCase()
+    const liveTitle = `${draft.title.slice(0, 173)} [live]`
+    const normLiveTitle = liveTitle.trim().toLowerCase()
+    if (isLive) {
+      if (existingLiveTitles.has(normTitle) || existingLiveTitles.has(normLiveTitle)) continue
+    } else if (existingTitles.has(normTitle)) continue
+    const finalTitle = isLive && existingTitles.has(normTitle) ? liveTitle : draft.title
     const validOrigins = draft.origins.filter(o => options.activeOrigins.has(o))
     const assetIds = run.candidates.filter(c => validOrigins.includes(c.origin) && run.approved.includes(c.id)).map(c => c.id)
     if (!validOrigins.length || !assetIds.length) continue
-    existingTitles.add(draft.title.trim().toLowerCase())
-    const step = storage.addChainStep(run, { title: draft.title, hypothesis: draft.hypothesis, category: draft.category, priority: draft.priority, targetAssetIds: assetIds, skills: draft.skills, sourceOrigins: validOrigins, ...(options.routeStep ? { specialistProfile: options.routeStep(draft) } : {}) })
+    existingTitles.add(finalTitle.trim().toLowerCase())
+    if (isLive) { existingLiveTitles.add(normTitle); existingLiveTitles.add(finalTitle.trim().toLowerCase()); liveAdded += 1 }
+    else specAdded += 1
+    const step = storage.addChainStep(run, { title: finalTitle, hypothesis: draft.hypothesis, category: draft.category, priority: draft.priority, targetAssetIds: assetIds, skills: draft.skills, sourceOrigins: validOrigins, ...(options.routeStep ? { specialistProfile: options.routeStep({ ...draft, title: finalTitle }) } : {}) })
     created.push(storage.updateChainStep(step.id, { status: 'ready' }))
   }
   return created

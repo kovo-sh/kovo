@@ -906,11 +906,32 @@ export function buildMultiHopProofContract(compact = false, input?: AssignmentBr
   }
 }
 
+export type PersonaPrivilegeTier = 'low' | 'standard' | 'elevated'
+
+const ELEVATED_PERSONA_TOKEN_RE = /(?:^|[^a-z0-9])(?:owner|admin|superadmin|superuser|root|bot|service|svc|system|internal|moderator|mod|staff|operator|dual)(?:[^a-z0-9]|$)/i
+const HIGH_ADMIN_PERSONA_TOKEN_RE = /(?:^|[^a-z0-9])(?:owner|admin|superadmin|superuser|root)(?:[^a-z0-9]|$)/i
+const LOW_PRIV_PERSONA_TOKEN_RE = /(?:^|[^a-z0-9])(?:viewer|guest|readonly|read_only|limited|basic|member|user|standard|customer|employee|demoted|revoked|suspended|external|unprivileged|analyst|contributor|reader)(?:[^a-z0-9]|$)/i
+
+/** Generic, zero-app-literal privilege tier classification for persona ordering and base-actor selection. */
+export function classifyPersonaPrivilege(
+  handle: string,
+  roleLabel?: string | null,
+): { tier: PersonaPrivilegeTier; elevated: boolean; rank: number } {
+  const combined = `${handle ?? ''} ${roleLabel ?? ''}`
+  if (ELEVATED_PERSONA_TOKEN_RE.test(combined)) {
+    return { tier: 'elevated', elevated: true, rank: HIGH_ADMIN_PERSONA_TOKEN_RE.test(combined) ? 3 : 2 }
+  }
+  if (LOW_PRIV_PERSONA_TOKEN_RE.test(combined)) {
+    return { tier: 'low', elevated: false, rank: 0 }
+  }
+  return { tier: 'standard', elevated: false, rank: 1 }
+}
+
 interface WorkingState {
   publicOrigins: string[]
   routes: AssignmentBriefRoute[]
   linked: AssignmentBriefRoute[]
-  personas: Array<{ handle: string; role?: string; harvestedIds: string[] }>
+  personas: Array<{ handle: string; role?: string; roleTier: PersonaPrivilegeTier; elevated: boolean; harvestedIds: string[] }>
   baseline?: { status?: number; keys: string[]; sample: Array<[string, string | number | boolean]> }
   confirmed: Array<Record<string, unknown>>
   detLead?: Record<string, unknown>
@@ -922,6 +943,39 @@ interface WorkingState {
   multiHopContractCompacted: boolean
   proofObligation?: Record<string, unknown>
   coverageContract?: string
+}
+
+function normalizeAndOrderBriefPersonas(
+  rawPersonas: AssignmentBriefInput['personas'],
+): WorkingState['personas'] {
+  const personaSeen = new Set<string>()
+  return (rawPersonas ?? [])
+    .map(p => {
+      const handle = cleanText(p.handle, 48)
+      const role = p.role ? cleanText(p.role, 32) : undefined
+      const priv = classifyPersonaPrivilege(handle, role)
+      const harvestedIds = [...new Set((p.harvestedIds ?? []).map(cleanHarvestedId).filter(Boolean))].slice(0, 6)
+      return {
+        handle,
+        ...(role ? { role } : {}),
+        roleTier: priv.tier,
+        elevated: priv.elevated,
+        privRank: priv.rank,
+        harvestedIds,
+      }
+    })
+    .filter(p => {
+      if (!p.handle || personaSeen.has(p.handle)) return false
+      personaSeen.add(p.handle)
+      return true
+    })
+    .sort((a, b) => {
+      if (a.privRank !== b.privRank) return a.privRank - b.privRank
+      if (a.harvestedIds.length !== b.harvestedIds.length) return b.harvestedIds.length - a.harvestedIds.length
+      return a.handle < b.handle ? -1 : a.handle > b.handle ? 1 : 0
+    })
+    .slice(0, 6)
+    .map(({ privRank: _rank, ...rest }) => rest)
 }
 
 function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<string, unknown> {
@@ -942,6 +996,8 @@ function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<
           personas: state.personas.map(p => ({
             handle: p.handle,
             ...(p.role ? { role: p.role } : {}),
+            roleTier: p.roleTier,
+            ...(p.elevated ? { elevated: true } : {}),
             ...(p.harvestedIds.length ? { harvestedIds: p.harvestedIds } : {}),
           })),
         }
@@ -981,27 +1037,7 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
     : sortRoutes(input.routes ?? []).slice(0, 12)
   const linked = sortRoutes(input.linkedRoutes ?? []).slice(0, 8)
 
-  const personaSeen = new Set<string>()
-  const personas = (input.personas ?? [])
-    .map(p => {
-      const handle = cleanText(p.handle, 48)
-      const harvestedIds = [...new Set((p.harvestedIds ?? []).map(cleanHarvestedId).filter(Boolean))].slice(0, 6)
-      return {
-        handle,
-        ...(p.role ? { role: cleanText(p.role, 32) } : {}),
-        harvestedIds,
-      }
-    })
-    .filter(p => {
-      if (!p.handle || personaSeen.has(p.handle)) return false
-      personaSeen.add(p.handle)
-      return true
-    })
-    .sort((a, b) => {
-      if (a.harvestedIds.length !== b.harvestedIds.length) return b.harvestedIds.length - a.harvestedIds.length
-      return a.handle < b.handle ? -1 : a.handle > b.handle ? 1 : 0
-    })
-    .slice(0, 6)
+  const personas = normalizeAndOrderBriefPersonas(input.personas)
 
   let baseline: WorkingState['baseline']
   if (input.baseline) {
