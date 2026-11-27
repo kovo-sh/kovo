@@ -16,6 +16,7 @@
  */
 import { classifyPersonaPrivilege } from './assignment-brief.ts'
 import {
+  CAPABILITY_KINDS,
   DERIVED_CAPABILITY_HANDLE_RE,
   sanitizeCheckpointText,
   type CapabilityKind,
@@ -51,6 +52,8 @@ export interface FrontierCapabilityInput {
   secretKind?: string | null
   fieldName?: string | null
   slot?: string | null
+  label?: string | null
+  sourceHopId?: string | null
   summary?: string | null
   valueHint?: string | null
   provenance?: string | null
@@ -190,10 +193,23 @@ const SKIP_SEGMENTS = new Set(['api', 'v1', 'v2', 'v3', 'v4', 'rest', 'public', 
 const NON_AGENTIC_PROVENANCES = new Set(['static_analysis', 'attacker_seed', 'floor_observation'])
 const GENERIC_ACTOR_LABELS = new Set(['', 'worker', 'unknown', 'anonymous', 'system', 'host'])
 
-const SIGNING_SECRET_RE = /(?:^|[^a-z0-9])(?:signing[_-]?(?:secret|key|salt)|hmac[_-]?(?:secret|key|salt)?|webhook[_-]?(?:secret|key|signing)|private[_-]?key|shared[_-]?secret|jwt[_-]?(?:secret|key)|client[_-]?secret|master[_-]?key|secret[_-]?key|signature[_-]?(?:key|secret|salt)|signing|salt)(?:[^a-z0-9]|$)/i
+const SIGNING_SECRET_RE = /(?:^|[^a-z0-9])(?:signing[_-]?(?:secret|key|salt|material)|hmac[_-]?(?:secret|key|salt)?|webhook[_-]?(?:secret|key|signing|salt)|(?:sig|signature|mac|digest|verify)[_-]?(?:secret|key|salt)|private[_-]?key|shared[_-]?secret|jwt[_-]?(?:secret|key)|client[_-]?secret|master[_-]?key|secret[_-]?key|signing|salt)(?:[^a-z0-9]|$)/i
+const SPARSE_SECRET_IDENT_RE = /(?:^|[^a-z0-9])(?:secret|salt|hmac|signing|sig)(?:[^a-z0-9]|$)/i
 const SIGNED_URL_FIELD_RE = /(?:^|[^a-z0-9])(?:signed[_-]?url|presigned[_-]?url|download[_-]?url|export[_-]?url|artifact[_-]?url|result[_-]?url|file[_-]?url|upload[_-]?url|callback[_-]?url|location[_-]?url|download[_-]?link)(?:[^a-z0-9]|$)/i
 const SIGNED_URL_VALUE_RE = /(?:https?:\/\/|\/)[^\s]*(?:[?&](?:sig|signature|expires|exp|x-amz-signature|token|download)=|\/(?:download|export|result|artifact|presign|signed)\b)/i
-const CREDENTIAL_TOKEN_RE = /(?:^|[^a-z0-9])(?:jwt|bearer|access[_-]?token|id[_-]?token|refresh[_-]?token|session[_-]?(?:token|id|cookie)|api[_-]?key|apikey|pat|invite[_-]?(?:token|code)|scim[_-]?token|service[_-]?token|auth[_-]?token|exchange[_-]?token|delegation[_-]?token|assertion|oauth[_-]?token|credential|token|cookie)(?:[^a-z0-9]|$)/i
+const CREDENTIAL_TOKEN_RE = /(?:^|[^a-z0-9])(?:jwt|bearer|access[_-]?token|id[_-]?token|refresh[_-]?token|session[_-]?(?:token|id|cookie)|api[_-]?key|apikey|pat|invite[_-]?(?:token|code)|scim(?:[_-]?(?:token|key|secret))?|service[_-]?token|auth[_-]?token|exchange[_-]?token|delegation(?:[_-]?(?:token|key|grant|assertion))?|assertion|oauth[_-]?token|credential|token|cookie)(?:[^a-z0-9]|$)/i
+const SIGNING_PRODUCER_ROUTE_RE = /\/(?:webhooks?|hooks?|signing|hmac|crypto)(?:\/|$)/i
+const CRED_PRODUCER_ROUTE_RE = /\/(?:oauth|oauth2|oidc|sso|auth|login|tokens?|sessions?|scim|delegat\w*|invites?)(?:\/|$)/i
+const DUAL_TENANT_FRONTIER_SIGNAL_RE = /(?:^|[^a-z0-9])(?:cache|cached|cache[_-]?bleed|cache[_-]?key|shared[_-]?(?:edge[_-]?)?cache|edge[_-]?cache|prime|primed[_-]?cache|warm|cdn|cross[_-]?tenant|dual[_-]?tenant|multi[_-]?tenant|abac|switch[_-]?(?:tenant|org|workspace)|(?:tenant|org|workspace)[_-]?switch)(?:[^a-z0-9]|$)/i
+const ORG_SWITCH_ROUTE_RE = /\/(?:orgs?|tenants?|organizations?|workspaces?)(?:\/[^/]+)?\/switch(?:\/|$)/i
+const CAP_HANDLE_PREFIX_RE = /^cap:/i
+const SYNTHETIC_PRECONDITION_CAP_RE = /^(?:surface|branch):/i
+const KNOWN_NEGATIVE_RULE_KINDS: ReadonlySet<string> = new Set<string>([
+  'credential_token', 'signing_secret', 'signed_or_download_url', 'entity_or_job_id',
+  'derive_signature', 'pivot_with_credential', 'consume_entity_id', 'redeem_signed_url',
+  ...CAPABILITY_KINDS,
+])
+const CAP_NOISE_NOUNS = new Set(['hop', 'cap', 'val', 'value', 'raw', 'slot', 'data', 'item', 'secret', 'token', 'key', 'salt', 'url'])
 const JWT_SHAPE_RE = /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}/
 const UUID_OR_PREFIX_ID_RE = /\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-z]{2,8}_[a-z0-9]{4,})\b/i
 
@@ -237,14 +253,27 @@ function extractPathNouns(normPath: string): string[] {
   return [...new Set(nouns)]
 }
 
+function parseCapIdParts(capId: string): { hopId: string | null; slot: string | null } {
+  const m = /^cap:hop_([^:]+):([^:]+)$/i.exec(capId.trim())
+  return m ? { hopId: m[1] ?? null, slot: m[2] ?? null } : { hopId: null, slot: null }
+}
+
+function isInvalidActorHandle(handle: string): boolean {
+  return !handle
+    || GENERIC_ACTOR_LABELS.has(handle.toLowerCase())
+    || CAP_HANDLE_PREFIX_RE.test(handle)
+    || DERIVED_CAPABILITY_HANDLE_RE.test(handle)
+}
+
 function extractCapabilityNouns(cap: FrontierCapabilityInput): Set<string> {
   const out = new Set<string>()
-  for (const raw of [cap.fieldName, cap.slot]) {
+  const capParts = parseCapIdParts(cap.capId)
+  for (const raw of [cap.fieldName, cap.label, cap.slot, cap.sourceHopId, capParts.hopId, capParts.slot]) {
     if (!raw) continue
     const snake = toSnake(raw).replace(/_(?:id|ids|uuid|key|token|secret|salt|url|handle|ref)$/, '')
     for (const part of snake.split('_')) {
       const n = singularizeNoun(part)
-      if (n.length >= 2 && !SKIP_SEGMENTS.has(n) && n !== 'hop' && n !== 'cap') out.add(n)
+      if (n.length >= 2 && !SKIP_SEGMENTS.has(n) && !CAP_NOISE_NOUNS.has(n) && !/^[hsv]\d+$/i.test(n)) out.add(n)
     }
   }
   if (cap.producerEndpoint) {
@@ -279,7 +308,9 @@ export function hasAgenticSealedCapabilities(ledger: Pick<CapabilityLedger, 'lis
 
 /** Generically classify a capability into one of the four structural frontier shapes. */
 export function classifyCapabilityShape(cap: FrontierCapabilityInput): CapabilityShapeKind {
-  const text = [cap.fieldName, cap.slot, cap.secretKind, cap.summary].filter(Boolean).join(' ')
+  const capParts = parseCapIdParts(cap.capId)
+  const identText = [cap.fieldName, cap.label, cap.slot, cap.sourceHopId, capParts.hopId, capParts.slot].filter(Boolean).join(' ')
+  const text = [identText, cap.secretKind, cap.summary].filter(Boolean).join(' ')
   if (cap.ledgerKind === 'signing_material' || cap.secretKind === 'signing_salt' || cap.secretKind === 'hmac_key' || SIGNING_SECRET_RE.test(text)) {
     return 'signing_secret'
   }
@@ -301,6 +332,17 @@ export function classifyCapabilityShape(cap: FrontierCapabilityInput): Capabilit
   ) {
     return 'credential_token'
   }
+  const primarySlot = (cap.fieldName ?? cap.slot ?? capParts.slot ?? '').trim()
+  const looksLikeEntityId = /(?:^|_)id$/i.test(primarySlot)
+  if (!looksLikeEntityId) {
+    const prodPath = cap.producerEndpoint ? normalizeRouteTemplate(cap.producerEndpoint, { preserveCase: false }) : ''
+    if (prodPath && SIGNING_PRODUCER_ROUTE_RE.test(prodPath)) return 'signing_secret'
+    if (prodPath && DOWNLOAD_ROUTE_RE.test(prodPath) && /(?:^|[^a-z0-9])(?:url|link|href|download|location)(?:[^a-z0-9]|$)/i.test(identText)) {
+      return 'signed_or_download_url'
+    }
+    if (prodPath && CRED_PRODUCER_ROUTE_RE.test(prodPath)) return 'credential_token'
+    if (SPARSE_SECRET_IDENT_RE.test(identText)) return 'signing_secret'
+  }
   if (typeof cap.valueHint === 'string' && UUID_OR_PREFIX_ID_RE.test(cap.valueHint)) return 'entity_or_job_id'
   return 'entity_or_job_id'
 }
@@ -309,14 +351,15 @@ interface PersonaContext {
   roleByHandle: Map<string, string | null | undefined>
   nonElevatedHandles: Set<string>
   basePersona: string | null
+  multiTenantPersona: string | null
 }
 
 function buildPersonaContext(personas: readonly FrontierPersonaInput[] = []): PersonaContext {
   const roleByHandle = new Map<string, string | null | undefined>()
-  const ranked: Array<{ handle: string; rank: number; idx: number; elevated: boolean; revoked: boolean }> = []
+  const ranked: Array<{ handle: string; rank: number; idx: number; elevated: boolean; revoked: boolean; multiTenant: boolean }> = []
   personas.forEach((p, idx) => {
     const h = p.handle.trim()
-    if (!h) return
+    if (!h || isInvalidActorHandle(h)) return
     roleByHandle.set(h, p.roleLabel)
     const priv = classifyPersonaPrivilege(h, p.roleLabel)
     ranked.push({
@@ -325,32 +368,72 @@ function buildPersonaContext(personas: readonly FrontierPersonaInput[] = []): Pe
       idx: typeof p.configIndex === 'number' && Number.isFinite(p.configIndex) ? p.configIndex : idx,
       elevated: priv.elevated,
       revoked: priv.revokedStale,
+      multiTenant: priv.multiTenant,
     })
   })
   ranked.sort((a, b) => a.rank - b.rank || a.idx - b.idx)
   const nonElevatedHandles = new Set(ranked.filter(r => !r.elevated).map(r => r.handle))
-  const basePersona = ranked.find(r => !r.elevated && !r.revoked)?.handle
-    ?? ranked.find(r => !r.elevated)?.handle
+  const basePersona = ranked.find(r => !r.elevated && !r.revoked && !r.multiTenant)?.handle
+    ?? ranked.find(r => !r.elevated && !r.multiTenant)?.handle
     ?? null
-  return { roleByHandle, nonElevatedHandles, basePersona }
+  const multiTenantPersona = ranked.find(r => !r.elevated && r.multiTenant)?.handle ?? null
+  return { roleByHandle, nonElevatedHandles, basePersona, multiTenantPersona }
+}
+
+function isDualTenantFrontierPair(
+  cap: FrontierCapabilityInput,
+  consumer?: Pick<IndexedConsumer, 'normPath' | 'paramNames'>,
+): boolean {
+  if (cap.temporalState === 'primed_cache' || cap.ledgerKind === 'parser_or_cache_primitive') return true
+  if (cap.producerEndpoint && ORG_SWITCH_ROUTE_RE.test(normalizeRouteTemplate(cap.producerEndpoint, { preserveCase: false }))) return true
+  if (consumer && ORG_SWITCH_ROUTE_RE.test(consumer.normPath)) return true
+  const corpus = [
+    cap.fieldName,
+    cap.label,
+    cap.slot,
+    cap.sourceHopId,
+    cap.summary,
+    cap.producerEndpoint,
+    cap.targetPath,
+    consumer?.normPath,
+    ...(consumer ? [...consumer.paramNames] : []),
+  ].filter(Boolean).join(' ')
+  return DUAL_TENANT_FRONTIER_SIGNAL_RE.test(corpus)
 }
 
 /**
- * Resolve the owning `actingPersona` for a capability without ever substituting an elevated
- * shortcut persona. Preserves non-elevated owning personas verbatim.
+ * Resolve the owning `actingPersona` for a capability without ever emitting a `cap:*` handle,
+ * an unapproved/elevated persona, or a `multi_tenant` persona on non-dual-tenant steps.
  */
-function resolveSafeActingPersona(cap: FrontierCapabilityInput, ctx: PersonaContext): string | null {
-  const raw = (cap.actingPersona ?? '').trim()
-  const isElevated = (handle: string): boolean => classifyPersonaPrivilege(handle, ctx.roleByHandle.get(handle)).elevated
-  if (raw && !GENERIC_ACTOR_LABELS.has(raw.toLowerCase())) {
-    if (!isElevated(raw)) return raw
-    const derived = (cap.derivedFromAttackerPersona ?? '').trim()
-    if (derived && !GENERIC_ACTOR_LABELS.has(derived.toLowerCase()) && !isElevated(derived)) return derived
-    return ctx.basePersona
+function resolveSafeActingPersona(
+  cap: FrontierCapabilityInput,
+  ctx: PersonaContext,
+  options?: { allowMultiTenant?: boolean },
+): string | null {
+  const allowMultiTenant = Boolean(options?.allowMultiTenant)
+  const hasConfigured = ctx.roleByHandle.size > 0
+  const isApprovedNonElevated = (handle: string): boolean => {
+    if (isInvalidActorHandle(handle)) return false
+    if (hasConfigured) return ctx.nonElevatedHandles.has(handle)
+    return !classifyPersonaPrivilege(handle, ctx.roleByHandle.get(handle)).elevated
   }
+  const acceptCandidate = (handle: string): string | null => {
+    if (!isApprovedNonElevated(handle)) return null
+    const priv = classifyPersonaPrivilege(handle, ctx.roleByHandle.get(handle))
+    if (priv.multiTenant && !allowMultiTenant) return ctx.basePersona
+    return handle
+  }
+
+  const raw = (cap.actingPersona ?? '').trim()
+  const rawAccepted = acceptCandidate(raw)
+  if (rawAccepted) return rawAccepted
+
   const derived = (cap.derivedFromAttackerPersona ?? '').trim()
-  if (derived && !GENERIC_ACTOR_LABELS.has(derived.toLowerCase()) && !isElevated(derived)) return derived
-  return ctx.basePersona ?? 'attacker'
+  const derivedAccepted = acceptCandidate(derived)
+  if (derivedAccepted) return derivedAccepted
+
+  if (allowMultiTenant && ctx.multiTenantPersona) return ctx.multiTenantPersona
+  return ctx.basePersona ?? (hasConfigured ? null : 'attacker')
 }
 
 interface ParsedNegativeRule {
@@ -381,15 +464,21 @@ function parseSurfaceKey(rawKey: string | undefined): { origin: string | null; m
       if (/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/.test(mid)) method = mid
     }
   } else {
+    const mUrl = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(https?:\/\/[^\s/]+)(\/\S*)$/i.exec(trimmed)
     const mSingle = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\/\S*)$/i.exec(trimmed)
-    if (mSingle) {
+    if (mUrl) {
+      method = mUrl[1]!.toUpperCase()
+      origin = mUrl[2]!
+      routeRaw = mUrl[3]!
+    } else if (mSingle) {
       method = mSingle[1]!.toUpperCase()
       routeRaw = mSingle[2]!
     } else if (trimmed.startsWith('/')) {
       routeRaw = trimmed
     }
   }
-  const normRoute = routeRaw ? normalizeRouteTemplate(routeRaw, { preserveCase: false }) : null
+  const routePathOnly = routeRaw ? (routeRaw.split(/[?#]/, 1)[0] ?? '') : ''
+  const normRoute = routePathOnly ? normalizeRouteTemplate(routePathOnly, { preserveCase: false }) : null
   return { origin, method, normRoute: normRoute && normRoute !== '/' ? normRoute : null }
 }
 
@@ -404,18 +493,21 @@ function buildNegativeRules(edges: readonly (FrontierNegativeEdgeInput | Negativ
     const method = methodRaw && methodRaw !== 'ANY' ? methodRaw : null
     const routeInput = (edge.route ?? '').trim()
     const normRoute = routeInput
-      ? normalizeRouteTemplate(routeInput, { preserveCase: false })
+      ? normalizeRouteTemplate(routeInput.split(/[?#]/, 1)[0] ?? routeInput, { preserveCase: false })
       : parsedSurface.normRoute
     if (!origin && !normRoute) continue
-    const capIds = new Set<string>([
-      ...(edge.capId ? [edge.capId.trim()] : []),
-      ...(edge.preconditionCapIds ?? []).map(s => s.trim()).filter(Boolean),
-    ])
+    const capIds = new Set<string>(
+      [
+        ...(edge.capId ? [edge.capId.trim()] : []),
+        ...(edge.preconditionCapIds ?? []).map(s => s.trim()),
+      ].filter(s => Boolean(s) && !SYNTHETIC_PRECONDITION_CAP_RE.test(s)),
+    )
     const kinds = new Set<string>(
       [edge.capabilityKind, edge.affordance, edge.hypothesisClass]
         .map(v => (typeof v === 'string' ? v.trim().toLowerCase() : ''))
-        .filter(Boolean),
+        .filter(v => Boolean(v) && KNOWN_NEGATIVE_RULE_KINDS.has(v)),
     )
+    if (!normRoute && capIds.size === 0 && kinds.size === 0) continue
     rules.push({ capIds, kinds, origin, method, normRoute })
   }
   return rules
@@ -678,19 +770,20 @@ export function rankCapabilityConsumerPairs(input: RankCapabilityConsumerPairsIn
     if (cap.capId.startsWith('cap:hop_synth:') || cap.capId.startsWith('cap:hop_seed_')) continue
     if (cap.temporalState === 'expired') continue
 
-    const actingPersona = resolveSafeActingPersona(cap, personaCtx)
-    if (!actingPersona) continue
-
     const shapeKind = classifyCapabilityShape(cap)
     const capNouns = extractCapabilityNouns(cap)
     const prodNorm = cap.producerEndpoint ? normalizeRouteTemplate(cap.producerEndpoint, { preserveCase: false }) : null
     const prodMethod = cap.producerMethod ? cap.producerMethod.trim().toUpperCase() : null
-    const label = sanitizeCheckpointText((cap.fieldName || cap.slot || cap.capId).trim(), 48)
+    const label = sanitizeCheckpointText((cap.fieldName || cap.label || cap.slot || cap.sourceHopId || cap.capId).trim(), 48)
 
     for (const consumer of consumers) {
       if (prodNorm && cap.origin === consumer.origin && prodNorm === consumer.normPath && (!prodMethod || prodMethod === consumer.method)) {
         continue
       }
+      const actingPersona = resolveSafeActingPersona(cap, personaCtx, {
+        allowMultiTenant: isDualTenantFrontierPair(cap, consumer),
+      })
+      if (!actingPersona) continue
       const match = scoreCapabilityConsumerMatch(cap, shapeKind, capNouns, actingPersona, consumer, personaCtx)
       if (!match) continue
 
@@ -867,21 +960,37 @@ function collectLedgerFrontierCapabilities(
   return nodes.map(node => {
     const meta = node.metadata ?? {}
     const factMeta = factMetaByCap.get(node.capId)
+    const capParts = parseCapIdParts(node.capId)
     let derivedFromAttackerPersona: string | null = null
     if (nonElevated.length > 0) {
       const prov = ledger.traceProvenanceToAttacker(node.capId, nonElevated)
-      if (prov.valid && prov.attackerRootPersonas.length > 0) derivedFromAttackerPersona = prov.attackerRootPersonas[0]!
+      if (prov.valid && prov.attackerRootPersonas.length > 0) {
+        const singleTenantRoot = prov.attackerRootPersonas.find(
+          h => !classifyPersonaPrivilege(h, personas.find(p => p.handle === h)?.roleLabel).multiTenant,
+        )
+        derivedFromAttackerPersona = singleTenantRoot ?? prov.attackerRootPersonas[0]!
+      }
     }
+    const sourceHopId = (typeof meta.sourceHopId === 'string' ? meta.sourceHopId
+      : typeof meta.hopReceiptId === 'string' ? meta.hopReceiptId
+      : node.parentHopReceiptIds[0]
+      ?? capParts.hopId) ?? null
+    const producerEndpoint = (typeof meta.endpoint === 'string' ? meta.endpoint
+      : typeof meta.producerEndpoint === 'string' ? meta.producerEndpoint
+      : typeof meta.route === 'string' ? meta.route
+      : factMeta?.endpoint) ?? null
     return {
       capId: node.capId,
       origin: node.serviceOrigin,
       actingPersona: node.actorPersona,
-      producerEndpoint: (typeof meta.endpoint === 'string' ? meta.endpoint : factMeta?.endpoint) ?? null,
+      producerEndpoint,
       producerMethod: (typeof meta.method === 'string' ? meta.method : factMeta?.method) ?? null,
       ledgerKind: node.kind,
       secretKind: typeof meta.secretKind === 'string' ? meta.secretKind : null,
       fieldName: (typeof meta.fieldName === 'string' ? meta.fieldName : factMeta?.fieldName) ?? null,
-      slot: typeof meta.slot === 'string' ? meta.slot : node.capId.split(':')[2] ?? null,
+      slot: (typeof meta.slot === 'string' ? meta.slot : capParts.slot) ?? null,
+      label: typeof meta.label === 'string' ? meta.label : null,
+      sourceHopId,
       summary: node.artifactSummary,
       provenance: node.provenance,
       temporalState: node.temporalState,

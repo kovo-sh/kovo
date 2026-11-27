@@ -3551,7 +3551,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       apiDependencies, specs: resolvedBundle.specs, hostTiers, frontierController,
     })
     const dataflowCreated = materializeGreyBoxDataflowWave1Steps(this.storage, run, {
-      activeOrigins, sourceMounted: false, maxSteps: 6, routeStep: routeStepToSpecialist,
+      activeOrigins, sourceMounted: false, maxSteps: 6, llmMode: privateModelProfiles(this.storage).length > 0 ? 'agentic' : 'deterministic-no-llm', routeStep: routeStepToSpecialist,
     })
     const created = [...dataflowCreated, ...compositeCreated]
     for (const step of created) {
