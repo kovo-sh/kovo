@@ -54,6 +54,7 @@ const DUAL_MODE_SET = new Set(['cross_org_transfer', 'dual_org_cache_bleed', 'ba
 const CRED_KIND_SET = new Set(['token', 'session', 'role', 'invite', 'pat', 'async_job', 'webhook_callback'])
 const ECON_EQ_SET = new Set(['over_refund', 'balance_minting', 'underpaid_fulfillment', 'ineligible_discount'])
 const PARSER_MODE_SET = new Set(['parser_differential', 'cache_primed'])
+const CACHE_PRIMED_MODE_ALIASES = new Set(['cache_poisoning', 'cache_deception', 'cache_bleed', 'cache_priming'])
 const DIFF_KIND_SET = new Set(['duplicate_json_key', 'path_normalization', 'header_normalization', 'hop_by_hop_smuggling', 'content_type_confusion'])
 const IMPACT_KIND_SET = new Set(['read', 'mutation'])
 const PIVOT_CTRL_SET = new Set(['authz_denied', 'unreachable_internal'])
@@ -579,7 +580,9 @@ const DUAL_ABAC_INF_KEYS = ['transferRecord', 'transferRecordExchangeId', 'trans
 const TEMPORAL_INF_KEYS = ['preRevocationBaseline', 'preRevocationBaselineExchangeId', 'revocationEvent', 'revocationEventExchangeId', 'primaryDeniedCheck', 'primaryDeniedCheckExchangeId', 'secondarySuccess', 'secondarySuccessExchangeId', 'credentialKind', 'credentialHandle', 'primarySurface', 'secondarySurface', 'elevatedRoleGranted'] as const
 const ECON_INF_KEYS = ['equation', 'baselineReadback', 'baselineReadbackExchangeId', 'baselineExchangeId', 'finalReadback', 'finalReadbackExchangeId', 'finalExchangeId', 'actionExchangeIds', 'actionsExchangeIds', 'actionExchangeId', 'balancesBefore', 'balancesAfter', 'authorizedDeposits', 'authorizedWithdrawals', 'paidAmount', 'refundedAmounts', 'baselineRefunded', 'fulfilledValue', 'fulfillmentState', 'subtotalAmount', 'requiredThreshold', 'discountApplied', 'finalTotalPaid', 'beforeBalance', 'afterBalance', 'initialBalance', 'finalBalance', 'raceRequests', 'authorizedCap', 'deltaObserved'] as const
 const CRYPTO_INF_KEYS = ['tamperedSignatureControl', 'tamperedSignatureControlExchangeId', 'tamperedControlExchangeId', 'sourceValidIssuance', 'sourceValidIssuanceExchangeId', 'sourceIssuanceExchangeId', 'replayedAcceptance', 'replayedAcceptanceExchangeId', 'replayedExchangeId', 'sourceScope', 'targetScope', 'sourceSignedResource', 'targetSignedResource', 'tamperedSignatureDigest', 'signatureDigest', 'replayedSignatureDigest'] as const
-const PARSER_CACHE_INF_KEYS = ['cleanControl', 'cleanControlExchangeId', 'differentialProbe', 'differentialProbeExchangeId', 'differentialKind', 'differentialFeature', 'impactKind', 'canonicalValue', 'variantValue', 'victimOrPrimeRequest', 'victimOrPrimeRequestExchangeId', 'victimPrimeExchangeId', 'attackerProbe', 'attackerProbeExchangeId', 'cacheKey', 'victimArtifactDigest', 'cacheHitObserved', 'cleanControlContainsVictimData', 'canonicalRequest', 'variantRequest', 'cachePrimeRequest', 'victimReadback', 'smuggledRequest', 'parserDiff', 'cacheBleed'] as const
+const PARSER_DIFF_MODE_KEYS = ['differentialProbe', 'differentialProbeExchangeId', 'differentialKind', 'differentialFeature', 'impactKind', 'canonicalValue', 'variantValue', 'canonicalRequest', 'variantRequest', 'smuggledRequest', 'parserDiff'] as const
+const CACHE_PRIMED_MODE_KEYS = ['victimOrPrimeRequest', 'victimOrPrimeRequestExchangeId', 'victimPrimeExchangeId', 'attackerProbe', 'attackerProbeExchangeId', 'cacheKey', 'cachePrimeRequest', 'victimReadback', 'cacheBleed', 'victimArtifactDigest', 'cacheHitObserved', 'cleanControlContainsVictimData'] as const
+const PARSER_CACHE_INF_KEYS = ['cleanControl', 'cleanControlExchangeId', ...PARSER_DIFF_MODE_KEYS, ...CACHE_PRIMED_MODE_KEYS] as const
 
 /** Authoritative, fail-closed v8 oracle family inference evaluating all 6 families independently. */
 export function inferV8OracleFamilyDetailed(rawInput: Record<string, unknown>): V8OracleInferenceResult {
@@ -591,7 +594,7 @@ export function inferV8OracleFamilyDetailed(rawInput: Record<string, unknown>): 
   if (hasAny(TEMPORAL_INF_KEYS)) matches.push('temporal_revocation')
   if (hasAny(ECON_INF_KEYS) || (Array.isArray(norm.actions) && norm.actions.length > 0)) matches.push('economic_conservation')
   if (hasAny(CRYPTO_INF_KEYS) || (norm.sourceTenant !== undefined && norm.sourceTenant !== null && norm.targetTenant !== undefined && norm.targetTenant !== null)) matches.push('cryptographic_scope_replay')
-  if (PARSER_MODE_SET.has(mode) || hasAny(PARSER_CACHE_INF_KEYS)) matches.push('parser_cache_differential')
+  if (PARSER_MODE_SET.has(mode) || DIFF_KIND_SET.has(mode) || CACHE_PRIMED_MODE_ALIASES.has(mode) || hasAny(PARSER_CACHE_INF_KEYS)) matches.push('parser_cache_differential')
   const hasPivotHop = Array.isArray(norm.hops) && norm.hops.length > 0 && ((norm.terminalImpact !== undefined && norm.terminalImpact !== null) || norm.hops.some(h => Boolean(h && typeof h === 'object' && ('surface' in (h as Record<string, unknown>) || 'role' in (h as Record<string, unknown>)))))
   const hasPivotCtrl = typeof norm.controlKind === 'string' && PIVOT_CTRL_SET.has(norm.controlKind.trim().toLowerCase())
   if (hasAny(['preChainControlDenied', 'preChainControlDeniedExchangeId', 'preChainControlExchangeId', 'attackerOriginPersona']) || hasPivotCtrl || hasPivotHop) matches.push('cross_surface_pivot')
@@ -606,12 +609,17 @@ function resolveDualAbacMode(raw: Record<string, unknown>): string | undefined {
   if (has('singleForeignControlDenied', 'singleForeignControlDeniedExchangeId', 'singleForeignControlExchangeId', 'batchRequest', 'batchRequestExchangeId')) hits.push('batch_partial_authz')
   return hits.length === 1 ? hits[0] : undefined
 }
-function resolveParserCacheMode(raw: Record<string, unknown>): string | undefined {
-  if (raw.mode !== undefined) return pickEnum(raw, 'mode', PARSER_MODE_SET)
-  const has = (...keys: string[]) => keys.some(k => raw[k] !== undefined && raw[k] !== null), hits: string[] = []
-  if (has('differentialProbe', 'differentialProbeExchangeId', 'differentialKind', 'differentialFeature', 'impactKind')) hits.push('parser_differential')
-  if (has('victimOrPrimeRequest', 'victimOrPrimeRequestExchangeId', 'victimPrimeExchangeId', 'attackerProbe', 'attackerProbeExchangeId', 'cacheKey')) hits.push('cache_primed')
-  return hits.length === 1 ? hits[0] : undefined
+function resolveParserCacheMode(raw: Record<string, unknown>): { mode?: 'parser_differential' | 'cache_primed'; inferredDifferentialKind?: string } {
+  const has = (keys: readonly string[]) => keys.some(k => raw[k] !== undefined && raw[k] !== null)
+  const hasDiff = has(PARSER_DIFF_MODE_KEYS), hasCache = has(CACHE_PRIMED_MODE_KEYS)
+  if (hasDiff && hasCache) return {}
+  if (raw.mode !== undefined) {
+    const rawMode = pickStr(raw, 'mode', 64), norm = rawMode ? rawMode.toLowerCase().replace(/[\s-]+/g, '_') : ''
+    if (norm === 'parser_differential' || norm === 'cache_primed') return { mode: norm }
+    if (DIFF_KIND_SET.has(norm)) return (raw.differentialKind !== undefined && pickEnum(raw, 'differentialKind', DIFF_KIND_SET) !== norm) ? {} : { mode: 'parser_differential', inferredDifferentialKind: norm }
+    return CACHE_PRIMED_MODE_ALIASES.has(norm) ? { mode: 'cache_primed' } : {}
+  }
+  return hasDiff ? { mode: 'parser_differential' } : hasCache ? { mode: 'cache_primed' } : {}
 }
 function resolveEconomicEquation(raw: Record<string, unknown>, baseRec: HostSignedRecord | undefined, finRec: HostSignedRecord | undefined): string | undefined {
   if (raw.equation !== undefined) return pickEnum(raw, 'equation', ECON_EQ_SET)
@@ -814,10 +822,10 @@ export function hydrateV8OracleInput(
     hydrateRole('postMutationReadback')
     hydrateRole('victimOrPrimeRequest', 'victimPrimeExchangeId')
     hydrateRole('attackerProbe')
-    const mode = resolveParserCacheMode(rawInput)
+    const { mode, inferredDifferentialKind } = resolveParserCacheMode(rawInput)
     if (mode) out.mode = mode
     if (mode === 'parser_differential') {
-      const dk = pickEnum(rawInput, 'differentialKind', DIFF_KIND_SET)
+      const dk = rawInput.differentialKind !== undefined ? pickEnum(rawInput, 'differentialKind', DIFF_KIND_SET) : inferredDifferentialKind
       const df = pickStr(rawInput, 'differentialFeature', 128)
       const ik = pickEnum(rawInput, 'impactKind', IMPACT_KIND_SET)
       if (dk) out.differentialKind = dk
@@ -1517,4 +1525,34 @@ function inferFixedPointStateTransitions<H extends DagHopLike, E extends DagEdge
     }
     if (!changed) break
   }
+}
+
+/** Concise rejection diagnostics for matching-route candidate controls when `terminalCtrl` is absent. */
+export function diagnoseRejectedTerminalControls<T extends DagEntryLike>(
+  candidates: readonly string[], entriesById: ReadonlyMap<string, T>, termEx: T | undefined, postMutRb: T | undefined,
+  termFam: string, termRawActor: string | null, termAuthd: boolean, nonTermExSet: ReadonlySet<string>, termAblationIds: ReadonlySet<string>,
+  hasExplicitVerifiedTermEdge: boolean, hasForeignTenantData: boolean, hopCount: number, capIdx: CapOriginIndex,
+  h: { normRouteFam: (p: string | null | undefined, eid?: string) => string; matchesNormalizedCtrlPath: (a: string | null | undefined, b: string | null | undefined) => boolean; matchesBoundTerminalControl: (c: T, ref: T) => boolean; sameCredIdentity: (a: T, b: T, capIdx: CapOriginIndex) => boolean; probeTenantOf: (e: T, capIdx?: CapOriginIndex) => string | null; isLoginCap: (cap: string, capIdx: CapOriginIndex) => boolean },
+): string[] {
+  const seen = new Set<string>(), out: string[] = [], normOrig = (o: string | null | undefined) => (o ?? '').trim().replace(/\/+$/, '').toLowerCase()
+  const rbFam = postMutRb ? h.normRouteFam(postMutRb.step.route ?? postMutRb.step.pathAndQuery, postMutRb.entityId) : ''
+  const onRoute = (cp: string, cf: string, ref: T | undefined, rf: string) => Boolean(ref && ((rf && cf === rf) || (cleanExactPath(cp) && cleanExactPath(cp) === cleanExactPath(ref.step.pathAndQuery ?? ref.step.route ?? '')) || h.matchesNormalizedCtrlPath(cp, ref.step.pathAndQuery ?? ref.step.route) || matchesNormalizedDotSegmentPath(cp, ref.step.pathAndQuery ?? ref.step.route)))
+  for (const id of candidates) {
+    if (out.length >= 3 || seen.has(id) || (termEx && id === termEx.exchangeId)) continue; seen.add(id)
+    const c = entriesById.get(id); if (!c) continue
+    const cp = c.step.pathAndQuery ?? c.step.route ?? '', cf = h.normRouteFam(c.step.route ?? c.step.pathAndQuery, c.entityId)
+    const onTerm = onRoute(cp, cf, termEx, termFam), onRb = onRoute(cp, cf, postMutRb, rbFam); if (!onTerm && !onRb) continue
+    const reasons: string[] = [], st = c.step.status, cRaw = actorOfEntry(c), isCap = Boolean(cRaw?.startsWith('cap:')), anon401 = !cRaw || ANON_HANDLE_RE.test(cRaw) || (isCap && cRaw !== termRawActor)
+    if (nonTermExSet.has(c.exchangeId)) reasons.push('in_non_terminal_hop')
+    if (c.step.arm !== 'control' && c.replayAttempt !== 'ablation_control') reasons.push(`arm=${c.step.arm} (pass arm:'control')`)
+    if (!(typeof st === 'number' && (DAG_DENIED_CTRL_STATUSES.has(st) || (termAblationIds.has(c.exchangeId) && DAG_ABLATION_DENIED_STATUSES.has(st))))) reasons.push(`status=${st ?? 'null'} (need 401/403/404)`)
+    const peer = Boolean(hopCount >= 2 && hasExplicitVerifiedTermEdge && st === 403 && termEx && hasForeignTenantData && !isPrivilegedActorOrRole(cRaw, resolveEntryIdentity(c).role, c.actorRoleLabel) && h.probeTenantOf(c, capIdx) && h.probeTenantOf(c, capIdx) === h.probeTenantOf(termEx, capIdx) && cleanExactPath(cp) === cleanExactPath(termEx.step.pathAndQuery ?? termEx.step.route ?? ''))
+    if ((isCap && cRaw !== termRawActor && !h.isLoginCap(cRaw!, capIdx)) || (termAuthd && !(st === 401 && anon401) && (!termEx || (!h.sameCredIdentity(c, termEx, capIdx) && !peer)))) reasons.push('cred_identity_mismatch')
+    else if (st === 401 && termAuthd && anon401) reasons.push('anon_401_for_authd_terminal')
+    const ref = onTerm ? termEx : postMutRb, rp = ref ? (ref.step.pathAndQuery ?? ref.step.route ?? '') : ''
+    const dot = Boolean(ref && (!c.origin || !ref.origin || normOrig(c.origin) === normOrig(ref.origin)) && c.step.method.toUpperCase() === ref.step.method.toUpperCase() && canonicalNonAuthQuery(cp) === canonicalNonAuthQuery(rp) && matchesNormalizedDotSegmentPath(cp, rp))
+    if (ref && !(h.matchesBoundTerminalControl(c, ref) || dot || Boolean(postMutRb && ref !== postMutRb && h.matchesBoundTerminalControl(c, postMutRb)))) reasons.push(c.origin && ref.origin && normOrig(c.origin) !== normOrig(ref.origin) ? 'origin_mismatch' : c.step.method.toUpperCase() !== ref.step.method.toUpperCase() ? `method_mismatch (${c.step.method.toUpperCase()}!=${ref.step.method.toUpperCase()})` : canonicalNonAuthQuery(cp) !== canonicalNonAuthQuery(rp) ? 'query_mismatch' : cleanExactPath(cp) === cleanExactPath(rp) ? 'entity_id_mismatch' : st === 404 ? 'status_404_dynamic_path' : 'sibling_object_unbound')
+    if (reasons.length > 0) out.push(`${c.exchangeId}: ${reasons.join(', ')}`)
+  }
+  return out
 }

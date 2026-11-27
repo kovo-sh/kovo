@@ -103,7 +103,7 @@ export interface VerifyTranscriptArtifact {
 export interface VerifyTranscriptRecord {
   exchangeId: string
   seq: number
-  op: VerifyExchangeOp
+  op: VerifyExchangeOp; raceTransport?: 'h2-single-packet' | 'http1-fallback'
   startedAt: number
   durationMs: number
   request?: VerifyTranscriptRequest
@@ -207,7 +207,7 @@ export class TranscriptStore {
   }
 
   record(input: {
-    op: VerifyExchangeOp
+    op: VerifyExchangeOp; raceTransport?: 'h2-single-packet' | 'http1-fallback'
     startedAt: number
     durationMs: number
     request?: VerifyTranscriptRequest
@@ -225,7 +225,7 @@ export class TranscriptStore {
     const unsigned: Omit<VerifyTranscriptRecord, 'signature'> = {
       exchangeId,
       seq: this.seq,
-      op: input.op,
+      op: input.op, ...(input.raceTransport ? { raceTransport: input.raceTransport } : {}),
       startedAt: input.startedAt,
       durationMs: Math.max(0, Math.round(input.durationMs)),
       ...(input.request ? { request: input.request } : {}),
@@ -1383,7 +1383,7 @@ function evaluateRaceClaim(
     if (!rec?.response) return { claim, passed: false, detail: `Unknown or failed race exchange ${id}.` }
     records.push(rec)
   }
-  if (claim.mode === 'h2-single-packet' && records.some(r => r.op !== 'http2')) return { claim, passed: false, detail: 'race claims an HTTP/2 single-packet barrier but the transcript recorded an HTTP/1.1 fallback exchange.' }
+  if (claim.mode === 'h2-single-packet' && records.some(r => r.op !== 'http2' && !(r.op === 'race' && r.raceTransport === 'h2-single-packet'))) return { claim, passed: false, detail: 'race claims an HTTP/2 single-packet barrier but the transcript recorded an HTTP/1.1 fallback exchange.' }
   if (claim.expectAllSuccess !== false && records.some(r => (r.response?.status ?? 0) < 200 || (r.response?.status ?? 0) >= 300)) {
     return { claim, passed: false, detail: 'race burst expected every participant to succeed; at least one exchange was denied or errored, so no duplicate effect is attributable to the burst.', observed: { statuses: records.map(r => r.response?.status ?? null) } }
   }
@@ -1664,7 +1664,7 @@ export function describeMissingEvidence(check: VerifyClaimCheck): string[] {
 function transcriptStatusSteps(store: TranscriptStore, factLog?: HostFactLog): ImpactStep[] {
   const out: ImpactStep[] = []
   for (const record of store.list()) {
-    if (!record.request || (record.op !== 'http' && record.op !== 'http2')) continue
+    if (!record.request || (record.op !== 'http' && record.op !== 'http2' && record.op !== 'race')) continue
     const arm = resolveCanonicalArm(record.request.sessionRole)
     const step = toTranscriptStep(store, record.exchangeId, arm, { factLog })
     if (step) out.push(step)
@@ -1801,7 +1801,7 @@ export function evaluateClaims(store: TranscriptStore, claims: readonly VerifyCl
   const citedRecords = claimedExchangeIds(claims)
     .filter(id => !context.allowedExchangeIds || context.allowedExchangeIds.has(id))
     .map(id => store.get(id))
-    .filter((rec): rec is VerifyTranscriptRecord => Boolean(rec?.request && rec.response && (rec.op === 'http' || rec.op === 'http2')))
+    .filter((rec): rec is VerifyTranscriptRecord => Boolean(rec?.request && rec.response && (rec.op === 'http' || rec.op === 'http2' || rec.op === 'race')))
   if (!hasTerminalOracle && !hasEvaluatedOrFp) {
     const ok2xx = citedRecords.filter(r => { const s = recordStatus(r); return s !== null && s >= 200 && s < 300 })
     const probe2xx = ok2xx.filter(r => r.request?.sessionRole === 'probe')

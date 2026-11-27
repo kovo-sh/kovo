@@ -1,0 +1,116 @@
+{
+  "id": "v8-m2-r4-kernel-claude-bypass-fp",
+  "side": "fp",
+  "archetype": "v8-m2-r4-kernel-unrelated-pad-hop-logical-state-transition",
+  "description": "R3-05 independent-review FP (r4-kernel): an unrelated harmless setup write (different entity, no shared value, same actor lineage) is padded in front of a single cross-tenant-looking terminal read that is a public changelog entry. hasVerifiedTermEdge must exclude host-synthesized bindingMode=logical_key_ablation edges that carry no shared entity/value causality; a multi-hop dual_tenant_abac chain must not be confirmed from a pad hop plus a denied control on the terminal route.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-rpc.ts",
+      "src/server/verify-support.ts"
+    ],
+    "classes": [
+      "bola",
+      "dual_tenant_abac",
+      "authorization"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Multi-hop cross-tenant read padded with unrelated hop",
+    "impact": "Terminal hop reads a public changelog entry; the setup hop is unrelated.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Two-hop cross-tenant changelog read with unrelated preference write"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    },
+    {
+      "handle": "viewer_a",
+      "roleLabel": "viewer (tenant-a)",
+      "role": "viewer",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-viewer-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "hop1_ex",
+      "arm": "setup",
+      "role": "setup",
+      "method": "POST",
+      "pathAndQuery": "/v1/preferences/notifications",
+      "persona": "member_a",
+      "requestJson": {
+        "digest": "weekly"
+      },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"saved\":true}"
+    },
+    {
+      "id": "hop2_ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/changelog/entries/cl_5521",
+      "persona": "viewer_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "hop2_prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/v1/changelog/entries/cl_5521",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"entryId\":\"cl_5521\",\"tenant\":\"tenant-b\",\"title\":\"Q3 public changelog\",\"visibility\":\"public\"}"
+    }
+  ],
+  "composite": {
+    "chainId": "v8-m2-r4-kernel-claude-bypass",
+    "terminalVulnClass": "bola",
+    "oracleFamily": "dual_tenant_abac",
+    "claimedDelta": "Unrelated preference write followed by a public changelog read that carries a tenant-b label."
+  },
+  "source": "independent_review"
+}
