@@ -651,7 +651,7 @@ export function kovoVerifyHelperGuidance(): string {
     'Typed helpers (prefer the helper for the class; each records the transcript roles the oracle checks):',
     ...KOVO_VERIFY_HELPERS.map(helper => `- ${helper.name} — ${helper.use}`),
     `Class hints: ${KOVO_VERIFY_CLASS_HINTS.map(([klass, helper]) => `${klass} -> ${helper}`).join('; ')}.`,
-    'Multi-hop chains: prefer ctx.chain({ chainId, terminalVulnClass }) (auto-wires hops[]/edges) or ctx.seal_capability (jsonPath/header/cookie/value only — NEVER regex; minted token: kind:"bearer_token", { capability:{ handle, target:"bearer" } }, OMIT as) -> ctx.http_send -> ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst -> ctx.prove_composite (replayMode="fresh_clean_replay"; connected DAG, no orphan hops; economic_conservation: baseline+final readback IDs in oracleInput). Never stop at disclosure/handle; with prerequisite setup hops, ALWAYS use ctx.prove_composite (NEVER standalone prove_race_burst/prove_access_boundary/prove_persisted_mutation) and declare EVERY causal hop (Hop 1->terminal) in hops[]+causalEdges[]. Probe hops: ONE low-priv/derived persona — never owner/admin.',
+    'Multi-hop chains: prefer ctx.chain({ chainId, terminalVulnClass }) (auto-wires hops[]/edges) or ctx.seal_capability (jsonPath/header/cookie/value only — NEVER regex; minted token: kind:"bearer_token", { capability:{ handle, target:"bearer" } }, OMIT as) -> ctx.http/ctx.http_send (negative controls MUST pass { arm: "control" }) -> ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst -> ctx.prove_composite (replayMode="fresh_clean_replay"; connected DAG; economic_conservation: baseline+final readback IDs). Never prove own-tenant reads or invite/job/export-handle mints; with setup hops ALWAYS use ctx.prove_composite (NEVER standalone prove_race_burst/prove_access_boundary/prove_persisted_mutation) and declare EVERY causal hop in hops[]+causalEdges[]. Probe hops: ONE low-priv/derived persona — never owner/admin.',
     KOVO_VERIFY_REPAIR_INSTRUCTION,
   ].join('\n')
 }
@@ -761,9 +761,9 @@ const KOVO_VERIFY_TS_EXAMPLE = [
 export const KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN = [
   'N-hop causal chain contract (prefer `ctx.chain({ chainId, terminalVulnClass })` over manual `ctx.prove_composite` in Mode A `fresh_clean_replay`):',
   '- One-shot builder: `const ch = ctx.chain({ chainId, terminalVulnClass }); ch.control(ctl); await ch.hop("hop_1", { claimedDelta }, async () => ...); ch.readback(fin); await ch.prove({ claimedImpact }); return ctx.result({ title })` (auto-wires `hops[]`/edges; `state_transition_binding`: `ch.stateTransition({ fromHopId, toHopId, entityId, ablationExchange })`).',
-  '- Seal & inject: assert 2xx before `ctx.seal_capability` (`jsonPath: "$.field"` | `header` | `cookie` | `value` — NEVER `regex`; `kind: "hmac_key"` / `"bearer_token"`); `ctx.http_send` (`role`: `"setup"|"control"|"probe"|"cleanup"` only; minted bearer: `{ capability: { handle, target: "bearer" } }`, OMIT `as`); `ctx.hmac_sign`/`ctx.jwt_sign`/`ctx.await_async`/`ctx.prove_race_burst`.',
-  '- Connected DAG (`dag_topology`): with ANY prerequisite setup hops, ALWAYS finalize via `ctx.prove_composite` (NEVER standalone `prove_race_burst`/`prove_access_boundary`/`prove_persisted_mutation`), declare EVERY executed causal hop (Hop 1 -> terminal) in `hops[]` + `causalEdges[]` reaching `terminalImpact.terminalHopId` (omitting Hop 1 or intermediate hops yields an incomplete receipt; no orphan hops; `state_transition_binding`: explicit `entityId` + `ablationExchangeIds` from clean pre-Stage-1 control).',
-  '- Terminal/provenance: NEVER stop at intermediate hops — chain to terminalHopId; attacker only (no victim/owner/admin); dual-tenant->dual_tenant_abac/cross_tenant_data_access. `economic_conservation`: `baselineReadbackExchangeId`, `finalReadbackExchangeId`, `actionExchangeIds` in `terminalImpact.oracleInput`.',
+  '- Seal & inject: assert 2xx before `ctx.seal_capability` (`jsonPath: "$.field"` | `header` | `cookie` | `value` — NEVER `regex`; `kind: "hmac_key"` / `"bearer_token"`); negative controls MUST pass `{ as: actor, arm: "control" }` on `ctx.http(...)`/`ctx.http_send(...)` (`role`/`arm`: `"setup"|"control"|"probe"|"cleanup"`; minted bearer: `{ capability: { handle, target: "bearer" } }`, OMIT `as`); `ctx.hmac_sign`/`ctx.jwt_sign`/`ctx.await_async`/`ctx.prove_race_burst`.',
+  '- Connected DAG (`dag_topology`): with ANY prerequisite setup hops, ALWAYS finalize via `ctx.prove_composite` (NEVER standalone `prove_race_burst`/`prove_access_boundary`/`prove_persisted_mutation`), declare EVERY executed causal hop (Hop 1 -> terminal) in `hops[]` + `causalEdges[]` reaching `terminalImpact.terminalHopId` (omitting Hop 1 or intermediate hops yields an incomplete receipt; no orphan hops; `state_transition_binding`: explicit `entityId` + `ablationExchangeIds` from clean pre-Stage-1 `{ arm: "control" }` probe).',
+  '- Terminal/provenance: NEVER prove own-tenant resource reads or stop at intermediate invite/job/export-handle mints — confirm cross-tenant/unauthorized victim impact on `terminalHopId`; attacker only (no victim/owner/admin); dual-tenant->dual_tenant_abac. `economic_conservation`: `baselineReadbackExchangeId`, `finalReadbackExchangeId`, `actionExchangeIds` in `terminalImpact.oracleInput`.',
 ].join('\n')
 
 const KOVO_VERIFY_TOOL_DESCRIPTION_BASE = [
@@ -809,7 +809,7 @@ export interface KovoVerifySealedCapabilitySummary { handle: string; kind: strin
 export interface KovoVerifyHopSummary { hopReceiptId: string; edgeId: string; binding: string; postconditionCapId?: string | null; terminalImpact?: string | null }
 export interface KovoVerifyCompositeSummary { chainId: string; terminalVulnClass: string; hopCount: number; replayMode: string; confirmed: boolean; failedStage?: string; verifiedEdgeCount: number }
 export interface KovoVerifyToolResult {
-  confirmed: boolean; reason: string; detail: string; title: string | null; transcriptDigest: string | null
+  confirmed: boolean; blocked?: boolean; reason: string; detail: string; title: string | null; transcriptDigest: string | null
   transcriptDigests: string[]; failures: string[]; disagreements: string[]; attempts: KovoVerifyAttemptSummary[]
   rejectedBy: string | null; missingEvidence: string[]; transcriptSummary: unknown[]
   exitCode?: number; stderrPreview?: string; usageHint?: string
@@ -828,6 +828,7 @@ function boundedRedactedStderr(raw: string, maxChars = 400): string {
 }
 
 export const CHECKPOINT_ONLY_CIRCUIT_BREAKER_THRESHOLD = 2
+const CHECKPOINT_PROOF_MARKER_RE = /(?:prove_composite|proveComposite|prove_|ctx\.result|compositeReceipt)/
 
 export function formatCheckpointOnlyCircuitBreaker(consecutiveCount: number): string {
   return `[CIRCUIT BREAKER — ${consecutiveCount} consecutive checkpoint_only kovo_verify calls] STOP calling kovo_verify for single-hop exploration or capability sealing. Sealed handles do NOT persist across separate kovo_verify scripts. Use http_request to probe hops first; call kovo_verify ONLY once you have the complete end-to-end chain ending in ctx.prove_composite(...) (or ctx.chain(...).prove()) in ONE script.`
@@ -836,27 +837,26 @@ export function formatCheckpointOnlyCircuitBreaker(consecutiveCount: number): st
 const KOVO_VERIFY_CHECKPOINT_ONLY_HINT =
   'checkpoint_only is a FAILURE: sealed handles do NOT persist across separate kovo_verify scripts. Use http_request to probe hops first, then call kovo_verify ONCE with the complete end-to-end chain ending in ctx.prove_composite(...) (or ctx.chain(...).prove()) in ONE script.'
 
-/**
- * Per-session `checkpoint_only` guard: omits misleading sealed metadata and trips
- * circuit-breaker at >= 2 consecutive calls.
- */
+/** Per-session `checkpoint_only` guard: omits misleading sealed metadata, trips circuit-breaker at >= 2, and hard-blocks non-proof scripts. */
 export function createCheckpointOnlySessionGuard() {
   let consecutiveCheckpointOnlyCalls = 0
   return {
     consecutiveCount: () => consecutiveCheckpointOnlyCalls,
-    summarizeOutcome<V extends { confirmed?: boolean; reason?: string; detail?: string; usageHint?: string }>(input: {
-      verdict: V
-      sealedCapabilities: readonly unknown[]
-      verifiedHops: readonly unknown[]
-      compositeReceipt?: Record<string, unknown>
-    }): KovoVerifyToolResult {
+    shouldBlockCheckpointOnlyScript(script: string): boolean {
+      return consecutiveCheckpointOnlyCalls >= CHECKPOINT_ONLY_CIRCUIT_BREAKER_THRESHOLD && !CHECKPOINT_PROOF_MARKER_RE.test(script)
+    },
+    buildBlockedOutcome(): KovoVerifyToolResult {
+      const directive = formatCheckpointOnlyCircuitBreaker(consecutiveCheckpointOnlyCalls)
+      return {
+        ...summarizeKovoVerifyOutcome({ confirmed: false, reason: 'checkpoint_blocked', detail: directive, usageHint: directive, rejectedBy: 'checkpoint_blocked', missingEvidence: ['composite_receipt'] }),
+        blocked: true,
+        usageHint: directive,
+      }
+    },
+    summarizeOutcome<V extends { confirmed?: boolean; reason?: string; detail?: string; usageHint?: string }>(input: { verdict: V; sealedCapabilities: readonly unknown[]; verifiedHops: readonly unknown[]; compositeReceipt?: Record<string, unknown> }): KovoVerifyToolResult {
       const isCheckpointOnly = input.verdict.confirmed !== true && input.verdict.reason === 'checkpoint_only'
       consecutiveCheckpointOnlyCalls = isCheckpointOnly ? consecutiveCheckpointOnlyCalls + 1 : 0
-      const v8Meta = {
-        ...(!isCheckpointOnly && input.sealedCapabilities.length ? { sealedCapabilities: input.sealedCapabilities } : {}),
-        ...(!isCheckpointOnly && input.verifiedHops.length ? { verifiedHops: input.verifiedHops } : {}),
-        ...(input.compositeReceipt ? { compositeReceipt: input.compositeReceipt } : {}),
-      }
+      const v8Meta = { ...(!isCheckpointOnly && input.sealedCapabilities.length ? { sealedCapabilities: input.sealedCapabilities } : {}), ...(!isCheckpointOnly && input.verifiedHops.length ? { verifiedHops: input.verifiedHops } : {}), ...(input.compositeReceipt ? { compositeReceipt: input.compositeReceipt } : {}) }
       if (isCheckpointOnly && consecutiveCheckpointOnlyCalls >= CHECKPOINT_ONLY_CIRCUIT_BREAKER_THRESHOLD) {
         const directive = formatCheckpointOnlyCircuitBreaker(consecutiveCheckpointOnlyCalls)
         const existingDetail = typeof input.verdict.detail === 'string' ? input.verdict.detail.trim() : ''
@@ -919,7 +919,7 @@ export function summarizeKovoVerifyOutcome(value: unknown): KovoVerifyToolResult
     : rawAttempts.map(item => (typeof item.stderr === 'string' ? item.stderr : (typeof item.stderrPreview === 'string' ? item.stderrPreview : ''))).find(t => t.trim().length > 0) ?? ''
   const stderrPreview = boundedRedactedStderr(rawStderr)
   const isCheckpointOnly = !confirmed && reason === 'checkpoint_only'
-  const isScriptFailure = !confirmed && (reason === 'claims_missing' || reason === 'execution_failed' || reason === 'checkpoint_only' || missingEvidence.includes('valid_proof_document') || (typeof exitCode === 'number' && exitCode !== 0) || stderrPreview.length > 0)
+  const isScriptFailure = !confirmed && (reason === 'claims_missing' || reason === 'execution_failed' || reason === 'checkpoint_only' || reason === 'checkpoint_blocked' || missingEvidence.includes('valid_proof_document') || (typeof exitCode === 'number' && exitCode !== 0) || stderrPreview.length > 0)
   const usageHint = isScriptFailure
     ? (typeof rec.usageHint === 'string' && rec.usageHint.trim() ? rec.usageHint.trim() : (isCheckpointOnly ? KOVO_VERIFY_CHECKPOINT_ONLY_HINT : KOVO_VERIFY_USAGE_HINT))
     : undefined
@@ -2244,8 +2244,8 @@ export function workerInvestigationPrompt(input: {
     task: 'defensive chain investigation',
     ...(specialistConfig ? { specialistProfile: specialistConfig.id, specialistFocus: specialistConfig.focusPrompt } : {}),
     explorationGuardrails: {
-      lowPrivFirst: 'Start discovery/probes as the lowest-privilege persona first (attacker ONLY; never victim/owner/admin shortcuts or shared-state priming — negative control only).',
-      ...(!isMultiHopStep ? { pushToTerminalImpact: 'Never stop at intermediate invite/token/metadata/role-write hops as broken_access_control; chain to terminal mutation/approval/secret readback (terminalHopId). Dual-tenant cross-tenant chains -> dual_tenant_abac/cross_tenant_data_access.' } : {}),
+      lowPrivFirst: 'Start discovery/probes as the lowest-privilege persona first (attacker ONLY; never victim/owner/admin shortcuts or shared-state priming — negative control only, passing { arm: "control" } on ctx.http calls).',
+      ...(!isMultiHopStep ? { pushToTerminalImpact: 'Never submit a proof for reading your own tenant resource or stop at intermediate invite/token/metadata/job/export-handle/role-write mints as broken_access_control; confirm cross-tenant/unauthorized victim impact on terminalHopId. Dual-tenant cross-tenant chains -> dual_tenant_abac.' } : {}),
       closureEvidence: 'For authz/workflow/business-logic/chain/race (>=2 personas or multi-step), never mark "ruled_out"/"no_issue_found" from a single 403/404 probe without /repos file:line or >=2 personas/steps; else run the missing check or record "needs_follow_up".',
     },
     ...(isMultiHopStep
@@ -2255,13 +2255,13 @@ export function workerInvestigationPrompt(input: {
             requiredCompositeProof: 'MUST verify the end-to-end causal chain with ctx.seal_capability(...) + ctx.prove_composite(...) (using ctx.hmac_sign / ctx.jwt_sign / ctx.await_async / ctx.prove_race_burst or ctx.chain(...).prove()) — do NOT substitute a standalone single-hop prove_access_boundary / prove_persisted_mutation call as your final proof; with prerequisite setup hops (disclosure, token/session, parser differential, cache prime, state rebind, async job polling), ALWAYS use ctx.prove_composite — NEVER standalone prove_race_burst / prove_access_boundary / prove_persisted_mutation.',
             declareAllExecutedHops: 'Declare EVERY causal hop (Hop 1 -> terminal) in prove_composite.hops[] connected via causalEdges[]; omitting Hop 1 or intermediate hops yields an incomplete receipt.',
             compositeCallSignature: 'Prefer const ch = ctx.chain({ chainId, terminalVulnClass }); ch.control(ctl); await ch.hop("hop_1", { claimedDelta }, ...); ch.readback(fin); await ch.prove({ claimedImpact }) (auto-wires hops[]/edges; or manual ctx.seal_capability({ exchangeId, slot, jsonPath, kind }) -> ctx.prove_composite)',
-            noPrematureSingleHop: 'Never stop at intermediate invite/token/metadata/role-write/job/cache hops as broken_access_control — seal via ctx.seal_capability and chain in ONE script to terminalHopId.',
-            singleOriginProbeArm: 'Run probe-arm hops as one low-priv attacker persona (or derived credential); never victim/owner/admin or target-tenant shortcuts; dual-tenant->dual_tenant_abac/cross_tenant_data_access.',
+            noPrematureSingleHop: 'Never submit a proof for reading your own tenant resource or stop at intermediate invite/token/metadata/role-write/job/export-handle/cache mints as broken_access_control — seal via ctx.seal_capability and chain in ONE script to cross-tenant/unauthorized victim impact on terminalHopId.',
+            singleOriginProbeArm: 'Run probe-arm hops as one low-priv attacker persona (or derived credential); never victim/owner/admin or target-tenant shortcuts; dual-tenant->dual_tenant_abac.',
             cryptoAndAsyncHelpers: 'Use ctx.hmac_sign / ctx.jwt_sign / ctx.await_async / ctx.prove_race_burst inside the same script, then confirm via ctx.prove_composite (replayMode: "fresh_clean_replay").',
             singleScriptConsolidation: 'Write ONE cohesive N-hop kovo_verify script using ctx.chain(...) (Hop 1 -> terminal -> ch.prove(...)) so hops[], exchangeIds, and causalEdges[] never mismatch.',
-            stateTransitionControlOrder: 'For state_transition_binding, run clean denied control (role: "control") BEFORE Stage 1 (or on a fresh untouched sibling entity) and pass explicit entityId + ablationExchangeIds.',
+            stateTransitionControlOrder: 'Always pass { arm: "control" } on negative-control ctx.http(...) / ctx.http_send(...) calls. For state_transition_binding, run clean denied control ({ arm: "control" }) BEFORE Stage 1 (or on a fresh untouched sibling entity) and pass explicit entityId + ablationExchangeIds.',
             economicConservationReadback: 'For terminalVulnClass: "economic_conservation", read baseline BEFORE the chain (preChainControlExchangeIds / oracleInput.baselineReadbackExchangeId), run mutating/race hops, read final AFTER (postChainReadbackExchangeIds / oracleInput.finalReadbackExchangeId), and pass { equation, balancesBefore/paidAmount, baselineReadbackExchangeId, finalReadbackExchangeId, actionExchangeIds } in terminalImpact.oracleInput (host hydrates host-signed records).',
-            connectedDagTopology: 'dag_topology: every hop in hops[] must be connected by causalEdges[] reaching terminalImpact.terminalHopId; never include unused or orphan exploratory hops in hops[].',
+            connectedDagTopology: 'dag_topology: every hop in hops[] must be connected by causalEdges[] reaching terminalImpact.terminalHopId; always pass { arm: "control" } on negative-control ctx.http(...) calls and never include unused or orphan exploratory hops in hops[].',
             derivedSessionTokenInjection: 'Derived bearer/session token: seal with kind: "bearer_token", inject with { capability: { handle, target: "bearer" } } (or Authorization: "Bearer " + handle), and OMIT as / persona.',
           },
         }

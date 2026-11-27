@@ -5054,22 +5054,22 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     }
 
     const personaForOrigin = (handle: string | undefined): string | undefined => {
-      if (!handle || rejectedPersonas.has(handle)) return undefined
-      const persona = grant.personas?.get(handle)
-      if (!persona) return undefined
-      return persona.originAllowlist.includes(origin) ? handle : undefined
+      const persona = handle && !rejectedPersonas.has(handle) ? grant.personas?.get(handle) : undefined
+      return persona && persona.originAllowlist.includes(origin) ? handle : undefined
     }
-    const nextUsablePersona = (): string | undefined => {
-      for (const handle of params.personas ?? []) {
-        const candidate = personaForOrigin(handle)
-        if (candidate) return candidate
-      }
-      return undefined
+    const discoveryPrivRank = (handle: string): number => {
+      const norm = `${handle} ${grant.personas?.get(handle)?.roleLabel ?? ''}`.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').toLowerCase()
+      if (/\b(?:owner|super\s*(?:user|admin)|superuser|superadmin|root|privileged|victim)\b/.test(norm)) return 4
+      if (/\b(?:admin|administrator)\b/.test(norm)) return 3
+      if (/\b(?:read\s*only|viewer|guest|readonly|anon|anonymous|unauthenticated|observer)\b/.test(norm)) return 0
+      return /\b(?:manager|editor|moderator|approver|maintainer|operator)\b/.test(norm) ? 2 : 1
     }
-    const isPersonaWideAuthInvalidation = (message: string): boolean =>
-      /(?:unknown persona|persona\b[^.\n]{0,60}\b(?:not registered|revoked|invalid|not allowed for origin|not permitted for origin)|originAllowlist|session\b[^.\n]{0,60}\b(?:expired|revoked|invalidated|terminated|not found)|credential\b[^.\n]{0,60}\b(?:expired|revoked|invalidated|missing))/i.test(message)
-    // All discovery fetches carry the approved owner session when one is available, so the SPA
-    // shell, API listings, config documents and OpenAPI specs behind login are visible.
+    const orderedOriginPersonas = [...(params.personas ?? [])].sort((a, b) => (discoveryPrivRank(a) - discoveryPrivRank(b)) || a.localeCompare(b))
+    const lowPrivOriginPersonas = orderedOriginPersonas.filter(h => discoveryPrivRank(h) < 3 && Boolean(grant.personas?.get(h)?.originAllowlist.includes(origin)))
+    const nextUsablePersona = (): string | undefined =>
+      (lowPrivOriginPersonas.length > 0 ? lowPrivOriginPersonas : orderedOriginPersonas).map(personaForOrigin).find((c): c is string => Boolean(c))
+    const isPersonaWideAuthInvalidation = (message: string): boolean => /(?:unknown persona|persona\b[^.\n]{0,60}\b(?:not registered|revoked|invalid|not allowed for origin|not permitted for origin)|originAllowlist|session\b[^.\n]{0,60}\b(?:expired|revoked|invalidated|terminated|not found)|credential\b[^.\n]{0,60}\b(?:expired|revoked|invalidated|missing))/i.test(message)
+    // Prefer low-privilege non-admin/non-owner personas for passive Phase-0 discovery (fallback only if none exist).
     let discoveryPersona = nextUsablePersona()
 
     const harvestRedirectHop = (hopOrigin: string, targetUrl: URL): void => {
@@ -5544,8 +5544,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       } catch { /* fall through to live GET / */ }
       if (!recoveredRoot) {
         let rootEx = await safeGet('/')
-        if (rootEx && (rootEx.status === 401 || rootEx.status === 403) && params.personas?.length) {
-          for (const handle of params.personas) {
+        if (rootEx && (rootEx.status === 401 || rootEx.status === 403) && orderedOriginPersonas.length) {
+          for (const handle of orderedOriginPersonas) {
             if (!personaForOrigin(handle)) continue
             if (originHalted || originUsed >= perOriginCap) break
             rootEx = await safeGet('/', { persona: handle })
@@ -5597,10 +5597,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       async seedPath => {
         if (originHalted || originUsed >= perOriginCap || signal.aborted) return
         let ex = await safeGet(seedPath)
-        // Config/route-map artifacts are often behind auth; retry with every approved persona (not
-        // just the first) so role-scoped tables are visible to the persona union.
-        if (ex && (ex.status === 401 || ex.status === 403) && params.personas?.length) {
-          for (const handle of params.personas) {
+        // Retry auth-gated non-root seeds with low-privilege personas ONLY — never escalate to
+        // owner/admin/victim personas on non-root seed/API endpoints during passive Phase-0 discovery.
+        if (ex && (ex.status === 401 || ex.status === 403) && lowPrivOriginPersonas.length) {
+          for (const handle of lowPrivOriginPersonas) {
             if (!personaForOrigin(handle)) continue
             if (originHalted || originUsed >= perOriginCap) break
             ex = await safeGet(seedPath, { persona: handle })
@@ -6514,8 +6514,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
 
     // 2d-ter. Multi-persona shell pass: every approved role persona gets its own root shell so
     // role-gated navigation (admin console) enters discovery instead of only persona[0]'s view.
-    if (!originHalted && !signal.aborted && (params.personas?.length ?? 0) > 0 && originUsed < perOriginCap) {
-      const handles = params.personas ?? []
+    if (!originHalted && !signal.aborted && orderedOriginPersonas.length > 0 && originUsed < perOriginCap) {
+      const handles = orderedOriginPersonas
       const personaCap = Math.min(handles.length, Math.max(1, Math.floor(perOriginCap * 0.12)))
       let personaFetches = 0
       for (const handle of handles) {
@@ -6571,7 +6571,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
               runId,
               scopeRevision,
               origin,
-              personas: params.personas,
+              personas: lowPrivOriginPersonas.length > 0 ? lowPrivOriginPersonas : orderedOriginPersonas,
               maxPages: Math.min(10, Math.max(1, Math.floor(crawlBudget / 2))),
               maxDepth: 3,
               budgetRemaining: crawlBudget,
