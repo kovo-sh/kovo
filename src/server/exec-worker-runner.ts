@@ -2,8 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { and, eq } from 'drizzle-orm'
 import {
   maxInlineVerifyRetries,
-  type CheckCoverage,
-  type CodeLocation,
+  type CheckCoverage, type CodeLocation,
 } from '../domain.ts'
 import { declarativeReplaySpecSchema, replaySpecOrigins, type DeclarativeReplaySpec } from '../replay-spec.ts'
 import {
@@ -12,6 +11,7 @@ import {
   registerAssignmentClock,
   type DeadlineTimerHandle,
 } from './active-clock.ts'
+import { createCheckpointOnlySessionGuard } from './agent-prompts.ts'
 import {
   KOVO_VERIFY_TS_ONLY_ERROR,
   createBoardTools,
@@ -1389,6 +1389,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       this.storage.capabilityLedger(run.id).listCapabilities().map(c => c.capId),
     )
     const sessionSealedCapHandles: string[] = []
+    const checkpointOnlyGuard = createCheckpointOnlySessionGuard()
     let confirmedDuringAssignment = false
     let gapCodedDuringAssignment = false
     let enteredKovoVerify = false
@@ -2498,42 +2499,38 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             if (ledgerSync.newCapabilityCount > 0 || ledgerSync.newEdgeCount > 0) {
               this.host.schedulePlanner(curRun.id)
             }
-            const v8Meta = {
-              ...(ledgerSync.sealedCapabilities.length ? { sealedCapabilities: ledgerSync.sealedCapabilities } : {}),
-              ...(ledgerSync.verifiedHops.length ? { verifiedHops: ledgerSync.verifiedHops } : {}),
-              ...(proof.compositeReceipt ? {
-                compositeReceipt: {
-                  chainId: proof.compositeReceipt.receipt.chainId,
-                  terminalVulnClass: proof.compositeReceipt.receipt.terminalVulnClass,
-                  hopCount: proof.compositeReceipt.receipt.hops.length,
-                  replayMode: proof.compositeReceipt.receipt.replayMode,
-                  confirmed: proof.compositeReceipt.verification.confirmed,
-                  ...(proof.compositeReceipt.verification.failedStage
-                    ? { failedStage: proof.compositeReceipt.verification.failedStage }
-                    : {}),
-                  verifiedEdgeCount: proof.compositeReceipt.verification.verifiedEdges.filter(e => e.verified).length,
-                },
-              } : {}),
-            }
+            const compositeReceipt = proof.compositeReceipt ? {
+              chainId: proof.compositeReceipt.receipt.chainId,
+              terminalVulnClass: proof.compositeReceipt.receipt.terminalVulnClass,
+              hopCount: proof.compositeReceipt.receipt.hops.length,
+              replayMode: proof.compositeReceipt.receipt.replayMode,
+              confirmed: proof.compositeReceipt.verification.confirmed,
+              ...(proof.compositeReceipt.verification.failedStage
+                ? { failedStage: proof.compositeReceipt.verification.failedStage }
+                : {}),
+              verifiedEdgeCount: proof.compositeReceipt.verification.verifiedEdges.filter(e => e.verified).length,
+            } : undefined
             if (!proof.verdict.confirmed) {
-              return summarizeKovoVerifyOutcome({ ...proof.verdict, ...v8Meta })
+              return checkpointOnlyGuard.summarizeOutcome({
+                verdict: proof.verdict,
+                sealedCapabilities: ledgerSync.sealedCapabilities,
+                verifiedHops: ledgerSync.verifiedHops,
+                ...(compositeReceipt ? { compositeReceipt } : {}),
+              })
             }
             confirmedDuringAssignment = true
             const persisted = this.host.persistAgentScriptProof({
-              run: curRun,
-              assignment: job.assignment,
-              script,
-              runtime,
-              title: args.title?.trim() || proof.claimTitle || undefined,
-              proof,
+              run: curRun, assignment: job.assignment, script, runtime,
+              title: args.title?.trim() || proof.claimTitle || undefined, proof,
               secrets: [...currentSecrets(), ...vaultScrubDescriptors(runVault)],
             })
             this.host.schedulePlanner(curRun.id)
-            return summarizeKovoVerifyOutcome({
-              ...proof.verdict,
-              ...v8Meta,
-              detail: `${proof.verdict.detail} Finding ${persisted.findingId} cites ${persisted.receiptId ? `ProofReceipt ${persisted.receiptId}` : 'the persisted script proof'} (replay spec ${persisted.replaySpecId}).`
-                .trim(),
+            return checkpointOnlyGuard.summarizeOutcome({
+              verdict: {
+                ...proof.verdict,
+                detail: `${proof.verdict.detail} Finding ${persisted.findingId} cites ${persisted.receiptId ? `ProofReceipt ${persisted.receiptId}` : 'the persisted script proof'} (replay spec ${persisted.replaySpecId}).`.trim(),
+              },
+              sealedCapabilities: ledgerSync.sealedCapabilities, verifiedHops: ledgerSync.verifiedHops, ...(compositeReceipt ? { compositeReceipt } : {}),
             })
             })
           },
@@ -2828,6 +2825,9 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               specialistProfile: specialistProfileId,
             },
             origins: targetOrigins,
+            ...([...new Set([...targetOrigins, ...permittedAtAdmission])].length > 1
+              ? { publicOrigins: [...new Set([...targetOrigins, ...permittedAtAdmission])] }
+              : {}),
             capabilityTier: run.capabilityTier,
             maxTurns: budget.maxTurns,
             budget,

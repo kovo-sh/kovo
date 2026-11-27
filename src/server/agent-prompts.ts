@@ -763,7 +763,7 @@ export const KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN = [
   '- One-shot builder: `const ch = ctx.chain({ chainId, terminalVulnClass }); ch.control(ctl); await ch.hop("hop_1", { claimedDelta }, async () => ...); ch.readback(fin); await ch.prove({ claimedImpact }); return ctx.result({ title })` (auto-wires `hops[]`/edges; `state_transition_binding`: `ch.stateTransition({ fromHopId, toHopId, entityId, ablationExchange })`).',
   '- Seal & inject: assert 2xx before `ctx.seal_capability` (`jsonPath: "$.field"` | `header` | `cookie` | `value` — NEVER `regex`; `kind: "hmac_key"` / `"bearer_token"`); `ctx.http_send` (`role`: `"setup"|"control"|"probe"|"cleanup"` only; minted bearer: `{ capability: { handle, target: "bearer" } }`, OMIT `as`); `ctx.hmac_sign`/`ctx.jwt_sign`/`ctx.await_async`/`ctx.prove_race_burst`.',
   '- Connected DAG (`dag_topology`): with ANY prerequisite setup hops, ALWAYS finalize via `ctx.prove_composite` (NEVER standalone `prove_race_burst`/`prove_access_boundary`/`prove_persisted_mutation`), declare EVERY executed causal hop (Hop 1 -> terminal) in `hops[]` + `causalEdges[]` reaching `terminalImpact.terminalHopId` (omitting Hop 1 or intermediate hops yields an incomplete receipt; no orphan hops; `state_transition_binding`: explicit `entityId` + `ablationExchangeIds` from clean pre-Stage-1 control).',
-  '- Terminal & provenance: NEVER stop at disclosure/handle/job/cache stub; ALL probe-arm hops run as one low-priv persona (never target-tenant/owner/admin). `economic_conservation`: pass `baselineReadbackExchangeId`, `finalReadbackExchangeId`, `actionExchangeIds` in `terminalImpact.oracleInput`.',
+  '- Terminal/provenance: NEVER stop at intermediate hops — chain to terminalHopId; attacker only (no victim/owner/admin); dual-tenant->dual_tenant_abac/cross_tenant_data_access. `economic_conservation`: `baselineReadbackExchangeId`, `finalReadbackExchangeId`, `actionExchangeIds` in `terminalImpact.oracleInput`.',
 ].join('\n')
 
 const KOVO_VERIFY_TOOL_DESCRIPTION_BASE = [
@@ -827,27 +827,64 @@ function boundedRedactedStderr(raw: string, maxChars = 400): string {
   return cleaned.length <= maxChars ? cleaned : `${cleaned.slice(0, Math.max(0, maxChars - 3))}...`
 }
 
+export const CHECKPOINT_ONLY_CIRCUIT_BREAKER_THRESHOLD = 2
+
+export function formatCheckpointOnlyCircuitBreaker(consecutiveCount: number): string {
+  return `[CIRCUIT BREAKER — ${consecutiveCount} consecutive checkpoint_only kovo_verify calls] STOP calling kovo_verify for single-hop exploration or capability sealing. Sealed handles do NOT persist across separate kovo_verify scripts. Use http_request to probe hops first; call kovo_verify ONLY once you have the complete end-to-end chain ending in ctx.prove_composite(...) (or ctx.chain(...).prove()) in ONE script.`
+}
+
+const KOVO_VERIFY_CHECKPOINT_ONLY_HINT =
+  'checkpoint_only is a FAILURE: sealed handles do NOT persist across separate kovo_verify scripts. Use http_request to probe hops first, then call kovo_verify ONCE with the complete end-to-end chain ending in ctx.prove_composite(...) (or ctx.chain(...).prove()) in ONE script.'
+
 /**
- * Normalize a verifyScript verdict (or an already-compact result) into the tool contract and
- * downgrade any `confirmed: true` that is not backed by two signature-valid, oracle-passed
- * transcript attempts. A script's stdout or a hand-written proof document can never confirm.
+ * Per-session `checkpoint_only` guard: omits misleading sealed metadata and trips
+ * circuit-breaker at >= 2 consecutive calls.
+ */
+export function createCheckpointOnlySessionGuard() {
+  let consecutiveCheckpointOnlyCalls = 0
+  return {
+    consecutiveCount: () => consecutiveCheckpointOnlyCalls,
+    summarizeOutcome<V extends { confirmed?: boolean; reason?: string; detail?: string; usageHint?: string }>(input: {
+      verdict: V
+      sealedCapabilities: readonly unknown[]
+      verifiedHops: readonly unknown[]
+      compositeReceipt?: Record<string, unknown>
+    }): KovoVerifyToolResult {
+      const isCheckpointOnly = input.verdict.confirmed !== true && input.verdict.reason === 'checkpoint_only'
+      consecutiveCheckpointOnlyCalls = isCheckpointOnly ? consecutiveCheckpointOnlyCalls + 1 : 0
+      const v8Meta = {
+        ...(!isCheckpointOnly && input.sealedCapabilities.length ? { sealedCapabilities: input.sealedCapabilities } : {}),
+        ...(!isCheckpointOnly && input.verifiedHops.length ? { verifiedHops: input.verifiedHops } : {}),
+        ...(input.compositeReceipt ? { compositeReceipt: input.compositeReceipt } : {}),
+      }
+      if (isCheckpointOnly && consecutiveCheckpointOnlyCalls >= CHECKPOINT_ONLY_CIRCUIT_BREAKER_THRESHOLD) {
+        const directive = formatCheckpointOnlyCircuitBreaker(consecutiveCheckpointOnlyCalls)
+        const existingDetail = typeof input.verdict.detail === 'string' ? input.verdict.detail.trim() : ''
+        const existingHint = typeof input.verdict.usageHint === 'string' ? input.verdict.usageHint.trim() : ''
+        return summarizeKovoVerifyOutcome({ ...input.verdict, ...v8Meta, detail: existingDetail ? `${directive} ${existingDetail}` : directive, usageHint: existingHint ? `${directive} ${existingHint}` : directive })
+      }
+      return summarizeKovoVerifyOutcome({ ...input.verdict, ...v8Meta })
+    },
+  }
+}
+
+/**
+ * Normalize a verifyScript verdict into the tool contract and downgrade any `confirmed: true`
+ * lacking two signature-valid, oracle-passed transcript attempts (script stdout is never evidence).
  */
 export function summarizeKovoVerifyOutcome(value: unknown): KovoVerifyToolResult {
-  const rec = value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {}
+  const rec = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
   const rawAttempts = (Array.isArray(rec.attempts) ? rec.attempts : [])
     .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
-  const attempts: KovoVerifyAttemptSummary[] = rawAttempts
-    .map((item, index) => ({
-      attempt: typeof item.attempt === 'number' ? item.attempt : index + 1,
-      oraclePassed: item.oraclePassed === true,
-      exitCode: typeof item.exitCode === 'number' ? item.exitCode : 1,
-      exchangeCount: typeof item.exchangeCount === 'number' ? item.exchangeCount : 0,
-      transcriptDigest: typeof item.transcriptDigest === 'string' ? item.transcriptDigest : '',
-      signaturesValid: item.signaturesValid === true,
-      failures: stringList(item.failures),
-    }))
+  const attempts: KovoVerifyAttemptSummary[] = rawAttempts.map((item, index) => ({
+    attempt: typeof item.attempt === 'number' ? item.attempt : index + 1,
+    oraclePassed: item.oraclePassed === true,
+    exitCode: typeof item.exitCode === 'number' ? item.exitCode : 1,
+    exchangeCount: typeof item.exchangeCount === 'number' ? item.exchangeCount : 0,
+    transcriptDigest: typeof item.transcriptDigest === 'string' ? item.transcriptDigest : '',
+    signaturesValid: item.signaturesValid === true,
+    failures: stringList(item.failures),
+  }))
   const disagreements = stringList(rec.disagreements)
   const transcriptDigests = attempts.map(attempt => attempt.transcriptDigest).filter(Boolean)
   const transcriptDigest = transcriptDigests.length > 0
@@ -856,114 +893,70 @@ export function summarizeKovoVerifyOutcome(value: unknown): KovoVerifyToolResult
   const failures = stringList(rec.failures).length > 0
     ? stringList(rec.failures)
     : [...new Set([...attempts.flatMap(attempt => attempt.failures), ...disagreements])]
-  // Structured repair feedback from the oracle is carried through verbatim so a worker can repair
-  // in one turn. Older handlers only emit the `rejected-by:` / `missing-evidence:` failure lines,
-  // so fall back to parsing those.
   const reportedRejectedBy = typeof rec.rejectedBy === 'string' && rec.rejectedBy.trim() ? rec.rejectedBy.trim() : null
-  const parsedRejectedBy = failures
-    .map(failure => /^rejected-by:\s*(.+)$/.exec(failure.trim())?.[1]?.trim())
-    .find((value): value is string => Boolean(value))
+  const parsedRejectedBy = failures.map(f => /^rejected-by:\s*(.+)$/.exec(f.trim())?.[1]?.trim()).find((v): v is string => Boolean(v))
   const rejectedBy = reportedRejectedBy ?? parsedRejectedBy ?? null
   const reportedMissingEvidence = stringList(rec.missingEvidence)
   const missingEvidence = reportedMissingEvidence.length > 0
     ? reportedMissingEvidence
-    : failures
-        .map(failure => /^missing-evidence:\s*(.+)$/.exec(failure.trim())?.[1]?.trim())
-        .filter((value): value is string => Boolean(value))
+    : failures.map(f => /^missing-evidence:\s*(.+)$/.exec(f.trim())?.[1]?.trim()).filter((v): v is string => Boolean(v))
   const transcriptSummary = Array.isArray(rec.transcriptSummary) ? rec.transcriptSummary : []
   let confirmed = rec.confirmed === true
   let reason = typeof rec.reason === 'string' && rec.reason ? rec.reason : (confirmed ? 'confirmed' : 'unconfirmed')
   let detail = typeof rec.detail === 'string' ? rec.detail : ''
   if (confirmed) {
-    const oracleBacked = attempts.length >= 2 && attempts.every(attempt =>
-      attempt.oraclePassed &&
-      attempt.signaturesValid &&
-      attempt.transcriptDigest.length > 0 &&
-      attempt.failures.length === 0)
+    const oracleBacked = attempts.length >= 2 && attempts.every(a => a.oraclePassed && a.signaturesValid && a.transcriptDigest.length > 0 && a.failures.length === 0)
     if (!oracleBacked) {
-      confirmed = false
-      reason = 'unverified'
+      confirmed = false; reason = 'unverified'
       detail = 'Handler claimed confirmation without two signature-valid, oracle-passed transcript attempts; script stdout is never evidence.'
       failures.push(detail)
     }
   }
   const reportedExitCode = typeof rec.exitCode === 'number' ? rec.exitCode : undefined
-  const attemptExitCode = attempts.find(attempt => attempt.exitCode !== 0)?.exitCode ?? attempts[0]?.exitCode
-  const exitCode = reportedExitCode ?? attemptExitCode
+  const exitCode = reportedExitCode ?? (attempts.find(a => a.exitCode !== 0)?.exitCode ?? attempts[0]?.exitCode)
   const rawStderr = typeof rec.stderrPreview === 'string' && rec.stderrPreview.trim()
     ? rec.stderrPreview
-    : rawAttempts
-        .map(item => (typeof item.stderr === 'string' ? item.stderr : (typeof item.stderrPreview === 'string' ? item.stderrPreview : '')))
-        .find(text => text.trim().length > 0) ?? ''
+    : rawAttempts.map(item => (typeof item.stderr === 'string' ? item.stderr : (typeof item.stderrPreview === 'string' ? item.stderrPreview : ''))).find(t => t.trim().length > 0) ?? ''
   const stderrPreview = boundedRedactedStderr(rawStderr)
-  const isScriptFailure = !confirmed && (
-    reason === 'claims_missing'
-    || reason === 'execution_failed'
-    || missingEvidence.includes('valid_proof_document')
-    || (typeof exitCode === 'number' && exitCode !== 0)
-    || stderrPreview.length > 0
-  )
+  const isCheckpointOnly = !confirmed && reason === 'checkpoint_only'
+  const isScriptFailure = !confirmed && (reason === 'claims_missing' || reason === 'execution_failed' || reason === 'checkpoint_only' || missingEvidence.includes('valid_proof_document') || (typeof exitCode === 'number' && exitCode !== 0) || stderrPreview.length > 0)
   const usageHint = isScriptFailure
-    ? (typeof rec.usageHint === 'string' && rec.usageHint.trim() ? rec.usageHint.trim() : KOVO_VERIFY_USAGE_HINT)
+    ? (typeof rec.usageHint === 'string' && rec.usageHint.trim() ? rec.usageHint.trim() : (isCheckpointOnly ? KOVO_VERIFY_CHECKPOINT_ONLY_HINT : KOVO_VERIFY_USAGE_HINT))
     : undefined
-  const sealedCapabilities: KovoVerifySealedCapabilitySummary[] = Array.isArray(rec.sealedCapabilities)
+  const sealedCapabilities: KovoVerifySealedCapabilitySummary[] = !isCheckpointOnly && Array.isArray(rec.sealedCapabilities)
     ? rec.sealedCapabilities
         .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
         .filter(item => typeof item.handle === 'string' && /^cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$/.test(item.handle))
         .map(item => ({
-          handle: String(item.handle),
-          kind: typeof item.kind === 'string' ? item.kind : 'generic_secret',
-          sha256Prefix: typeof item.sha256Prefix === 'string' ? item.sha256Prefix.slice(0, 16) : '',
-          ...(typeof item.derivedFromCapabilityId === 'string' && /^cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$/.test(item.derivedFromCapabilityId)
-            ? { derivedFromCapabilityId: item.derivedFromCapabilityId }
-            : {}),
+          handle: String(item.handle), kind: typeof item.kind === 'string' ? item.kind : 'generic_secret', sha256Prefix: typeof item.sha256Prefix === 'string' ? item.sha256Prefix.slice(0, 16) : '',
+          ...(typeof item.derivedFromCapabilityId === 'string' && /^cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$/.test(item.derivedFromCapabilityId) ? { derivedFromCapabilityId: item.derivedFromCapabilityId } : {}),
         }))
     : []
-  const verifiedHops: KovoVerifyHopSummary[] = Array.isArray(rec.verifiedHops)
+  const verifiedHops: KovoVerifyHopSummary[] = !isCheckpointOnly && Array.isArray(rec.verifiedHops)
     ? rec.verifiedHops
         .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
         .filter(item => typeof item.hopReceiptId === 'string' && typeof item.edgeId === 'string')
         .map(item => ({
-          hopReceiptId: String(item.hopReceiptId),
-          edgeId: String(item.edgeId),
-          binding: typeof item.binding === 'string' ? item.binding : 'value_binding',
+          hopReceiptId: String(item.hopReceiptId), edgeId: String(item.edgeId), binding: typeof item.binding === 'string' ? item.binding : 'value_binding',
           ...(typeof item.postconditionCapId === 'string' || item.postconditionCapId === null ? { postconditionCapId: item.postconditionCapId as string | null } : {}),
           ...(typeof item.terminalImpact === 'string' || item.terminalImpact === null ? { terminalImpact: item.terminalImpact as string | null } : {}),
         }))
     : []
-  const rawComp = rec.compositeReceipt && typeof rec.compositeReceipt === 'object' && !Array.isArray(rec.compositeReceipt)
-    ? rec.compositeReceipt as Record<string, unknown>
-    : null
+  const rawComp = rec.compositeReceipt && typeof rec.compositeReceipt === 'object' && !Array.isArray(rec.compositeReceipt) ? rec.compositeReceipt as Record<string, unknown> : null
   const compositeReceipt: KovoVerifyCompositeSummary | undefined = rawComp && typeof rawComp.chainId === 'string'
     ? {
-        chainId: rawComp.chainId,
-        terminalVulnClass: typeof rawComp.terminalVulnClass === 'string' ? rawComp.terminalVulnClass : 'unknown',
-        hopCount: typeof rawComp.hopCount === 'number' ? rawComp.hopCount : 0,
-        replayMode: typeof rawComp.replayMode === 'string' ? rawComp.replayMode : 'fresh_clean_replay',
-        confirmed: rawComp.confirmed === true && confirmed,
-        ...(typeof rawComp.failedStage === 'string' ? { failedStage: rawComp.failedStage } : {}),
+        chainId: rawComp.chainId, terminalVulnClass: typeof rawComp.terminalVulnClass === 'string' ? rawComp.terminalVulnClass : 'unknown',
+        hopCount: typeof rawComp.hopCount === 'number' ? rawComp.hopCount : 0, replayMode: typeof rawComp.replayMode === 'string' ? rawComp.replayMode : 'fresh_clean_replay',
+        confirmed: rawComp.confirmed === true && confirmed, ...(typeof rawComp.failedStage === 'string' ? { failedStage: rawComp.failedStage } : {}),
         verifiedEdgeCount: typeof rawComp.verifiedEdgeCount === 'number' ? rawComp.verifiedEdgeCount : 0,
       }
     : undefined
   return {
-    confirmed,
-    reason,
-    detail,
-    title: typeof rec.title === 'string' ? rec.title : (typeof rec.claimTitle === 'string' ? rec.claimTitle : null),
-    transcriptDigest,
-    transcriptDigests,
-    failures,
-    disagreements,
-    attempts,
-    rejectedBy,
-    missingEvidence,
-    transcriptSummary,
-    ...(isScriptFailure && typeof exitCode === 'number' ? { exitCode } : {}),
-    ...(isScriptFailure ? { stderrPreview } : {}),
-    ...(usageHint ? { usageHint } : {}),
-    ...(sealedCapabilities.length ? { sealedCapabilities } : {}),
-    ...(verifiedHops.length ? { verifiedHops } : {}),
-    ...(compositeReceipt ? { compositeReceipt } : {}),
+    confirmed, reason, detail, title: typeof rec.title === 'string' ? rec.title : (typeof rec.claimTitle === 'string' ? rec.claimTitle : null),
+    transcriptDigest, transcriptDigests, failures, disagreements, attempts, rejectedBy, missingEvidence, transcriptSummary,
+    ...(isScriptFailure && typeof exitCode === 'number' ? { exitCode } : {}), ...(isScriptFailure ? { stderrPreview } : {}),
+    ...(usageHint ? { usageHint } : {}), ...(sealedCapabilities.length ? { sealedCapabilities } : {}),
+    ...(verifiedHops.length ? { verifiedHops } : {}), ...(compositeReceipt ? { compositeReceipt } : {}),
   }
 }
 
@@ -2195,6 +2188,7 @@ export function workerInvestigationPrompt(input: {
     dependsOnFactIds?: readonly string[]
   }
   origins: readonly string[]
+  publicOrigins?: readonly string[]
   capabilityTier: CapabilityTier
   maxTurns: number
   budget?: PromptAssignmentBudget
@@ -2242,11 +2236,16 @@ export function workerInvestigationPrompt(input: {
     ...(effectiveWallClockMs !== undefined ? { wallClockMs: effectiveWallClockMs } : {}),
     ...(effectiveWallClockSettlementMs !== undefined ? { wallClockSettlementMs: effectiveWallClockSettlementMs } : {}),
   }
+  const approvedPublicOrigins = [...new Set([
+    ...input.origins,
+    ...(input.publicOrigins ?? []),
+  ].map(o => o.trim()).filter(Boolean))]
   return JSON.stringify({
     task: 'defensive chain investigation',
     ...(specialistConfig ? { specialistProfile: specialistConfig.id, specialistFocus: specialistConfig.focusPrompt } : {}),
     explorationGuardrails: {
-      lowPrivFirst: 'Start exploration, priming, and probes as the lowest-privilege persona first; reserve privileged personas for negative-control/target observation, never priming shared state/caches.',
+      lowPrivFirst: 'Start discovery/probes as the lowest-privilege persona first (attacker ONLY; never victim/owner/admin shortcuts or shared-state priming — negative control only).',
+      ...(!isMultiHopStep ? { pushToTerminalImpact: 'Never stop at intermediate invite/token/metadata/role-write hops as broken_access_control; chain to terminal mutation/approval/secret readback (terminalHopId). Dual-tenant cross-tenant chains -> dual_tenant_abac/cross_tenant_data_access.' } : {}),
       closureEvidence: 'For authz/workflow/business-logic/chain/race (>=2 personas or multi-step), never mark "ruled_out"/"no_issue_found" from a single 403/404 probe without /repos file:line or >=2 personas/steps; else run the missing check or record "needs_follow_up".',
     },
     ...(isMultiHopStep
@@ -2256,8 +2255,8 @@ export function workerInvestigationPrompt(input: {
             requiredCompositeProof: 'MUST verify the end-to-end causal chain with ctx.seal_capability(...) + ctx.prove_composite(...) (using ctx.hmac_sign / ctx.jwt_sign / ctx.await_async / ctx.prove_race_burst or ctx.chain(...).prove()) — do NOT substitute a standalone single-hop prove_access_boundary / prove_persisted_mutation call as your final proof; with prerequisite setup hops (disclosure, token/session, parser differential, cache prime, state rebind, async job polling), ALWAYS use ctx.prove_composite — NEVER standalone prove_race_burst / prove_access_boundary / prove_persisted_mutation.',
             declareAllExecutedHops: 'Declare EVERY causal hop (Hop 1 -> terminal) in prove_composite.hops[] connected via causalEdges[]; omitting Hop 1 or intermediate hops yields an incomplete receipt.',
             compositeCallSignature: 'Prefer const ch = ctx.chain({ chainId, terminalVulnClass }); ch.control(ctl); await ch.hop("hop_1", { claimedDelta }, ...); ch.readback(fin); await ch.prove({ claimedImpact }) (auto-wires hops[]/edges; or manual ctx.seal_capability({ exchangeId, slot, jsonPath, kind }) -> ctx.prove_composite)',
-            noPrematureSingleHop: 'Never stop at disclosure/handle, job creation, cache prime, or token stubs — seal via ctx.seal_capability and continue in ONE script to ctx.prove_composite.',
-            singleOriginProbeArm: 'Run all probe-arm hops as a single starting low-privilege persona (or derived credential); never use a target-tenant persona on the probe arm.',
+            noPrematureSingleHop: 'Never stop at intermediate invite/token/metadata/role-write/job/cache hops as broken_access_control — seal via ctx.seal_capability and chain in ONE script to terminalHopId.',
+            singleOriginProbeArm: 'Run probe-arm hops as one low-priv attacker persona (or derived credential); never victim/owner/admin or target-tenant shortcuts; dual-tenant->dual_tenant_abac/cross_tenant_data_access.',
             cryptoAndAsyncHelpers: 'Use ctx.hmac_sign / ctx.jwt_sign / ctx.await_async / ctx.prove_race_burst inside the same script, then confirm via ctx.prove_composite (replayMode: "fresh_clean_replay").',
             singleScriptConsolidation: 'Write ONE cohesive N-hop kovo_verify script using ctx.chain(...) (Hop 1 -> terminal -> ch.prove(...)) so hops[], exchangeIds, and causalEdges[] never mismatch.',
             stateTransitionControlOrder: 'For state_transition_binding, run clean denied control (role: "control") BEFORE Stage 1 (or on a fresh untouched sibling entity) and pass explicit entityId + ablationExchangeIds.',
@@ -2270,6 +2269,7 @@ export function workerInvestigationPrompt(input: {
     goal: input.goal,
     step: input.step,
     targetOrigins: input.origins,
+    ...(approvedPublicOrigins.length > 1 ? { publicOrigins: approvedPublicOrigins } : {}),
     capabilityTier: input.capabilityTier,
     maxTurns: effectiveMaxTurns,
     settlementStartsAtTurn: effectiveSettlementTurn,
