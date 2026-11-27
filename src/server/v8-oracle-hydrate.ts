@@ -1205,6 +1205,11 @@ export function entryCarriesRequestToken(entry: HydratableEntry, token: string):
   const reqLeaves = new Set<string>(); collectJsonStringLeaves(entry.step.requestJson, reqLeaves); return [...reqLeaves].some(l => l === tok || l.includes(tok))
 }
 export const cleanExactPath = (p: string | null | undefined): string => (p ?? '').split(/[?#]/, 1)[0]!.replace(/\/+$/, '').toLowerCase()
+export function matchesNormalizedDotSegmentPath(cRaw: string | null | undefined, rRaw: string | null | undefined): boolean {
+  const norm = (s: string) => { const st: string[] = []; for (const seg of cleanExactPath(s).split('/')) { if (!seg || seg === '.') continue; if (seg === '..') st.pop(); else st.push(seg) } return '/' + st.join('/') }
+  const cp = cleanExactPath(cRaw), rp = cleanExactPath(rRaw)
+  return Boolean(cp && rp && (rp.includes('/..') || rp.includes('/.') || cp.includes('/..') || cp.includes('/.')) && norm(cp) === norm(rp))
+}
 export function canonicalNonAuthQuery(p: string | null | undefined): string {
   const qIdx = (p ?? '').indexOf('?'); if (qIdx < 0) return ''
   const pairs: [string, string][] = []

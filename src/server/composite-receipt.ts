@@ -12,7 +12,7 @@ import { resolveCompositeTerminalExchange } from './composite-terminal.ts'
 import { HostFactLog } from './host-fact-log.ts'
 import { proofReceiptSchema, receiptIdSchema } from './proof-receipt.ts'
 import { extractTenantMarkers, isJobOrHandleStub, type V8OracleFamily } from './v8-oracle-families.ts'
-import { TERMINAL_CLASS_CONTRACT, buildCapOriginIndex, canonicalNonAuthQuery, cleanExactPath, collectUrlParamTokens, entryCarriesRequestToken, entryMatchesCorrelation, entryMatchesEntity, inferSupplementalHostCausalEdges, isHydratedStub, isPrivilegedActorOrRole, normalizeV8OracleInputKeys, partitionNonCausalControlHops, resolveEntryIdentity, resolveTerminalContract, resolveV8OracleFamilyOrDiagnostic, sanitizeEmbeddedProofReceipt, selectStateTransitionPair, type CapOriginIndex, type EconomicAutoHydrateContext, type TerminalContractKind } from './v8-oracle-hydrate.ts'
+import { TERMINAL_CLASS_CONTRACT, buildCapOriginIndex, canonicalNonAuthQuery, cleanExactPath, collectUrlParamTokens, entryCarriesRequestToken, entryMatchesCorrelation, entryMatchesEntity, inferSupplementalHostCausalEdges, isHydratedStub, isPrivilegedActorOrRole, matchesNormalizedDotSegmentPath, normalizeV8OracleInputKeys, partitionNonCausalControlHops, resolveEntryIdentity, resolveTerminalContract, resolveV8OracleFamilyOrDiagnostic, sanitizeEmbeddedProofReceipt, selectStateTransitionPair, type CapOriginIndex, type EconomicAutoHydrateContext, type TerminalContractKind } from './v8-oracle-hydrate.ts'
 export { TERMINAL_CLASS_CONTRACT, type TerminalContractKind }
 import type { ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 
@@ -667,7 +667,8 @@ function verifyTerminalImpactGate(
     const anonFor401 = !cRaw || ANON_ACTOR_RE.test(cRaw) || (isCapCtrl && cRaw !== termRawActor)
     const sameTenantForeignPeer = Boolean(receipt.hops.length >= 2 && hasExplicitVerifiedTermEdge && c.step.status === 403 && termEx && hasForeignTenantData && !isPrivilegedActorOrRole(cRaw, roleOf(c), c.actorRoleLabel) && probeTenantOf(c, capIdx) && probeTenantOf(c, capIdx) === probeTenantOf(termEx, capIdx) && cleanExactPath(c.step.pathAndQuery ?? c.step.route ?? '') === cleanExactPath(termEx.step.pathAndQuery ?? termEx.step.route ?? ''))
     if ((c.step.status === 401 && termAuthd && anonFor401) || (termAuthd && (!termEx || (!sameCredIdentity(c, termEx, capIdx) && !sameTenantForeignPeer)))) return false
-    return Boolean((termEx && matchesBoundTerminalControl(c, termEx, ctrlCtx)) || (postMutRb && matchesBoundTerminalControl(c, postMutRb, ctrlCtx)))
+    const dotNorm = Boolean(termEx && (!c.origin || !termEx.origin || normOrigin(c.origin) === normOrigin(termEx.origin)) && c.step.method.toUpperCase() === termEx.step.method.toUpperCase() && canonicalNonAuthQuery(c.step.pathAndQuery ?? c.step.route ?? '') === canonicalNonAuthQuery(termEx.step.pathAndQuery ?? termEx.step.route ?? '') && matchesNormalizedDotSegmentPath(c.step.pathAndQuery ?? c.step.route, termEx.step.pathAndQuery ?? termEx.step.route))
+    return Boolean((termEx && (matchesBoundTerminalControl(c, termEx, ctrlCtx) || dotNorm)) || (postMutRb && matchesBoundTerminalControl(c, postMutRb, ctrlCtx)))
   })
   const hasCleanDeniedCtrl = Boolean(terminalCtrl)
   const v8Default = dispatchDefaultV8Oracle(receipt, dag, idx, factLog, termEx, options, terminalCtrl, postMutRb, { termEndpoint, termFam, hasOob: hasBoundOob, hasBrowser: hasBoundBrowser, hasBody, isStub, ownTenantOnly, hasForeignTenantData, hasVerifiedTermEdge, upstreamEntries, capIdx })
@@ -684,7 +685,7 @@ function verifyTerminalImpactGate(
   const singleHopProofOk = Boolean(ti.proofReceipt && terminalVerification?.confirmed && receipt.hops.length === 1 && !v8Default)
   const hasDerivedTerminalProof = contract === 'auth_or_logic' && hasTermDerivedCrypto && (hasPostMutation || hasForeignTenantData)
   if (!singleHopProofOk) {
-    if (!hasCleanDeniedCtrl && !hasDerivedTerminalProof && !(v8Default?.explicit && v8Default.family === 'parser_cache_differential')) return failUnproven(`Missing clean denied control (401/403/404) bound to terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['clean_denied_control_401_403_404'])
+    if (!hasCleanDeniedCtrl && !hasDerivedTerminalProof) return failUnproven(`Missing clean denied control (401/403/404) bound to terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['clean_denied_control_401_403_404'])
     if ((!termEx && !hasPostMutation) || !termEndpoint || !termFam) return failUnproven(`Missing concrete terminal exchange or endpoint for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['terminal_exchange_with_endpoint'])
     if (!v8Default && !hasPostMutation && (PRIV_ESC_CLASS_RE.test(receipt.terminalVulnClass) || isCrossTenantCls) && isReadOnlyDirectoryOrMetadataImpact(termEx)) return failUnproven('terminal_impact_unproven: privilege_escalation/bfla/cross-tenant cannot confirm on a read-only directory/roster/metadata listing GET without private payload content, a state-mutating terminal action + postChainReadbackExchangeIds, or a verified v8 oracle family.')
     if (!v8Default && isCrossTenantCls && !crossTenantSatisfied) return failUnproven('terminal_impact_unproven: cross-tenant class requires positive non-reflected foreign tenant data (request URL/query tokens stripped) or persisted mutation readback.')

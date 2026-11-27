@@ -321,6 +321,40 @@ test('Fix 1b: parser_cache_differential and economic_conservation confirm cleanl
   assert.equal(pcRes.confirmed, true, `canonical parser_cache_differential without oracleFamily must confirm, got: ${pcRes.reason}`)
   assert.equal(pcRes.terminalOracleFamily, 'parser_cache_differential')
 
+  // Stripping preChainControlExchangeIds or turning control 403 -> 200 MUST still fail closed for parser_cache_differential!
+  const pcNoCtrl = verifyCompositeReceipt(
+    {
+      chainId: 'fix1b-parser-diff-no-ctrl',
+      terminalVulnClass: 'parser_cache_differential',
+      hops: [
+        { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/public/../admin/ledger' }, exchangeIds: ['pc-probe'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Bypassed route ACL', producedCapabilities: [], consumedCapabilities: [] },
+      ],
+      causalEdges: [],
+      terminalImpact: {
+        terminalHopId: 'hop_1',
+        terminalExchangeId: 'pc-probe',
+        summary: 'Parser differential with stripped preChainControlExchangeIds must fail closed.',
+        claimedImpact: 'Parser differential with stripped preChainControlExchangeIds must fail closed.',
+        preChainControlExchangeIds: [],
+        postChainReadbackExchangeIds: [],
+        oracleFamily: 'parser_cache_differential',
+        oracleInput: {
+          mode: 'parser_differential',
+          differentialKind: 'path_normalization',
+          differentialFeature: 'dotdot_segment',
+          impactKind: 'read',
+          cleanControl: 'pc-ctrl',
+          differentialProbe: 'pc-probe',
+        },
+      },
+      replayMode: 'fresh_clean_replay',
+    },
+    { entries: [pcCtrl, pcProbe] },
+    { signingKey: SIGNING_KEY, attackerPersonas: ['member_a'] },
+  )
+  assert.equal(pcNoCtrl.confirmed, false, 'parser_cache_differential with stripped preChainControlExchangeIds must fail closed')
+  assert.equal(pcNoCtrl.failedStage, 'terminal_impact')
+
   // --- Ambiguous and empty oracleInput without oracleFamily MUST reject with valid family list ---
   for (const [label, badInput, expectedCode] of [
     ['empty', {}, /unmapped_oracle_input/],
