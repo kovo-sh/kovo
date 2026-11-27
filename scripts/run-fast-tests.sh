@@ -14,6 +14,7 @@
 #   bash scripts/run-fast-tests.sh --quarantine tests/QUARANTINE.json
 #   bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json
 #   bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json --shard 1/6
+#   bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json --file tests/foo.test.ts
 #   bash scripts/run-fast-tests.sh --check-only --quarantine tests/QUARANTINE.json [--now YYYY-MM-DD]
 #   KOVO_FAST_TEST_JOBS=12 bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json
 set -uo pipefail
@@ -33,6 +34,7 @@ SHARD_SPEC=""
 BACKLOG_PATH=""
 PREV_QUARANTINE_PATH=""
 FORBID_KERNEL_VERDICTS=0
+ONLY_FILES=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -47,9 +49,11 @@ while [[ $# -gt 0 ]]; do
     --jobs) JOBS_OVERRIDE="${2:?--jobs requires an integer}"; shift 2;;
     --shard) SHARD_SPEC="${2:?--shard requires <k>/<N>}"; shift 2;;
     --shard=*) SHARD_SPEC="${1#--shard=}"; shift;;
+    --file) ONLY_FILES+=("${2:?--file requires a test file path}"); shift 2;;
+    --file=*) ONLY_FILES+=("${1#--file=}"); shift;;
     --json) JSON_OUT=1; shift;;
     --skip-git-cap-check) SKIP_GIT_CAP_CHECK=1; shift;;
-    -h|--help) sed -n '2,21p' "$0"; exit 0;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0;;
     *) echo "unknown option: $1" >&2; exit 2;;
   esac
 done
@@ -182,7 +186,12 @@ if (( JOBS > 16 )); then JOBS=16; fi
 if (( JOBS < 1 )); then JOBS=1; fi
 
 EXCLUDED_JOINED="$(printf '%s\n' "${EXCLUDE_SPECS[@]}")"
+ONLY_FILES_JOINED=""
+if (( ${#ONLY_FILES[@]} > 0 )); then
+  ONLY_FILES_JOINED="$(printf '%s\n' "${ONLY_FILES[@]}")"
+fi
 export EXCLUDED_JOINED FAST_TEST_JOBS="$JOBS"
+export FAST_TEST_ONLY_FILES="$ONLY_FILES_JOINED"
 export FAST_TEST_QUARANTINE="$QUARANTINE_PATH"
 export FAST_TEST_CHECK_ONLY="$CHECK_ONLY"
 export FAST_TEST_NOW="$NOW_DATE"
@@ -251,6 +260,25 @@ if (
   console.error(`FAIL: invalid --shard '${shardIndexRaw}/${shardTotalRaw}' (expected integers 1 <= k <= N)`)
   process.exit(2)
 }
+
+const onlyFilesRaw = (process.env.FAST_TEST_ONLY_FILES || '')
+  .split(/\r?\n/)
+  .map(s => s.trim())
+  .filter(Boolean)
+const onlyFilesActive = onlyFilesRaw.length > 0
+if (onlyFilesActive && shardActive) {
+  console.error('FAIL: --file cannot be combined with --shard')
+  process.exit(2)
+}
+const onlyFiles = onlyFilesActive
+  ? [...new Set(onlyFilesRaw.map(raw => {
+      const norm = raw.replace(/\\/g, '/').replace(/^\.\//, '')
+      if (norm.startsWith('/')) {
+        return relative(repoRoot, norm).split(sep).join(posix.sep)
+      }
+      return norm
+    }))].sort()
+  : []
 
 const excludedMap = new Map()
 for (const line of (process.env.EXCLUDED_JOINED || '').split(/\r?\n/)) {
@@ -644,22 +672,34 @@ if (quarantinePath) {
 }
 
 // 3. Orphan-test check (M-35): every tests/**/*.test.ts must be fast-run or excluded.
+//    Skipped when `--file` scopes to an explicit narrow subset of touched test files.
 const orphanFiles = []
-for (const file of nestedFiles) {
-  if (!excludedMap.has(file)) {
-    orphanFiles.push(file)
+if (!onlyFilesActive) {
+  for (const file of nestedFiles) {
+    if (!excludedMap.has(file)) {
+      orphanFiles.push(file)
+    }
   }
-}
-if (orphanFiles.length > 0) {
-  errors.push(
-    `Orphan test file(s) not executed by top-level fast glob and not categorized in EXCLUDE_TESTS: ${orphanFiles.join(', ')}`,
-  )
-}
+  if (orphanFiles.length > 0) {
+    errors.push(
+      `Orphan test file(s) not executed by top-level fast glob and not categorized in EXCLUDE_TESTS: ${orphanFiles.join(', ')}`,
+    )
+  }
 
-if (isDefaultTestsDir) {
-  for (const [file, meta] of excludedMap) {
-    if (!discoveredSet.has(file)) {
-      errors.push(`Stale EXCLUDE_TESTS entry (${meta.tier}): ${file} does not exist on disk`)
+  if (isDefaultTestsDir) {
+    for (const [file, meta] of excludedMap) {
+      if (!discoveredSet.has(file)) {
+        errors.push(`Stale EXCLUDE_TESTS entry (${meta.tier}): ${file} does not exist on disk`)
+      }
+    }
+  }
+} else {
+  for (const file of onlyFiles) {
+    const absTestFile = isDefaultTestsDir ? resolve(repoRoot, file) : join(testsDirAbs, file.replace(/^tests\//, ''))
+    if (!file.endsWith('.test.ts')) {
+      errors.push(`Invalid --file '${file}' (must end with .test.ts)`)
+    } else if (!existsSync(absTestFile)) {
+      errors.push(`Requested --file does not exist: ${file}`)
     }
   }
 }
@@ -671,7 +711,7 @@ const quarantinedFileCount = quarantinedByFile.size
 
 // Accounting invariant: every discovered test file is either executed or excluded.
 const accounted = runFiles.length + skippedByExclude.length
-if (accounted !== allDiscovered.length && orphanFiles.length === 0) {
+if (!onlyFilesActive && accounted !== allDiscovered.length && orphanFiles.length === 0) {
   errors.push(`Test accounting mismatch: ${accounted} accounted != ${allDiscovered.length} discovered`)
 }
 
@@ -705,21 +745,31 @@ if (errors.length > 0) {
 // sort Playwright/UI suites (tests/ux-*.test.ts, tests/fix-*.test.ts) first, then alphabetical
 // for the rest, and assign round-robin (idx % N === k - 1) so heavy Playwright tests spread evenly.
 const PLAYWRIGHT_UI_RE = /^tests\/(?:ux|fix)-[^/]+\.test\.ts$/
-const selectedRunFiles = shardActive
-  ? [...runFiles]
-      .sort((a, b) => {
-        const pa = PLAYWRIGHT_UI_RE.test(a) ? 0 : 1
-        const pb = PLAYWRIGHT_UI_RE.test(b) ? 0 : 1
-        return pa !== pb ? pa - pb : a.localeCompare(b)
-      })
-      .filter((_, i) => i % shardTotal === shardIndex - 1)
-  : runFiles
+const skippedSelectedExcluded = onlyFilesActive ? onlyFiles.filter(f => excludedMap.has(f)) : []
+const selectedRunFiles = onlyFilesActive
+  ? onlyFiles.filter(f => !excludedMap.has(f))
+  : shardActive
+    ? [...runFiles]
+        .sort((a, b) => {
+          const pa = PLAYWRIGHT_UI_RE.test(a) ? 0 : 1
+          const pb = PLAYWRIGHT_UI_RE.test(b) ? 0 : 1
+          return pa !== pb ? pa - pb : a.localeCompare(b)
+        })
+        .filter((_, i) => i % shardTotal === shardIndex - 1)
+    : runFiles
 
 if (checkOnly) {
   if (jsonOut) {
     console.log(JSON.stringify({
       ok: true,
       checkOnly: true,
+      scoped: onlyFilesActive,
+      ...(onlyFilesActive
+        ? {
+            selectedFiles: selectedRunFiles,
+            skippedExcludedSelected: skippedSelectedExcluded,
+          }
+        : {}),
       discovered: allDiscovered.length,
       fast: runFiles.length,
       ...(shardActive
@@ -749,8 +799,9 @@ if (checkOnly) {
       ? `, ${totalQuarantinedCases}/${maxQuarantinedCases} quarantined cases across ${quarantinedFileCount} files (${kernelQuarantinedCases} kernel/critical, ${kernelVerdictQuarantinedCases} legacy kernel verdict, earliest expiry ${earliestExpiry || 'n/a'})`
       : ''
     const shardNote = shardActive ? `, shard ${shardIndex}/${shardTotal}: ${selectedRunFiles.length} files` : ''
+    const scopeNote = onlyFilesActive ? `, scoped: ${selectedRunFiles.length}/${onlyFiles.length} files` : ''
     console.log(
-      `Fast-test inventory PASS: ${allDiscovered.length} discovered (${runFiles.length} fast, ${skippedByExclude.length} excluded${qNote}${shardNote}, 0 orphans)`,
+      `Fast-test inventory PASS: ${allDiscovered.length} discovered (${runFiles.length} fast, ${skippedByExclude.length} excluded${qNote}${shardNote}${scopeNote}, 0 orphans)`,
     )
   }
   process.exit(0)
@@ -768,10 +819,20 @@ const qBanner = quarantinePath
   ? `, ${totalQuarantinedCases}/${maxQuarantinedCases} quarantined cases in ${quarantinedFileCount} files`
   : ''
 const shardBanner = shardActive ? `shard ${shardIndex}/${shardTotal}: ${selectedRunFiles.length}/` : ''
+const effectiveJobs = orderedRunFiles.length > 0 ? Math.min(jobs, orderedRunFiles.length) : 1
 if (!jsonOut) {
-  console.log(
-    `Discovered ${allDiscovered.length} test files (${shardBanner}${runFiles.length} fast zero-LLM, ${skippedByExclude.length} excluded${qBanner}, 0 orphans; concurrency=${jobs})`,
-  )
+  if (onlyFilesActive) {
+    const exclNote = skippedSelectedExcluded.length > 0
+      ? `, ${skippedSelectedExcluded.length} excluded (${skippedSelectedExcluded.join(', ')})`
+      : ''
+    console.log(
+      `Scoped fast-test run: ${selectedRunFiles.length}/${onlyFiles.length} file(s) selected${exclNote} (skipped full ${runFiles.length}-suite corpus${qBanner}; concurrency=${effectiveJobs})`,
+    )
+  } else {
+    console.log(
+      `Discovered ${allDiscovered.length} test files (${shardBanner}${runFiles.length} fast zero-LLM, ${skippedByExclude.length} excluded${qBanner}, 0 orphans; concurrency=${jobs})`,
+    )
+  }
 }
 
 const tStart = Date.now()
@@ -1073,7 +1134,7 @@ async function worker() {
   }
 }
 
-await Promise.all(Array.from({ length: jobs }, worker))
+await Promise.all(Array.from({ length: orderedRunFiles.length > 0 ? effectiveJobs : 0 }, worker))
 
 // 2nd verification pass on files where any quarantined case passed on run 1,
 // guarding against nondeterminism before declaring a stale quarantine entry.
@@ -1171,6 +1232,13 @@ const overallOk = failedFiles.length === 0 && staleEntries.length === 0 && ledge
 if (jsonOut) {
   console.log(JSON.stringify({
     ok: overallOk,
+    scoped: onlyFilesActive,
+    ...(onlyFilesActive
+      ? {
+          selectedFiles: selectedRunFiles,
+          skippedExcludedSelected: skippedSelectedExcluded,
+        }
+      : {}),
     wallSec,
     discovered: allDiscovered.length,
     fast: results.length,
