@@ -9,7 +9,7 @@ export interface GbDataflowEndpointInput { id: string; origin: string; method: s
 export interface GbDataflowParamInput { endpointId: string; name: string; location: string; inferredType?: string | null; isObjectId?: boolean }
 export interface GbDataflowDependencyInput { producerEndpointId?: string; consumerEndpointId?: string; producer?: string; consumer?: string; producerOrigin?: string; consumerOrigin?: string; resourceKey: string; personaHandle?: string | null }
 export interface GbDataflowExchangeInput { origin: string; finalOrigin?: string | null; method: string; pathAndQuery: string; status: number; personaHandle?: string | null; respHeaders?: Record<string, string> | string | null; bodyPreview?: string | null }
-export interface GbDataflowPersonaInput { handle: string; roleLabel?: string | null; tenantLabel?: string | null }
+export interface GbDataflowPersonaInput { handle: string; roleLabel?: string | null; tenantLabel?: string | null; configIndex?: number }
 export interface GbDataflowSynthesizeInput {
   approvedOrigins: readonly string[] | ReadonlySet<string>
   endpoints: readonly GbDataflowEndpointInput[]
@@ -324,15 +324,55 @@ function buildEdges(nodes: readonly EndpointNode[], byId: ReadonlyMap<string, En
   return outgoing
 }
 
+const CACHE_OR_DUAL_TENANT_SIGNAL_RE = /(?:^|[^a-z0-9])(?:cache|cached|cache[_-]?bleed|prime|warm|cdn|cross[_-]?tenant|dual[_-]?tenant|abac|switch[_-]?(?:tenant|org)|tenant[_-]?switch|org[_-]?switch)(?:[^a-z0-9]|$)/i
+const TENANT_SCOPE_PATH_RE = /\/(?:tenants?|orgs?|organizations?|workspaces?)(?:\/|$)/i
+const TENANT_SCOPE_PARAM_RE = /^(?:tenant|tenant_id|org|org_id|organization_id|workspace|workspace_id|cache_key)$/i
+
+function isMultiTenantChainHypothesis(
+  pNodes: readonly EndpointNode[],
+  pEdges: readonly DataflowEdge[],
+  diffs: readonly string[],
+): boolean {
+  const signalCorpus = [
+    ...pNodes.map(n => n.normPath),
+    ...pEdges.map(e => e.field),
+    ...diffs,
+  ].join(' ')
+  if (CACHE_OR_DUAL_TENANT_SIGNAL_RE.test(signalCorpus)) return true
+  const hasTenantScope = pNodes.some(
+    n => TENANT_SCOPE_PATH_RE.test(n.normPath) || [...n.paramNames].some(p => TENANT_SCOPE_PARAM_RE.test(p)),
+  )
+  return hasTenantScope && (pNodes.some(n => n.personaDiff.hasAsymmetry) || pNodes.some(n => n.role === 'edge'))
+}
+
 function orderPersonasLowPrivFirst(
   observed: readonly string[],
   personas: readonly GbDataflowPersonaInput[],
+  options?: { preferMultiTenant?: boolean },
 ): { ordered: string[]; basePersona?: string } {
-  const roleByHandle = new Map<string, string | null | undefined>(personas.map(p => [p.handle, p.roleLabel]))
-  const handles = [...new Set([...observed.filter(p => p && p !== 'anonymous'), ...personas.map(p => p.handle).filter(Boolean)])]
+  const roleByHandle = new Map<string, string | null | undefined>()
+  const configIndexByHandle = new Map<string, number>()
+  personas.forEach((p, idx) => {
+    if (!p.handle) return
+    roleByHandle.set(p.handle, p.roleLabel)
+    if (!configIndexByHandle.has(p.handle)) {
+      configIndexByHandle.set(p.handle, typeof p.configIndex === 'number' && Number.isFinite(p.configIndex) ? p.configIndex : idx)
+    }
+  })
+  const observedClean = observed.filter(p => p && p !== 'anonymous')
+  const baseObservedOffset = personas.length
+  observedClean.forEach((handle, idx) => {
+    if (!configIndexByHandle.has(handle)) configIndexByHandle.set(handle, baseObservedOffset + idx)
+  })
+  const handles = [...new Set([...personas.map(p => p.handle).filter(Boolean), ...observedClean])]
+  const effectiveRank = (handle: string): number => {
+    const priv = classifyPersonaPrivilege(handle, roleByHandle.get(handle))
+    if (options?.preferMultiTenant && priv.multiTenant) return -1
+    return priv.rank
+  }
   handles.sort((a, b) =>
-    classifyPersonaPrivilege(a, roleByHandle.get(a)).rank - classifyPersonaPrivilege(b, roleByHandle.get(b)).rank
-    || a.localeCompare(b),
+    effectiveRank(a) - effectiveRank(b)
+    || (configIndexByHandle.get(a) ?? Number.MAX_SAFE_INTEGER) - (configIndexByHandle.get(b) ?? Number.MAX_SAFE_INTEGER),
   )
   const basePersona = handles.find(h => !classifyPersonaPrivilege(h, roleByHandle.get(h)).elevated)
   return { ordered: handles.slice(0, 5), ...(basePersona ? { basePersona } : {}) }
@@ -347,7 +387,12 @@ function buildChainDraft(pNodes: readonly EndpointNode[], pEdges: readonly Dataf
   const hopTrace = pNodes.map((n, i) => `Hop ${i + 1}: ${n.method} ${n.origin}${n.normPath}${pEdges[i] ? ` (yields ${pEdges[i]!.field} [${pEdges[i]!.kind}])` : ''}`).join(' -> ')
   const diffs = pNodes.map(n => n.personaDiff.summary).filter(Boolean)
   const tags = [`[chain_hops=${pNodes.length}]`, '[lane=chain]', `[dataflow_source=${fromLive ? 'live' : 'spec'}]`, `[api_dependency:${fields.join(',')}]`, ...(crossOrigin ? [`[cross_origin_edge:${origins[0]}->${origins[origins.length - 1]}]`] : []), ...(diffs.length ? [`[persona_diff:${diffs[0]}]`] : [])]
-  const { ordered: obsPersonas, basePersona } = orderPersonasLowPrivFirst(pNodes.flatMap(n => [...n.personaDiff.allowed, ...n.personaDiff.denied]), personas)
+  const preferMultiTenant = isMultiTenantChainHypothesis(pNodes, pEdges, diffs)
+  const { ordered: obsPersonas, basePersona } = orderPersonasLowPrivFirst(
+    pNodes.flatMap(n => [...n.personaDiff.allowed, ...n.personaDiff.denied]),
+    personas,
+    { preferMultiTenant },
+  )
   const hypothesis = `${tags.join(' ')} Producer->consumer multi-hop dataflow chain: ${hopTrace}.${diffs.length ? ` Observed differentials: ${diffs.slice(0, 2).join('; ')}.` : ''}${basePersona ? ` Base persona: ${basePersona}.` : ''}${obsPersonas.length ? ` Relevant personas: ${obsPersonas.join(', ')}.` : ''} Verify control vs variant boundaries end-to-end with kovo_verify, sealing intermediate tokens/handles with capability.seal.`.slice(0, 1400)
   const category = kinds.includes('signed_url_or_location') && pNodes[pNodes.length - 1]!.acceptsSignedUrl ? 'upload-storage'
     : kinds.includes('credential_token') || kinds.includes('invite_or_grant') ? 'auth-identity' : 'broken-access-control'
@@ -430,9 +475,13 @@ export function synthesizeGreyBoxDataflowStepsFromStore(
     const deniedRows = storage.client.prepare(`SELECT origin, final_origin AS finalOrigin, method, path_and_query AS pathAndQuery, status, persona_handle AS personaHandle, resp_headers AS respHeaders, body_preview AS bodyPreview FROM broker_exchanges WHERE run_id = ? AND status IN (401, 403) ORDER BY created_at DESC LIMIT 100`).all(run.id) as unknown as GbDataflowExchangeInput[]
     brokerExchanges = [...okRows, ...deniedRows].filter(r => approvedOrigins.has(r.origin))
   } catch { /* best-effort runtime scan */ }
+  const approvedOrder = new Map(run.approvedPersonaIds.map((id, i) => [id, i]))
   const personas = [...resolveRunPersonas(storage, run.projectId, run.approvedPersonaIds).values()]
-    .map(p => ({ handle: p.handle, roleLabel: p.roleLabel }))
-    .sort((a, b) => classifyPersonaPrivilege(a.handle, a.roleLabel).rank - classifyPersonaPrivilege(b.handle, b.roleLabel).rank || a.handle.localeCompare(b.handle))
+    .map((p, idx) => ({ handle: p.handle, roleLabel: p.roleLabel, configIndex: approvedOrder.get(p.id) ?? idx }))
+    .sort((a, b) =>
+      classifyPersonaPrivilege(a.handle, a.roleLabel).rank - classifyPersonaPrivilege(b.handle, b.roleLabel).rank
+      || a.configIndex - b.configIndex,
+    )
   return synthesizeGreyBoxDataflowGraph({ approvedOrigins, endpoints, endpointParams, apiDependencies, brokerExchanges, personas, sourceMounted: options.sourceMounted, mountedRepos: options.mountedRepos, maxSteps: options.maxSteps ?? DEFAULT_MAX_STEPS }).steps
 }
 

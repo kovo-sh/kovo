@@ -63,6 +63,8 @@ export interface AssignmentBriefRoute {
 export interface AssignmentBriefPersona {
   handle: string
   role?: string
+  /** Original configured persona index used for deterministic same-tier tie-breaking. */
+  configIndex?: number
   /** Resource IDs harvested for this persona (never tokens/cookies). */
   harvestedIds?: readonly string[]
 }
@@ -906,32 +908,64 @@ export function buildMultiHopProofContract(compact = false, input?: AssignmentBr
   }
 }
 
-export type PersonaPrivilegeTier = 'low' | 'standard' | 'elevated'
+export type PersonaPrivilegeTier = 'low' | 'standard' | 'multi_tenant' | 'elevated'
 
-const ELEVATED_PERSONA_TOKEN_RE = /(?:^|[^a-z0-9])(?:owner|admin|superadmin|superuser|root|bot|service|svc|system|internal|moderator|mod|staff|operator|dual)(?:[^a-z0-9]|$)/i
+export interface PersonaPrivilegeClassification {
+  tier: PersonaPrivilegeTier
+  elevated: boolean
+  multiTenant: boolean
+  rank: number
+}
+
+const ELEVATED_PERSONA_TOKEN_RE = /(?:^|[^a-z0-9])(?:owner|admin|superadmin|superuser|root|bot|service|svc|system|internal|moderator|mod|staff|operator)(?:[^a-z0-9]|$)/i
 const HIGH_ADMIN_PERSONA_TOKEN_RE = /(?:^|[^a-z0-9])(?:owner|admin|superadmin|superuser|root)(?:[^a-z0-9]|$)/i
 const LOW_PRIV_PERSONA_TOKEN_RE = /(?:^|[^a-z0-9])(?:viewer|guest|readonly|read_only|limited|basic|member|user|standard|customer|employee|demoted|revoked|suspended|external|unprivileged|analyst|contributor|reader)(?:[^a-z0-9]|$)/i
+const MULTI_TENANT_TOKEN_RE = /(?:^|[^a-z0-9])(?:dual|multi[_-]?tenant|cross[_-]?tenant|shared[_-]?tenant)(?:[^a-z0-9]|$)/i
+const MEMBERSHIP_PAIR_RE = /(?:\[[^\]]+\]|[^,;\s]+[:@][^,;\s]+)/
+
+function inspectRoleMemberships(roleLabel?: string | null): { hasMultiTenantLowPriv: boolean; allExplicitMembershipsElevated: boolean } {
+  const raw = (roleLabel ?? '').trim()
+  if (!raw) return { hasMultiTenantLowPriv: false, allExplicitMembershipsElevated: false }
+  const stripped = raw.replace(/^.*?\bmemberships?\s*[:=]\s*/i, '')
+  const hadMembershipsPrefix = stripped !== raw
+  const parts = stripped.split(/[,;]+/).map(s => s.trim()).filter(Boolean)
+  if (parts.length < 2) return { hasMultiTenantLowPriv: false, allExplicitMembershipsElevated: false }
+  const pairCount = parts.filter(part => MEMBERSHIP_PAIR_RE.test(part)).length
+  if (!hadMembershipsPrefix && pairCount < 2) return { hasMultiTenantLowPriv: false, allExplicitMembershipsElevated: false }
+  const hasLowOrNonElevated = parts.some(part => LOW_PRIV_PERSONA_TOKEN_RE.test(part) || !ELEVATED_PERSONA_TOKEN_RE.test(part))
+  return {
+    hasMultiTenantLowPriv: hasLowOrNonElevated,
+    allExplicitMembershipsElevated: !hasLowOrNonElevated,
+  }
+}
 
 /** Generic, zero-app-literal privilege tier classification for persona ordering and base-actor selection. */
 export function classifyPersonaPrivilege(
   handle: string,
   roleLabel?: string | null,
-): { tier: PersonaPrivilegeTier; elevated: boolean; rank: number } {
+): PersonaPrivilegeClassification {
   const combined = `${handle ?? ''} ${roleLabel ?? ''}`
+  const memberships = inspectRoleMemberships(roleLabel)
+  if (
+    memberships.hasMultiTenantLowPriv
+    || (!memberships.allExplicitMembershipsElevated && MULTI_TENANT_TOKEN_RE.test(combined))
+  ) {
+    return { tier: 'multi_tenant', elevated: false, multiTenant: true, rank: 2 }
+  }
   if (ELEVATED_PERSONA_TOKEN_RE.test(combined)) {
-    return { tier: 'elevated', elevated: true, rank: HIGH_ADMIN_PERSONA_TOKEN_RE.test(combined) ? 3 : 2 }
+    return { tier: 'elevated', elevated: true, multiTenant: false, rank: HIGH_ADMIN_PERSONA_TOKEN_RE.test(combined) ? 4 : 3 }
   }
   if (LOW_PRIV_PERSONA_TOKEN_RE.test(combined)) {
-    return { tier: 'low', elevated: false, rank: 0 }
+    return { tier: 'low', elevated: false, multiTenant: false, rank: 0 }
   }
-  return { tier: 'standard', elevated: false, rank: 1 }
+  return { tier: 'standard', elevated: false, multiTenant: false, rank: 1 }
 }
 
 interface WorkingState {
   publicOrigins: string[]
   routes: AssignmentBriefRoute[]
   linked: AssignmentBriefRoute[]
-  personas: Array<{ handle: string; role?: string; roleTier: PersonaPrivilegeTier; elevated: boolean; harvestedIds: string[] }>
+  personas: Array<{ handle: string; role?: string; roleTier: PersonaPrivilegeTier; elevated: boolean; multiTenant: boolean; harvestedIds: string[] }>
   baseline?: { status?: number; keys: string[]; sample: Array<[string, string | number | boolean]> }
   confirmed: Array<Record<string, unknown>>
   detLead?: Record<string, unknown>
@@ -950,17 +984,20 @@ function normalizeAndOrderBriefPersonas(
 ): WorkingState['personas'] {
   const personaSeen = new Set<string>()
   return (rawPersonas ?? [])
-    .map(p => {
+    .map((p, idx) => {
       const handle = cleanText(p.handle, 48)
-      const role = p.role ? cleanText(p.role, 32) : undefined
-      const priv = classifyPersonaPrivilege(handle, role)
+      const priv = classifyPersonaPrivilege(handle, p.role)
+      const role = p.role ? cleanText(p.role, 48) : undefined
       const harvestedIds = [...new Set((p.harvestedIds ?? []).map(cleanHarvestedId).filter(Boolean))].slice(0, 6)
+      const configIndex = typeof p.configIndex === 'number' && Number.isFinite(p.configIndex) ? p.configIndex : idx
       return {
         handle,
         ...(role ? { role } : {}),
         roleTier: priv.tier,
         elevated: priv.elevated,
+        multiTenant: priv.multiTenant,
         privRank: priv.rank,
+        configIndex,
         harvestedIds,
       }
     })
@@ -969,13 +1006,9 @@ function normalizeAndOrderBriefPersonas(
       personaSeen.add(p.handle)
       return true
     })
-    .sort((a, b) => {
-      if (a.privRank !== b.privRank) return a.privRank - b.privRank
-      if (a.harvestedIds.length !== b.harvestedIds.length) return b.harvestedIds.length - a.harvestedIds.length
-      return a.handle < b.handle ? -1 : a.handle > b.handle ? 1 : 0
-    })
+    .sort((a, b) => (a.privRank - b.privRank) || (a.configIndex - b.configIndex))
     .slice(0, 6)
-    .map(({ privRank: _rank, ...rest }) => rest)
+    .map(({ privRank: _rank, configIndex: _cfg, ...rest }) => rest)
 }
 
 function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<string, unknown> {
@@ -997,6 +1030,7 @@ function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<
             handle: p.handle,
             ...(p.role ? { role: p.role } : {}),
             roleTier: p.roleTier,
+            ...(p.multiTenant ? { multiTenant: true } : {}),
             ...(p.elevated ? { elevated: true } : {}),
             ...(p.harvestedIds.length ? { harvestedIds: p.harvestedIds } : {}),
           })),

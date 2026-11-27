@@ -375,7 +375,7 @@ describe('M2 R5: trace-proof-compiler fixes', () => {
 })
 
 describe('M2 R5: assignment-brief & exploiter-tools persona ordering, precheck, and balanced repo listing', () => {
-  test('assignment-brief sorts low-priv personas before elevated owner/admin/bot/service/dual personas even when elevated personas have more harvestedIds', () => {
+  test('assignment-brief sorts low-priv personas in configured order before multi-tenant and elevated owner/admin/bot/service personas even when elevated personas have more harvestedIds', () => {
     const packet = buildAssignmentBriefPacket({
       missionKind: 'multihop_chain',
       origin: API_ORIGIN,
@@ -390,13 +390,17 @@ describe('M2 R5: assignment-brief & exploiter-tools persona ordering, precheck, 
       ],
     })
     const parsed = JSON.parse(packet.text) as {
-      personas: Array<{ handle: string; roleTier: string; elevated?: boolean; harvestedIds?: string[] }>
+      personas: Array<{ handle: string; roleTier: string; elevated?: boolean; multiTenant?: boolean; harvestedIds?: string[] }>
     }
     const handles = parsed.personas.map(p => p.handle)
-    assert.deepEqual(handles.slice(0, 2), ['viewer_c', 'member_b'], 'low-priv personas must come before all elevated personas')
+    assert.deepEqual(handles.slice(0, 2), ['member_b', 'viewer_c'], 'low-priv personas must come first in configured order before multi-tenant and elevated personas')
     assert.equal(parsed.personas[0]!.roleTier, 'low')
     assert.equal(parsed.personas[0]!.elevated, undefined)
-    for (const elev of parsed.personas.slice(2)) {
+    assert.equal(parsed.personas[2]!.handle, 'dual_member')
+    assert.equal(parsed.personas[2]!.roleTier, 'multi_tenant')
+    assert.equal(parsed.personas[2]!.multiTenant, true)
+    assert.equal(parsed.personas[2]!.elevated, undefined)
+    for (const elev of parsed.personas.slice(3)) {
       assert.equal(elev.roleTier, 'elevated', `${elev.handle} must be tagged roleTier=elevated`)
       assert.equal(elev.elevated, true, `${elev.handle} must be tagged elevated=true`)
     }
@@ -404,9 +408,10 @@ describe('M2 R5: assignment-brief & exploiter-tools persona ordering, precheck, 
     assert.equal(classifyPersonaPrivilege('root_ops', 'superuser').elevated, true)
   })
 
-  test('buildExploiterUserPrompt and buildExploiterSystemPrompt separate low-priv base vs elevated reference personas and reinforce same-actor control baseline', () => {
+  test('buildExploiterUserPrompt and buildExploiterSystemPrompt separate low-priv base, multi-tenant base, and elevated reference personas and reinforce same-actor control baseline', () => {
     const sys = buildExploiterSystemPrompt({ hasMountedRepos: false, allowWebSearch: false })
     assert.match(sys, /attackerBasePersonas/)
+    assert.match(sys, /multiTenantBasePersonas/)
     assert.match(sys, /elevatedReferencePersonas/)
     assert.match(sys, /same base attacker persona/i)
     assert.match(sys, /bola.*bfla.*broken_access_control.*dual_tenant_abac/i)
@@ -424,23 +429,29 @@ describe('M2 R5: assignment-brief & exploiter-tools persona ordering, precheck, 
         { handle: 'member_b', roleLabel: 'member', originAllowlist: [API_ORIGIN] },
       ],
     })) as {
-      attackerBasePersonas: { instruction: string; personas: Array<{ handle: string }> }
+      primaryAttackerBasePersona?: string
+      attackerBasePersonas: { instruction: string; primary?: string; personas: Array<{ handle: string }> }
+      multiTenantBasePersonas?: { instruction: string; personas: Array<{ handle: string }> }
       elevatedReferencePersonas: { instruction: string; personas: Array<{ handle: string }> }
       personas: Array<{ handle: string }>
     }
 
+    assert.equal(user.primaryAttackerBasePersona, 'member_b')
+    assert.equal(user.attackerBasePersonas.primary, 'member_b')
     assert.deepEqual(user.attackerBasePersonas.personas.map(p => p.handle), ['member_b'])
     assert.match(user.attackerBasePersonas.instruction, /START ALL CHAINS HERE/i)
     assert.match(user.attackerBasePersonas.instruction, /exact same base attacker persona/i)
+    assert.deepEqual(user.multiTenantBasePersonas?.personas.map(p => p.handle), ['dual_member'])
+    assert.match(user.multiTenantBasePersonas?.instruction ?? '', /Multi-Tenant Base Personas/i)
     assert.deepEqual(
       user.elevatedReferencePersonas.personas.map(p => p.handle).sort(),
-      ['dual_member', 'owner_a', 'svc_worker'],
+      ['owner_a', 'svc_worker'],
     )
     assert.match(user.elevatedReferencePersonas.instruction, /NEVER use as hop-1 attacker base/i)
     assert.equal(user.personas[0]!.handle, 'member_b', 'personas array must also place lowest-priv persona first')
   })
 
-  test('runSubmitExploitTrace precheck rejects elevated hop-1 base personas when low-priv personas exist, and allows when only elevated exist', async () => {
+  test('runSubmitExploitTrace precheck rejects elevated hop-1 base personas when low-priv personas exist, allows multi-tenant personas, and allows elevated when only elevated exist', async () => {
     const makeEx = (id: string, persona: string): RecordedRequestExchange => ({
       exchangeId: id,
       origin: API_ORIGIN,
@@ -482,7 +493,7 @@ describe('M2 R5: assignment-brief & exploiter-tools persona ordering, precheck, 
     })
     const submitMixed = mixedTools.find(t => t.name === 'submit_exploit_trace')!
 
-    for (const badId of ['ex-owner', 'ex-dual', 'ex-role-admin']) {
+    for (const badId of ['ex-owner', 'ex-role-admin']) {
       const res = JSON.parse(extractText(await submitMixed.execute({
         title: 'Elevated shortcut attempt',
         vulnClass: 'bfla',
@@ -496,6 +507,16 @@ describe('M2 R5: assignment-brief & exploiter-tools persona ordering, precheck, 
     }
     assert.equal(verifyCalls, 0, 'elevated hop-1 precheck must fail fast before verifier runs')
 
+    // Multi-tenant hop 1 passes precheck and reaches verifier
+    const dualRes = JSON.parse(extractText(await submitMixed.execute({
+      title: 'Multi-tenant base check',
+      vulnClass: 'dual_tenant_abac',
+      exchangeIds: ['ex-dual'],
+      terminalExchangeId: 'ex-dual',
+    }, {} as never, { abortSignal: new AbortController().signal } as never))) as Record<string, unknown>
+    assert.equal(dualRes.confirmed, true)
+    assert.equal(verifyCalls, 1)
+
     // Low-priv hop 1 passes precheck and reaches verifier
     const okRes = JSON.parse(extractText(await submitMixed.execute({
       title: 'Low-priv base check',
@@ -504,7 +525,7 @@ describe('M2 R5: assignment-brief & exploiter-tools persona ordering, precheck, 
       terminalExchangeId: 'ex-low',
     }, {} as never, { abortSignal: new AbortController().signal } as never))) as Record<string, unknown>
     assert.equal(okRes.confirmed, true)
-    assert.equal(verifyCalls, 1)
+    assert.equal(verifyCalls, 2)
 
     // When ONLY elevated personas exist in personasPub, precheck allows them through
     let elevatedOnlyVerifyCalls = 0
