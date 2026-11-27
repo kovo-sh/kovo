@@ -908,19 +908,21 @@ export function buildMultiHopProofContract(compact = false, input?: AssignmentBr
   }
 }
 
-export type PersonaPrivilegeTier = 'low' | 'standard' | 'multi_tenant' | 'elevated'
+export type PersonaPrivilegeTier = 'low' | 'standard' | 'multi_tenant' | 'revoked_stale' | 'elevated'
 
 export interface PersonaPrivilegeClassification {
   tier: PersonaPrivilegeTier
   elevated: boolean
   multiTenant: boolean
+  revokedStale: boolean
   rank: number
 }
 
 const ELEVATED_PERSONA_TOKEN_RE = /(?:^|[^a-z0-9])(?:owner|admin|superadmin|superuser|root|bot|service|svc|system|internal|moderator|mod|staff|operator)(?:[^a-z0-9]|$)/i
 const HIGH_ADMIN_PERSONA_TOKEN_RE = /(?:^|[^a-z0-9])(?:owner|admin|superadmin|superuser|root)(?:[^a-z0-9]|$)/i
-const LOW_PRIV_PERSONA_TOKEN_RE = /(?:^|[^a-z0-9])(?:viewer|guest|readonly|read_only|limited|basic|member|user|standard|customer|employee|demoted|revoked|suspended|external|unprivileged|analyst|contributor|reader)(?:[^a-z0-9]|$)/i
+const LOW_PRIV_PERSONA_TOKEN_RE = /(?:^|[^a-z0-9])(?:viewer|guest|readonly|read_only|limited|basic|member|user|standard|customer|employee|external|unprivileged|analyst|contributor|reader)(?:[^a-z0-9]|$)/i
 const MULTI_TENANT_TOKEN_RE = /(?:^|[^a-z0-9])(?:dual|multi[_-]?tenant|cross[_-]?tenant|shared[_-]?tenant)(?:[^a-z0-9]|$)/i
+const REVOKED_STALE_TOKEN_RE = /(?:^|[^a-z0-9])(?:revoked|demoted|disabled|suspended|former|expired)(?:[^a-z0-9]|$)/i
 const MEMBERSHIP_PAIR_RE = /(?:\[[^\]]+\]|[^,;\s]+[:@][^,;\s]+)/
 
 function inspectRoleMemberships(roleLabel?: string | null): { hasMultiTenantLowPriv: boolean; allExplicitMembershipsElevated: boolean } {
@@ -945,27 +947,30 @@ export function classifyPersonaPrivilege(
   roleLabel?: string | null,
 ): PersonaPrivilegeClassification {
   const combined = `${handle ?? ''} ${roleLabel ?? ''}`
+  if (REVOKED_STALE_TOKEN_RE.test(combined)) {
+    return { tier: 'revoked_stale', elevated: false, multiTenant: false, revokedStale: true, rank: 3 }
+  }
   const memberships = inspectRoleMemberships(roleLabel)
   if (
     memberships.hasMultiTenantLowPriv
     || (!memberships.allExplicitMembershipsElevated && MULTI_TENANT_TOKEN_RE.test(combined))
   ) {
-    return { tier: 'multi_tenant', elevated: false, multiTenant: true, rank: 2 }
+    return { tier: 'multi_tenant', elevated: false, multiTenant: true, revokedStale: false, rank: 2 }
   }
   if (ELEVATED_PERSONA_TOKEN_RE.test(combined)) {
-    return { tier: 'elevated', elevated: true, multiTenant: false, rank: HIGH_ADMIN_PERSONA_TOKEN_RE.test(combined) ? 4 : 3 }
+    return { tier: 'elevated', elevated: true, multiTenant: false, revokedStale: false, rank: HIGH_ADMIN_PERSONA_TOKEN_RE.test(combined) ? 5 : 4 }
   }
   if (LOW_PRIV_PERSONA_TOKEN_RE.test(combined)) {
-    return { tier: 'low', elevated: false, multiTenant: false, rank: 0 }
+    return { tier: 'low', elevated: false, multiTenant: false, revokedStale: false, rank: 0 }
   }
-  return { tier: 'standard', elevated: false, multiTenant: false, rank: 1 }
+  return { tier: 'standard', elevated: false, multiTenant: false, revokedStale: false, rank: 1 }
 }
 
 interface WorkingState {
   publicOrigins: string[]
   routes: AssignmentBriefRoute[]
   linked: AssignmentBriefRoute[]
-  personas: Array<{ handle: string; role?: string; roleTier: PersonaPrivilegeTier; elevated: boolean; multiTenant: boolean; harvestedIds: string[] }>
+  personas: Array<{ handle: string; role?: string; roleTier: PersonaPrivilegeTier; elevated: boolean; multiTenant: boolean; revokedStale: boolean; harvestedIds: string[] }>
   baseline?: { status?: number; keys: string[]; sample: Array<[string, string | number | boolean]> }
   confirmed: Array<Record<string, unknown>>
   detLead?: Record<string, unknown>
@@ -996,6 +1001,7 @@ function normalizeAndOrderBriefPersonas(
         roleTier: priv.tier,
         elevated: priv.elevated,
         multiTenant: priv.multiTenant,
+        revokedStale: priv.revokedStale,
         privRank: priv.rank,
         configIndex,
         harvestedIds,
@@ -1031,6 +1037,7 @@ function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<
             ...(p.role ? { role: p.role } : {}),
             roleTier: p.roleTier,
             ...(p.multiTenant ? { multiTenant: true } : {}),
+            ...(p.revokedStale ? { revokedStale: true } : {}),
             ...(p.elevated ? { elevated: true } : {}),
             ...(p.harvestedIds.length ? { harvestedIds: p.harvestedIds } : {}),
           })),

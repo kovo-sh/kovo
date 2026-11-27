@@ -22,6 +22,7 @@ import {
 import {
   ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE,
   buildAssignmentBriefPacket,
+  classifyPersonaPrivilege,
   fitHopCheckpointForBrief,
 } from '../src/server/assignment-brief.ts'
 import {
@@ -36,7 +37,6 @@ import {
 } from '../src/server/exec-dispatch.ts'
 import {
   isPersistentWorkflowContinuationStep,
-  personaPrivilegeRank,
   sortPersonasLowPrivFirst,
   type ExecReconPlanner,
 } from '../src/server/exec-recon-planner.ts'
@@ -535,15 +535,16 @@ test('Move3.3: low-privilege-first persona ordering beats alphabetical admin-fir
     { handle: 'guest_0', roleLabel: 'guest (public)', originAllowlist: [ORIGIN] },
     { handle: 'viewer_1', roleLabel: 'read_only viewer (org-c)', originAllowlist: [ORIGIN] },
   ]
-  assert.equal(personaPrivilegeRank({ handle: 'viewer_1', roleLabel: 'readonly' }), 0)
-  assert.equal(personaPrivilegeRank({ handle: 'member_b', roleLabel: 'member' }), 1)
-  assert.equal(personaPrivilegeRank({ handle: 'manager_1', roleLabel: 'manager' }), 2)
-  assert.equal(personaPrivilegeRank({ handle: 'tenant_admin', roleLabel: 'tenant_admin' }), 3)
+  assert.equal(classifyPersonaPrivilege('viewer_1', 'readonly').rank, 0)
+  assert.equal(classifyPersonaPrivilege('member_b', 'member').rank, 0)
+  assert.equal(classifyPersonaPrivilege('manager_1', 'manager').rank, 1)
+  assert.equal(classifyPersonaPrivilege('revoked_or_demoted', 'revoked member').rank, 3)
+  assert.equal(classifyPersonaPrivilege('tenant_admin', 'tenant_admin').rank, 5)
 
   const sorted = sortPersonasLowPrivFirst(inputPersonas)
   assert.deepEqual(
     sorted.map(p => p.handle),
-    ['guest_0', 'viewer_1', 'member_b', 'editor_1', 'manager_1', 'admin_a', 'owner_root', 'tenant_admin'],
+    ['member_b', 'guest_0', 'viewer_1', 'editor_1', 'manager_1', 'admin_a', 'owner_root', 'tenant_admin'],
   )
 
   // Verify assignmentBriefForStep picks lowest-privilege persona (NOT admin_a) as proofObligation.controlPersona.

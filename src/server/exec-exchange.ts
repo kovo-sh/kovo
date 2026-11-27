@@ -35,8 +35,8 @@ export class ExecServiceModule<THost extends ExecCoreServices> {
 export function publicPersonasFromGrant(
   grant: { personas?: ReadonlyMap<string, { handle: string; roleLabel: string; originAllowlist: string[] }> },
 ) {
-  return [...grant.personas?.values() ?? []].map(p => ({
-    handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist,
+  return [...grant.personas?.values() ?? []].map((p, configIndex) => ({
+    handle: p.handle, roleLabel: p.roleLabel, originAllowlist: p.originAllowlist, configIndex,
   }))
 }
 
