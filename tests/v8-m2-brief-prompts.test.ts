@@ -321,3 +321,58 @@ test('Mode-A brief contracts and multihop-chains playbook eliminate dual_tenant_
   const scan = scanSourceTreeForContamination(REPO_ROOT)
   assert.equal(scan.ok, true, `v8 contamination hits: ${JSON.stringify(scan.hits)}`)
 })
+
+test('buildAssignmentBriefPacket reduction preserves >= 2 personas and up to 2 linkedRoutes before last-resort trimming', () => {
+  const input = {
+    missionKind: 'class_scan' as const,
+    origin: 'https://svc-a.example.test',
+    routes: [
+      { method: 'POST', path: '/api/v1/transfers', riskScore: 95 },
+      { method: 'GET', path: '/api/v1/orders', riskScore: 80 },
+      { method: 'GET', path: '/api/v1/health', riskScore: 10 },
+    ],
+    linkedRoutes: [
+      { method: 'POST', path: '/api/v1/invites/redeem', riskScore: 92 },
+      { method: 'POST', path: '/api/v1/admin/export', riskScore: 88 },
+      { method: 'GET', path: '/api/v1/linked/extra-1', riskScore: 50 },
+      { method: 'GET', path: '/api/v1/linked/extra-2', riskScore: 40 },
+      { method: 'GET', path: '/api/v1/linked/extra-3', riskScore: 30 },
+    ],
+    personas: [
+      { handle: 'actor_alpha', role: 'member (org_a)', harvestedIds: ['id-a-1', 'id-a-2', 'id-a-3', 'id-a-4', 'id-a-5'] },
+      { handle: 'actor_beta', role: 'member (org_b)', harvestedIds: ['id-b-1', 'id-b-2', 'id-b-3', 'id-b-4'] },
+      { handle: 'actor_gamma', role: 'viewer (org_c)', harvestedIds: ['id-c-1'] },
+      { handle: 'actor_delta', role: 'guest (org_d)', harvestedIds: [] },
+    ],
+    baseline: {
+      status: 200,
+      topLevelKeys: Array.from({ length: 12 }, (_, i) => `baseline_field_key_${i}`),
+      sampleNumericOrStateFields: Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`state_metric_${i}`, `val_${i}_padding`])),
+    },
+    alreadyConfirmedOnOrigin: Array.from({ length: 15 }, (_, i) => ({
+      method: 'GET',
+      path: `/api/v1/confirmed/route-${i}`,
+      param: `param_${i}`,
+      cwe: 'CWE-639',
+      findingId: `fnd-${i}`,
+    })),
+    decoupledProofPipeline: true,
+  }
+
+  // Standard 1536B cap triggers reduction, shedding bulky baseline/confirmed/excess items while preserving >= 2 personas & 2 linkedRoutes.
+  const standard = buildAssignmentBriefPacket(input, ASSIGNMENT_BRIEF_MAX_BYTES)
+  assert.equal(standard.truncated, true)
+  assert.ok(standard.bytes <= ASSIGNMENT_BRIEF_MAX_BYTES)
+  const parsedStd = JSON.parse(standard.text) as {
+    linkedRoutes?: Array<{ path: string }>
+    personas?: Array<{ handle: string }>
+  }
+  assert.equal(parsedStd.linkedRoutes?.length, 2, 'must preserve top 2 linkedRoutes under byte cap')
+  assert.deepEqual(parsedStd.linkedRoutes?.map(r => r.path), ['/api/v1/invites/redeem', '/api/v1/admin/export'])
+  assert.ok((parsedStd.personas?.length ?? 0) >= 2, 'must preserve at least 2 distinct personas under byte cap')
+
+  // Extreme tight cap (320B) still obeys the hard byte cap by dropping linkedRoutes and trimming personas as a last resort.
+  const extreme = buildAssignmentBriefPacket(input, 320)
+  assert.equal(extreme.truncated, true)
+  assert.ok(extreme.bytes <= 320, `expected <= 320 B, got ${extreme.bytes}`)
+})

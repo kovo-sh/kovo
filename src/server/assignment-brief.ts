@@ -1122,19 +1122,11 @@ export function buildAssignmentBriefPacket(
       continue
     }
 
-    // Secondary material first.
-    if (state.linked.length) {
-      state.linked.pop()
-      continue
-    }
+    // Secondary material first: preserve up to 2 linked routes & 2 distinct personas before shedding bulk.
+    if (state.linked.length > 2) { state.linked.pop(); continue }
     const minRoutes = state.publicOrigins.length > 1 ? Math.min(state.routes.length, state.publicOrigins.length) : 1
-    if (state.routes.length > minRoutes) {
-      state.routes.pop(); continue
-    }
-    if (state.personas.length > 1) {
-      state.personas.pop()
-      continue
-    }
+    if (state.routes.length > minRoutes) { state.routes.pop(); continue }
+    if (state.personas.length > 2) { state.personas.pop(); continue }
     if (state.baseline?.keys.length) {
       state.baseline.keys.pop()
       continue
@@ -1147,8 +1139,9 @@ export function buildAssignmentBriefPacket(
       state.confirmed.pop()
       continue
     }
-    if (state.personas[0]?.harvestedIds.length) {
-      state.personas[0].harvestedIds.pop()
+    const personaWithIds = [...state.personas].reverse().find(p => p.harvestedIds.length)
+    if (personaWithIds) {
+      personaWithIds.harvestedIds.pop()
       continue
     }
     if (state.routes[0]?.params?.length) {
@@ -1175,6 +1168,13 @@ export function buildAssignmentBriefPacket(
       state.hopCheckpoint = fitHopCheckpointForBrief(input.hopCheckpoint, nextHopBudget).checkpoint
       state.hopCheckpointBudget = nextHopBudget
       continue
+    }
+    // Last-resort drop of remaining linked routes / second persona only if still over cap.
+    if (state.linked.length) {
+      state.linked.pop(); continue
+    }
+    if (state.personas.length > 1) {
+      state.personas.pop(); continue
     }
     if (state.code) {
       state.code = undefined
