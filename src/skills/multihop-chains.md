@@ -3,11 +3,11 @@ Tags: multihop, hop-checkpoint, composite-receipt, derived-custody, async-pivot
 Summary: Verify N-hop CompositeProofReceipt chains via ctx.chain and prove_composite.
 
 ## 1. Quick-Reference Contract
-1. **Origin/Control:** Low-priv attacker ONLY (no victim/owner/admin); controls pass `{arm:"control"}` on `ctx.http`; minted: `kind:"bearer_token"`, `{capability:{handle,target:"bearer"}}`, OMIT `as`.
-2. **One Script:** `http_request`/`kovo_http` first; NEVER seal-only `kovo_verify` (blocked after 2x), own-tenant/handle-stub proofs, or standalone `prove_*` — chain to `terminalHopId` via `ctx.chain`/`ctx.prove_composite`.
+1. **Origin:** Low-priv ONLY (no victim/owner/admin); `{arm:"control"}`; minted:`kind:"bearer_token"`, `{capability:{handle,target:"bearer"}}`, OMIT `as`.
+2. **Script:** `kovo_http`/`http_request` first; NEVER seal-only `kovo_verify`, own-tenant/link/token stubs, or standalone `prove_race_burst`/`prove_access_boundary`/`prove_persisted_mutation` -> `terminalHopId` via `ctx.chain`/`ctx.prove_composite`.
 3. **Tools:** `ctx.seal_capability` (`jsonPath`/`header`/`cookie`/`value`, no `regex`), `ctx.hmac_sign`/`ctx.jwt_sign`, `ctx.await_async`, `ctx.prove_race_burst`.
-4. **Class/Econ:** Match `terminalVulnClass` (dual-tenant->`dual_tenant_abac`); ablation=SAME actor (`arm:"control"`); `economic_conservation`: `baselineReadbackExchangeId`+`finalReadbackExchangeId`.
-5. **DAG/Twins:** Declare EVERY causal hop (Hop 1->terminal) in `hops[]`->`terminalHopId` via `causalEdges[]`; `fresh_clean_replay`+`ctx.result`; `invariant_enforced_hardened`.
+4. **Class/Econ:** `terminalVulnClass` (dual-tenant->`dual_tenant_abac`); ablation=SAME actor; `economic_conservation`:`baselineReadbackExchangeId`+`finalReadbackExchangeId`.
+5. **DAG:** Declare EVERY executed causal hop (Hop 1->terminal) in `hops[]`->`terminalHopId` via `causalEdges[]` (no orphan hops); `fresh_clean_replay`+`ctx.result`; `invariant_enforced_hardened`.
 
 ## 2. Working from a Pre-Hydrated `hopCheckpoint`
 Your `AssignmentBrief` may include a bounded (`<= 2 KB`) `hopCheckpoint` object:

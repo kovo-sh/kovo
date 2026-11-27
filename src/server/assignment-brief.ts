@@ -888,7 +888,7 @@ export function buildMultiHopProofContract(compact = false, input?: AssignmentBr
   if (compact) {
     return {
       attackerOriginRule: 'Low-priv only (no victim/owner/admin); non-admin tenant->dual_tenant_abac; SAME actor; {arm:"control"}.',
-      continueChainRule: 'kovo_http/http_request; no own-tenant/invite/job/export stubs; seal+chain->terminalHopId+ctx.chain().prove() in SAME script.',
+      continueChainRule: 'kovo_http; no own-tenant/handle stubs; ctx.seal_capability Hops 3-5->terminalHopId+ctx.chain().prove() in SAME script.',
       ...(helperPatterns.length ? { helperPatterns } : {}),
       modeATsRecipe: COMPACT_MULTIHOP_MODE_A_RECIPE,
       hardenedTwinRule: 'Guard holds: no Hop1-2 finding; record_coverage(status="ruled_out", proofGapReason="invariant_enforced_hardened")+complete_intent.',
