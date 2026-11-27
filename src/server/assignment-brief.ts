@@ -1055,7 +1055,7 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
     : undefined
   const decoupled = input.decoupledProofPipeline ?? (process.env.KOVO_DECOUPLED_PROOF_PIPELINE === '1')
   const hopCheckpointBudget = ASSIGNMENT_BRIEF_HOP_CHECKPOINT_MAX_BYTES
-  const fittedCheckpoint = !decoupled && input.hopCheckpoint
+  const fittedCheckpoint = input.hopCheckpoint
     ? fitHopCheckpointForBrief(input.hopCheckpoint, hopCheckpointBudget)
     : undefined
   const proofObligation = !decoupled && input.proofObligation ? normalizeProofObligation(input.proofObligation) : undefined

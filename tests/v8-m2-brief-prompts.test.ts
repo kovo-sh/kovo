@@ -376,3 +376,70 @@ test('buildAssignmentBriefPacket reduction preserves >= 2 personas and up to 2 l
   assert.equal(extreme.truncated, true)
   assert.ok(extreme.bytes <= 320, `expected <= 320 B, got ${extreme.bytes}`)
 })
+
+test('decoupledProofPipeline preserves hopCheckpoint continuity (verifiedHops, capabilityHandles, nextGoal, workflowNotebook) while omitting legacy contracts', () => {
+  const packet = buildAssignmentBriefPacket({
+    missionKind: 'chain_step_2',
+    origin: 'https://svc-a.example.test',
+    publicOrigins: ['https://svc-a.example.test', 'https://svc-b.example.test'],
+    routes: [
+      { method: 'POST', path: '/api/v1/tokens/exchange', riskScore: 95 },
+      { method: 'GET', path: '/api/v1/exports/download', riskScore: 92 },
+    ],
+    hopCheckpoint: {
+      schema: 'v8.hop_checkpoint.v1',
+      branchKey: 'branch-decoupled-1',
+      depth: 2,
+      doNotRediscover: true,
+      capabilityHandles: ['cap:hop_1:scoped_tok'],
+      verifiedHops: [
+        { hop: 1, receiptId: 'rcpt-1', capId: 'cap:hop_1:scoped_tok', service: 'svc-a', surface: '/api/v1/tokens/exchange' },
+      ],
+      nextGoal: {
+        endpoint: '/api/v1/exports/download',
+        method: 'GET',
+        service: 'svc-b',
+        goal: 'Redeem cap:hop_1:scoped_tok on svc-b export download',
+      },
+      workflowNotebook: {
+        discoveredRoutes: ['POST /api/v1/tokens/exchange', 'GET /api/v1/exports/download'],
+        triedRecipes: ['POST /api/v1/tokens/exchange [actor_low] -> 200'],
+        verifiedHypotheses: ['Token exchange mints cross-service capability'],
+      },
+    },
+    proofObligation: {
+      route: 'GET /api/v1/exports/download',
+      method: 'GET',
+      deliverable: 'cross-tenant download proof',
+    },
+    sealedCapabilityCount: 1,
+    decoupledProofPipeline: true,
+  })
+
+  assert.ok(packet.bytes <= ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE)
+  const parsed = JSON.parse(packet.text) as {
+    hopCheckpoint?: {
+      schema?: string
+      doNotRediscover?: boolean
+      capabilityHandles?: string[]
+      verifiedHops?: Array<{ hop: number; capId?: string }>
+      nextGoal?: { endpoint?: string; goal?: string }
+      workflowNotebook?: { discoveredRoutes?: string[]; triedRecipes?: string[]; verifiedHypotheses?: string[] }
+    }
+    multiHopProofContract?: unknown
+    proofObligation?: unknown
+    coverageContract?: unknown
+  }
+
+  assert.ok(parsed.hopCheckpoint, 'decoupled brief must preserve hopCheckpoint across rounds')
+  assert.equal(parsed.hopCheckpoint.schema, 'v8.hop_checkpoint.v1')
+  assert.equal(parsed.hopCheckpoint.doNotRediscover, true)
+  assert.deepEqual(parsed.hopCheckpoint.capabilityHandles, ['cap:hop_1:scoped_tok'])
+  assert.equal(parsed.hopCheckpoint.verifiedHops?.length, 1)
+  assert.equal(parsed.hopCheckpoint.nextGoal?.endpoint, '/api/v1/exports/download')
+  assert.ok(parsed.hopCheckpoint.workflowNotebook?.discoveredRoutes?.includes('POST /api/v1/tokens/exchange'))
+  assert.ok(parsed.hopCheckpoint.workflowNotebook?.triedRecipes?.includes('POST /api/v1/tokens/exchange [actor_low] -> 200'))
+  assert.equal(parsed.multiHopProofContract, undefined, 'legacy multiHopProofContract must stay omitted in decoupled mode')
+  assert.equal(parsed.proofObligation, undefined, 'legacy proofObligation must stay omitted in decoupled mode')
+  assert.equal(parsed.coverageContract, undefined, 'legacy coverageContract must stay omitted in decoupled mode')
+})

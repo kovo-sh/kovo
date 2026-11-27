@@ -2801,7 +2801,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           origins: targetOrigins, ...(allPublicOrigins.length > 1 ? { publicOrigins: allPublicOrigins } : {}),
           capabilityTier: run.capabilityTier, maxTurns: budget.maxTurns, budget, personas: personasPub, mountedRepos,
           parentFacts: parentFacts.map(f => ({ id: f.id, kind: f.kind, origin: f.origin, summary: f.summary, data: f.data })),
-          alreadyConfirmed: confirmedRefs, detLeads, ...(assignmentBrief ? { assignmentBrief } : {}), specsSummary: stagedSpecs, bolaTestQueue, unconfirmedHardSurface, specialistFocus: specialistConfig.focusPrompt,
+          alreadyConfirmed: confirmedRefs, detLeads, ...(assignmentBrief ? { assignmentBrief } : {}), specsSummary: stagedSpecs, bolaTestQueue, unconfirmedHardSurface, peerDiscoveries: this.storage.listFacts(run.id, { includeTainted: false, limit: 120 }).filter(f => f.assignmentId !== job.assignment.id && permittedAtAdmission.has(f.origin) && !neededParentFactIds.has(f.id)), specialistFocus: specialistConfig.focusPrompt,
         },
         runKovoVerify: async ({ script, title, signal }) => {
           if (!handlers.kovo_verify) return { confirmed: false, rejectedBy: 'backend', reason: 'verifier_unavailable', detail: 'kovo_verify backend unavailable.' }
