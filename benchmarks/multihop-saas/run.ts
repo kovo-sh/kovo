@@ -499,6 +499,8 @@ export interface ProductChainVerdict {
   twoSideConfirmed: boolean
   replayMode?: 'fresh_clean_replay' | 'one_shot_transcript'
   dropReason: ProductDropReason | null
+  failureReason: string | null
+  missingHopIds: string[]
   matchedFindingIds: string[]
   oracleEventSeqs: number[]
   terminalVulnClass: string
@@ -1372,6 +1374,15 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
       }
     }
 
+    const failureReason: string | null = twoSideConfirmed
+      ? null
+      : (typeof evaluation?.failureReason === 'string' && evaluation.failureReason.trim()
+          ? evaluation.failureReason
+          : null)
+    const missingHopIds: string[] = Array.isArray(evaluation?.missingHopIds)
+      ? [...evaluation.missingHopIds]
+      : expected.hopIds.filter((hopId) => !observedHopIds.has(hopId))
+
     return {
       chainId: expected.chainId,
       expectedHops: evaluation?.hopsTotal ?? expected.hopIds.length,
@@ -1382,6 +1393,8 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
       twoSideConfirmed,
       replayMode,
       dropReason,
+      failureReason,
+      missingHopIds,
       matchedFindingIds,
       oracleEventSeqs: chainEvents.map((e) => e.seq),
       terminalVulnClass: expected.vulnClass,
