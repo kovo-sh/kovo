@@ -41,8 +41,8 @@ type Protocol = 'openai-responses' | 'anthropic-messages'
 const providerId = 'kovo'
 export const defaultMaxRequestBytes = 4 * 1024 * 1024
 export const maxRequestBytesCeiling = 12 * 1024 * 1024
-export const defaultFirstEventTimeoutMs = 120_000
-export const defaultIdleTimeoutMs = 180_000
+export const defaultFirstEventTimeoutMs = 45_000
+export const defaultIdleTimeoutMs = 60_000
 export const defaultTotalTimeoutMs = 600_000
 export const defaultMaxCalls = 220
 export const defaultMaxTransportRetries = 2
@@ -1148,10 +1148,10 @@ function makeFetch(
   })
   const firstEventTimeoutMs = options.runtimePolicyManaged
     ? candidatePolicy.firstEventTimeoutMs
-    : (options.firstEventTimeoutMs ?? defaultFirstEventTimeoutMs)
+    : (options.firstEventTimeoutMs ?? (Number.isFinite(Number(process.env.KOVO_PROVIDER_FIRST_EVENT_TIMEOUT_MS)) && Number(process.env.KOVO_PROVIDER_FIRST_EVENT_TIMEOUT_MS) > 0 ? Math.floor(Number(process.env.KOVO_PROVIDER_FIRST_EVENT_TIMEOUT_MS)) : defaultFirstEventTimeoutMs))
   const idleTimeoutMs = options.runtimePolicyManaged
     ? candidatePolicy.idleTimeoutMs
-    : (options.idleTimeoutMs ?? defaultIdleTimeoutMs)
+    : (options.idleTimeoutMs ?? (Number.isFinite(Number(process.env.KOVO_PROVIDER_IDLE_TIMEOUT_MS)) && Number(process.env.KOVO_PROVIDER_IDLE_TIMEOUT_MS) > 0 ? Math.floor(Number(process.env.KOVO_PROVIDER_IDLE_TIMEOUT_MS)) : defaultIdleTimeoutMs))
   const totalTimeoutMs = options.runtimePolicyManaged
     ? candidatePolicy.totalTimeoutMs
     : (options.totalTimeoutMs ?? defaultTotalTimeoutMs)
