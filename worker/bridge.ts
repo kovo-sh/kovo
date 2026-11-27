@@ -67,6 +67,10 @@ export interface VerifyScriptRequest {
   /** SDK source files (zero-dep TypeScript) written next to the script. */
   sdkFiles?: Array<{ name: string; content: string }>
   timeoutMs?: number
+  /** Optional per-attempt RPC paths (used inside per-run warm verify containers). */
+  rpcSocket?: string
+  rpcTokenFile?: string
+  rpcContextFile?: string
 }
 
 export interface VerifyScriptResult {
@@ -1254,7 +1258,20 @@ async function runOfflineScript(req: OfflineScriptRequest, inputDirectory: strin
 // Layer-3 kovo_verify script runner (3-hook SDK, transcript-backed claims)
 // ============================================================================
 
-async function runVerifyScript(req: VerifyScriptRequest): Promise<VerifyScriptResult> {
+function resolveVerifyRpcPath(override: string | undefined, envVal: string | undefined, fallback: string): string {
+  if (override === undefined) return envVal ?? fallback
+  if (
+    typeof override !== 'string'
+    || !override.startsWith('/')
+    || /[\0\r\n]/.test(override)
+    || override.split(/[\\/]+/).includes('..')
+  ) {
+    throw new Error('Invalid verification RPC path.')
+  }
+  return override
+}
+
+export async function runVerifyScript(req: VerifyScriptRequest): Promise<VerifyScriptResult> {
   if (req.runtime !== 'ts') {
     throw new Error(`Unsupported verification runtime: ${String(req.runtime)}. kovo_verify supports TypeScript only (runtime='ts').`)
   }
@@ -1262,10 +1279,15 @@ async function runVerifyScript(req: VerifyScriptRequest): Promise<VerifyScriptRe
   if (Buffer.byteLength(req.code) > maxScriptCodeBytes) throw new Error('Verification script exceeds 256 KiB limit.')
   if (typeof req.nonce !== 'string' || !/^[a-f0-9]{16,128}$/i.test(req.nonce)) throw new Error('Verification nonce is invalid.')
   const timeoutMs = Math.max(1_000, Math.min(req.timeoutMs ?? 90_000, 120_000))
-  const dir = await mkdtemp(join(tmpdir(), 'kovo-verify-'))
+  const rpcSocket = resolveVerifyRpcPath(req.rpcSocket, process.env.KOVO_RPC_SOCKET, '/kovo-rpc/verify.sock')
+  const rpcTokenFile = resolveVerifyRpcPath(req.rpcTokenFile, process.env.KOVO_RPC_TOKEN_FILE, '/kovo-rpc/token')
+  const rpcContextFile = resolveVerifyRpcPath(req.rpcContextFile, process.env.KOVO_RPC_CONTEXT_FILE, '/kovo-rpc/context.json')
+  const dir = await mkdtemp(join(tmpdir(), `kovo-attempt-${req.nonce.slice(0, 16)}-`))
+  const attemptTmp = join(dir, 'tmp')
   const resultPath = join(dir, 'result.json')
   const scriptPath = join(dir, 'candidate.ts')
   try {
+    await mkdir(attemptTmp, { recursive: true, mode: 0o700 })
     await writeFile(scriptPath, req.code, { mode: 0o600 })
     let sdkBytes = 0
     for (const file of req.sdkFiles ?? []) {
@@ -1280,9 +1302,11 @@ async function runVerifyScript(req: VerifyScriptRequest): Promise<VerifyScriptRe
       timeoutMs,
       maxBytes: maxOutputBytes,
       env: {
-        KOVO_RPC_SOCKET: process.env.KOVO_RPC_SOCKET ?? '/kovo-rpc/verify.sock',
-        KOVO_RPC_TOKEN_FILE: process.env.KOVO_RPC_TOKEN_FILE ?? '/kovo-rpc/token',
-        KOVO_RPC_CONTEXT_FILE: process.env.KOVO_RPC_CONTEXT_FILE ?? '/kovo-rpc/context.json',
+        TMPDIR: attemptTmp,
+        HOME: attemptTmp,
+        KOVO_RPC_SOCKET: rpcSocket,
+        KOVO_RPC_TOKEN_FILE: rpcTokenFile,
+        KOVO_RPC_CONTEXT_FILE: rpcContextFile,
         KOVO_VERIFY_NONCE: req.nonce,
         KOVO_PROOF_RESULT_FILE: resultPath,
       },
@@ -1304,7 +1328,7 @@ async function runVerifyScript(req: VerifyScriptRequest): Promise<VerifyScriptRe
       timedOut: res.timedOut,
     }
   } finally {
-    try { await unlink(scriptPath) } catch { /* ignore */ }
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined)
   }
 }
 
