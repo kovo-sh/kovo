@@ -1,7 +1,10 @@
 /**
  * Bounded, read-only web search tool (`src/server/web-search-tool.ts`) for the decoupled Exploiter.
- * Never sends cookies, credentials, or secrets; caps timeout <= 10s and results <= 5.
+ * Routes all live outbound calls through `EgressGateway` (`egressFetch`, HTTPS-only, SSRF-safe);
+ * never sends cookies, credentials, or secrets; caps timeout <= 10s and results <= 5.
  */
+import { egressFetch } from './egress-gateway.ts'
+
 export interface WebSearchArgs { query: string; domains?: string[]; maxResults?: number }
 export interface WebSearchResultItem { title: string; url: string; snippet: string }
 export interface WebSearchResponse { ok: boolean; query: string; results: WebSearchResultItem[]; error?: string }
@@ -109,8 +112,6 @@ export async function executeWebSearch(args: WebSearchArgs, opts: WebSearchOptio
     : cleanQuery
   const baseEndpoint = (opts.endpoint ?? process.env.KOVO_WEB_SEARCH_ENDPOINT ?? '').trim() || DEFAULT_DDG_HTML_ENDPOINT
   const requestUrl = `${baseEndpoint}${baseEndpoint.includes('?') ? '&' : '?'}q=${encodeURIComponent(effectiveQuery)}`
-  const fetchFn = opts.fetchImpl ?? globalThis.fetch
-  if (typeof fetchFn !== 'function') return { ok: false, query: cleanQuery, results: [], error: 'Web search unavailable: fetch API not present.' }
   if (opts.signal?.aborted) return { ok: false, query: cleanQuery, results: [], error: 'Web search aborted.' }
 
   const controller = new AbortController()
@@ -118,10 +119,16 @@ export async function executeWebSearch(args: WebSearchArgs, opts: WebSearchOptio
   opts.signal?.addEventListener('abort', onOuterAbort, { once: true })
   const timer = setTimeout(() => controller.abort(new Error(`timeout after ${timeoutMs}ms`)), timeoutMs)
   try {
-    const res = await fetchFn(requestUrl, {
+    const reqInit: RequestInit = {
       method: 'GET', redirect: 'follow', credentials: 'omit', signal: controller.signal,
       headers: { Accept: 'application/json, text/html;q=0.9', 'User-Agent': 'KovoHunter-Research/1.0' },
-    })
+    }
+    const res = opts.fetchImpl
+      ? await opts.fetchImpl(requestUrl, reqInit)
+      : await egressFetch(requestUrl, reqInit, {
+          allowLocalLab: false, allowHttp: false, followRedirects: true,
+          maxRedirects: 3, timeoutMs, maxResponseBytes: MAX_RESPONSE_BYTES, rejectUnauthorized: true,
+        })
     if (!res.ok) return { ok: false, query: cleanQuery, results: [], error: `Web search unavailable: upstream HTTP ${res.status}.` }
     const rawBody = (await res.text()).slice(0, MAX_RESPONSE_BYTES)
     const contentType = (res.headers.get('content-type') ?? '').toLowerCase()
