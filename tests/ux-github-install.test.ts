@@ -41,8 +41,8 @@ test('resolveGithubAppSlug & githubAppInstallUrl: env precedence, validation, gi
   delete process.env.KOVO_GITHUB_APP_SLUG
 
   try {
-    // Default null when neither env nor github-app.json is set
-    assert.equal(resolveGithubAppSlug(dataDir), null)
+    // Default baked-in Kovo Security app slug when neither env nor github-app.json is set
+    assert.equal(resolveGithubAppSlug(dataDir), 'kovo-security')
     assert.equal(githubAppInstallUrl(null), null)
     assert.equal(githubAppInstallUrl(undefined), null)
     assert.equal(githubAppInstallUrl('INVALID_SLUG'), null)
