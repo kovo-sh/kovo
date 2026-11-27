@@ -24,8 +24,11 @@ function loadCompiledEntrypoint(script: string): (ctx: Record<string, unknown>) 
 interface MockCallLog {
   chainArgs: Array<[string, string]>
   controls: string[]
+  controlInsideHop: boolean
   readbacks: string[]
   hops: string[]
+  edges: Array<Record<string, unknown>>
+  stateTransitions: Array<Record<string, unknown>>
   httpCalls: Array<{ target: unknown; opts: Record<string, unknown> }>
   sealCalls: Array<Record<string, unknown>>
   proveArgs: Array<Record<string, unknown>>
@@ -33,19 +36,27 @@ interface MockCallLog {
 
 function createMockCtx(responses: Array<{ status?: number; json?: unknown; headers?: Record<string, string> }>) {
   const log: MockCallLog = {
-    chainArgs: [], controls: [], readbacks: [], hops: [], httpCalls: [], sealCalls: [], proveArgs: [],
+    chainArgs: [], controls: [], controlInsideHop: false, readbacks: [], hops: [], edges: [], stateTransitions: [], httpCalls: [], sealCalls: [], proveArgs: [],
   }
   let exCounter = 0
   let capCounter = 0
+  let hopDepth = 0
   const ctx = {
     chain(chainId: string, terminalVulnClass: string) {
       log.chainArgs.push([chainId, terminalVulnClass])
       return {
-        control(ref: { exchangeId: string }) { log.controls.push(ref.exchangeId); return this },
+        control(ref: { exchangeId: string }) {
+          if (hopDepth > 0) log.controlInsideHop = true
+          log.controls.push(ref.exchangeId)
+          return this
+        },
         readback(ref: { exchangeId: string }) { log.readbacks.push(ref.exchangeId); return this },
+        edge(e: Record<string, unknown>) { log.edges.push(e); return this },
+        stateTransition(e: Record<string, unknown>) { log.stateTransitions.push(e); return this },
         async hop(hopId: string, _meta: unknown, fn: () => Promise<unknown>) {
           log.hops.push(hopId)
-          return fn()
+          hopDepth += 1
+          try { return await fn() } finally { hopDepth -= 1 }
         },
         async prove(opts: Record<string, unknown>) {
           log.proveArgs.push(opts)
@@ -56,6 +67,7 @@ function createMockCtx(responses: Array<{ status?: number; json?: unknown; heade
     async http_send(target: unknown, opts: Record<string, unknown> = {}) {
       const idx = exCounter
       exCounter += 1
+      if ((opts.arm === 'control' || opts.role === 'control') && hopDepth > 0) log.controlInsideHop = true
       log.httpCalls.push({ target, opts })
       const spec = responses[idx] ?? { status: 200, json: {} }
       return {
@@ -78,6 +90,26 @@ function createMockCtx(responses: Array<{ status?: number; json?: unknown; heade
     },
   }
   return { ctx, log }
+}
+
+/** Verify DAG reachability (mirrors composite-receipt validateDagTopology: 0 orphan hops). */
+function assertAllHopsReachTerminal(hops: string[], edges: Array<Record<string, unknown>>, terminalHopId: string): void {
+  const revAdj = new Map<string, string[]>(hops.map(h => [h, []]))
+  for (const e of edges) {
+    const from = String(e.fromHopId ?? ''), to = String(e.toHopId ?? '')
+    assert.ok(revAdj.has(from) && revAdj.has(to), `Edge ${from}->${to} references unknown hop`)
+    assert.notEqual(from, to, `Edge self-loop on ${from}`)
+    revAdj.get(to)!.push(from)
+  }
+  const seen = new Set<string>([terminalHopId])
+  const queue = [terminalHopId]
+  while (queue.length > 0) {
+    for (const prev of revAdj.get(queue.shift()!) ?? []) {
+      if (!seen.has(prev)) { seen.add(prev); queue.push(prev) }
+    }
+  }
+  const orphans = hops.filter(h => !seen.has(h))
+  assert.deepEqual(orphans, [], `Expected 0 orphan hops reaching ${terminalHopId}, found: ${orphans.join(', ')}`)
 }
 
 describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
@@ -344,8 +376,16 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
     assert.equal(log.httpCalls[0]!.target, '/api/orders')
     assert.equal(log.httpCalls[1]!.target, '/api/orders/order_999999/approve?ref=order_999999')
     assert.equal(log.httpCalls[1]!.opts.arm, 'control')
+    assert.equal(log.httpCalls[1]!.opts.role, 'control')
+    assert.equal(log.httpCalls[1]!.opts.session, 'ctrl_clean')
+    assert.equal(log.controlInsideHop, false)
     assert.deepEqual(log.httpCalls[1]!.opts.body, { orderId: 'order_999999', email: 'newuser@example.test' })
     assert.equal(log.httpCalls[2]!.target, '/api/orders/order_999999/approve?ref=order_999999')
+    // Dynamic >=6-char JSON ID must STILL be sealed & wired via explicit value_binding edge!
+    assert.equal(log.sealCalls.length, 1)
+    assert.equal(log.sealCalls[0]!.jsonPath, 'items[0].id')
+    assert.deepEqual(log.edges, [{ kind: 'value_binding', fromHopId: 'step_1', toHopId: 'step_2', capabilityHandle: 'cap:hop_1:cap_1' }])
+    assertAllHopsReachTerminal(log.hops, log.edges, 'step_2')
   })
 
   it('supports custom header sealing, explicit control/readback, vulnClass normalization, and uncompilable inputs', async () => {
@@ -459,5 +499,215 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
     assert.equal(missingTerm.ok, false)
     assert.equal(missingTerm.script, undefined)
     assert.ok(missingTerm.uncompilableReasons[0]!.includes('nope'))
+  })
+
+  it('compiles a 4-hop POST -> GET job -> GET url -> GET download chain with sealed value_binding edges on every hop and 0 orphans', async () => {
+    const jobId = 'job_exp_884422'
+    const sig = '9f8e7d6c5b4a3210fedcba98'
+    const signedUrl = `https://storage.example.test/files/export/org_a/report.csv?tenant=org_a&sig=${sig}&job=${jobId}`
+
+    const baseExchanges: RecordedRequestExchange[] = [
+      {
+        exchangeId: 'e1',
+        origin: 'https://app.example.test',
+        method: 'POST',
+        pathAndQuery: '/api/v1/orgs/org_a/exports',
+        persona: 'member_a',
+        status: 202,
+        responseJson: { jobId, tenant: 'org_a' },
+        timestampMs: 100,
+      },
+      {
+        exchangeId: 'e2',
+        origin: 'https://app.example.test',
+        method: 'GET',
+        pathAndQuery: `/api/v1/jobs/${jobId}`,
+        persona: 'member_a',
+        status: 200,
+        responseJson: { job: { id: jobId, status: 'completed' } },
+        timestampMs: 200,
+      },
+      {
+        exchangeId: 'e3',
+        origin: 'https://app.example.test',
+        method: 'GET',
+        pathAndQuery: `/api/v1/exports/${jobId}/url`,
+        persona: 'member_a',
+        status: 200,
+        responseJson: { jobId, signedUrl },
+        timestampMs: 300,
+      },
+      {
+        exchangeId: 'e4',
+        origin: 'https://storage.example.test',
+        method: 'GET',
+        pathAndQuery: `/files/export/org_a/report.csv?tenant=org_a&sig=${sig}&job=${jobId}`,
+        persona: 'member_a',
+        status: 200,
+        responseBody: 'acct,balance\n1,9999\n',
+        timestampMs: 400,
+      },
+    ]
+
+    // Variant A: exact signedUrl download (step_1 -> step_2 -> step_3 -> step_4)
+    const compiledExact = compileTraceToKovoVerifyScript({
+      submission: {
+        title: 'Four-hop async export signed url download',
+        vulnClass: 'cross_tenant_data_access',
+        exchangeIds: ['e1', 'e2', 'e3', 'e4'],
+        terminalExchangeId: 'e4',
+        attackerPersona: 'member_a',
+      },
+      exchanges: baseExchanges,
+      runOrigin: 'https://app.example.test',
+    })
+
+    assert.equal(compiledExact.ok, true)
+    assert.ok(compiledExact.script)
+    assert.doesNotMatch(compiledExact.script, new RegExp(jobId))
+    assert.doesNotMatch(compiledExact.script, new RegExp(sig))
+
+    const fnExact = loadCompiledEntrypoint(compiledExact.script)
+    const { ctx: ctxExact, log: logExact } = createMockCtx([
+      { status: 403, json: { error: 'denied' } }, // clean synthesized control
+      { status: 202, json: { jobId: 'job_live_556677' } },
+      { status: 200, json: { job: { id: '[redacted:cap:hop_1:cap_1]', status: 'completed' } } },
+      { status: 200, json: { jobId: '[redacted:cap:hop_1:cap_1]', signedUrl: 'https://storage.example.test/files/export/org_a/report.csv?sig=liveSig998877665544' } },
+      { status: 200, json: { ok: true } },
+    ])
+    await fnExact(ctxExact)
+
+    assert.deepEqual(logExact.hops, ['step_1', 'step_2', 'step_3', 'step_4'])
+    assert.equal(logExact.controlInsideHop, false)
+    assert.equal(logExact.httpCalls[0]!.opts.arm, 'control')
+    assert.equal(logExact.httpCalls[0]!.opts.role, 'control')
+    assert.equal(logExact.httpCalls[0]!.opts.session, 'ctrl_clean')
+    // step_3 must use cap_2.handle (NOT redacted ex.json.job.id!)
+    assert.match(String(logExact.httpCalls[3]!.target), /cap:hop_2:cap_2/)
+    assert.equal(logExact.sealCalls.length, 3)
+    assert.deepEqual(
+      logExact.edges.map(e => `${e.fromHopId}->${e.toHopId}:${e.kind}`),
+      ['step_1->step_2:value_binding', 'step_2->step_3:value_binding', 'step_3->step_4:value_binding'],
+    )
+    assertAllHopsReachTerminal(logExact.hops, logExact.edges, 'step_4')
+
+    // Variant B: path-tampered download reusing ?sig= from step_3's signedUrl
+    const tamperedExchanges: RecordedRequestExchange[] = [
+      ...baseExchanges.slice(0, 3),
+      {
+        exchangeId: 'e4_tamper',
+        origin: 'https://storage.example.test',
+        method: 'GET',
+        pathAndQuery: `/files/export/org_b/treasury.csv?tenant=org_a&sig=${sig}&job=${jobId}`,
+        persona: 'member_a',
+        status: 200,
+        responseBody: 'secret,42\n',
+        timestampMs: 400,
+      },
+    ]
+    const compiledTamper = compileTraceToKovoVerifyScript({
+      submission: {
+        title: 'Four-hop async export path tamper',
+        vulnClass: 'cross_tenant_data_access',
+        exchangeIds: ['e1', 'e2', 'e3', 'e4_tamper'],
+        terminalExchangeId: 'e4_tamper',
+        attackerPersona: 'member_a',
+      },
+      exchanges: tamperedExchanges,
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(compiledTamper.ok, true)
+    assert.ok(compiledTamper.script)
+    assert.doesNotMatch(compiledTamper.script, new RegExp(sig))
+
+    const fnTamper = loadCompiledEntrypoint(compiledTamper.script)
+    const { ctx: ctxTamper, log: logTamper } = createMockCtx([
+      { status: 403 },
+      { status: 202, json: { jobId: 'job_live_556677' } },
+      { status: 200, json: { job: { id: '[redacted:cap:hop_1:cap_1]' } } },
+      { status: 200, json: { jobId: '[redacted:cap:hop_1:cap_1]', signedUrl: 'https://storage.example.test/files/export/org_a/report.csv?tenant=org_a&sig=liveSig998877665544&job=[redacted:cap:hop_1:cap_1]' } },
+      { status: 200 },
+    ])
+    await fnTamper(ctxTamper)
+
+    assert.deepEqual(logTamper.hops, ['step_1', 'step_2', 'step_3', 'step_4'])
+    assert.equal(logTamper.controlInsideHop, false)
+    assert.ok(logTamper.sealCalls.some(c => c.value === 'liveSig998877665544'), 'step_3 must extract and seal live sig from signedUrl')
+    assert.deepEqual(
+      logTamper.edges.map(e => `${e.fromHopId}->${e.toHopId}:${e.kind}`),
+      ['step_1->step_2:value_binding', 'step_2->step_3:value_binding', 'step_3->step_4:value_binding'],
+    )
+    assertAllHopsReachTerminal(logTamper.hops, logTamper.edges, 'step_4')
+  })
+
+  it('prunes unlinked read-only recon exchanges and handles short numeric IDs and mutating state transitions without fabricating unrelated edges', async () => {
+    // 1) Unlinked read-only recon exchange is pruned with warning
+    const reconTrace: RecordedRequestExchange[] = [
+      { exchangeId: 'r_me', origin: 'https://app.example.test', method: 'GET', pathAndQuery: '/api/me', persona: 'user_a', status: 200, responseJson: { user: 'alice' }, timestampMs: 10 },
+      { exchangeId: 'r_1', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/items', persona: 'user_a', status: 201, responseJson: { id: 42 }, timestampMs: 20 },
+      { exchangeId: 'r_dead', origin: 'https://app.example.test', method: 'GET', pathAndQuery: '/api/items/42/status', persona: 'user_a', status: 200, responseJson: { ready: true }, timestampMs: 30 },
+      { exchangeId: 'r_2', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/items/42/approve', persona: 'user_a', status: 200, responseJson: { approved: true }, timestampMs: 40 },
+    ]
+    const compiledShort = compileTraceToKovoVerifyScript({
+      submission: { title: 'Short numeric id with recon pruning', vulnClass: 'forged_settlement', exchangeIds: ['r_me', 'r_1', 'r_dead', 'r_2'], terminalExchangeId: 'r_2' },
+      exchanges: reconTrace,
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(compiledShort.ok, true)
+    assert.ok(compiledShort.script)
+    assert.ok(compiledShort.warnings.some(w => /pruned unlinked read-only recon exchange "r_me"/i.test(w)))
+    assert.ok(compiledShort.warnings.some(w => /pruned unlinked read-only recon exchange "r_dead"/i.test(w)))
+
+    const fnShort = loadCompiledEntrypoint(compiledShort.script)
+    const { ctx: ctxShort, log: logShort } = createMockCtx([
+      { status: 403 },
+      { status: 201, json: { id: 99 } }, // Attempt 2 fresh numeric ID!
+      { status: 200, json: { approved: true } },
+    ])
+    await fnShort(ctxShort)
+    assert.deepEqual(logShort.hops, ['step_1', 'step_2'])
+    assert.equal(logShort.httpCalls[2]!.target, '/api/items/99/approve')
+    assert.equal(logShort.edges.length, 1)
+    assert.equal(logShort.edges[0]!.kind, 'value_binding')
+    assert.match(String(logShort.edges[0]!.valueDigest), /^[0-9a-f]{64}$/)
+    assertAllHopsReachTerminal(logShort.hops, logShort.edges, 'step_2')
+
+    // 2) Sequential mutating steps sharing a concrete entity get stateTransition; unrelated steps get 0 fabricated edges
+    const mutTrace: RecordedRequestExchange[] = [
+      { exchangeId: 'm1', origin: 'https://app.example.test', method: 'PATCH', pathAndQuery: '/api/orders/ord_101/rebind', persona: 'user_a', requestJson: { beneficiary: 'attacker' }, status: 200, responseJson: { ok: true }, timestampMs: 10 },
+      { exchangeId: 'm2', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/orders/ord_101/settle', persona: 'user_a', status: 200, responseJson: { settled: true }, timestampMs: 20 },
+    ]
+    const compiledMut = compileTraceToKovoVerifyScript({
+      submission: { title: 'Order rebind then settle', vulnClass: 'forged_settlement', exchangeIds: ['m1', 'm2'], terminalExchangeId: 'm2' },
+      exchanges: mutTrace,
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(compiledMut.ok, true)
+    assert.ok(compiledMut.script)
+    const fnMut = loadCompiledEntrypoint(compiledMut.script)
+    const { ctx: ctxMut, log: logMut } = createMockCtx([{ status: 403 }, { status: 200, json: { ok: true } }, { status: 200, json: { settled: true } }])
+    await fnMut(ctxMut)
+    assert.equal(logMut.controlInsideHop, false)
+    assert.equal(logMut.stateTransitions.length, 1)
+    assert.equal(logMut.stateTransitions[0]!.fromHopId, 'step_1')
+    assert.equal(logMut.stateTransitions[0]!.toHopId, 'step_2')
+    assert.equal(logMut.stateTransitions[0]!.entityId, 'ord_101')
+    assertAllHopsReachTerminal(logMut.hops, logMut.stateTransitions, 'step_2')
+
+    // 3) Unrelated mutating + terminal steps MUST NOT fabricate edges
+    const unrelated: RecordedRequestExchange[] = [
+      { exchangeId: 'u1', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/alpha', persona: 'user_a', status: 200, responseJson: { ok: true }, timestampMs: 10 },
+      { exchangeId: 'u2', origin: 'https://app.example.test', method: 'GET', pathAndQuery: '/api/beta', persona: 'user_a', status: 200, responseJson: { ok: true }, timestampMs: 20 },
+    ]
+    const compiledUnrel = compileTraceToKovoVerifyScript({
+      submission: { title: 'Unrelated hops', vulnClass: 'broken_access_control', exchangeIds: ['u1', 'u2'], terminalExchangeId: 'u2' },
+      exchanges: unrelated,
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(compiledUnrel.ok, true)
+    const { ctx: ctxUnrel, log: logUnrel } = createMockCtx([{ status: 403 }, { status: 200 }, { status: 200 }])
+    await loadCompiledEntrypoint(compiledUnrel.script!)(ctxUnrel)
+    assert.equal(logUnrel.edges.length, 0)
+    assert.equal(logUnrel.stateTransitions.length, 0)
   })
 })
