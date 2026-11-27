@@ -27,7 +27,7 @@ type SourceKind = 'jsonPath' | 'setCookie' | 'locationQuery' | 'header' | 'jsonU
 type SealKind = 'bearer_token' | 'api_token' | 'cookie' | 'header_secret' | 'signed_url' | 'generic_secret'
 interface ExtractedSource {
   stepIdx: number; kind: SourceKind; selector: string; value: string
-  jsAccess?: string; cookieName?: string; headerName?: string; paramName?: string; fromHash?: boolean; isSecretKey?: boolean; isIdKey?: boolean
+  jsAccess?: string; cookieName?: string; headerName?: string; paramName?: string; fromHash?: boolean; isSecretKey?: boolean; isIdKey?: boolean; isUrlKey?: boolean
 }
 interface SealSpec { varName: string; slot: string; source: ExtractedSource; kind: SealKind; defaultHeaderName?: string; defaultCookieName?: string }
 interface VarSpec { varName: string; source: ExtractedSource }
@@ -37,7 +37,7 @@ type CompiledEdge =
   | { kind: 'state_transition_binding'; fromStepIdx: number; toStepIdx: number; entityExpr: string }
 interface StepPlan {
   exchange: RecordedRequestExchange; stepNumber: number; hopId: string
-  seals: SealSpec[]; vars: VarSpec[]; primaryCapability?: PrimaryCapSpec; entityIdExpr?: string
+  seals: SealSpec[]; vars: VarSpec[]; primaryCapability?: PrimaryCapSpec; signedUrlCapVar?: string; entityIdExpr?: string
   omitPersona: boolean; forceNoFollowRedirects: boolean; pathExpr: string; deltaPath: string; headersExpr?: string; bodyExpr?: string
   usesDynamicUrlOrBody: boolean; dynamicDepSteps: Set<number>; boundVars: Set<string>; hasSealedUrlOrBodyDep: boolean
 }
@@ -68,9 +68,11 @@ const HOP_BY_HOP = new Set('host content-length connection keep-alive proxy-conn
 const SKIP_TAINT_HDRS = new Set([...HOP_BY_HOP, ...'authorization cookie proxy-authorization content-type accept accept-language user-agent origin referer cache-control pragma'.split(' ')])
 const GENERIC_VALUES = new Set('true false null undefined bearer application/json text/html text/plain utf-8 public private active inactive pending success failed status created updated deleted viewer member admin owner default localhost unknown anonymous system internal external enabled disabled approved rejected completed processing verified'.split(' '))
 const SECRET_KEY_RE = /(?:token|secret|jwt|auth|session|cookie|api_?key|access_?key|code|sig|signature|hmac|nonce|ticket|assertion|credential|bearer)/i
+const URL_KEY_RE = /(?:url|href|download|redirect|callback)/i
 const ID_KEY_RE = /^(?:id|.*_id|.*Id|code|slug|ref|key|handle|job|order|export|invite|token)$/i
 const SHORT_SKIP_RE = /^(?:v\d+|0+|1|2|3|ok|no|on|id|en)$/i
 const ENTITY_SEG_RE = /^(?=.*\d)[a-zA-Z0-9][a-zA-Z0-9._-]{1,63}$/
+const UUID_VAL_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const AUTH_HDR_RE = /^(?:authorization|proxy-authorization|cookie|x-api-key|x-auth-token|x-access-token|x-session-token|x-service-token|x-internal-token)$/i
 const UNIQUE_KEY_RE = /^(?:email|e_?mail|username|user_?name|handle|slug|org_?slug|tenant_?slug|subdomain|account_?name)$/i
 const EMAIL_VAL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/, SIMPLE_ENTITY_ID_RE = /^[a-zA-Z]{2,20}[_-]\d{2,16}$/
@@ -123,7 +125,7 @@ function extractSources(ex: RecordedRequestExchange, stepIdx: number): Extracted
     if (depth > 4 || node === null || node === undefined) return
     if (typeof node === 'string' || typeof node === 'number') {
       const s = String(node).trim(); if (!s || !jp) return
-      out.push({ stepIdx, kind: 'jsonPath', selector: jp, value: s, jsAccess: js, isSecretKey: SECRET_KEY_RE.test(lastKey) || SECRET_KEY_RE.test(jp), isIdKey: ID_KEY_RE.test(lastKey) })
+      out.push({ stepIdx, kind: 'jsonPath', selector: jp, value: s, jsAccess: js, isSecretKey: SECRET_KEY_RE.test(lastKey) || SECRET_KEY_RE.test(jp), isIdKey: ID_KEY_RE.test(lastKey), isUrlKey: URL_KEY_RE.test(lastKey) })
       if (typeof node === 'string' && (/^https?:\/\//i.test(s) || (s.startsWith('/') && (s.includes('?') || s.includes('#'))))) {
         try {
           const u = new URL(s, 'http://kovo-local.invalid')
@@ -186,27 +188,40 @@ function detectUniqueFields(bodyJson: unknown, bound: ReadonlySet<string>): stri
   }
   walk(bodyJson, '', 0); return out
 }
-function formatSealCall(s: SealSpec): string {
+const isSignedUrlValue = (v: string): boolean => {
+  const t = v.trim()
+  return /^https?:\/\//i.test(t) || (t.startsWith('/') && !t.startsWith('//') && (t.includes('?') || /\/[a-zA-Z0-9._-]{16,}/.test(t)))
+}
+const isSignedUrlSource = (src: ExtractedSource): boolean =>
+  isSignedUrlValue(src.value) || Boolean(src.kind === 'jsonPath' && src.isUrlKey)
+const stepJsAccess = (jsAccess: string | undefined, stepVar: string): string =>
+  jsAccess ? jsAccess.replace(/^ex\./, `${stepVar}.`) : 'undefined'
+function formatSealCall(s: SealSpec, stepVar: string): string {
+  const jsExpr = stepJsAccess(s.source.jsAccess, stepVar)
   const sel = s.source.kind === 'jsonPath' ? `jsonPath: ${JSON.stringify(s.source.selector)}`
     : s.source.kind === 'setCookie' ? `setCookie: ${JSON.stringify(s.source.cookieName!)}`
     : s.source.kind === 'locationQuery' ? `locationQuery: ${JSON.stringify(s.source.paramName!)}`
     : s.source.kind === 'jsonUrlQuery'
       ? (s.source.fromHash
-          ? `value: new URLSearchParams(new URL(String(${s.source.jsAccess} ?? ""), "http://kovo-local.invalid").hash.slice(1)).get(${JSON.stringify(s.source.paramName!)}) ?? ""`
-          : `value: new URL(String(${s.source.jsAccess} ?? ""), "http://kovo-local.invalid").searchParams.get(${JSON.stringify(s.source.paramName!)}) ?? ""`)
+          ? `value: new URLSearchParams(new URL(String(${jsExpr} ?? ""), "http://kovo-local.invalid").hash.slice(1)).get(${JSON.stringify(s.source.paramName!)}) ?? ""`
+          : `value: new URL(String(${jsExpr} ?? ""), "http://kovo-local.invalid").searchParams.get(${JSON.stringify(s.source.paramName!)}) ?? ""`)
     : `header: ${JSON.stringify(s.source.headerName!)}`
-  const f = [`exchangeId: ex.exchangeId`, `slot: ${JSON.stringify(s.slot)}`, sel, `kind: ${JSON.stringify(s.kind)}`]
+  const f = [`slot: ${JSON.stringify(s.slot)}`, sel, `kind: ${JSON.stringify(s.kind)}`]
   if (s.defaultHeaderName) f.push(`defaultHeaderName: ${JSON.stringify(s.defaultHeaderName)}`)
   if (s.defaultCookieName && s.source.kind !== 'setCookie') f.push(`defaultCookieName: ${JSON.stringify(s.defaultCookieName)}`)
-  return `${s.varName} = await ctx.seal_capability({ ${f.join(', ')} })`
+  return `const ${s.varName} = await ch.seal(${stepVar}, { ${f.join(', ')} })`
 }
-const formatTarget = (origin: string, pathExpr: string, runOrigin?: string): string =>
-  origin.trim() && (!runOrigin || origin.trim() !== runOrigin.trim()) ? `{ origin: ${JSON.stringify(origin.trim())}, path: ${pathExpr} }` : pathExpr
-function formatHttpOpts(o: { method: string; persona?: string; headersExpr?: string; bodyExpr?: string; followRedirectsFalse?: boolean; capability?: PrimaryCapSpec; arm?: 'control'; role?: 'control'; session?: string; entityIdExpr?: string }): string {
-  const f = [`method: ${JSON.stringify(o.method.toUpperCase())}`]
+const formatTarget = (origin: string, pathExpr: string, runOrigin?: string, asPathObj = false): string =>
+  origin.trim() && (!runOrigin || origin.trim() !== runOrigin.trim())
+    ? `{ origin: ${JSON.stringify(origin.trim())}, path: ${pathExpr} }`
+    : asPathObj ? `{ path: ${pathExpr} }` : pathExpr
+function formatHttpOpts(o: { hopId?: string; method: string; persona?: string; headersExpr?: string; bodyExpr?: string; followRedirectsFalse?: boolean; capability?: PrimaryCapSpec; arm?: 'control'; role?: 'control'; session?: string; entityIdExpr?: string; claimedDelta?: string }): string {
+  const f: string[] = []
+  if (o.hopId) f.push(`hopId: ${JSON.stringify(o.hopId)}`)
+  f.push(`method: ${JSON.stringify(o.method.toUpperCase())}`)
   if (o.persona) f.push(`as: ${JSON.stringify(o.persona)}`)
   if (o.capability) {
-    const c = [`handle: ${o.capability.capVar}.handle`, `target: ${JSON.stringify(o.capability.target)}`]
+    const c = [`handle: ${o.capability.capVar}`, `target: ${JSON.stringify(o.capability.target)}`]
     if (o.capability.headerName) c.push(`headerName: ${JSON.stringify(o.capability.headerName)}`)
     if (o.capability.cookieName) c.push(`cookieName: ${JSON.stringify(o.capability.cookieName)}`)
     if (o.capability.queryParam) c.push(`queryParam: ${JSON.stringify(o.capability.queryParam)}`)
@@ -215,6 +230,7 @@ function formatHttpOpts(o: { method: string; persona?: string; headersExpr?: str
   if (o.headersExpr) f.push(`headers: ${o.headersExpr}`); if (o.bodyExpr) f.push(`body: ${o.bodyExpr}`); if (o.followRedirectsFalse) f.push('followRedirects: false')
   if (o.arm) f.push(`arm: ${JSON.stringify(o.arm)}`); if (o.role) f.push(`role: ${JSON.stringify(o.role)}`); if (o.session) f.push(`session: ${JSON.stringify(o.session)}`)
   if (o.entityIdExpr) f.push(`entityId: ${o.entityIdExpr}`)
+  if (o.claimedDelta) f.push(`claimedDelta: ${JSON.stringify(o.claimedDelta)}`)
   return `{ ${f.join(', ')} }`
 }
 const sanitizeControlHeaders = (headers?: Record<string, string>): string | undefined => {
@@ -252,10 +268,11 @@ function addCompiledEdge(st: BindingState, edge: CompiledEdge): void {
 function bindLeafValue(st: BindingState, plan: StepPlan, src: ExtractedSource, toStepIdx: number, target: string, encode: boolean, preferHandle: boolean): string | undefined {
   const toStep = toStepIdx + 1; plan.usesDynamicUrlOrBody = true; plan.dynamicDepSteps.add(src.stepIdx)
   if (canSealSource(src, st.blocked)) {
-    const prevSealStep = st.sealedValues.get(src.value), s = getOrCreateSeal(st, src, 'generic_secret')
+    const signedUrl = isSignedUrlSource(src)
+    const prevSealStep = st.sealedValues.get(src.value), s = getOrCreateSeal(st, src, signedUrl ? 'signed_url' : 'generic_secret')
     addCompiledEdge(st, { kind: 'value_binding', fromStepIdx: src.stepIdx, toStepIdx, capVar: s.varName })
-    if (preferHandle || src.kind !== 'jsonPath' || src.value.trim().length < 8 || (prevSealStep !== undefined && prevSealStep < src.stepIdx)) {
-      plan.hasSealedUrlOrBodyDep = true; st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target }); return `${s.varName}.handle`
+    if (preferHandle || signedUrl || src.kind !== 'jsonPath' || src.value.trim().length < 8 || (prevSealStep !== undefined && prevSealStep < src.stepIdx)) {
+      plan.hasSealedUrlOrBodyDep = true; st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target }); return s.varName
     }
     const v = getOrCreateVar(st, src); plan.boundVars.add(v.varName); st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'var', selector: src.selector, target })
     return encode ? `encodeURIComponent(String(${v.varName}))` : v.varName
@@ -287,7 +304,7 @@ function bindRequestHeaders(st: BindingState, plan: StepPlan, toStepIdx: number,
         if (src && canSealSource(src, st.blocked)) {
           const s = getOrCreateSeal(st, src, 'cookie', { defaultCookieName: cName })
           if (!plan.primaryCapability) { plan.primaryCapability = { capVar: s.varName, target: 'cookie', cookieName: cName }; plan.omitPersona = true }
-          else hdrEntries.push([k, `\`${cName}=\${${s.varName}.handle}\``])
+          else hdrEntries.push([k, `\`${cName}=\${${s.varName}}\``])
           handled.add('cookie'); addCompiledEdge(st, { kind: 'value_binding', fromStepIdx: src.stepIdx, toStepIdx, capVar: s.varName })
           st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target: `cookie:${cName}` }); break
         }
@@ -302,7 +319,7 @@ function bindRequestHeaders(st: BindingState, plan: StepPlan, toStepIdx: number,
     if (src && canSealSource(src, st.blocked)) {
       const s = getOrCreateSeal(st, src, 'header_secret', { defaultHeaderName: k })
       if (!plan.primaryCapability) { plan.primaryCapability = { capVar: s.varName, target: 'header', headerName: k }; if (AUTH_HDR_RE.test(l) || !ex.persona) plan.omitPersona = true }
-      else hdrEntries.push([k, `${s.varName}.handle`])
+      else hdrEntries.push([k, s.varName])
       addCompiledEdge(st, { kind: 'value_binding', fromStepIdx: src.stepIdx, toStepIdx, capVar: s.varName })
       st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target: `header:${l}` })
     } else hdrEntries.push([k, JSON.stringify(v)])
@@ -320,20 +337,12 @@ function bindStepPlan(st: BindingState, plan: StepPlan, toStepIdx: number, maxPr
   const qIdx = rawPq.indexOf('?'), rawPath = qIdx >= 0 ? rawPq.slice(0, qIdx) : rawPq, rawQuery = qIdx >= 0 ? rawPq.slice(qIdx + 1) : ''
   const fullUrl = ex.origin ? `${ex.origin.trim().replace(/\/+$/, '')}${rawPq}` : '', urlSrc = (fullUrl ? lookup(fullUrl) : undefined) ?? lookup(rawPq)
   let urlBound = false
-  if (urlSrc && canSealSource(urlSrc, st.blocked)) {
-    const prevSeal = st.sealedValues.get(urlSrc.value)
-    if (/^https?:\/\//i.test(urlSrc.value) && !plan.primaryCapability) {
-      const s = getOrCreateSeal(st, urlSrc, 'signed_url')
-      plan.primaryCapability = { capVar: s.varName, target: 'url' }; plan.pathExpr = JSON.stringify(rawPath || '/'); plan.deltaPath = rawPath || '/'
-      plan.usesDynamicUrlOrBody = true; plan.dynamicDepSteps.add(urlSrc.stepIdx); plan.hasSealedUrlOrBodyDep = true; urlBound = true
-      addCompiledEdge(st, { kind: 'value_binding', fromStepIdx: urlSrc.stepIdx, toStepIdx, capVar: s.varName })
-      st.inferredBindings.push({ fromStep: urlSrc.stepIdx + 1, toStep, kind: 'seal', selector: urlSrc.selector, target: 'url' })
-    } else if (urlSrc.value.startsWith('/') && urlSrc.kind === 'jsonPath' && !(prevSeal !== undefined && prevSeal < urlSrc.stepIdx)) {
-      const s = getOrCreateSeal(st, urlSrc, 'signed_url'), v = getOrCreateVar(st, urlSrc)
-      plan.pathExpr = `String(${v.varName})`; plan.deltaPath = rawPath || '/'; plan.usesDynamicUrlOrBody = true; plan.dynamicDepSteps.add(urlSrc.stepIdx); plan.boundVars.add(v.varName); urlBound = true
-      addCompiledEdge(st, { kind: 'value_binding', fromStepIdx: urlSrc.stepIdx, toStepIdx, capVar: s.varName })
-      st.inferredBindings.push({ fromStep: urlSrc.stepIdx + 1, toStep, kind: 'var', selector: urlSrc.selector, target: 'url' })
-    }
+  if (urlSrc && canSealSource(urlSrc, st.blocked) && (isSignedUrlSource(urlSrc) || urlSrc.value.startsWith('/'))) {
+    const s = getOrCreateSeal(st, urlSrc, 'signed_url')
+    plan.signedUrlCapVar = s.varName; plan.pathExpr = s.varName; plan.deltaPath = rawPath || '/'
+    plan.usesDynamicUrlOrBody = true; plan.dynamicDepSteps.add(urlSrc.stepIdx); plan.hasSealedUrlOrBodyDep = true; urlBound = true
+    addCompiledEdge(st, { kind: 'value_binding', fromStepIdx: urlSrc.stepIdx, toStepIdx, capVar: s.varName })
+    st.inferredBindings.push({ fromStep: urlSrc.stepIdx + 1, toStep, kind: 'seal', selector: urlSrc.selector, target: 'url' })
   }
   if (!urlBound) {
     const pathParts: Array<{ lit?: string; expr?: string }> = [], deltaSegs: string[] = []
@@ -350,12 +359,12 @@ function bindStepPlan(st: BindingState, plan: StepPlan, toStepIdx: number, maxPr
       for (const [k] of qEntries) counts.set(k, (counts.get(k) ?? 0) + 1)
       for (const [k, v] of qEntries) {
         const src = lookup(v, true); if (!src) { kept.push({ k, raw: v }); continue }
-        if (canSealSource(src, st.blocked) && (isOpaque(src.value, src, st.blocked, k) || src.kind === 'jsonUrlQuery')) {
+        if (canSealSource(src, st.blocked) && (isOpaque(src.value, src, st.blocked, k) || src.kind === 'jsonUrlQuery' || isSignedUrlSource(src))) {
           plan.usesDynamicUrlOrBody = true; plan.dynamicDepSteps.add(src.stepIdx); plan.hasSealedUrlOrBodyDep = true
-          const s = getOrCreateSeal(st, src, 'generic_secret')
+          const s = getOrCreateSeal(st, src, isSignedUrlSource(src) ? 'signed_url' : 'generic_secret')
           addCompiledEdge(st, { kind: 'value_binding', fromStepIdx: src.stepIdx, toStepIdx, capVar: s.varName })
           if (!plan.primaryCapability && counts.get(k) === 1) plan.primaryCapability = { capVar: s.varName, target: 'url', queryParam: k }
-          else kept.push({ k, expr: `${s.varName}.handle` })
+          else kept.push({ k, expr: s.varName })
           st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target: `query:${k}` })
         } else { const expr = bindLeafValue(st, plan, src, toStepIdx, `query:${k}`, true, false); kept.push(expr ? { k, expr } : { k, raw: v }) }
       }
@@ -384,23 +393,67 @@ function bindStepPlan(st: BindingState, plan: StepPlan, toStepIdx: number, maxPr
 }
 
 function extractRequestEntities(ex: RecordedRequestExchange, blocked: ReadonlySet<string>): string[] {
-  const out: string[] = [], add = (v: string) => { const t = v.trim(); if (ENTITY_SEG_RE.test(t) && !blocked.has(t.toLowerCase()) && !SHORT_SKIP_RE.test(t) && !out.includes(t)) out.push(t) }
-  ;(ex.pathAndQuery || '/').split('?')[0]!.split('/').forEach((seg, idx) => { if (idx > 1 && seg) { try { add(decodeURIComponent(seg)) } catch { add(seg) } } })
+  const out: string[] = []
+  const add = (v: string) => { const t = v.trim(); if (ENTITY_SEG_RE.test(t) && !blocked.has(t.toLowerCase()) && !SHORT_SKIP_RE.test(t) && !out.includes(t)) out.push(t) }
+  const isStructuredId = (t: string): boolean => !/^\d+$/.test(t) && (SIMPLE_ENTITY_ID_RE.test(t) || UUID_VAL_RE.test(t) || /^[a-zA-Z]{2,16}[_-][a-zA-Z0-9_-]*\d[a-zA-Z0-9_-]*$/.test(t))
+  const rawPq = ex.pathAndQuery || '/', qIdx = rawPq.indexOf('?')
+  const rawPath = qIdx >= 0 ? rawPq.slice(0, qIdx) : rawPq, rawQuery = qIdx >= 0 ? rawPq.slice(qIdx + 1) : ''
+  rawPath.split('/').forEach((seg, idx) => { if (idx >= 1 && seg) { try { add(decodeURIComponent(seg)) } catch { add(seg) } } })
+  if (rawQuery) {
+    for (const [k, v] of new URLSearchParams(rawQuery).entries()) {
+      const t = v.trim(); if (ID_KEY_RE.test(k) || isStructuredId(t)) add(t)
+    }
+  }
+  const walkBody = (node: unknown, depth: number, lastKey: string): void => {
+    if (depth > 4 || node === null || node === undefined) return
+    if (typeof node === 'string' || typeof node === 'number') {
+      const t = String(node).trim()
+      if (ID_KEY_RE.test(lastKey) || (typeof node === 'string' && isStructuredId(t))) add(t)
+    } else if (Array.isArray(node)) {
+      for (let i = 0; i < Math.min(node.length, 25); i += 1) walkBody(node[i], depth + 1, lastKey)
+    } else if (typeof node === 'object') {
+      for (const [k, v] of Object.entries(node as Record<string, unknown>)) walkBody(v, depth + 1, k)
+    }
+  }
   const body = ex.requestJson !== undefined ? ex.requestJson : tryParseJson(ex.requestBody)
-  if (body && typeof body === 'object' && !Array.isArray(body)) for (const [k, v] of Object.entries(body as Record<string, unknown>)) if (ID_KEY_RE.test(k) && (typeof v === 'string' || typeof v === 'number')) add(String(v))
+  if (body !== undefined) walkBody(body, 0, '')
+  else if (typeof ex.requestBody === 'string' && (getHeaderCI(ex.requestHeaders, 'content-type') ?? '').toLowerCase().includes('application/x-www-form-urlencoded')) {
+    for (const [k, v] of new URLSearchParams(ex.requestBody).entries()) {
+      const t = v.trim(); if (ID_KEY_RE.test(k) || isStructuredId(t)) add(t)
+    }
+  }
   return out
+}
+function computeReachableToTerminal(edges: readonly CompiledEdge[], terminalIdx: number): Set<number> {
+  const revAdj = new Map<number, number[]>()
+  for (const e of edges) {
+    const list = revAdj.get(e.toStepIdx)
+    if (list) list.push(e.fromStepIdx)
+    else revAdj.set(e.toStepIdx, [e.fromStepIdx])
+  }
+  const reachable = new Set<number>([terminalIdx]), queue = [terminalIdx]
+  while (queue.length > 0) {
+    for (const prev of revAdj.get(queue.shift()!) ?? []) {
+      if (!reachable.has(prev)) { reachable.add(prev); queue.push(prev) }
+    }
+  }
+  return reachable
 }
 function linkMutatingStateTransitions(st: BindingState, terminalIdx: number): void {
   const entByStep = st.plans.map(p => extractRequestEntities(p.exchange, st.blocked))
-  for (let i = 0; i < terminalIdx; i += 1) {
-    if (READ_ONLY_METHODS.has(st.plans[i]!.exchange.method.toUpperCase()) || st.edges.some(e => e.fromStepIdx === i)) continue
+  let reachable = computeReachableToTerminal(st.edges, terminalIdx)
+  for (let i = terminalIdx - 1; i >= 0; i -= 1) {
+    if (READ_ONLY_METHODS.has(st.plans[i]!.exchange.method.toUpperCase()) || reachable.has(i)) continue
     for (let j = i + 1; j <= terminalIdx; j += 1) {
+      if (!reachable.has(j)) continue
       const sharedVar = [...st.plans[i]!.boundVars].find(v => st.plans[j]!.boundVars.has(v))
       const sharedLit = sharedVar ? undefined : entByStep[i]!.find(ent => entByStep[j]!.includes(ent))
       const entityExpr = sharedVar ? `String(${sharedVar})` : sharedLit ? JSON.stringify(sharedLit) : undefined
       if (!entityExpr) continue
       addCompiledEdge(st, { kind: 'state_transition_binding', fromStepIdx: i, toStepIdx: j, entityExpr })
-      st.plans[i]!.entityIdExpr ??= entityExpr; st.plans[j]!.entityIdExpr ??= entityExpr; break
+      st.plans[i]!.entityIdExpr ??= entityExpr; st.plans[j]!.entityIdExpr ??= entityExpr
+      reachable = computeReachableToTerminal(st.edges, terminalIdx)
+      break
     }
   }
 }
@@ -433,7 +486,7 @@ function formatEdgeLine(e: CompiledEdge, plans: readonly StepPlan[]): string {
   const fromHopId = JSON.stringify(plans[e.fromStepIdx]!.hopId), toHopId = JSON.stringify(plans[e.toStepIdx]!.hopId)
   if (e.kind === 'state_transition_binding') return `  ch.stateTransition({ fromHopId: ${fromHopId}, toHopId: ${toHopId}, entityId: ${e.entityExpr}, ablationExchange: ctrl })`
   return e.capVar
-    ? `  ch.edge({ kind: "value_binding", fromHopId: ${fromHopId}, toHopId: ${toHopId}, capabilityHandle: ${e.capVar}.handle })`
+    ? `  ch.edge({ kind: "value_binding", fromHopId: ${fromHopId}, toHopId: ${toHopId}, capabilityHandle: ${e.capVar} })`
     : `  ch.edge({ kind: "value_binding", fromHopId: ${fromHopId}, toHopId: ${toHopId}, valueDigest: await _sha256(${e.digestVar}) })`
 }
 
@@ -473,19 +526,15 @@ export function compileTraceToKovoVerifyScript(input: {
 
   const passWarnings: string[] = []
   let { st, readbackPlan } = runBindingPass(causal, terminalIdx, explicitReadback, allowedSet, blocked, passWarnings)
-  const keep = new Set(causal.map((_, i) => i))
-  for (let changed = true; changed;) {
-    changed = false
-    for (const i of [...keep]) {
-      if (i === terminalIdx || !READ_ONLY_METHODS.has(causal[i]!.method.toUpperCase())) continue
-      if (!st.edges.some(e => e.fromStepIdx === i && keep.has(e.toStepIdx))) {
-        keep.delete(i); changed = true
-        warnings.push(`pruned unlinked read-only recon exchange "${causal[i]!.exchangeId}" (${causal[i]!.method.toUpperCase()} ${causal[i]!.pathAndQuery || '/'})`)
-      }
+  const reachable = computeReachableToTerminal(st.edges, terminalIdx)
+  for (let i = 0; i < causal.length; i += 1) {
+    if (!reachable.has(i)) {
+      const m = causal[i]!.method.toUpperCase(), kind = READ_ONLY_METHODS.has(m) ? 'unlinked read-only recon' : 'unreachable'
+      warnings.push(`pruned ${kind} exchange "${causal[i]!.exchangeId}" (${m} ${causal[i]!.pathAndQuery || '/'})`)
     }
   }
-  if (keep.size < causal.length) {
-    causal = causal.filter((_, i) => keep.has(i)); terminalIdx = causal.findIndex(e => e.exchangeId === terminalEx.exchangeId)
+  if (reachable.size < causal.length) {
+    causal = causal.filter((_, i) => reachable.has(i)); terminalIdx = causal.findIndex(e => e.exchangeId === terminalEx.exchangeId)
     ;({ st, readbackPlan } = runBindingPass(causal, terminalIdx, explicitReadback, allowedSet, blocked, warnings))
   } else warnings.push(...passWarnings)
 
@@ -505,29 +554,27 @@ export function compileTraceToKovoVerifyScript(input: {
   const emitCtrl = (): void => {
     const srcEx = explicitControl ?? terminalEx, cBodyJson = srcEx.requestJson !== undefined ? srcEx.requestJson : tryParseJson(srcEx.requestBody)
     const cBody = (!explicitControl && ctrlUsesDyn) ? termPlan.bodyExpr : (cBodyJson !== undefined ? JSON.stringify(cBodyJson) : (srcEx.requestBody ? JSON.stringify(srcEx.requestBody) : undefined))
-    const stripAllQ = Boolean(!explicitControl && termPlan.primaryCapability?.target === 'url' && !termPlan.primaryCapability.queryParam)
+    const stripAllQ = Boolean(!explicitControl && (termPlan.signedUrlCapVar || (termPlan.primaryCapability?.target === 'url' && !termPlan.primaryCapability.queryParam)))
     const cPath = (!explicitControl && ctrlUsesDyn) ? termPlan.pathExpr : JSON.stringify(explicitControl ? (srcEx.pathAndQuery || '/') : sanitizeControlPath(srcEx.pathAndQuery || '/', st.sealedValues, stripAllQ))
-    lines.push(`  const ctrl = await ctx.http_send(${formatTarget(srcEx.origin, cPath, runOrigin)}, ${formatHttpOpts({ method: srcEx.method || 'GET', persona: explicitControl ? (explicitControl.persona?.trim() || attackerPersona) : attackerPersona, headersExpr: sanitizeControlHeaders(srcEx.requestHeaders), bodyExpr: cBody, arm: 'control', role: 'control', session: 'ctrl_clean' })})`, '  ch.control(ctrl)')
+    lines.push(`  const ctrl = await ch.control(${formatTarget(srcEx.origin, cPath, runOrigin)}, ${formatHttpOpts({ method: srcEx.method || 'GET', persona: explicitControl ? (explicitControl.persona?.trim() || attackerPersona) : attackerPersona, headersExpr: sanitizeControlHeaders(srcEx.requestHeaders), bodyExpr: cBody, session: 'ctrl_clean' })})`)
   }
-  const planOpts = (p: StepPlan, fallbackPersona?: string) => formatHttpOpts({ method: p.exchange.method || 'GET', persona: p.omitPersona ? undefined : (p.exchange.persona?.trim() || fallbackPersona), headersExpr: p.headersExpr, bodyExpr: p.bodyExpr, followRedirectsFalse: p.forceNoFollowRedirects, capability: p.primaryCapability, entityIdExpr: p.entityIdExpr })
+  const planOpts = (p: StepPlan, fallbackPersona?: string, stepMeta?: { hopId: string; claimedDelta: string }) => formatHttpOpts({ ...(stepMeta ?? {}), method: p.exchange.method || 'GET', persona: p.omitPersona ? undefined : (p.exchange.persona?.trim() || fallbackPersona), headersExpr: p.headersExpr, bodyExpr: p.bodyExpr, followRedirectsFalse: p.forceNoFollowRedirects, capability: p.primaryCapability, entityIdExpr: p.entityIdExpr })
 
   if (ctrlAfterIdx < 0) emitCtrl()
   for (let i = 0; i < plans.length; i += 1) {
-    const p = plans[i]!
+    const p = plans[i]!, stepVar = `step_${p.stepNumber}`
     lines.push(
-      ...p.seals.map(s => `  let ${s.varName}`), ...p.vars.map(v => `  let ${v.varName}`),
-      `  const h_${p.stepNumber} = await ch.hop(${JSON.stringify(p.hopId)}, { claimedDelta: ${JSON.stringify(`${p.exchange.method.toUpperCase()} ${p.deltaPath}`)} }, async () => {`,
-      `    const ex = await ctx.http_send(${formatTarget(p.exchange.origin, p.pathExpr, runOrigin)}, ${planOpts(p)})`,
-      ...p.seals.map(s => `    ${formatSealCall(s)}`), ...p.vars.map(v => `    ${v.varName} = ${v.source.jsAccess ?? 'undefined'}`),
-      '    return ex', '  })',
+      `  const ${stepVar} = await ch.step(${formatTarget(p.exchange.origin, p.pathExpr, runOrigin, Boolean(p.signedUrlCapVar))}, ${planOpts(p, undefined, { hopId: p.hopId, claimedDelta: `${p.exchange.method.toUpperCase()} ${p.deltaPath}` })})`,
+      ...p.seals.map(s => `  ${formatSealCall(s, stepVar)}`),
+      ...p.vars.map(v => `  const ${v.varName} = ${stepJsAccess(v.source.jsAccess, stepVar)}`),
       ...st.edges.filter(e => e.toStepIdx === i).map(e => formatEdgeLine(e, plans)),
     )
     if (ctrlAfterIdx === i) emitCtrl()
   }
-  if (readbackPlan) lines.push(`  const rb = await ctx.http_send(${formatTarget(readbackPlan.exchange.origin, readbackPlan.pathExpr, runOrigin)}, ${planOpts(readbackPlan, attackerPersona)})`, '  ch.readback(rb)')
+  if (readbackPlan) lines.push(`  const rb = await ch.readback(${formatTarget(readbackPlan.exchange.origin, readbackPlan.pathExpr, runOrigin, Boolean(readbackPlan.signedUrlCapVar))}, ${planOpts(readbackPlan, attackerPersona)})`)
 
   const prove = [
-    `terminalHopId: ${JSON.stringify(termPlan.hopId)}`, `terminalExchange: h_${termPlan.stepNumber}`, 'control: ctrl',
+    `terminalHopId: ${JSON.stringify(termPlan.hopId)}`, `terminalExchange: step_${termPlan.stepNumber}`, 'control: ctrl',
     ...(readbackPlan ? ['readback: rb'] : []), ...(validOracleFamily ? [`oracleFamily: ${JSON.stringify(validOracleFamily)}`] : []),
     `claimedImpact: ${JSON.stringify((submission.reproNotes?.trim() || submission.title || terminalVulnClass).slice(0, 240))}`,
   ]
