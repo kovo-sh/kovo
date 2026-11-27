@@ -4116,7 +4116,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     ? { earlyExit, earlyExitTurnsSaved: earlyExit.turnsSaved }
     : {}
 
-  const registeredProofTools = options.decoupledMode ? ['submit_exploit_trace'] : (handlers.kovo_verify ? ['kovo_verify'] : [])
+  const registeredProofTools = options.decoupledMode ? (handlers.kovo_verify ? ['submit_exploit_trace', 'kovo_verify'] : ['submit_exploit_trace']) : (handlers.kovo_verify ? ['kovo_verify'] : [])
   const trace = options.trace
   const traceRunId = options.traceContext?.runId ?? options.requestId
   const traceAssignmentId = options.traceContext?.assignmentId ?? options.sessionId
@@ -4172,7 +4172,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       ? [...options.overrideTools({ scrubbers, signal: sessionController.signal, inlineLimit, onCompleteIntent: onCompleteIntentCb, specSubmission: specSubmissionOpts })]
       : [...options.overrideTools])
     : buildWorkerTools(handlers, scrubbers, sessionController.signal, inlineLimit, onCompleteIntentCb, specSubmissionOpts)
-  const decoupledSettlementAllowed = new Set(['submit_exploit_trace', 'search_run', 'analyze', 'sandbox_exec', 'record_fact', 'complete_intent', 'repo', 'query_cves'])
+  const decoupledSettlementAllowed = new Set(['submit_exploit_trace', 'kovo_verify', 'search_run', 'analyze', 'sandbox_exec', 'record_fact', 'complete_intent', 'repo', 'query_cves'])
   // Extra tools have unknown semantics: keep them sequential so a round that calls one never races.
   const allTools: ToolRegistration[] = [
     ...builtTools,
