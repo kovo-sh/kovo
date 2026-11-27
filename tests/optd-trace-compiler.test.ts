@@ -1341,4 +1341,92 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
     assert.equal(nonEcon.ok, true)
     assert.doesNotMatch(nonEcon.script!, /ch\.race\(/)
   })
+
+  it('infers low-privilege attackerPersona for root step_1 when missing/null or privileged while preserving dual_member on dual_tenant_abac', async () => {
+    const tok = 'eyJhbGciOiJIUzI1NiJ9.rootPersonaTokenPayload123.sigABC999'
+
+    // 1) step_1 has null/undefined persona, step_2 has owner_a, controlExchange has member_a -> infers member_a on step_1 & ctrl
+    const missingRootTrace: RecordedRequestExchange[] = [
+      { exchangeId: 'ctrl_low', origin: 'https://app.example.test', method: 'GET', pathAndQuery: '/api/v1/admin/ledger', persona: 'member_a', status: 403, timestampMs: 10 },
+      { exchangeId: 'unauth_1', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/v1/tokens/issue', status: 200, responseJson: { accessToken: tok }, timestampMs: 20 },
+      { exchangeId: 'priv_2', origin: 'https://app.example.test', method: 'GET', pathAndQuery: '/api/v1/admin/ledger', persona: 'owner_a', requestHeaders: { Authorization: `Bearer ${tok}` }, status: 200, responseJson: { total: 9000 }, timestampMs: 30 },
+    ]
+    const c1 = compileTraceToKovoVerifyScript({
+      submission: { title: 'Missing root persona', vulnClass: 'privilege_escalation', exchangeIds: ['ctrl_low', 'unauth_1', 'priv_2'], controlExchangeId: 'ctrl_low', terminalExchangeId: 'priv_2' },
+      exchanges: missingRootTrace,
+      allowedPersonas: ['owner_a', 'dual_member', 'member_a'],
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(c1.ok, true)
+    const { ctx: ctx1, log: log1 } = createMockCtx([{ status: 403 }, { status: 200, json: { accessToken: 'fresh_tok_1' } }, { status: 200 }])
+    await loadCompiledEntrypoint(c1.script!)(ctx1)
+    assert.equal(log1.httpCalls[0]!.opts.as, 'member_a')
+    assert.equal(log1.httpCalls[1]!.opts.as, 'member_a', 'step_1 with missing persona must inherit low-privilege member_a')
+    assert.equal(log1.httpCalls[2]!.opts.as, undefined, 'step_2 injecting bearer capability keeps as: undefined')
+
+    // 2) step_1 has missing persona, step_2 has dual_member, readback has viewer_b on non-dual class -> picks viewer_b over dual_member
+    const dualVsViewer: RecordedRequestExchange[] = [
+      { exchangeId: 's1_nil', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/v1/orders/ord_77/rebind', status: 200, responseJson: { ok: true }, timestampMs: 10 },
+      { exchangeId: 's2_dual', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/v1/orders/ord_77/settle', persona: 'dual_member', status: 200, responseJson: { settled: true }, timestampMs: 20 },
+      { exchangeId: 'rb_low', origin: 'https://app.example.test', method: 'GET', pathAndQuery: '/api/v1/orders/ord_77', persona: 'viewer_b', status: 200, responseJson: { settled: true }, timestampMs: 30 },
+    ]
+    const c2 = compileTraceToKovoVerifyScript({
+      submission: { title: 'Prefer viewer over dual_member on forged_settlement', vulnClass: 'forged_settlement', exchangeIds: ['s1_nil', 's2_dual', 'rb_low'], terminalExchangeId: 's2_dual', readbackExchangeId: 'rb_low' },
+      exchanges: dualVsViewer,
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(c2.ok, true)
+    const { ctx: ctx2, log: log2 } = createMockCtx([{ status: 403 }, { status: 200 }, { status: 200 }, { status: 200 }])
+    await loadCompiledEntrypoint(c2.script!)(ctx2)
+    assert.equal(log2.httpCalls[1]!.opts.as, 'viewer_b')
+
+    // 3) step_1 explicitly had owner_a while member_a exists -> replaces root hop with member_a + warning
+    const ownerRoot: RecordedRequestExchange[] = [
+      { exchangeId: 'o_1', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/v1/tokens/issue', persona: 'owner_a', status: 200, responseJson: { accessToken: tok }, timestampMs: 10 },
+      { exchangeId: 'o_2', origin: 'https://app.example.test', method: 'GET', pathAndQuery: '/api/v1/admin/ledger', persona: 'member_a', requestHeaders: { Authorization: `Bearer ${tok}` }, status: 200, responseJson: { total: 1 }, timestampMs: 20 },
+    ]
+    const c3 = compileTraceToKovoVerifyScript({
+      submission: { title: 'Privileged owner_a root downgraded', vulnClass: 'privilege_escalation', exchangeIds: ['o_1', 'o_2'], terminalExchangeId: 'o_2' },
+      exchanges: ownerRoot,
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(c3.ok, true)
+    assert.ok(c3.warnings.some(w => /Root hop step_1 persona "owner_a" replaced/i.test(w)))
+    const { ctx: ctx3, log: log3 } = createMockCtx([{ status: 403 }, { status: 200, json: { accessToken: 'fresh_tok_3' } }, { status: 200 }])
+    await loadCompiledEntrypoint(c3.script!)(ctx3)
+    assert.equal(log3.httpCalls[1]!.opts.as, 'member_a')
+
+    // 4) Legitimate dual_tenant_abac trace run as dual_member preserves dual_member even when allowedPersonas lists member_a
+    const dualAbac: RecordedRequestExchange[] = [
+      { exchangeId: 'd_1', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/v1/permissions/prime', persona: 'dual_member', status: 200, responseJson: { sessionTok: tok }, timestampMs: 10 },
+      { exchangeId: 'd_2', origin: 'https://app.example.test', method: 'GET', pathAndQuery: '/api/v1/reports/export', persona: 'dual_member', requestHeaders: { 'X-Session-Tok': tok }, status: 200, responseJson: { rows: 5 }, timestampMs: 20 },
+    ]
+    const c4 = compileTraceToKovoVerifyScript({
+      submission: { title: 'Dual tenant cache bleed', vulnClass: 'dual_tenant_abac', oracleFamily: 'dual_tenant_abac', exchangeIds: ['d_1', 'd_2'], terminalExchangeId: 'd_2' },
+      exchanges: dualAbac,
+      allowedPersonas: ['member_a', 'dual_member', 'owner_a'],
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(c4.ok, true)
+    const { ctx: ctx4, log: log4 } = createMockCtx([{ status: 403 }, { status: 200, json: { sessionTok: 'fresh_tok_4' } }, { status: 200 }])
+    await loadCompiledEntrypoint(c4.script!)(ctx4)
+    assert.equal(log4.httpCalls[0]!.opts.as, 'dual_member')
+    assert.equal(log4.httpCalls[1]!.opts.as, 'dual_member')
+
+    // 5) Root ch.race with missing persona inherits low-priv persona from readbackExchange
+    const raceMissingPersona: RecordedRequestExchange[] = [
+      { exchangeId: 'rm_1', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/v1/orders/ord_8/refund', requestJson: { amount: 60 }, status: 200, responseJson: { refunded: 60 }, timestampMs: 10 },
+      { exchangeId: 'rm_2', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/v1/orders/ord_8/refund', requestJson: { amount: 60 }, status: 200, responseJson: { refunded: 60 }, timestampMs: 11 },
+      { exchangeId: 'rm_rb', origin: 'https://app.example.test', method: 'GET', pathAndQuery: '/api/v1/orders/ord_8', persona: 'member_a', status: 200, responseJson: { paidAmount: 100, refundedTotal: 120 }, timestampMs: 20 },
+    ]
+    const c5 = compileTraceToKovoVerifyScript({
+      submission: { title: 'Race with unauthenticated burst and member_a readback', vulnClass: 'economic_conservation', oracleFamily: 'economic_conservation', exchangeIds: ['rm_1', 'rm_2', 'rm_rb'], terminalExchangeId: 'rm_2', readbackExchangeId: 'rm_rb' },
+      exchanges: raceMissingPersona,
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(c5.ok, true)
+    const { ctx: ctx5, log: log5 } = createMockCtx([{ status: 200 }, { status: 200 }, { status: 200 }, { status: 200 }])
+    await loadCompiledEntrypoint(c5.script!)(ctx5)
+    assert.equal((log5.raceCalls[0]!.request as Record<string, unknown>).as, 'member_a')
+  })
 })

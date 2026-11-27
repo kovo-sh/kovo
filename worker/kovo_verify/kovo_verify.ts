@@ -8,7 +8,6 @@
 import { readFileSync, writeFileSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 import { dirname, join } from 'node:path'
-
 export type ClaimKind = 'status' | 'header' | 'body_contains' | 'jsonpath' | 'css' | 'dom_sentinel' | 'oob' | 'timing' | 'composite_receipt' | 'host_evaluated_expression'
 export interface StatusClaim { kind: 'status'; exchangeId: string; expected: number | number[]; message?: string }
 export interface HeaderClaim { kind: 'header'; exchangeId: string; name: string; equals?: string; matches?: string; absent?: boolean; message?: string }
@@ -46,7 +45,6 @@ export interface RaceRequestInput { target?: HttpTarget; url?: HttpTarget; path?
 export interface RaceBurstInput { requests: Array<RaceRequestInput | HttpTarget>; barrier?: 'auto' | 'h2' | 'http1'; session?: string; minDistinctOutcomes?: number; expectAllSuccess?: boolean; readRoute?: HttpTarget; readMethod?: string; readPersona?: string; serialRequest?: RaceRequestInput | HttpTarget; balanceField?: string; capField?: string; unitDebit?: number; vulnClass?: string; baselineExchangeId?: string; postExchangeId?: string; serialExchangeIds?: string[]; serialPreExchangeId?: string; serialPostExchangeId?: string; message?: string }
 export interface InjectionDifferentialInput { control?: DifferentialArmInput | HttpTarget; probe?: DifferentialArmInput | HttpTarget; variant?: DifferentialArmInput | HttpTarget; url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; method?: string; headers?: Record<string, string>; as?: string; controlBody?: string | Record<string, unknown>; probeBody?: string | Record<string, unknown>; expectedOutput?: string; vulnClass?: string; session?: string; message?: string }
 export interface SignedUrlMintInput { control?: DifferentialArmInput | HttpTarget; probe?: DifferentialArmInput | HttpTarget; controlExchangeId?: string; probeExchangeId?: string; variant?: 'auto' | 'key_traversal' | 'unauth_write_mint'; url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; method?: string; headers?: Record<string, string>; as?: string; controlBody?: string | Record<string, unknown>; probeBody?: string | Record<string, unknown>; session?: string; message?: string }
-
 export interface ProofResult { sdk: 'kovo_verify.ts'; nonce: string; title: string; severity: string; description?: string; claims: VerifyClaim[] }
 export interface RpcContext { nonce: string; runId: string; targetOrigins: string[]; sdkVersion: string }
 interface RpcEnvelope { ok: boolean; result?: unknown; error?: string }
@@ -80,7 +78,6 @@ export interface CompositeVerificationResult { confirmed: boolean; ok?: boolean;
 export interface BrowserExchange { exchangeId: string; status: number; url: string; html: string; title?: string; executedSentinels: string[]; durationMs: number }
 export interface OobHandle { exchangeId: string; token: string; url: string; dnsHost: string }
 export interface OobCheck extends OobHandle { hit: boolean; checkExchangeId?: string; hits: Array<{ protocol: string; token: string; remoteIp?: string; timestamp?: number }> }
-
 export interface HttpOptions { as?: string; persona?: string; session?: string; role?: 'setup' | 'control' | 'probe' | 'cleanup'; arm?: 'setup' | 'control' | 'probe' | 'cleanup'; isControl?: boolean; control?: boolean; method?: string; headers?: Record<string, string>; body?: string | Record<string, unknown> | unknown[]; jsonBody?: unknown; textBody?: string; followRedirects?: boolean; timeoutMs?: number; capability?: string | CapabilityInjectionSpec; capabilityTarget?: 'bearer' | 'header' | 'cookie' | 'url'; capabilityHeaderName?: string; capabilityCookieName?: string; capabilityQueryParam?: string; authMutation?: Record<string, unknown>; entityId?: string; correlationIds?: string[]; evidenceRole?: string; replayAttempt?: 'mode_a' | 'ablation_control' | 'primary' }
 export type HttpTargetString = `/${string}` | `http://${string}` | `https://${string}` | `cap:${string}` | `${'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS'} ${string}`
 export type HttpTargetObj = HttpOptions & { exchangeId?: never; url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; target?: HttpTarget; origin?: string }
@@ -99,14 +96,12 @@ export interface ChainHopOptions { surface?: HopSurface; target?: HopTargetInput
 export interface ChainStepOptions extends HttpOptions { hopId?: string; surface?: HopSurface; claimedDelta?: string; canaryToken?: string; proofReceipt?: ProofReceiptInput; producedCapabilities?: string[]; consumedCapabilities?: string[] }
 export type ChainSealSelector = string | (Omit<SealCapabilityInput, 'exchangeId' | 'exchange' | 'slot'> & { slot?: string })
 export interface ChainRaceBurstOptions extends ChainHopOptions, Omit<HttpOptions, 'role' | 'arm'> { hopId?: string; requests?: Array<RaceRequestInput | HttpTarget>; request?: RaceRequestInput | HttpTarget; count?: number; concurrency?: number; barrier?: 'auto' | 'h2' | 'http1'; readRoute?: HttpTarget; readMethod?: string; readPersona?: string; baseline?: ExchangeRef; readback?: ExchangeRef; url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; origin?: string }
-export interface StateTransitionEdgeInput { fromHopId: string; toHopId: string; entityId: string; ablationExchange?: ExchangeRef | ExchangeRef[]; ablationExchangeIds?: string[]; mutationKind?: string }
+export interface StateTransitionEdgeInput { fromHopId: string; toHopId: string; entityId: string; ablationExchange?: ExchangeRef | ExchangeRef[]; ablationExchanges?: ExchangeRef | ExchangeRef[]; ablation?: ExchangeRef | ExchangeRef[]; ablationExchangeIds?: string[]; mutationKind?: string }
 export interface ChainProveOptions { terminalHopId?: string; claimedImpact?: string; summary?: string; terminalExchange?: ExchangeRef; terminalExchangeId?: string; control?: ExchangeRef | ExchangeRef[]; controlExchanges?: ExchangeRef | ExchangeRef[]; preChainControlExchangeIds?: string[]; readback?: ExchangeRef | ExchangeRef[]; postChainReadbackExchangeIds?: string[]; modeAFailureExchange?: ExchangeRef; modeAFailureExchangeId?: string; oracleFamily?: OracleFamily; oracleInput?: Record<string, unknown>; proofReceipt?: ProofReceiptInput; replayMode?: ReplayMode; benchmarkMode?: boolean }
 interface HopRecorder { hopId: string; target?: HopTargetObject; exchangeIds: string[]; oobEventIds: string[]; browserTraceIds: string[]; producedCapabilities: string[]; consumedCapabilities: string[]; entityId?: string; correlationIds: string[]; controlExCount: number; nonControlExCount: number; capConsumeExchange: Map<string, string>; cryptoConsumptions: Array<{ sourceCapabilityId: string; derivedCapabilityId?: string; alg?: string }>; asyncPolls: Array<{ pollRecordId: string; correlationId?: string; triggerExchangeId?: string }>; onProduce(cap: string, exchangeId?: string): void; onExchange(exchangeId: string, isControl?: boolean): void; onCorrelation(correlationId: string): void }
 interface ExSealDiag { status: number; mediaType: string; isJson: boolean; parsedJson: unknown; topKeys: string[]; headerNames: string[]; hasLocation: boolean; locationParamNames: string[]; hasSetCookie: boolean }
 interface RpcTransport { socketPath: string; token: string; nonce: string }
-
 export const KOVO_VERIFY_SDK_VERSION = 'kovo_verify/v8'
-
 function readContext(): RpcContext {
   const raw = JSON.parse(readFileSync(process.env.KOVO_RPC_CONTEXT_FILE ?? '/kovo-rpc/context.json', 'utf8')) as Record<string, unknown>
   return { nonce: typeof raw.nonce === 'string' ? raw.nonce : '', runId: typeof raw.runId === 'string' ? raw.runId : 'unknown-run', targetOrigins: Array.isArray(raw.targetOrigins) ? raw.targetOrigins.filter((v): v is string => typeof v === 'string') : [], sdkVersion: typeof raw.sdkVersion === 'string' ? raw.sdkVersion : KOVO_VERIFY_SDK_VERSION }
@@ -222,7 +217,6 @@ const normExRef = (v: unknown): unknown => (v && typeof v === 'object' && !Array
 const normExList = (v: unknown): unknown => Array.isArray(v) ? v.map(normExRef) : v
 const normCapList = (v: unknown): unknown => Array.isArray(v) ? v.map(x => unwrapCapabilityHandle(x)) : v
 const mapFields = (obj: Record<string, unknown>, map: Record<string, (v: unknown) => unknown>): Record<string, unknown> => { const out: Record<string, unknown> = { ...obj }; for (const [k, fn] of Object.entries(map)) if (out[k] !== undefined) out[k] = fn(out[k]); return out }
-
 const EDGE_KIND_ALIASES: Record<string, CausalEdgeInput['kind']> = {
   value_binding: 'value_binding', value: 'value_binding', valuebinding: 'value_binding', capability: 'value_binding', capability_binding: 'value_binding', cap_binding: 'value_binding',
   derived_crypto_binding: 'derived_crypto_binding', derived_crypto: 'derived_crypto_binding', derivedcrypto: 'derived_crypto_binding', crypto_binding: 'derived_crypto_binding', crypto: 'derived_crypto_binding', hmac_sign: 'derived_crypto_binding', jwt_sign: 'derived_crypto_binding', hmac: 'derived_crypto_binding', jwt: 'derived_crypto_binding',
@@ -299,7 +293,6 @@ export class ChainBuilder {
     this.ctx = ctx; this.chainId = opts.chainId.trim(); this.terminalVulnClass = normVulnClass(opts.terminalVulnClass)
     this.replayMode = opts.replayMode ?? 'fresh_clean_replay'; this.benchmarkMode = opts.benchmarkMode
   }
-
   private nextHopId(): string { let id: string; do { id = `hop_${++this.hopSeq}` } while (this.hops.some(h => h.receipt.hopId === id)); return id }
   private recordRefs(list: string[], ref: ExchangeRef | ExchangeRef[] | undefined): void { for (const x of !ref ? [] : Array.isArray(ref) ? ref : [ref]) { const id = typeof x === 'string' ? x : x?.exchangeId; pushUnique(list, id); if (id && x && typeof x === 'object' && typeof (x as Partial<HttpExchange>).status === 'number') this.exStatus.set(id, (x as Partial<HttpExchange>).status!) } }
   control(target: HttpTargetString | HttpTargetObj, opts?: HttpOptions): Promise<HttpExchange>
@@ -357,7 +350,7 @@ export class ChainBuilder {
     const fromHopId = input.fromHopId?.trim(), toHopId = input.toHopId?.trim(), entityId = input.entityId?.trim()
     if (!fromHopId || !toHopId) throw new Error('state_transition_binding requires non-empty fromHopId and toHopId.')
     if (!entityId) throw new Error('state_transition_binding requires an explicit non-empty entityId (never auto-guessed).')
-    const ablationIds: string[] = []; for (const id of [...extractExchangeIds(input.ablationExchange), ...(input.ablationExchangeIds ?? [])]) pushUnique(ablationIds, id)
+    const ablationIds: string[] = []; for (const id of [...extractExchangeIds(input.ablationExchange), ...extractExchangeIds(input.ablationExchanges), ...extractExchangeIds(input.ablation), ...(input.ablationExchangeIds ?? [])]) pushUnique(ablationIds, id)
     if (ablationIds.length === 0) throw new Error('state_transition_binding requires explicit ablationExchange / ablationExchangeIds (never auto-guessed).')
     this.explicitEdges.push({ kind: 'state_transition_binding', fromHopId, toHopId, entityId, ablationExchangeIds: ablationIds, ...(input.mutationKind ? { mutationKind: input.mutationKind } : {}) }); return this
   }
@@ -467,7 +460,7 @@ export class ChainBuilder {
     }
     return Object.keys(oi).length > 0 ? oi : undefined
   }
-  build(opts: ChainProveOptions = {}): CompositeProofReceiptInput {
+  build(opts: ChainProveOptions = {}, pruneDangling = Boolean(opts.terminalHopId)): CompositeProofReceiptInput {
     if (this.hops.length === 0) throw new Error(`ChainBuilder "${this.chainId}" has no recorded hops.`)
     const hopIdx = new Map(this.hops.map((h, i) => [h.receipt.hopId, i])), edges: CausalEdgeInput[] = [], seenEdges = new Set<string>()
     const resHop = (id: string | undefined): string | undefined => { const t = id?.trim(); return !t ? undefined : (!hopIdx.has(t) && t.toLowerCase() === 'race' && this.lastRaceHopId && hopIdx.has(this.lastRaceHopId) ? this.lastRaceHopId : t) }
@@ -498,31 +491,35 @@ export class ChainBuilder {
     }
     const linkedHops = new Set<string>(edges.flatMap(e => [e.fromHopId, e.toHopId])), resolvedTermHopId = resHop(opts.terminalHopId)
     const controlOnlyHops = this.hops.filter(h => h.isControlOnly && !linkedHops.has(h.receipt.hopId) && h.receipt.hopId !== resolvedTermHopId)
-    const activeHops = controlOnlyHops.length < this.hops.length ? this.hops.filter(h => !controlOnlyHops.includes(h)) : this.hops
-    const demotedCtrlIds = activeHops.length < this.hops.length ? controlOnlyHops.flatMap(h => h.receipt.exchangeIds ?? []) : []
-    const lastHop = activeHops[activeHops.length - 1]!.receipt, termHop = (resolvedTermHopId ? activeHops.find(h => h.receipt.hopId === resolvedTermHopId)?.receipt : undefined) ?? lastHop, preControl: string[] = [], postReadback: string[] = []
+    const keptHops = controlOnlyHops.length < this.hops.length ? this.hops.filter(h => !controlOnlyHops.includes(h)) : this.hops
+    const demotedCtrlIds = keptHops.length < this.hops.length ? controlOnlyHops.flatMap(h => h.receipt.exchangeIds ?? []) : []
+    const lastHop = keptHops[keptHops.length - 1]!.receipt, finalTermHopId = resolvedTermHopId ?? lastHop.hopId
+    const reach = new Set<string>([finalTermHopId]), q = [finalTermHopId]
+    for (let i = 0; i < q.length; i++) for (const e of edges) if (e.toHopId === q[i] && !reach.has(e.fromHopId)) { reach.add(e.fromHopId); q.push(e.fromHopId) }
+    const pruned = pruneDangling && reach.size >= 2 && reach.size < keptHops.length
+    const activeHops = pruned ? keptHops.filter(h => reach.has(h.receipt.hopId)) : keptHops, finalEdges = pruned ? edges.filter(e => reach.has(e.fromHopId) && reach.has(e.toHopId)) : edges
+    const termHop = (resolvedTermHopId ? activeHops.find(h => h.receipt.hopId === resolvedTermHopId)?.receipt : undefined) ?? activeHops[activeHops.length - 1]!.receipt, preControl: string[] = [], postReadback: string[] = []
     for (const id of [...this.controlIds, ...this.baselineReadbackIds, ...demotedCtrlIds]) pushUnique(preControl, id)
     this.recordRefs(preControl, opts.control); this.recordRefs(preControl, opts.controlExchanges); for (const id of opts.preChainControlExchangeIds ?? []) pushUnique(preControl, id)
     for (const id of this.readbackIds) pushUnique(postReadback, id); this.recordRefs(postReadback, opts.readback); for (const id of opts.postChainReadbackExchangeIds ?? []) pushUnique(postReadback, id)
     const terminalExchangeId = opts.terminalExchangeId ?? extractExchangeIds(opts.terminalExchange)[0], modeAFailureExchangeId = opts.modeAFailureExchangeId ?? extractExchangeIds(opts.modeAFailureExchange)[0]
     const lastExIds = termHop.exchangeIds ?? [], resolvedTermEx = terminalExchangeId ?? lastExIds[lastExIds.length - 1], normCls = this.terminalVulnClass
-    const effFamily: OracleFamily | undefined = opts.oracleFamily ?? (/^(?:economic_conservation|conserved_balance|ledger_overcredit|over_refund|double_spend|race_condition)$/.test(normCls) ? 'economic_conservation' : /^(?:dual_tenant_abac|cross_tenant_(?:export|read|write|idor))$/.test(normCls) ? 'dual_tenant_abac' : undefined)
-    const oracleInput = effFamily ? this.synthOracleInput(effFamily, opts.oracleInput, activeHops, edges, preControl, postReadback, resolvedTermEx, Boolean(opts.oracleFamily) || normCls === 'dual_tenant_abac') : (opts.oracleInput ? { ...opts.oracleInput } : undefined)
+    const effFamily: OracleFamily | undefined = opts.oracleFamily ?? (/^(?:economic_conservation|conserved_balance|ledger_overcredit|over_refund|double_spend|race_condition)$/.test(normCls) ? 'economic_conservation' : /^(?:dual_tenant_abac|cross_tenant_(?:export|read|write|idor))$/.test(normCls) ? 'dual_tenant_abac' : /^(?:parser_cache_differential|cache_bleed|cache_poisoning|cache_deception|web_cache_deception|web_cache_poisoning|path_confusion|request_smuggling)$/.test(normCls) ? 'parser_cache_differential' : undefined)
+    const oracleInput = effFamily ? this.synthOracleInput(effFamily, opts.oracleInput, activeHops, finalEdges, preControl, postReadback, resolvedTermEx, Boolean(opts.oracleFamily) || normCls === 'dual_tenant_abac') : (opts.oracleInput ? { ...opts.oracleInput } : undefined)
     return {
       chainId: this.chainId, terminalVulnClass: this.terminalVulnClass, replayMode: opts.replayMode ?? this.replayMode,
       ...(opts.benchmarkMode ?? this.benchmarkMode !== undefined ? { benchmarkMode: opts.benchmarkMode ?? this.benchmarkMode } : {}),
-      hops: activeHops.map(h => h.receipt), causalEdges: edges,
+      hops: activeHops.map(h => h.receipt), causalEdges: finalEdges,
       terminalImpact: {
-        terminalHopId: resolvedTermHopId ?? lastHop.hopId, claimedImpact: opts.claimedImpact ?? opts.summary ?? termHop.claimedDelta,
+        terminalHopId: finalTermHopId, claimedImpact: opts.claimedImpact ?? opts.summary ?? termHop.claimedDelta,
         ...(terminalExchangeId ? { terminalExchangeId } : {}), ...(preControl.length ? { preChainControlExchangeIds: preControl } : {}),
         ...(postReadback.length ? { postChainReadbackExchangeIds: postReadback } : {}), ...(modeAFailureExchangeId ? { modeAFailureExchangeId } : {}),
         ...(opts.oracleFamily ? { oracleFamily: opts.oracleFamily } : {}), ...(oracleInput ? { oracleInput } : {}), ...(opts.proofReceipt ? { proofReceipt: opts.proofReceipt } : {}),
       },
     }
   }
-  prove(opts: ChainProveOptions = {}): Promise<CompositeVerificationResult> { return this.ctx.prove_composite(this.build(opts)) }
+  prove(opts: ChainProveOptions = {}): Promise<CompositeVerificationResult> { return this.ctx.prove_composite(this.build(opts, true)) }
 }
-
 export class VerifyContext {
   readonly nonce: string; readonly runId: string; readonly targetOrigins: string[]; readonly targetOrigin: string; readonly sdkVersion: string
   readonly claims: VerifyClaim[] = []; readonly expect: Expectations; readonly assert: Expectations
@@ -549,7 +546,6 @@ export class VerifyContext {
     }
     this.expect = expectations; this.assert = expectations
   }
-
   get lastRpcOp(): string | null { return this._lastRpcOp }
   /** @internal */ _pushHopRecorder(rec: HopRecorder): void { this._hopStack.push(rec) }
   /** @internal */ _popHopRecorder(rec: HopRecorder): void { const i = this._hopStack.lastIndexOf(rec); if (i >= 0) this._hopStack.splice(i, 1) }
@@ -717,9 +713,12 @@ export class VerifyContext {
     const hop = this.activeHop(); if (hop) { pushUnique(hop.browserTraceIds, res.exchangeId); if (!hop.target) hop.target = { origin: target.origin ?? this.targetOrigin, method: 'GET', pathAndQuery: target.path } }; return res
   }
   readonly oob = {
-    mint: async (label: string, origin?: string): Promise<OobHandle> => { const res = await this.callRpc('oob', { action: 'mint', label, ...(origin ? { origin } : {}) }, 30_000) as OobHandle; pushUnique(this.activeHop()?.oobEventIds ?? [], res.exchangeId); return res },
-    check: async (handle: OobHandle): Promise<OobCheck> => { const res = { ...handle, ...(await this.callRpc('oob', { action: 'check', token: handle.token, exchangeId: handle.exchangeId }, 30_000) as OobCheck) }; pushUnique(this.activeHop()?.oobEventIds ?? [], res.checkExchangeId ?? res.exchangeId); return res },
+    mint: async (label = 'oob', origin?: string): Promise<OobHandle> => { const res = await this.callRpc('oob', { action: 'mint', label, ...(origin ? { origin } : {}) }, 30_000) as OobHandle; pushUnique(this.activeHop()?.oobEventIds ?? [], res.exchangeId); return res },
+    check: async (handle: OobHandle | string): Promise<OobCheck> => { const h = typeof handle === 'string' ? { token: handle, exchangeId: '', url: '', dnsHost: '' } : handle, res = { ...h, ...(await this.callRpc('oob', { action: 'check', token: h.token, ...(h.exchangeId ? { exchangeId: h.exchangeId } : {}) }, 30_000) as OobCheck) }; pushUnique(this.activeHop()?.oobEventIds ?? [], res.checkExchangeId ?? res.exchangeId); return res },
+    wait: async (handle: OobHandle | string, opts?: number | { timeoutMs?: number; immediateMs?: number }): Promise<OobCheck> => { const h = typeof handle === 'string' ? { token: handle, exchangeId: '', url: '', dnsHost: '' } : handle, ms = typeof opts === 'number' ? opts : opts?.timeoutMs, im = typeof opts === 'object' ? opts?.immediateMs : undefined, res = { ...h, ...(await this.callRpc('oob', { action: 'wait', token: h.token, ...(ms !== undefined ? { timeoutMs: ms } : {}), ...(im !== undefined ? { immediateMs: im } : {}) }, Math.max(30_000, (ms ?? 3_000) + 10_000)) as OobCheck) }; pushUnique(this.activeHop()?.oobEventIds ?? [], res.checkExchangeId ?? res.exchangeId); return res },
   }
+  oob_create(label = 'oob', origin?: string): Promise<OobHandle> { return this.oob.mint(label, origin) }; oob_mint(label = 'oob', origin?: string): Promise<OobHandle> { return this.oob.mint(label, origin) }
+  oob_poll(handle: OobHandle | string, opts?: number | { timeoutMs?: number; immediateMs?: number }): Promise<OobCheck> { return this.oob.wait(handle, opts) }; oob_check(handle: OobHandle | string): Promise<OobCheck> { return this.oob.check(handle) }
   private async callProof<T extends { ok?: boolean; confirmed?: boolean; claim?: VerifyClaim; claims?: VerifyClaim[] }>(op: string, input: unknown, errMsg: string, timeoutMs: number, hydrateKeys?: readonly string[]): Promise<T> {
     if (!input || typeof input !== 'object') throw new Error(errMsg)
     const raw = await this.callRpc(op, normalizeProofCapabilities(input) as Record<string, unknown>, timeoutMs) as Record<string, unknown>, res = (hydrateKeys ? hydrateFields(raw, hydrateKeys) : raw) as unknown as T

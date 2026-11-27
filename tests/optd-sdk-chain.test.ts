@@ -88,7 +88,7 @@ function makeGrant(origin: string, port: number): Grant {
   }
 }
 
-async function startFixture(t: TestContext, runId: string): Promise<{ origin: string; server: VerifyRpcServer; ctx: VerifyContext }> {
+async function startFixture(t: TestContext, runId: string, opts?: { withCanary?: boolean }): Promise<{ origin: string; server: VerifyRpcServer; ctx: VerifyContext; triggerOob?: (token: string) => void }> {
   resetRunCustodyBudgets(runId)
   t.after(() => resetRunCustodyBudgets(runId))
 
@@ -97,8 +97,34 @@ async function startFixture(t: TestContext, runId: string): Promise<{ origin: st
   let refundedTotal = 0
   let cachePrimed = false
   let itemOwnerTenant = 'tenant-b'
+  let entryWarmed = false
+  const FWD_TOK = 'fwd_tok_aabbccddeeff112233'
+  const oobHits = new Map<string, Array<{ protocol: string; token: string; remoteIp: string; timestamp: number }>>()
   const httpServer = createServer(async (req, res) => {
     const u = new URL(req.url ?? '/', 'http://127.0.0.1')
+
+    if (u.pathname === '/api/v1/cache/warm' && req.method === 'POST') {
+      entryWarmed = true
+      return sendJson(res, 200, { ok: true, entityId: 'entry-99', warmed: true })
+    }
+    if (u.pathname === '/api/v1/cache/fwd' && req.method === 'POST') {
+      if (!entryWarmed) return sendJson(res, 403, { error: 'not_warmed' })
+      return sendJson(res, 200, { ok: true, entityId: 'entry-99', dlToken: FWD_TOK })
+    }
+    if (u.pathname === '/api/v1/cache/list' && req.method === 'GET') {
+      if (req.headers.authorization === `Bearer ${FWD_TOK}`) return sendJson(res, 200, { items: ['doc-1'] })
+      return sendJson(res, 403, { error: 'denied' })
+    }
+    if (u.pathname === '/api/v1/cache/open' && req.method === 'GET') {
+      if (req.headers.authorization === `Bearer ${FWD_TOK}`) return sendJson(res, 200, { preview: 'header' })
+      return sendJson(res, 403, { error: 'denied' })
+    }
+    if (u.pathname === '/api/v1/cache/content' && req.method === 'GET') {
+      if (entryWarmed && req.headers.authorization === `Bearer ${FWD_TOK}`) {
+        return sendJson(res, 200, { tenantId: 'tenant-b', records: [{ id: 'doc-99', ownerEmail: 'sec@tenant-b.test', secretValue: 'cross-tenant-doc-payload' }] })
+      }
+      return sendJson(res, 403, { error: 'forbidden_content' })
+    }
 
     if (u.pathname === '/api/v1/exports/mint' && req.method === 'POST') {
       const raw = await readBody(req)
@@ -167,9 +193,22 @@ async function startFixture(t: TestContext, runId: string): Promise<{ origin: st
   const port = (httpServer.address() as AddressInfo).port
   origin = `http://127.0.0.1:${port}`
 
+  let oobSeq = 0
+  const canary = opts?.withCanary ? {
+    mintCanary: (_r: string, label: string) => {
+      const token = `oob_tok_${++oobSeq}_${label.replace(/[^a-z0-9]/gi, '')}`
+      const httpUrl = `http://oob.local.test/${token}`
+      return { token, httpUrl, url: httpUrl, dnsHost: `${token}.oob.local.test` }
+    },
+    checkCanary: (token: string) => {
+      const hits = oobHits.get(token) ?? []
+      return { found: true, triggered: hits.length > 0, hit: hits.length > 0, hits, detail: hits[hits.length - 1] }
+    },
+  } : undefined
   const server = new VerifyRpcServer({
     broker: new RequestBroker({ transportConfig: { http2: false } }),
     grant: makeGrant(origin, port),
+    ...(canary ? { canary } : {}),
     runId,
     assignmentId: `asg-${runId}`,
     targetOrigins: [origin],
@@ -195,7 +234,12 @@ async function startFixture(t: TestContext, runId: string): Promise<{ origin: st
     if (prev.nonce === undefined) delete process.env[VERIFY_NONCE_ENV]; else process.env[VERIFY_NONCE_ENV] = prev.nonce
   })
 
-  return { origin, server, ctx: new VerifyContext() }
+  const triggerOob = (token: string) => {
+    const list = oobHits.get(token) ?? []
+    list.push({ protocol: 'http', token, remoteIp: '127.0.0.1', timestamp: Date.now() })
+    oobHits.set(token, list)
+  }
+  return { origin, server, ctx: new VerifyContext(), triggerOob }
 }
 
 test('worker/kovo_verify/kovo_verify.ts stays <= 800 LOC', () => {
@@ -738,4 +782,83 @@ test('live VerifyRpcServer: compiled trace with repeated concurrent refund POSTs
   const runCompiled = (new Function(rewritten) as () => (c: VerifyContext) => Promise<{ claims: Array<{ kind: string }> }>)()
   const out = await runCompiled(ctx)
   assert.ok(out.claims.some(c => c.kind === 'composite_receipt'), `Expected live compiled ch.race script to confirm: ${JSON.stringify(out)}`)
+})
+
+test('live VerifyRpcServer: ChainBuilder prunes dangling side-branch hops (warm->fwd->content + fwd->list/open) while preserving disconnected 2-hop diagnostics', async t => {
+  const { ctx } = await startFixture(t, 'run-optd-sdk-side-branch-prune')
+
+  const ch = ctx.chain('chain-optd-side-branch', 'cross_tenant_read')
+  const fwdAblation = await ch.control('POST /api/v1/cache/fwd', { as: 'member_a', entityId: 'entry-99' })
+  assert.equal(fwdAblation.status, 403)
+  const ctrl = await ch.control('GET /api/v1/cache/content', { as: 'member_a' })
+  assert.equal(ctrl.status, 403)
+
+  const warm = await ch.step('POST /api/v1/cache/warm', { hopId: 'warm', as: 'member_a', entityId: 'entry-99', claimedDelta: 'Warm cache entry.' })
+  assert.equal(warm.status, 200)
+  const fwd = await ch.step('POST /api/v1/cache/fwd', { hopId: 'fwd', as: 'member_a', entityId: 'entry-99', claimedDelta: 'Mint forwarded token.' })
+  assert.equal(fwd.status, 200)
+  ch.stateTransition({ fromHopId: 'warm', toHopId: 'fwd', entityId: 'entry-99', ablation: fwdAblation })
+
+  const fwdCap = await ch.seal(fwd, { jsonPath: '$.dlToken', kind: 'bearer_token' })
+  // Two dangling side-branch preview/listing hops branching off `fwd` that never feed into `content`
+  const list = await ch.step('GET /api/v1/cache/list', { hopId: 'list', capability: fwdCap, claimedDelta: 'List items (side branch).' })
+  assert.equal(list.status, 200)
+  const open = await ch.step('GET /api/v1/cache/open', { hopId: 'open', capability: fwdCap, claimedDelta: 'Preview item (side branch).' })
+  assert.equal(open.status, 200)
+  // Real terminal hop `content`
+  const content = await ch.step('GET /api/v1/cache/content', { hopId: 'content', capability: fwdCap, claimedDelta: 'Read cross-tenant content.' })
+  assert.equal(content.status, 200)
+
+  // Explicit terminalHopId in ch.build() prunes `list` and `open` and drops their edges
+  const built = ch.build({ terminalHopId: 'content', terminalExchange: content, claimedImpact: 'Cross-tenant content read.' })
+  assert.deepEqual(built.hops.map(h => h.hopId), ['warm', 'fwd', 'content'])
+  const edgeSummary = (built.causalEdges ?? []).map(e => `${e.fromHopId}->${e.toHopId}:${e.kind}`)
+  assert.deepEqual(edgeSummary, ['warm->fwd:state_transition_binding', 'fwd->content:value_binding'])
+
+  // Live ch.prove() (even WITHOUT explicit terminalHopId) prunes `list` & `open` and confirms!
+  const proved = await ch.prove({ terminalExchange: content, claimedImpact: 'Cross-tenant content read via warm->fwd->content.' })
+  assert.equal(proved.confirmed, true, `Expected pruned warm->fwd->content chain to confirm live: ${JSON.stringify(proved)}`)
+
+  // Disconnected 2-hop chain with 0 edges into terminalHopId MUST NOT collapse to 1 hop!
+  const chDisc = ctx.chain('chain-optd-disconnected', 'cross_tenant_read')
+  chDisc.control(ctrl)
+  const d1 = await chDisc.step('POST /api/v1/cache/warm', { hopId: 'disc_1', as: 'member_a', claimedDelta: 'Unlinked hop 1.' })
+  const d2 = await chDisc.step('GET /api/v1/cache/content', { hopId: 'disc_2', capability: fwdCap, claimedDelta: 'Unlinked hop 2.' })
+  assert.equal(d1.status, 200)
+  assert.equal(d2.status, 200)
+  const builtDisc = chDisc.build({ terminalHopId: 'disc_2', terminalExchange: d2 })
+  assert.deepEqual(builtDisc.hops.map(h => h.hopId), ['disc_1', 'disc_2'], 'Disconnected 2-hop chain (reach.size < 2) must NOT prune away disc_1')
+  const provedDisc = await chDisc.prove({ terminalHopId: 'disc_2', terminalExchange: d2 })
+  assert.equal(provedDisc.confirmed, false)
+  assert.equal(provedDisc.hopCount, 2, 'Live prove() must keep both disconnected hops instead of collapsing to 1 hop')
+})
+
+test('live VerifyRpcServer: parser_cache_differential auto-synthesizes oracleInput without oracleFamily and ctx.oob_create/ctx.oob_poll attach hop OOB events', async t => {
+  const { ctx, triggerOob } = await startFixture(t, 'run-optd-sdk-parser-oob', { withCanary: true })
+
+  // 1) parser_cache_differential without explicit oracleFamily auto-synthesizes oracleInput
+  const chParser = ctx.chain('chain-optd-parser-auto', 'parser_cache_differential')
+  chParser.control('ex-ctrl-clean')
+  chParser.recordHop({ hopId: 'h1', target: 'GET /api/v1/probe', exchangeIds: ['ex-diff-probe'], claimedDelta: 'Differential probe.' })
+  chParser.readback('ex-rb-post')
+  assert.deepEqual(chParser.build().terminalImpact.oracleInput, {
+    cleanControlExchangeId: 'ex-ctrl-clean',
+    differentialProbeExchangeId: 'ex-diff-probe',
+    postMutationReadbackExchangeId: 'ex-rb-post',
+  })
+
+  // 2) ctx.oob_create + ctx.oob_poll ergonomic aliases record hop-bound oobEventIds
+  const chOob = ctx.chain('chain-optd-oob-ergo', 'ssrf')
+  let mintedToken = ''
+  const pollRes = await chOob.hop('oob_hop', { claimedDelta: 'Triggered OOB callback.' }, async () => {
+    const h = await ctx.oob_create('ssrf-check')
+    mintedToken = h.token
+    assert.ok(h.url.includes(h.token))
+    triggerOob!(h.token)
+    return ctx.oob_poll(h, { timeoutMs: 250 })
+  })
+  assert.equal(pollRes.hit, true)
+  assert.equal(pollRes.token, mintedToken)
+  const oobBuilt = chOob.build()
+  assert.ok((oobBuilt.hops[0]!.oobEventIds?.length ?? 0) >= 2, `Expected mint + poll oobEventIds on hop, got ${JSON.stringify(oobBuilt.hops[0]!.oobEventIds)}`)
 })
