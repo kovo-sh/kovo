@@ -29,6 +29,10 @@ import {
   parseTestFileTags,
   readTestFileTags,
 } from './test-tiers.ts'
+import {
+  parseKernelCosmeticTrailer,
+  verifyCosmeticKernelDiff,
+} from './lib/kernel-cosmetic-ast.ts'
 
 export type ContractChangeKind = 'tunable_constant_change' | 'gate_assert_literal_change'
 
@@ -71,6 +75,9 @@ export interface CommitParitySlice {
   sha: string
   diffText: string
   commitMessage: string
+  baseRef?: string | null
+  headRef?: string | null
+  filePairs?: ReadonlyMap<string, { base: string | null; head: string | null }>
 }
 
 export interface MissingLooseningSide {
@@ -94,6 +101,8 @@ export interface CommitParityEvalResult {
   reviewedByTrailers: string[]
   overridden: boolean
   overrideTrailer: string | null
+  cosmeticVerified?: boolean
+  cosmeticReason?: string | null
   reason: string | null
 }
 
@@ -112,6 +121,8 @@ export interface ParityGateEvalResult {
   reviewedByTrailers: string[]
   overridden: boolean
   overrideTrailer: string | null
+  cosmeticVerified?: boolean
+  cosmeticReason?: string | null
   commitResults?: CommitParityEvalResult[]
   reason: string | null
 }
@@ -661,6 +672,9 @@ function evaluateSingleDiffParityGate(opts: {
   commitMessages: string
   mode: 'strict' | 'warn'
   rootDir: string
+  baseRef?: string | null
+  headRef?: string | null
+  filePairs?: ReadonlyMap<string, { base: string | null; head: string | null }>
   corpusById: ReadonlyMap<string, ParityCorpusCaseMeta>
   corpusByFile: ReadonlyMap<string, ParityCorpusCaseMeta>
   corpusUsesCovers: boolean
@@ -739,6 +753,82 @@ function evaluateSingleDiffParityGate(opts: {
       overridden: false,
       overrideTrailer: null,
       reason,
+    }
+  }
+
+  const cosmetic = parseKernelCosmeticTrailer(opts.commitMessages)
+  if (cosmetic.present) {
+    if (cosmetic.malformed) {
+      return {
+        sha: opts.sha,
+        required: true,
+        ok: false,
+        warned: false,
+        kernelFilesTouched,
+        corpusFilesTouched,
+        parityCaseTrailers,
+        validParityCaseIds: [],
+        invalidParityCaseIds: [],
+        uncoveredKernelFiles: kernelFilesTouched,
+        loosening,
+        missingLooseningSides: [],
+        reviewedByTrailers,
+        overridden: false,
+        overrideTrailer: null,
+        cosmeticVerified: false,
+        cosmeticReason: null,
+        reason: `Malformed Kernel-cosmetic trailer ("${cosmetic.malformed}"); expected "Kernel-cosmetic: <reason (min 6 chars)>".`,
+      }
+    }
+    const astRes = verifyCosmeticKernelDiff({
+      rootDir: opts.rootDir,
+      baseRef: opts.baseRef ?? null,
+      headRef: opts.headRef ?? 'HEAD',
+      kernelFiles: kernelFilesTouched,
+      filePairs: opts.filePairs,
+    })
+    if (astRes.ok) {
+      return {
+        sha: opts.sha,
+        required: true,
+        ok: true,
+        warned: false,
+        kernelFilesTouched,
+        corpusFilesTouched,
+        parityCaseTrailers,
+        validParityCaseIds: [],
+        invalidParityCaseIds: [],
+        uncoveredKernelFiles: [],
+        loosening,
+        missingLooseningSides: [],
+        reviewedByTrailers,
+        overridden: false,
+        overrideTrailer: null,
+        cosmeticVerified: true,
+        cosmeticReason: cosmetic.reason,
+        reason: null,
+      }
+    }
+    const detail = astRes.failedFiles.map(f => `${f.file}: ${f.reason}`).join('; ')
+    return {
+      sha: opts.sha,
+      required: true,
+      ok: false,
+      warned: false,
+      kernelFilesTouched,
+      corpusFilesTouched,
+      parityCaseTrailers,
+      validParityCaseIds: [],
+      invalidParityCaseIds: [],
+      uncoveredKernelFiles: kernelFilesTouched,
+      loosening,
+      missingLooseningSides: [],
+      reviewedByTrailers,
+      overridden: false,
+      overrideTrailer: null,
+      cosmeticVerified: false,
+      cosmeticReason: null,
+      reason: `Kernel-cosmetic AST verification failed: ${detail}`,
     }
   }
 
@@ -943,6 +1033,9 @@ export function evaluateParityGate(opts: {
   commitMessages: string
   mode: 'strict' | 'warn'
   rootDir?: string
+  baseRef?: string | null
+  headRef?: string | null
+  filePairs?: ReadonlyMap<string, { base: string | null; head: string | null }>
   knownParityCaseIds?: ReadonlySet<string>
   knownParityCases?: ReadonlyMap<string, ParityCorpusCaseMeta>
   commits?: ReadonlyArray<CommitParitySlice>
@@ -973,7 +1066,14 @@ export function evaluateParityGate(opts: {
   const slices: ReadonlyArray<CommitParitySlice> =
     opts.commits && opts.commits.length > 0
       ? opts.commits
-      : [{ sha: 'diff', diffText: opts.diffText, commitMessage: opts.commitMessages }]
+      : [{
+          sha: 'diff',
+          diffText: opts.diffText,
+          commitMessage: opts.commitMessages,
+          baseRef: opts.baseRef ?? null,
+          headRef: opts.headRef ?? 'HEAD',
+          filePairs: opts.filePairs,
+        }]
 
   const commitResults = slices.map(slice =>
     evaluateSingleDiffParityGate({
@@ -982,6 +1082,9 @@ export function evaluateParityGate(opts: {
       commitMessages: slice.commitMessage,
       mode: opts.mode,
       rootDir,
+      baseRef: slice.baseRef ?? opts.baseRef ?? null,
+      headRef: slice.headRef ?? opts.headRef ?? 'HEAD',
+      filePairs: slice.filePairs ?? opts.filePairs,
       corpusById,
       corpusByFile,
       corpusUsesCovers,
@@ -999,7 +1102,13 @@ export function evaluateParityGate(opts: {
   const missingLooseningSides = commitResults.flatMap(r => r.missingLooseningSides)
   const reviewedByTrailers = commitResults.flatMap(r => r.reviewedByTrailers)
   const overriddenResult = commitResults.find(r => r.overridden) ?? null
-  const required = commitResults.some(r => r.required)
+  const requiredResults = commitResults.filter(r => r.required)
+  const cosmeticVerified =
+    requiredResults.length > 0 && requiredResults.every(r => r.cosmeticVerified === true)
+  const cosmeticReason = cosmeticVerified
+    ? (requiredResults.find(r => r.cosmeticReason)?.cosmeticReason ?? null)
+    : null
+  const required = requiredResults.length > 0
   const ok = commitResults.every(r => r.ok)
   const warned = commitResults.some(r => r.warned)
   const failures = commitResults.filter(r => r.reason !== null)
@@ -1025,6 +1134,7 @@ export function evaluateParityGate(opts: {
     reviewedByTrailers,
     overridden: overriddenResult !== null && ok,
     overrideTrailer: overriddenResult?.overrideTrailer ?? null,
+    ...(cosmeticVerified ? { cosmeticVerified: true, cosmeticReason } : {}),
     ...(opts.commits && opts.commits.length > 0 ? { commitResults } : {}),
     reason,
   }
@@ -1044,6 +1154,9 @@ export function evaluateContractChange(opts: {
    */
   requirePerId?: boolean | 'strict'
   rootDir?: string
+  baseRef?: string | null
+  headRef?: string | null
+  filePairs?: ReadonlyMap<string, { base: string | null; head: string | null }>
   knownParityCaseIds?: ReadonlySet<string>
   knownParityCases?: ReadonlyMap<string, ParityCorpusCaseMeta>
   commits?: ReadonlyArray<CommitParitySlice>
@@ -1057,6 +1170,9 @@ export function evaluateContractChange(opts: {
     commitMessages: opts.commitMessages,
     mode: opts.mode,
     rootDir: opts.rootDir,
+    baseRef: opts.baseRef,
+    headRef: opts.headRef,
+    filePairs: opts.filePairs,
     knownParityCaseIds: opts.knownParityCaseIds,
     knownParityCases: opts.knownParityCases,
     commits: opts.commits,
@@ -1207,10 +1323,13 @@ function readSingleCommitDiffAndMsg(
   const msgRes = commitMessageOverride != null
     ? { ok: true, stdout: commitMessageOverride }
     : runGit(rootDir, ['log', '-1', '--format=%B', sha])
+  const parentRes = runGit(rootDir, ['rev-parse', '--verify', `${sha}^`])
   return {
     sha: shortSha,
     diffText: diffRes.stdout,
     commitMessage: msgRes.stdout,
+    baseRef: parentRes.ok && parentRes.stdout.trim() ? parentRes.stdout.trim() : null,
+    headRef: sha,
   }
 }
 
@@ -1244,7 +1363,14 @@ export function readCommitRangeParitySlices(
   const logRes = commitMessageOverride != null
     ? { ok: true, stdout: commitMessageOverride }
     : runGit(rootDir, ['log', '--format=%B', range])
-  return [{ sha: range, diffText: diffRes.stdout, commitMessage: logRes.stdout }]
+  const [rangeBase, rangeHead] = range.split('..')
+  return [{
+    sha: range,
+    diffText: diffRes.stdout,
+    commitMessage: logRes.stdout,
+    baseRef: rangeBase || null,
+    headRef: rangeHead || 'HEAD',
+  }]
 }
 
 /**
@@ -1297,6 +1423,8 @@ export function checkGitRepo(opts: CheckGitRepoOptions = {}): ContractChangeRepo
       sourceLabel: 'staged (--cached)',
       requirePerId: perIdMode,
       rootDir,
+      baseRef: 'HEAD',
+      headRef: 'STAGED',
     })
     return {
       ok: committed.ok,
@@ -1347,6 +1475,8 @@ export function checkGitRepo(opts: CheckGitRepoOptions = {}): ContractChangeRepo
     sourceLabel: 'working tree (uncommitted)',
     requirePerId: perIdMode,
     rootDir,
+    baseRef: 'HEAD',
+    headRef: 'WORKTREE',
   })
 
   return {
@@ -1393,6 +1523,8 @@ export function formatContractChangeReport(result: ContractChangeRepoResult): st
     if (p?.required) {
       if (p.overridden && p.ok) {
         lines.push(`parity-gate [${sec.sourceLabel}]: OVERRIDE (${p.kernelFilesTouched.length} confirmation-kernel file(s) overridden via Kernel-gate-override: ${p.overrideTrailer})`)
+      } else if (p.cosmeticVerified && p.ok) {
+        lines.push(`parity-gate [${sec.sourceLabel}]: PASS (cosmetic/non-behavioral kernel diff verified by AST; ${p.kernelFilesTouched.length} file(s))`)
       } else if (p.ok && !p.warned) {
         const via = p.corpusFilesTouched.length > 0
           ? `corpus diff (${p.corpusFilesTouched.length} file(s))`
@@ -1415,7 +1547,7 @@ export function formatContractChangeReport(result: ContractChangeRepoResult): st
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
 
-const usage = `Kovo Hunter Contract-Change Diff Lint
+const usage = `Kovo Contract-Change Diff Lint
 
 Usage:
   node scripts/check-contract-change.ts [options]

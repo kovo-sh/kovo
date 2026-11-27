@@ -194,7 +194,7 @@ async function readProduct(directory: string, entry: Scenario, product: Product,
         const lines = report.toString('utf8').split(/\r?\n/)
         if (!audit.reportVersion || !lines.includes('- **Run** ' + audit.runId) ||
             !lines.includes('- **Report version** ' + audit.reportVersion)) {
-          throw new Error(context + ' has a recording for a different Kovo Hunter report version.')
+          throw new Error(context + ' has a recording for a different Kovo report version.')
         }
       }
       recordingAudit = 'verified'

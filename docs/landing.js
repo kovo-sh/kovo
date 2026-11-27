@@ -1,4 +1,4 @@
-// Kovo Hunter landing (lab). Plain JS, no deps.
+// Kovo landing (lab). Plain JS, no deps.
 // Icons, glyphs and behaviours mirror src/components/run/{icons,glyphs,toast,theme}.tsx.
 (() => {
   'use strict'
@@ -60,7 +60,7 @@
     $$('[data-glyph]', scope).forEach(el => { el.innerHTML = glyph(el.dataset.glyph) })
     $$('[data-sev]', scope).forEach(el => { el.innerHTML = sev(el.dataset.sev) })
   }
-  // KovoHunterMark (brand/KovoHunterMark.tsx), monochrome
+  // KovoMark (brand/KovoMark.tsx), monochrome
   const MARK = '<svg viewBox="0 0 64 64" fill="none" aria-hidden="true"><path d="M 11.25 24.79 A 19.80 19.80 0 0 1 33.80 22.02" stroke="currentColor" stroke-width="4.6"/><path d="M 41.98 30.20 A 19.80 19.80 0 0 1 39.21 52.75" stroke="currentColor" stroke-width="4.6"/><path d="M 16.20 47.80 L 48.00 16.00" stroke="currentColor" stroke-width="4.6"/><path d="M 38.00 15.20 H 48.80 V 26.00" stroke="currentColor" stroke-width="4.6" stroke-linecap="square"/><path d="M 10.20 47.80 L 14.20 43.80 H 19.60 L 20.20 44.40 V 49.80 L 16.20 53.80 V 47.80 Z" fill="currentColor"/></svg>'
 
   hydrateIcons()
@@ -100,8 +100,8 @@
 
   // ------------------------------------------------------------ copy
   const CMDS = {
-    docker: 'docker run -p 8000:8000 -v kovo-data:/data ghcr.io/kovo-sh/kovo-hunter',
-    source: 'git clone https://github.com/kovo-sh/kovo-hunter.git\ncd kovo-hunter && npm ci && npm run worker:build && npm run build && npm start',
+    docker: 'docker run -p 8000:8000 -v kovo-data:/data ghcr.io/kovo-sh/kovo',
+    source: 'git clone https://github.com/kovo-sh/kovo.git\ncd kovo && npm ci && npm run worker:build && npm run build && npm start',
   }
   async function copyText(text) {
     try { await navigator.clipboard.writeText(text); return true } catch (e) {

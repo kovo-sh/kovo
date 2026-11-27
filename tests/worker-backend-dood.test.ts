@@ -110,7 +110,7 @@ test('KOVO_HOST_SCRATCH_DIR translates per-session container paths without expos
   writeFileSync(join(rpcDir, 'context.json'), '{}', { mode: 0o444 })
 
   const args = workerContainerCreateArgs({
-    image: 'ghcr.io/wwwillchen/kovo-worker:latest',
+    image: 'ghcr.io/kovo-sh/kovo-worker:latest',
     name: 'kovo-' + randomUUID(),
     assignmentId: randomUUID(),
     runLabel: 'dood-bind',
@@ -146,7 +146,7 @@ test('KOVO_WORKER_SCRATCH_VOLUME emits per-session volume-subpath mounts', t => 
   writeFileSync(join(reposDir, 'main.py'), 'print(1)\n', { mode: 0o644 })
 
   const args = workerContainerCreateArgs({
-    image: 'ghcr.io/wwwillchen/kovo-worker:latest',
+    image: 'ghcr.io/kovo-sh/kovo-worker:latest',
     name: 'kovo-' + randomUUID(),
     assignmentId: randomUUID(),
     runLabel: 'dood-vol',
@@ -323,7 +323,7 @@ test('DOCKER_HOST is preserved for socket-proxy TCP and preserved when spawning 
 })
 
 test('KOVO_WORKER_AUTO_PULL=1 inspects first, deduplicates concurrent pulls, and reports errors clearly', async () => {
-  const image = 'ghcr.io/wwwillchen/kovo-worker:sha-1234567'
+  const image = 'ghcr.io/kovo-sh/kovo-worker:sha-1234567'
 
   // 1. Disabled by default: zero docker calls.
   let disabledCalls = 0
@@ -389,7 +389,7 @@ test('KOVO_WORKER_AUTO_PULL=1 inspects first, deduplicates concurrent pulls, and
     () => ensureWorkerImageAvailable(image, retryRunner, AbortSignal.timeout(5_000), {
       env: { KOVO_WORKER_AUTO_PULL: '1' },
     }),
-    /Failed to pull worker image "ghcr\.io\/wwwillchen\/kovo-worker:sha-1234567".*registry 503/,
+    /Failed to pull worker image "ghcr\.io\/kovo-sh\/kovo-worker:sha-1234567".*registry 503/,
   )
   shouldFail = false
   await ensureWorkerImageAvailable(image, retryRunner, AbortSignal.timeout(5_000), {
@@ -399,7 +399,7 @@ test('KOVO_WORKER_AUTO_PULL=1 inspects first, deduplicates concurrent pulls, and
 
 test('LinuxWorkerBackend uses KOVO_WORKER_IMAGE env and deduplicates auto-pull across concurrent runs', async t => {
   withEnv(t, {
-    KOVO_WORKER_IMAGE: 'ghcr.io/wwwillchen/kovo-worker:v1.2.3',
+    KOVO_WORKER_IMAGE: 'ghcr.io/kovo-sh/kovo-worker:v1.2.3',
     KOVO_WORKER_AUTO_PULL: '1',
     KOVO_WARM_WORKERS: '0',
   })
@@ -434,8 +434,8 @@ test('LinuxWorkerBackend uses KOVO_WORKER_IMAGE env and deduplicates auto-pull a
   assert.equal(inspectCount, 1)
   assert.equal(pullCount, 1)
   assert.deepEqual(imagesSeen, [
-    'ghcr.io/wwwillchen/kovo-worker:v1.2.3',
-    'ghcr.io/wwwillchen/kovo-worker:v1.2.3',
+    'ghcr.io/kovo-sh/kovo-worker:v1.2.3',
+    'ghcr.io/kovo-sh/kovo-worker:v1.2.3',
   ])
 })
 
@@ -447,10 +447,10 @@ test('packaging artifacts (Dockerfile, .dockerignore, docker-compose.yml, docker
   const workflow = readFileSync(join(repoRoot, '.github/workflows/docker-publish.yml'), 'utf8')
 
   assert.match(dockerfile, /FROM docker:27-cli AS docker-cli/)
-  assert.match(dockerfile, /ARG KOVO_WORKER_IMAGE=ghcr\.io\/wwwillchen\/kovo-worker:latest/)
+  assert.match(dockerfile, /ARG KOVO_WORKER_IMAGE=ghcr\.io\/kovo-sh\/kovo-worker:latest/)
   assert.match(dockerfile, /USER 10001:10001/)
   assert.match(dockerfile, /http:\/\/127\.0\.0\.1:.*\/health/)
-  assert.match(dockerfile, /org\.opencontainers\.image\.source="https:\/\/github\.com\/wwwillchen\/guardian"/)
+  assert.match(dockerfile, /org\.opencontainers\.image\.source="https:\/\/github\.com\/kovo-sh\/kovo"/)
 
   for (const ignored of ['.git', 'node_modules', 'build', 'benchmarks', 'local-lab', 'plans', '*.sqlite*', '.env*']) {
     assert.ok(dockerignore.includes(ignored), `.dockerignore missing ${ignored}`)

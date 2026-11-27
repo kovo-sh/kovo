@@ -174,7 +174,7 @@
     { at: 22.8, html: '<span class="td">   a41c9e2..7d03f1b  main -&gt; main</span>' },
     { at: 23.05, deploy: true },
   ]
-  const DOCKER = 'docker run -p 8000:8000 -v kovo-data:/data ghcr.io/kovo-sh/kovo-hunter'
+  const DOCKER = 'docker run -p 8000:8000 -v kovo-data:/data ghcr.io/kovo-sh/kovo'
 
   // ------------------------------------------------------------ playhead → UI time
   // Piecewise-linear [playhead s, UI s]. Flat-ish segments are holds (the UI

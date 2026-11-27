@@ -89,7 +89,7 @@ export function evaluateVikunjaCleanOracle(
 /**
  * Evaluates the hard 0-FP clean negative-control gate:
  * PASS iff the external DB oracle stays strictly silent (`observed === false`)
- * AND Kovo Hunter emits zero findings/receipts targeting `oss-clean-vikunja-01`.
+ * AND Kovo emits zero findings/receipts targeting `oss-clean-vikunja-01`.
  */
 export function assertVikunjaZeroFalsePositives(
   runId: string,

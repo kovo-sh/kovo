@@ -1,6 +1,6 @@
 # staging-concurrency — realism fixture #3
 
-A shared, stateful tenant that models Kovo Hunter's `staging_isolated` contract: mutations
+A shared, stateful tenant that models Kovo's `staging_isolated` contract: mutations
 are pre-authorized, every created entity is run-tagged, and teardown must leave the
 database indistinguishable from before the run.
 

@@ -6,7 +6,7 @@
  *   1. A realistic local multi-origin mock SaaS target (loopback app server with a `308` redirect
  *      hop, cross-port IdP login server setting session cookies, protected `/api/profile`, and
  *      benign public routes), PLUS
- *   2. A fresh isolated Kovo Hunter server (`scripts/serve.ts` with `HARDENED_NODE_FLAGS` and
+ *   2. A fresh isolated Kovo server (`scripts/serve.ts` with `HARDENED_NODE_FLAGS` and
  *      `KOVO_QA_ANOMALIES=1`),
  *
  * and drives 5 complete real-user Playwright journeys at 1280×720, saving numbered PNG screenshots
@@ -368,7 +368,7 @@ async function startMockMultiOriginSaas(): Promise<MockMultiOriginSaas> {
 }
 
 // ---------------------------------------------------------------------------
-// Isolated Kovo Hunter server lifecycle
+// Isolated Kovo server lifecycle
 // ---------------------------------------------------------------------------
 
 function ensureBuilt(): void {

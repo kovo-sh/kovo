@@ -14,11 +14,11 @@ RUN npm run build
 
 FROM node:24-bookworm-slim AS runtime
 
-ARG KOVO_WORKER_IMAGE=ghcr.io/wwwillchen/kovo-worker:latest
+ARG KOVO_WORKER_IMAGE=ghcr.io/kovo-sh/kovo-worker:latest
 
-LABEL org.opencontainers.image.source="https://github.com/wwwillchen/guardian" \
-      org.opencontainers.image.title="kovo-hunter" \
-      org.opencontainers.image.description="Kovo Hunter defensive web-application security verification platform"
+LABEL org.opencontainers.image.source="https://github.com/kovo-sh/kovo" \
+      org.opencontainers.image.title="kovo" \
+      org.opencontainers.image.description="Kovo defensive web-application security verification platform"
 
 ENV NODE_ENV=production \
     PORT=8000 \

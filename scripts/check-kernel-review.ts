@@ -32,6 +32,10 @@ import {
   parseUnifiedDiff,
   resolveCommitBaseRef,
 } from './check-contract-change.ts'
+import {
+  parseKernelCosmeticTrailer,
+  verifyCosmeticKernelDiff,
+} from './lib/kernel-cosmetic-ast.ts'
 
 export const FALLBACK_CONFIRMATION_KERNEL_FILES: readonly string[] = Object.freeze([
   'src/server/agent-script-proof.ts',
@@ -76,6 +80,11 @@ export interface ExpeditedOverrideTrailer {
   raw: string
 }
 
+export interface CosmeticOverrideInfo {
+  reason: string
+  verifiedFiles: string[]
+}
+
 export interface BypassCaseValidation {
   caseId: string
   ok: boolean
@@ -94,6 +103,7 @@ export interface KernelReviewEvalResult {
   kernelFilesTouched: string[]
   corpusFilesInDiff: string[]
   expeditedOverride: ExpeditedOverrideTrailer | null
+  cosmeticOverride: CosmeticOverrideInfo | null
   authorModels: Array<{ modelId: string; family: string }>
   reviewedByTrailers: ReviewedByTrailer[]
   acceptedReview: ReviewedByTrailer | null
@@ -108,6 +118,9 @@ export interface EvaluateKernelReviewOptions {
   addedOrModifiedCorpusFiles?: readonly string[]
   commitMessages: string
   rootDir?: string
+  baseRef?: string | null
+  headRef?: string | null
+  kernelFilePairs?: ReadonlyMap<string, { base: string | null; head: string | null }>
   sourceLabel?: string
   authorModelOverride?: string | null
   allowCaseIds?: ReadonlySet<string>
@@ -435,6 +448,7 @@ export function evaluateKernelReview(opts: EvaluateKernelReviewOptions): KernelR
       kernelFilesTouched: [],
       corpusFilesInDiff,
       expeditedOverride: null,
+      cosmeticOverride: null,
       authorModels: [],
       reviewedByTrailers: [],
       acceptedReview: null,
@@ -455,11 +469,72 @@ export function evaluateKernelReview(opts: EvaluateKernelReviewOptions): KernelR
       kernelFilesTouched,
       corpusFilesInDiff,
       expeditedOverride: expedited.valid,
+      cosmeticOverride: null,
       authorModels,
       reviewedByTrailers: [],
       acceptedReview: null,
       bypassCase: null,
       violations: [],
+      durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+    }
+  }
+
+  const cosmetic = parseKernelCosmeticTrailer(opts.commitMessages)
+  if (cosmetic.present) {
+    const cosmeticViolations: string[] = []
+    if (cosmetic.malformed) {
+      cosmeticViolations.push(
+        `Malformed "Kernel-cosmetic:" trailer ("${cosmetic.malformed}"); expected "Kernel-cosmetic: <reason (min 6 chars)>".`,
+      )
+    } else {
+      const astRes = verifyCosmeticKernelDiff({
+        rootDir: opts.rootDir ?? REPO_ROOT,
+        baseRef: opts.baseRef ?? null,
+        headRef: opts.headRef ?? 'HEAD',
+        kernelFiles: kernelFilesTouched,
+        filePairs: opts.kernelFilePairs,
+      })
+      if (astRes.ok) {
+        return {
+          ok: true,
+          required: true,
+          manifestSource: manifest.source,
+          sourceLabel,
+          kernelFilesTouched,
+          corpusFilesInDiff,
+          expeditedOverride: null,
+          cosmeticOverride: {
+            reason: cosmetic.reason!,
+            verifiedFiles: astRes.checkedFiles,
+          },
+          authorModels,
+          reviewedByTrailers: [],
+          acceptedReview: null,
+          bypassCase: null,
+          violations: [],
+          durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        }
+      }
+      for (const failed of astRes.failedFiles) {
+        cosmeticViolations.push(
+          `Kernel-cosmetic AST verification failed for ${failed.file}: ${failed.reason}`,
+        )
+      }
+    }
+    return {
+      ok: false,
+      required: true,
+      manifestSource: manifest.source,
+      sourceLabel,
+      kernelFilesTouched,
+      corpusFilesInDiff,
+      expeditedOverride: null,
+      cosmeticOverride: null,
+      authorModels,
+      reviewedByTrailers: [],
+      acceptedReview: null,
+      bypassCase: null,
+      violations: cosmeticViolations,
       durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
     }
   }
@@ -482,7 +557,7 @@ export function evaluateKernelReview(opts: EvaluateKernelReviewOptions): KernelR
       )
     } else {
       violations.push(
-        `Confirmation-kernel diff (${kernelFilesTouched.join(', ')}) requires a different-model "Reviewed-by: <reviewer-model-id> <bypass-case-id>" trailer (or operator-signed "Expedited-kernel-fix: <operator-id> <reason>").`,
+        `Confirmation-kernel diff (${kernelFilesTouched.join(', ')}) requires a different-model "Reviewed-by: <reviewer-model-id> <bypass-case-id>" trailer (or AST-verified "Kernel-cosmetic: <reason>" / operator-signed "Expedited-kernel-fix: <operator-id> <reason>").`,
       )
     }
     return {
@@ -493,6 +568,7 @@ export function evaluateKernelReview(opts: EvaluateKernelReviewOptions): KernelR
       kernelFilesTouched,
       corpusFilesInDiff,
       expeditedOverride: null,
+      cosmeticOverride: null,
       authorModels,
       reviewedByTrailers,
       acceptedReview: null,
@@ -552,6 +628,7 @@ export function evaluateKernelReview(opts: EvaluateKernelReviewOptions): KernelR
     kernelFilesTouched,
     corpusFilesInDiff,
     expeditedOverride: null,
+    cosmeticOverride: null,
     authorModels,
     reviewedByTrailers,
     acceptedReview,
@@ -591,6 +668,7 @@ export function checkKernelReviewRepo(opts: CheckKernelReviewRepoOptions = {}): 
       kernelFilesTouched: [],
       corpusFilesInDiff: [],
       expeditedOverride: null,
+      cosmeticOverride: null,
       authorModels: [],
       reviewedByTrailers: [],
       acceptedReview: null,
@@ -645,6 +723,8 @@ export function checkKernelReviewRepo(opts: CheckKernelReviewRepoOptions = {}): 
     addedOrModifiedCorpusFiles,
     commitMessages: logRes.stdout,
     rootDir,
+    baseRef,
+    headRef: 'HEAD',
     sourceLabel: `committed (${range})`,
     authorModelOverride: opts.authorModelOverride ?? process.env.KOVO_AUTHOR_MODEL ?? null,
     allowCaseIds: opts.allowCaseIds,
@@ -665,6 +745,9 @@ export function formatKernelReviewReport(result: KernelReviewEvalResult): string
   if (result.ok && result.expeditedOverride) {
     return `check-kernel-review [${result.sourceLabel}]: PASS — EXPEDITED OVERRIDE (${result.kernelFilesTouched.length} kernel file(s); operator=${result.expeditedOverride.operatorId}; post-merge independent review required within 24h)`
   }
+  if (result.ok && result.cosmeticOverride) {
+    return `check-kernel-review [${result.sourceLabel}]: PASS (cosmetic/non-behavioral kernel diff verified by AST; ${result.kernelFilesTouched.length} file(s))`
+  }
   if (result.ok && result.acceptedReview) {
     const bypassNote = result.bypassCase?.viaAllowList
       ? `${result.acceptedReview.bypassCaseId} (via --allow-case-id)`
@@ -680,7 +763,7 @@ export function formatKernelReviewReport(result: KernelReviewEvalResult): string
   return lines.join('\n')
 }
 
-const usage = `Kovo Hunter Independent Kernel Review Lane Gate (R3-05)
+const usage = `Kovo Independent Kernel Review Lane Gate (R3-05)
 
 Usage:
   node scripts/check-kernel-review.ts [options]

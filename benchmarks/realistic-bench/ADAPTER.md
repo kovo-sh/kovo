@@ -1,7 +1,7 @@
-# Kovo Hunter integration adapter (`realistic-bench`)
+# Kovo integration adapter (`realistic-bench`)
 
 Pane 3's contract (`run.ts`) owns materialization, the impact oracle and grading, but it stops
-at "what the scanner may see" (`briefingFor`). Kovo Hunter's engines need more: authenticated
+at "what the scanner may see" (`briefingFor`). Kovo's engines need more: authenticated
 personas, a benchmark-server handle for `EngineEnv`, and finding objects in the grader schema.
 This adapter is that missing layer.
 
@@ -13,7 +13,7 @@ All code here is benchmark scope: nothing under `src/` or `scripts/` was modifie
 | --- | --- |
 | `kovo-adapter.ts` | `runKovoAgainstMaterialized()` — discovery → hypotheses → probes → replay-spec synthesis → Zero-LLM verification, emitted as `SubmittedFinding[]` + `RunTelemetry`. Also `startOobCanaryBroker()`, `readMaterializedSurface()`, `loadKovoEngine()`, and a manifest-mode `runKovoLivePipelineAgainstMaterialized()`. |
 | `kovo-login.ts` | Derives the login route from `variant.json` routes and exchanges briefing email/password for cookie/bearer credentials per persona. |
-| `benchmark-realistic.ts` | Thin CLI: materialize → run Kovo Hunter → `gradeRun()` → recall/precision by class + decoy FP count. |
+| `benchmark-realistic.ts` | Thin CLI: materialize → run Kovo → `gradeRun()` → recall/precision by class + decoy FP count. |
 
 The engine itself is imported from the repo (never copied): `scripts/benchmark-env.ts`
 (`createEngineEnv`, `discoverEndpoints`), `scripts/benchmark-probes.ts`
@@ -159,7 +159,7 @@ loopback-only login, and — via throwing getters — that `groundTruth`/`plan.s
 
 ## Baseline after merging engine `ca992f6` (native, no shims)
 
-Apps snapshot synced read-only at 2026-11-21 23:28 PT; Kovo Hunter engine at `ca992f6`
+Apps snapshot synced read-only at 2026-11-21 23:28 PT; Kovo engine at `ca992f6`
 (23/25 xben-25, 0 FP). Adapter now consumes `synthesizeSpecs` (multiple specs per signal).
 Nine runs, `KOVO_ALLOW_LOCAL_LAB=1`, `v4-full`, grey-box:
 

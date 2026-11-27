@@ -1,7 +1,7 @@
 /**
  * Confirmation-consistency audit (precision integrity).
  *
- * Reads persisted Kovo Hunter store(s) read-only and asserts the product invariant:
+ * Reads persisted Kovo store(s) read-only and asserts the product invariant:
  *   every finding persisted `runtime_confirmed` / `confirmed` must have persisted evidence that
  *   satisfies its oracle — its linked replay spec's `last_verification_diff.verdict === 'confirmed'`,
  *   an OOB ProofReceipt (`finding.verification` starts with `ProofReceipt` / an

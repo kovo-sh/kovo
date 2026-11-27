@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kovo Hunter: Architecture Walkthrough</title>
+<title>Kovo: Architecture Walkthrough</title>
 <style>
 :root {
   --bg: #fbfbfa; --bg-2: #f2f2ef; --panel: #ffffff; --ink: #1b1d21; --ink-2: #4a4f58; --ink-3: #7b818c;
@@ -213,7 +213,7 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
 <body>
 <header class="top">
   <button class="btn" id="toc-toggle" aria-label="Toggle contents">☰</button>
-  <div class="brand">Kovo Hunter <span>Architecture walkthrough · principal-to-principal</span></div>
+  <div class="brand">Kovo <span>Architecture walkthrough · principal-to-principal</span></div>
   <div class="spacer"></div>
   <span class="small muted mono" title="Snapshot this document was written against">main @ 3aee419</span>
   <button class="btn" id="theme-toggle" aria-label="Toggle dark mode">◐ Theme</button>
@@ -238,7 +238,7 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
 <section class="doc" id="thesis">
   <div class="kicker">Section 1</div>
   <h2>Executive architecture &amp; design thesis</h2>
-  <p class="lede">Kovo Hunter is a defensive web-application security verifier. It finds vulnerabilities in authorized targets,
+  <p class="lede">Kovo is a defensive web-application security verifier. It finds vulnerabilities in authorized targets,
   <em>proves</em> them with host-verified evidence, and re-tests patches. v8 targets deep multi-hop causal chains (3–6 hops) across
   multi-service SaaS, where each endpoint looks fine alone and the impact only shows up when the steps are combined.</p>
   <blockquote class="thesis">The LLM is a cheap, creative, <strong>untrusted</strong> hypothesis generator. The host is an expensive, boring,
@@ -279,7 +279,7 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
     <span><i style="border-color:var(--target);background:var(--target-soft)"></i>Target (authorized)</span>
   </div>
   <div class="topo">
-    <div class="topo-svg-wrap"><svg id="topo" viewBox="0 0 1000 560" role="img" aria-label="Kovo Hunter system topology"></svg></div>
+    <div class="topo-svg-wrap"><svg id="topo" viewBox="0 0 1000 560" role="img" aria-label="Kovo system topology"></svg></div>
     <aside class="inspector" id="inspector" aria-live="polite">
       <div class="empty">Select a component in the diagram.<br><br>Try <b>RequestBroker</b> to follow the only path to the target, or <b>DerivedCapabilityVault</b> to see where raw bytes end up.</div>
     </aside>
@@ -701,7 +701,7 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
       inv: ['Confirmed ⇒ evidence confirms', 'Hash-chained audit log', 'LLM judge never confirms'] },
     { k: 'Stage 7 · Grading', title: 'Two-side grader (benchmark only)', short: 'Two-side grader',
       files: ['scripts/benchmark-multihop.ts', 'scripts/certify-v8.ts', 'scripts/check-v8-contamination.ts'],
-      desc: 'In certification, a TP needs both sides. Side 1: ChainOracle v2, the lab\'s own observation of the full ordered causal DAG from an attacker-eligible persona with no shortcut personas. Side 2: Kovo Hunter\'s host-verified CompositeProofReceipt (Mode A clean replay). The hardened twin of the same chain must not confirm.',
+      desc: 'In certification, a TP needs both sides. Side 1: ChainOracle v2, the lab\'s own observation of the full ordered causal DAG from an attacker-eligible persona with no shortcut personas. Side 2: Kovo\'s host-verified CompositeProofReceipt (Mode A clean replay). The hardened twin of the same chain must not confirm.',
       worker: S('sv', '// not involved: grading is outside the product boundary'),
       host: 'Side 1 ChainOracle v2: H1 → H2 → H3 ordered, attacker persona, 0 shortcuts ' + S('okc', '✓') + '\nSide 2 CompositeProofReceipt (Mode A) confirmed ' + S('okc', '✓') + '\n→ TP\nhardened twin: no receipt, no oracle hit → ' + S('okc', '0 decoy FPs') + '\nfunnel: H1 → H2 → H3 → H4+ → FinalOracle → CompositeReceiptConfirmed\nanti-heuristic gate: --no-llm ≤ 5% · precision gate: 100% worst-run',
       inv: ['Both sides or no TP', 'Hardened twins = 0 FPs', 'Anti-contamination lint'] }

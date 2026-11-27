@@ -1,6 +1,6 @@
 // Persona login for a materialized realistic-bench app.
 //
-// Kovo Hunter's EngineEnv expects ready-to-use credentials per persona ({cookie} or {token}),
+// Kovo's EngineEnv expects ready-to-use credentials per persona ({cookie} or {token}),
 // while the benchmark briefing only hands out email/password (plus origin + optional API ref).
 // This module bridges the two by deriving the login route from the materialized surface
 // (variant.json routes), never from truth/ or a manifest.

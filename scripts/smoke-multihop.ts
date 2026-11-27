@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Kovo Hunter v8 — Multi-Hop Smoke Battery (Tier 0 + Tier 1).
+// Kovo v8 — Multi-Hop Smoke Battery (Tier 0 + Tier 1).
 //
 // Tier 0 (< 90 s, $0):
 //   Runs `scripts/worker-gate.sh` + v8 unit/chaos test suites
@@ -194,7 +194,7 @@ export interface V8SmokeGateReportInput {
 // CLI
 // ---------------------------------------------------------------------------
 
-const USAGE = `Kovo Hunter v8 — Multi-Hop Smoke Battery (defensive QA)
+const USAGE = `Kovo v8 — Multi-Hop Smoke Battery (defensive QA)
 
 Usage:
   node scripts/smoke-multihop.ts [flags]
@@ -224,7 +224,7 @@ Flags:
   --max-duration-ms <n>            Wall-clock cap per Tier-1 cell in ms (default 600000)
   --dry-run                        Plan cells & print report; starts ZERO external processes
   --out-dir <path>                 Artifact directory (default .kovo/smoke-multihop)
-  --data-dir <path>                Kovo Hunter model profile source dir (default $KOVO_DATA_DIR)
+  --data-dir <path>                Kovo model profile source dir (default $KOVO_DATA_DIR)
   --baseline <path>                Optional baseline JSON report for hop-funnel non-regression
   --seed <n>                       Deterministic dev seed (default 1)
   --cell-index <n>                 Explicit rotation index (default UTC day-of-year)
@@ -1233,7 +1233,7 @@ export function renderV8CompactTable(cells: readonly V8CellMetrics[]): string {
 
 export function renderV8MarkdownSummary(report: V8SmokeReport): string {
   const lines: string[] = [
-    `# Kovo Hunter v8 Multi-Hop Smoke Battery (${report.executionMode})`,
+    `# Kovo v8 Multi-Hop Smoke Battery (${report.executionMode})`,
     '',
     `- **Git SHA:** \`${report.gitSha}\``,
     `- **Tier:** \`${report.args.tier}\` | **Archetype:** \`${report.args.resolvedArchetype}\` (selector: \`${report.args.archetype}\`) | **Mode:** \`${report.args.mode}\``,

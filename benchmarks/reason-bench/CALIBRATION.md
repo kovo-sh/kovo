@@ -27,7 +27,7 @@ export KOVO_ALLOW_LOCAL_LAB=1
 # agentic runs need the Docker worker backend (worker sessions)
 newgrp docker -c 'docker image inspect kovo-worker:v4 >/dev/null && echo worker-ok'
 
-# enabled model profile (OpenRouter DeepSeek V4.1 Flash in the Kovo Hunter data dir)
+# enabled model profile (OpenRouter DeepSeek V4.1 Flash in the Kovo data dir)
 export KOVO_DATA_DIR="$HOME/guardian-data"
 
 # salted held-out seeds (owner-only file; NEVER print or commit the value)

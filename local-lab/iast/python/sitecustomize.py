@@ -1,4 +1,4 @@
-"""Kovo Hunter v4 zero-egress Python IAST hook for local-lab containers."""
+"""Kovo v4 zero-egress Python IAST hook for local-lab containers."""
 import json
 import os
 import re

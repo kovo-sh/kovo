@@ -2,7 +2,7 @@
 
 An offline, loopback-only benchmark for measuring a defensive scanner's **High/Critical recall and
 precision** against realistic, multi-tenant web applications — a more faithful alternative to
-single-bug CTF suites like XBOW/XBEN. Built to score Kovo Hunter, but scanner-agnostic.
+single-bug CTF suites like XBOW/XBEN. Built to score Kovo, but scanner-agnostic.
 
 Everything runs on `127.0.0.1` behind `KOVO_ALLOW_LOCAL_LAB=1`; all data is synthetic and every
 dangerous sink (SSRF, XXE, path traversal, command execution, SSTI) is a safe, instrumented
@@ -102,9 +102,9 @@ The same scorecard can be produced from externally captured artifacts with
 
 ## Parallel agentic matrix (real `Execution` harness)
 
-`scripts/benchmark-realistic.ts` drives Kovo Hunter's real `Execution` loop. A parallel
-agentic matrix must not share one Kovo Hunter data dir (the second Store would fail with
-`Another Kovo Hunter server is using this data directory`). With `--concurrency > 1`,
+`scripts/benchmark-realistic.ts` drives Kovo's real `Execution` loop. A parallel
+agentic matrix must not share one Kovo data dir (the second Store would fail with
+`Another Kovo server is using this data directory`). With `--concurrency > 1`,
 per-cell isolation is on by default:
 
 ```sh
@@ -117,14 +117,14 @@ newgrp docker -c 'cd <repo> && node scripts/benchmark-realistic.ts \
   --out-dir /tmp/rb-agentic-matrix'
 ```
 
-Each cell creates `<out-dir>/data/<app>-seed<seed>-<mode>/`, initializes a fresh Kovo Hunter
+Each cell creates `<out-dir>/data/<app>-seed<seed>-<mode>/`, initializes a fresh Kovo
 Store, copies only the enabled `model_profiles` rows (+ workspace identity), and symlinks
 `credentials/` to the source data dir. The key is never copied into the out-dir. Isolated
 dirs are removed after grading unless `--keep-data-dirs` is passed; `--isolate-data-dir`
 can also be forced for a single cell.
 
 **Current engine gap (do not misread as a benchmark bug):** as of repo `c345f46` / engine
-`ca992f6`, the full Kovo Hunter pipeline confirmed **0 vulnerabilities on every dev seed tried**
+`ca992f6`, the full Kovo pipeline confirmed **0 vulnerabilities on every dev seed tried**
 (acme 0/22, 0/22, 0/20; shopflow 0/18, 0/19, 0/20; opsportal 0/16, 0/18, 0/17 for seeds
 42/1/2). Precision was 100% on shopflow, 0% on acme/opsportal (a few unmatched findings).
 The gap is engine-side (recon stops at the SPA shell; query/body-driven classes are never
@@ -230,7 +230,7 @@ is a pure simulator (`lib/simshell.ts`); `node:fs` is confined to the jailed sta
 build-time tooling; secrets are synthetic (`rb_fake_*`, `rbs_*`). Nothing starts without
 `KOVO_ALLOW_LOCAL_LAB=1`.
 
-## Integrating a scanner (e.g. Kovo Hunter)
+## Integrating a scanner (e.g. Kovo)
 
 ```ts
 import { startRealisticApp, briefingFor, gradeRun, renderScorecard } from './run.ts'

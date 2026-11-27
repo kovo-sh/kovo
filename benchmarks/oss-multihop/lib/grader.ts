@@ -61,7 +61,7 @@ function areCausalEdgesValid(receipt: KovoCompositeProofReceipt): boolean {
 /**
  * Verifies two-side confirmation:
  * 1) External impact oracle observed the terminal impact on the vulnerable build, AND
- * 2) Kovo Hunter produced a host-verified Mode-A `CompositeProofReceipt` originating from an
+ * 2) Kovo produced a host-verified Mode-A `CompositeProofReceipt` originating from an
  *    allowed attacker persona with verified causal edges and matching run/correlation.
  */
 export function verifyTwoSideConfirmation(
@@ -81,7 +81,7 @@ export function verifyTwoSideConfirmation(
 
   if (!receipt) {
     if (oracleConfirmed) {
-      reasons.push('External oracle observed impact, but Kovo Hunter emitted no CompositeProofReceipt.')
+      reasons.push('External oracle observed impact, but Kovo emitted no CompositeProofReceipt.')
       return {
         confirmed: false,
         status: 'unconfirmed_oracle_only',
@@ -91,7 +91,7 @@ export function verifyTwoSideConfirmation(
         reasons,
       }
     }
-    reasons.push('Neither external oracle nor Kovo Hunter receipt confirmed this anchor.')
+    reasons.push('Neither external oracle nor Kovo receipt confirmed this anchor.')
     return {
       confirmed: false,
       status: 'fn',
@@ -102,7 +102,7 @@ export function verifyTwoSideConfirmation(
   }
 
   if (!receipt.verified || !receipt.terminalImpact.observed) {
-    reasons.push('Kovo Hunter CompositeProofReceipt is not host-verified or terminalImpact.observed is false.')
+    reasons.push('Kovo CompositeProofReceipt is not host-verified or terminalImpact.observed is false.')
     return {
       confirmed: false,
       status: oracleConfirmed ? 'unconfirmed_oracle_only' : 'fn',
@@ -157,7 +157,7 @@ export function verifyTwoSideConfirmation(
   }
 
   if (!oracleConfirmed || !matchingObs) {
-    reasons.push('Kovo Hunter emitted a verified receipt, but the external impact oracle did not observe impact.')
+    reasons.push('Kovo emitted a verified receipt, but the external impact oracle did not observe impact.')
     return {
       confirmed: false,
       status: 'unconfirmed_receipt_only',

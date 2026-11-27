@@ -647,7 +647,7 @@ export function formatVerdictFlipReport(result: VerdictFlipRepoResult): string {
   return lines.join('\n')
 }
 
-const usage = `Kovo Hunter Verdict-Flip & Gate-Repair Tests-Only Guard (R3-05)
+const usage = `Kovo Verdict-Flip & Gate-Repair Tests-Only Guard (R3-05)
 
 Usage:
   node scripts/check-verdict-flip.ts [options]

@@ -445,7 +445,7 @@ function rewritePlaceholders(
   out = out.replace(/\{\{interactsh-?url\}\}/gi, preferDnsCanary ? '{{kovo_canary_dns}}' : '{{kovo_canary_http}}')
   // Rewrite benign random generators
   out = out.replace(/\{\{(?:randstr|rand_int\([^)]*\)|rand_text_alpha\([^)]*\)|rand_text_alphanumeric\([^)]*\)|rand_base\([^)]*\)|rand_char\([^)]*\))\}\}/gi, '{{rand}}')
-  // Reject any unresolved {{...}} other than Kovo Hunter's 3 safe placeholders
+  // Reject any unresolved {{...}} other than Kovo's 3 safe placeholders
   const stripped = out.replace(/\{\{(?:rand|kovo_canary_http|kovo_canary_dns)\}\}/g, 'X')
   if (/\{\{[^}]*\}\}/.test(stripped)) {
     return { ok: false, reason: 'unresolved_placeholder' }

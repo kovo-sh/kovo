@@ -893,7 +893,7 @@ export function formatFixtureContaminationReport(res: FixtureContaminationResult
   return lines.join('\n')
 }
 
-const usage = `Kovo Hunter Blueprint-Derived Fixture-Contamination Ratchet Lint (R2-20)
+const usage = `Kovo Blueprint-Derived Fixture-Contamination Ratchet Lint (R2-20)
 
 Usage:
   node scripts/check-fixture-contamination.ts [--root <dir>] [--baseline <path>] [--json] [--write-baseline] [--bootstrap] [--help]

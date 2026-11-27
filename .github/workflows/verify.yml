@@ -1,4 +1,4 @@
-name: Verify Kovo Hunter
+name: Verify Kovo
 
 on:
   push:

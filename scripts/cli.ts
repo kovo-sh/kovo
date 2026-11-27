@@ -65,10 +65,10 @@ const SEVERITY_ORDER: Record<string, number> = {
 
 export function formatCliHelp(): string {
   return [
-    'Kovo Hunter Headless Security Scanner CLI',
+    'Kovo Headless Security Scanner CLI',
     '',
     'Usage:',
-    '  kovo-hunter scan [options]',
+    '  kovo scan [options]',
     '',
     'Options:',
     '  --repo <path>              Local repository path to mount read-only into /repos (repeatable)',
@@ -127,7 +127,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
       help: true,
     }
   } else if (args[0] && !args[0].startsWith('-')) {
-    throw new Error(`Unknown Kovo Hunter CLI command: "${args[0]}". Expected "kovo-hunter scan".`)
+    throw new Error(`Unknown Kovo CLI command: "${args[0]}". Expected "kovo scan".`)
   }
 
   const opts: CliOptions = {
@@ -271,7 +271,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
         break
       }
       default:
-        throw new Error(`Unknown CLI flag: "${arg}". Run "kovo-hunter scan --help" for usage.`)
+        throw new Error(`Unknown CLI flag: "${arg}". Run "kovo scan --help" for usage.`)
     }
   }
 
@@ -567,7 +567,7 @@ export async function runCli(argv: readonly string[]): Promise<0 | 1 | 2> {
   }
 
   if (opts.origins.length === 0 && opts.repos.length === 0) {
-    console.error('[kovo] Provide at least one --origin <url> or --repo <path>. Run "kovo-hunter scan --help".')
+    console.error('[kovo] Provide at least one --origin <url> or --repo <path>. Run "kovo scan --help".')
     return 1
   }
 

@@ -1,7 +1,7 @@
 // Shared contracts for realistic-bench. Every module (lib/, generator/, grader/, apps/*) imports
 // these types; change them only with a coordinated update across all consumers.
 // Taxonomy + funnel names deliberately mirror src/domain.ts (checked by tests/contracts.test.ts)
-// but are copied, not imported, so the benchmark stays self-contained and independent of Kovo Hunter.
+// but are copied, not imported, so the benchmark stays self-contained and independent of Kovo.
 
 export const appNames = ['acme-saas', 'shopflow', 'opsportal'] as const
 export type AppName = typeof appNames[number]
@@ -55,7 +55,7 @@ export const budgetThresholdsUsd = [1, 5, 20] as const
 
 // ---------------------------------------------------------------------------------------------
 // Impact oracle side-channel (lib/oracle.ts). Never exposed on the app's HTTP surface and never
-// fed into Kovo Hunter's ReplayVerifier; only the grader consumes it.
+// fed into Kovo's ReplayVerifier; only the grader consumes it.
 // ---------------------------------------------------------------------------------------------
 export interface OracleEvent {
   seq: number
@@ -200,7 +200,7 @@ export interface GroundTruth {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Grader input (adapter target for Kovo Hunter output) and output
+// Grader input (adapter target for Kovo output) and output
 // ---------------------------------------------------------------------------------------------
 export type FindingStatus =
   | 'runtime_confirmed' | 'confirmed' | 'static_verified' | 'proposed' | 'open_proof_gap' | 'ruled_out'

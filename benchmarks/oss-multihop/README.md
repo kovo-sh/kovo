@@ -1,6 +1,6 @@
 # `oss-multihop` — Real-World OSS / CVE Multi-Hop Anchor Corpus
 
-`benchmarks/oss-multihop/` defines the declarative anchor specifications, safety validators, external impact oracle evaluators, and two-side grading engine for Kovo Hunter v8's Real-World OSS Multi-Hop Anchor Corpus (see [`plans/v8.md`](../../plans/v8.md) §"Real-World OSS / CVE Multi-Hop Anchor Corpus", §M2, and §M4).
+`benchmarks/oss-multihop/` defines the declarative anchor specifications, safety validators, external impact oracle evaluators, and two-side grading engine for Kovo v8's Real-World OSS Multi-Hop Anchor Corpus (see [`plans/v8.md`](../../plans/v8.md) §"Real-World OSS / CVE Multi-Hop Anchor Corpus", §M2, and §M4).
 
 Binding specification: [`CONTRACTS.md`](./CONTRACTS.md).
 

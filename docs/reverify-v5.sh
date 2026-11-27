@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Re-run the Kovo Hunter v5 release gate on the current tree.
+# Re-run the Kovo v5 release gate on the current tree.
 #
 #   bash docs/reverify-v5.sh --full    # release gate: build + all suites + Playwright + orphan hygiene
 #   bash docs/reverify-v5.sh --fast    # no Docker: typecheck, build, Docker-free unit suites only
@@ -179,7 +179,7 @@ orphan_check() {
   echo "   active kovo containers (not a gate failure): $up"
 }
 
-echo "Kovo Hunter v5 gate ($MODE) — repo: $ROOT"
+echo "Kovo v5 gate ($MODE) — repo: $ROOT"
 echo "logs: $TMP"
 echo
 

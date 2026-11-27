@@ -2,7 +2,7 @@
 // benchmarks/realistic-bench/lib/types.ts: every realistic-bench rule and shape is preserved, and
 // the reasoning-specific domain, persona, causal-chain and oracle kinds are layered on top.
 // Taxonomy + funnel names deliberately mirror src/domain.ts but are copied, not imported, so the
-// benchmark stays self-contained and independent of Kovo Hunter.
+// benchmark stays self-contained and independent of Kovo.
 
 export const appNames = ['ledgerflow', 'forgecloud'] as const
 export type AppName = typeof appNames[number]
@@ -97,7 +97,7 @@ export const budgetThresholdsUsd = [1, 5, 20] as const
 
 // ---------------------------------------------------------------------------------------------
 // Impact oracle side-channel (lib/oracle.ts). Never exposed on the app's HTTP surface and never
-// fed into Kovo Hunter's ReplayVerifier; only the grader consumes it.
+// fed into Kovo's ReplayVerifier; only the grader consumes it.
 // ---------------------------------------------------------------------------------------------
 export interface OracleEvent {
   seq: number
@@ -302,7 +302,7 @@ export interface GroundTruth {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Grader input (adapter target for Kovo Hunter output) and output
+// Grader input (adapter target for Kovo output) and output
 // ---------------------------------------------------------------------------------------------
 export type FindingStatus =
   | 'runtime_confirmed' | 'confirmed' | 'static_verified' | 'proposed' | 'open_proof_gap' | 'ruled_out'
