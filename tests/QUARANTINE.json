@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "maxQuarantinedCases": 179,
+  "maxQuarantinedCases": 177,
   "maxKernelVerdictQuarantinedCases": 27,
   "entries": [
     {
@@ -1271,22 +1271,6 @@
       "file": "tests/v8-q33-auth-and-json.test.ts",
       "testName": "derived session token injects Authorization: Bearer <rawToken> on wire across all 4 call patterns + cookie/override edge cases",
       "assertionLocation": "tests/v8-q33-auth-and-json.test.ts:186:1",
-      "ownerStream": "v8-triage",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/v8-q33-dag-and-econ-docs.test.ts",
-      "testName": "Q33.2: dag_topology connected-DAG rule forbids unused/orphan exploratory hops in hops[]",
-      "assertionLocation": "tests/v8-q33-dag-and-econ-docs.test.ts:165:1",
-      "ownerStream": "v8-triage",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/v8-q33-dag-and-econ-docs.test.ts",
-      "testName": "Q33.3: derived session token injection rule teaches kind=\"bearer_token\", target=\"bearer\"/Authorization header, and omitting as/persona",
-      "assertionLocation": "tests/v8-q33-dag-and-econ-docs.test.ts:197:1",
       "ownerStream": "v8-triage",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
