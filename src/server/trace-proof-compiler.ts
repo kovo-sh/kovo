@@ -607,6 +607,61 @@ function formatRaceCall(p: StepPlan, concurrency: number, hasDynPreRb: boolean, 
   return `ch.race({ ${raceFields.join(', ')} })`
 }
 
+function resolveStepPersona(
+  p: StepPlan, isRoot: boolean, attackerPersona: string | undefined,
+  allowedSet: ReadonlySet<string> | undefined, allowDual: boolean, warnings: string[],
+): string | undefined {
+  if (p.omitPersona) return undefined
+  const raw = p.exchange.persona?.trim()
+  if (!isRoot) return raw || undefined
+  if (!raw) return attackerPersona
+  if (attackerPersona && raw !== attackerPersona && isDisallowedRootPersona(raw, allowedSet, allowDual)
+    && personaPrivilegeRank(attackerPersona, allowedSet, allowDual) < personaPrivilegeRank(raw, allowedSet, allowDual)) {
+    warnings.push(`Root hop ${p.hopId} persona "${raw}" replaced with lower-privilege attackerPersona "${attackerPersona}".`)
+    return attackerPersona
+  }
+  return raw
+}
+
+function pruneAndBindCausalExchanges(
+  initialCausal: RecordedRequestExchange[], initialTermIdx: number, terminalEx: RecordedRequestExchange,
+  explicitReadback: RecordedRequestExchange | undefined, allowedSet: ReadonlySet<string> | undefined,
+  blocked: ReadonlySet<string>, warnings: string[],
+) {
+  let causal = initialCausal, terminalIdx = initialTermIdx
+  const passWarnings: string[] = []
+  let { st, readbackPlan } = runBindingPass(causal, terminalIdx, explicitReadback, allowedSet, blocked, passWarnings)
+  const reachable = computeReachableToTerminal(st.edges, terminalIdx)
+  const prunedPollsBy202Id = new Map<string, RecordedRequestExchange>()
+  for (let i = 0; i < causal.length; i += 1) {
+    if (!reachable.has(i)) {
+      const ex = causal[i]!, m = ex.method.toUpperCase(), kind = READ_ONLY_METHODS.has(m) ? 'unlinked read-only recon' : 'unreachable'
+      warnings.push(`pruned ${kind} exchange "${ex.exchangeId}" (${m} ${ex.pathAndQuery || '/'})`)
+      if (m === 'GET' && ex.status === 200) {
+        for (const depIdx of st.plans[i]!.dynamicDepSteps) {
+          if (reachable.has(depIdx) && causal[depIdx]!.status === 202) prunedPollsBy202Id.set(causal[depIdx]!.exchangeId, ex)
+        }
+      }
+    }
+  }
+  if (reachable.size < causal.length) {
+    causal = causal.filter((_, i) => reachable.has(i)); terminalIdx = causal.findIndex(e => e.exchangeId === terminalEx.exchangeId)
+    ;({ st, readbackPlan } = runBindingPass(causal, terminalIdx, explicitReadback, allowedSet, blocked, warnings))
+  } else warnings.push(...passWarnings)
+
+  const asyncPollsByStep = new Map<number, StepPlan>()
+  for (let i = 0; i < st.plans.length; i += 1) {
+    if (causal[i]!.status !== 202 || (i >= st.plans.length - 1 && !readbackPlan)) continue
+    const pollEx = prunedPollsBy202Id.get(causal[i]!.exchangeId)
+    if (!pollEx) continue
+    const pollPlan = mkStepPlan(pollEx, st.plans.length + 1, `async_poll_${i + 1}`), prevBindLen = st.inferredBindings.length
+    bindStepPlan(st, pollPlan, st.plans.length, i + 1)
+    st.inferredBindings.length = prevBindLen
+    asyncPollsByStep.set(i, pollPlan)
+  }
+  return { causal, terminalIdx, st, readbackPlan, asyncPollsByStep }
+}
+
 export function compileTraceToKovoVerifyScript(input: {
   submission: ExploitTraceSubmission; exchanges: RecordedRequestExchange[]; allowedPersonas?: string[]; runOrigin?: string
 }): CompiledTraceResult {
@@ -641,37 +696,9 @@ export function compileTraceToKovoVerifyScript(input: {
   const terminalEx = causal[terminalIdx]!, raceConcurrency = collapsed.raceConcurrency
   const allowedSet = allowedPersonas?.length ? new Set(allowedPersonas) : undefined
   const blocked = buildBlockedValues(exchanges, allowedPersonas, submission.attackerPersona?.trim() || undefined, runOrigin)
-
-  const passWarnings: string[] = []
-  let { st, readbackPlan } = runBindingPass(causal, terminalIdx, explicitReadback, allowedSet, blocked, passWarnings)
-  const reachable = computeReachableToTerminal(st.edges, terminalIdx)
-  const prunedPollsBy202Id = new Map<string, RecordedRequestExchange>()
-  for (let i = 0; i < causal.length; i += 1) {
-    if (!reachable.has(i)) {
-      const ex = causal[i]!, m = ex.method.toUpperCase(), kind = READ_ONLY_METHODS.has(m) ? 'unlinked read-only recon' : 'unreachable'
-      warnings.push(`pruned ${kind} exchange "${ex.exchangeId}" (${m} ${ex.pathAndQuery || '/'})`)
-      if (m === 'GET' && ex.status === 200) {
-        for (const depIdx of st.plans[i]!.dynamicDepSteps) {
-          if (reachable.has(depIdx) && causal[depIdx]!.status === 202) prunedPollsBy202Id.set(causal[depIdx]!.exchangeId, ex)
-        }
-      }
-    }
-  }
-  if (reachable.size < causal.length) {
-    causal = causal.filter((_, i) => reachable.has(i)); terminalIdx = causal.findIndex(e => e.exchangeId === terminalEx.exchangeId)
-    ;({ st, readbackPlan } = runBindingPass(causal, terminalIdx, explicitReadback, allowedSet, blocked, warnings))
-  } else warnings.push(...passWarnings)
-
-  const asyncPollsByStep = new Map<number, StepPlan>()
-  for (let i = 0; i < st.plans.length; i += 1) {
-    if (causal[i]!.status !== 202 || (i >= st.plans.length - 1 && !readbackPlan)) continue
-    const pollEx = prunedPollsBy202Id.get(causal[i]!.exchangeId)
-    if (!pollEx) continue
-    const pollPlan = mkStepPlan(pollEx, st.plans.length + 1, `async_poll_${i + 1}`), prevBindLen = st.inferredBindings.length
-    bindStepPlan(st, pollPlan, st.plans.length, i + 1)
-    st.inferredBindings.length = prevBindLen
-    asyncPollsByStep.set(i, pollPlan)
-  }
+  const bound = pruneAndBindCausalExchanges(causal, terminalIdx, terminalEx, explicitReadback, allowedSet, blocked, warnings)
+  causal = bound.causal; terminalIdx = bound.terminalIdx
+  const { st, readbackPlan, asyncPollsByStep } = bound
 
   const { terminalVulnClass, validOracleFamily } = normalizeVulnClass(submission.vulnClass, submission.oracleFamily, causal.length, warnings)
   const allowDualPersona = validOracleFamily === 'dual_tenant_abac' || terminalVulnClass === 'dual_tenant_abac' || /^cross_tenant_/.test(terminalVulnClass)
@@ -716,18 +743,6 @@ export function compileTraceToKovoVerifyScript(input: {
     const cPath = (!effectiveControl && ctrlUsesDyn) ? termPlan.pathExpr : JSON.stringify(effectiveControl ? (srcEx.pathAndQuery || '/') : sanitizeControlPath(srcEx.pathAndQuery || '/'))
     lines.push(`  const ctrl = await ch.control(${formatTarget(srcEx.origin, cPath, runOrigin)}, ${formatHttpOpts({ method: srcEx.method || 'GET', persona: effectiveControl ? (effectiveControl.persona?.trim() || attackerPersona) : attackerPersona, headersExpr: sanitizeControlHeaders(srcEx.requestHeaders), bodyExpr: cBody, session: 'ctrl_clean' })})`)
   }
-  const resolveStepPersona = (p: StepPlan, isRoot: boolean): string | undefined => {
-    if (p.omitPersona) return undefined
-    const raw = p.exchange.persona?.trim()
-    if (!isRoot) return raw || undefined
-    if (!raw) return attackerPersona
-    if (attackerPersona && raw !== attackerPersona && isDisallowedRootPersona(raw, allowedSet, allowDualPersona)
-      && personaPrivilegeRank(attackerPersona, allowedSet, allowDualPersona) < personaPrivilegeRank(raw, allowedSet, allowDualPersona)) {
-      warnings.push(`Root hop ${p.hopId} persona "${raw}" replaced with lower-privilege attackerPersona "${attackerPersona}".`)
-      return attackerPersona
-    }
-    return raw
-  }
   const planOpts = (p: StepPlan, fallbackPersona?: string, stepMeta?: { hopId: string; claimedDelta: string }, role?: 'control' | 'setup', explicitPersona?: string) => formatHttpOpts({ ...(stepMeta ?? {}), method: p.exchange.method || 'GET', persona: p.omitPersona ? undefined : (explicitPersona ?? (p.exchange.persona?.trim() || fallbackPersona)), headersExpr: p.headersExpr, bodyExpr: p.bodyExpr, followRedirectsFalse: p.forceNoFollowRedirects, capability: p.primaryCapability, ...(role ? { role } : {}), entityIdExpr: p.entityIdExpr })
 
   const dynPreRb = Boolean(emitBaselineReadback && readbackPlan && raceConcurrency >= 2 && readbackPlan.usesDynamicUrlOrBody)
@@ -740,7 +755,8 @@ export function compileTraceToKovoVerifyScript(input: {
   }
   for (let i = 0; i < plans.length; i += 1) {
     const p = plans[i]!, stepVar = `step_${p.stepNumber}`, isRaceStep = i === terminalIdx && raceConcurrency >= 2
-    const isRootHop = i === 0 || !st.edges.some(e => e.toStepIdx === i), stepPersona = resolveStepPersona(p, isRootHop)
+    const isRootHop = i === 0 || !st.edges.some(e => e.toStepIdx === i)
+    const stepPersona = resolveStepPersona(p, isRootHop, attackerPersona, allowedSet, allowDualPersona, warnings)
     if (isRaceStep && dynPreRb && readbackPlan) {
       lines.push(`  const preRb = await ctx.http_send(${formatTarget(readbackPlan.exchange.origin, readbackPlan.pathExpr, runOrigin, Boolean(readbackPlan.signedUrlCapVar))}, ${planOpts(readbackPlan, attackerPersona, undefined, 'control')})`)
     }
