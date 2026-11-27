@@ -72,7 +72,10 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-chromium-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
       - name: Install Playwright Chromium system dependencies
-        run: npx playwright install-deps chromium
+        run: |
+          # Remove pre-installed Microsoft APT repo to prevent upstream packages.microsoft.com 403 flakes on Ubuntu 24.04 runners.
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources || true
+          npx playwright install-deps chromium
       - name: Install Playwright Chromium browser (cache miss)
         if: steps.pw-cache.outputs.cache-hit != 'true'
         run: npx playwright install chromium
@@ -127,7 +130,10 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-chromium-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
       - name: Install Playwright Chromium system dependencies
-        run: npx playwright install-deps chromium
+        run: |
+          # Remove pre-installed Microsoft APT repo to prevent upstream packages.microsoft.com 403 flakes on Ubuntu 24.04 runners.
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources || true
+          npx playwright install-deps chromium
       - name: Install Playwright Chromium browser (cache miss)
         if: steps.pw-cache.outputs.cache-hit != 'true'
         run: npx playwright install chromium
@@ -165,7 +171,10 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-chromium-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
       - name: Install Playwright Chromium system dependencies
-        run: npx playwright install-deps chromium
+        run: |
+          # Remove pre-installed Microsoft APT repo to prevent upstream packages.microsoft.com 403 flakes on Ubuntu 24.04 runners.
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources || true
+          npx playwright install-deps chromium
       - name: Install Playwright Chromium browser (cache miss)
         if: steps.pw-cache.outputs.cache-hit != 'true'
         run: npx playwright install chromium
