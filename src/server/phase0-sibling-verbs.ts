@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { classifyPersonaPrivilege } from './assignment-brief.ts'
 import { BrokerCircuitOpen, BrokerDenied } from './broker.ts'
 import type { BrokerExchangeResult, Grant, RequestBroker } from './broker.ts'
 import { normalizeRouteTemplate } from './route-template.ts'
@@ -136,9 +137,6 @@ const PREFIX_SEGMENT_RE = /^[A-Za-z0-9_-]{1,64}$/
 const VERSION_ONLY_RE = /^v\d+$/i
 const ALLOWED_RECORDED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
 const DISCOVERY_STATUSES = new Set([200, 204, 400, 401, 403, 405, 422])
-const ELEVATED_PERSONA_RE = /\b(?:owner|super\s*(?:user|admin)|superuser|superadmin|root|privileged|victim|admin|administrator)\b/i
-const LOW_PRIV_READONLY_RE = /\b(?:read\s*only|viewer|guest|readonly|anon|anonymous|unauthenticated|observer)\b/i
-const MID_PRIV_ROLE_RE = /\b(?:manager|editor|moderator|approver|maintainer|operator)\b/i
 
 interface ResourceFamilyRecord {
   prefix: string
@@ -571,16 +569,6 @@ export function extractSiblingVerbCandidates(options: ExtractSiblingVerbOptions)
   return selected
 }
 
-function personaPrivilegeRank(handle: string, roleLabel?: string | null, privilege?: string | null): number {
-  const norm = `${handle} ${roleLabel ?? ''} ${privilege ?? ''}`
-    .replace(/([a-z])([A-Z])/g, '$1 $2')
-    .replace(/[_-]+/g, ' ')
-    .toLowerCase()
-  if (ELEVATED_PERSONA_RE.test(norm)) return 3
-  if (LOW_PRIV_READONLY_RE.test(norm)) return 0
-  return MID_PRIV_ROLE_RE.test(norm) ? 2 : 1
-}
-
 function selectLowPrivilegePersona(
   personas: readonly string[] | undefined,
   grant: Grant,
@@ -588,23 +576,33 @@ function selectLowPrivilegePersona(
   preferredPersona?: string,
 ): string | undefined {
   if ((grant.tier ?? 0) < 2) return undefined
+  const classifyHandle = (handle: string) => {
+    const entry = grant.personas?.get(handle)
+    const roleText = [entry?.roleLabel, entry?.privilege].filter(Boolean).join(' ')
+    return classifyPersonaPrivilege(handle, roleText)
+  }
   const isAllowedLowPriv = (handle: string | undefined): handle is string => {
     if (!handle) return false
     const entry = grant.personas?.get(handle)
     if (!entry || !entry.originAllowlist.includes(origin)) return false
-    return personaPrivilegeRank(handle, entry.roleLabel, entry.privilege) < 3
+    const priv = classifyHandle(handle)
+    return !priv.elevated && !priv.revokedStale
   }
   if (isAllowedLowPriv(preferredPersona)) return preferredPersona
+  const grantOrder = new Map<string, number>()
+  let orderIdx = 0
+  for (const key of grant.personas?.keys() ?? []) {
+    grantOrder.set(key, orderIdx++)
+  }
   const eligible = [...new Set(personas ?? [])]
     .filter(isAllowedLowPriv)
-    .sort((a, b) => {
-      const aEntry = grant.personas?.get(a)
-      const bEntry = grant.personas?.get(b)
-      const rankDiff = personaPrivilegeRank(a, aEntry?.roleLabel, aEntry?.privilege)
-        - personaPrivilegeRank(b, bEntry?.roleLabel, bEntry?.privilege)
-      return rankDiff !== 0 ? rankDiff : a.localeCompare(b)
-    })
-  return eligible[0]
+    .map((handle, pos) => ({
+      handle,
+      rank: classifyHandle(handle).rank,
+      configIndex: grantOrder.get(handle) ?? (orderIdx + pos),
+    }))
+    .sort((a, b) => (a.rank - b.rank) || (a.configIndex - b.configIndex))
+  return eligible[0]?.handle
 }
 
 function parseAllowHeaderMethods(respHeaders: Record<string, string> | undefined | null): string[] {

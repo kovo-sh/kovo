@@ -37,7 +37,7 @@ import {
 import {
   ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE,
   assertAssignmentBriefSize,
-  buildAssignmentBrief, selectBriefRoutes,
+  buildAssignmentBrief, classifyPersonaPrivilege, selectBriefRoutes,
   type MissionKind,
 } from './assignment-brief.ts'
 import {
@@ -1832,24 +1832,16 @@ export interface HopContinuationExchangeRef {
   personaHandle?: string | null
 }
 
-/** Rank personas lowest-privilege-first (viewer/guest/readonly < member/user/tenant < manager/editor < admin/owner/superuser). */
-export function personaPrivilegeRank(persona: { handle: string; roleLabel?: string }): number {
-  const norm = `${persona.handle} ${persona.roleLabel ?? ''}`.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase()
-  const tokens = new Set(norm.split(/[^a-z0-9]+/).filter(Boolean))
-  const isHighPriv = /\bsuper\s*(?:user|admin)\b/.test(norm)
-    || tokens.has('admin') || tokens.has('administrator') || tokens.has('owner')
-    || tokens.has('superuser') || tokens.has('superadmin') || tokens.has('root') || tokens.has('privileged')
-  const isLowPriv = /\bread\s*only\b/.test(norm)
-    || tokens.has('viewer') || tokens.has('guest') || tokens.has('readonly')
-    || tokens.has('anon') || tokens.has('anonymous') || tokens.has('unauthenticated') || tokens.has('observer')
-  if (isLowPriv && !isHighPriv) return 0
-  if (isHighPriv) return 3
-  if (tokens.has('manager') || tokens.has('editor') || tokens.has('moderator') || tokens.has('approver') || tokens.has('maintainer') || tokens.has('operator')) return 2
-  return 1
-}
-
-export function sortPersonasLowPrivFirst<T extends { handle: string; roleLabel?: string }>(personas: readonly T[]): T[] {
-  return [...personas].sort((a, b) => (personaPrivilegeRank(a) - personaPrivilegeRank(b)) || a.handle.localeCompare(b.handle))
+/** Sort personas lowest-privilege-first via `classifyPersonaPrivilege`, preserving configured order (`configIndex` ASC). */
+export function sortPersonasLowPrivFirst<T extends { handle: string; roleLabel?: string; configIndex?: number }>(personas: readonly T[]): T[] {
+  return personas
+    .map((persona, idx) => ({
+      persona,
+      rank: classifyPersonaPrivilege(persona.handle, persona.roleLabel).rank,
+      configIndex: typeof persona.configIndex === 'number' && Number.isFinite(persona.configIndex) ? persona.configIndex : idx,
+    }))
+    .sort((a, b) => (a.rank - b.rank) || (a.configIndex - b.configIndex))
+    .map(entry => entry.persona)
 }
 
 const PERSISTENT_WORKFLOW_STEP_RE = /\b(?:workflow|business[_ -]?logic|state[_ -]?machine|lifecycle|authz|bola|bfla|idor|abac|broken[_ -]?access[_ -]?control|access[_ -]?control)\b/i

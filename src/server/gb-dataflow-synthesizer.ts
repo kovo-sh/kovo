@@ -374,7 +374,14 @@ function orderPersonasLowPrivFirst(
     effectiveRank(a) - effectiveRank(b)
     || (configIndexByHandle.get(a) ?? Number.MAX_SAFE_INTEGER) - (configIndexByHandle.get(b) ?? Number.MAX_SAFE_INTEGER),
   )
-  const basePersona = handles.find(h => !classifyPersonaPrivilege(h, roleByHandle.get(h)).elevated)
+  const basePersona = (
+    options?.preferMultiTenant
+      ? handles.find(h => classifyPersonaPrivilege(h, roleByHandle.get(h)).multiTenant)
+      : undefined
+  ) ?? handles.find(h => {
+    const priv = classifyPersonaPrivilege(h, roleByHandle.get(h))
+    return !priv.elevated && !priv.revokedStale && !priv.multiTenant
+  })
   return { ordered: handles.slice(0, 5), ...(basePersona ? { basePersona } : {}) }
 }
 
