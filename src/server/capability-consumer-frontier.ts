@@ -18,13 +18,10 @@ import { classifyPersonaPrivilege } from './assignment-brief.ts'
 import {
   CAPABILITY_KINDS,
   DERIVED_CAPABILITY_HANDLE_RE,
-  computeArtifactDigest,
-  formatDerivedCapabilityHandle,
   sanitizeCheckpointText,
   type CapabilityKind,
   type CapabilityLedger,
   type CapabilityNode,
-  type CapabilitySurface,
   type NegativeEdge,
 } from './capability-ledger.ts'
 import type { ChainHop } from './graph-coordinator.ts'
@@ -339,18 +336,6 @@ export function hasAgenticSealedCapabilities(
   return ledger.listCapabilities().some(isAgenticSealedCapabilityNode)
 }
 
-function classifyHopSurface(hop: ChainHop): CapabilitySurface {
-  if (hop.artifactKind === 'stored_write_handle') return 'browser'
-  if (hop.artifactKind === 'ssrf_redirect_target') return 'webhook'
-  if (hop.artifactKind === 'workflow_state_handle') return 'async_job'
-  const ep = (hop.endpoint ?? '/').toLowerCase()
-  if (/\/(?:graphql|gql)\b/.test(ep)) return 'graphql'
-  if (/\/(?:webhooks?|hooks?|callback)\b/.test(ep)) return 'webhook'
-  if (/\/(?:jobs?|exports?|tasks?|builds?|pipelines?|runs?|async)\b/.test(ep)) return 'async_job'
-  if (/\/(?:storage|files?|artifacts?|downloads?|uploads?|media)\b/.test(ep)) return 'storage'
-  return 'http'
-}
-
 function resolveHopCapabilityKind(hop: ChainHop, textCorpus: string): CapabilityKind {
   if (hop.artifactKind === 'token_ref') {
     return SIGNING_SECRET_RE.test(textCorpus) ? 'signing_material' : 'scoped_token'
@@ -470,7 +455,7 @@ export function buildHopRuntimeObservationIndex(
 }
 
 /** Sanitize a `ChainHop` identifier so opaque `secret:<factId>` refs never trip raw-secret metadata guards. */
-export function sanitizeLedgerHopId(hopId: string): string {
+function sanitizeLedgerHopId(hopId: string): string {
   return sanitizeCheckpointText(
     hopId.replace(/(?:^|:)(?:secret|jwt|token|key|password|passwd|credential):/gi, ':ref_'),
     120,
@@ -497,61 +482,6 @@ export function inspectChainHopRuntimeObservation(
     ...(cue.secretKind ? { secretKind: cue.secretKind } : {}),
     ...(cue.label ? { label: cue.label } : {}),
   }
-}
-
-/**
- * Sync extracted typed `ChainHop`s into `CapabilityLedger` as quarantined `capability_only` nodes.
- * Strictly marks live agentic runtime-observed hops with `metadata.runtimeObserved = true` ONLY when
- * `llmMode === 'agentic'` and backed by a live non-static agentic fact / 2xx exchange, keeping
- * static/hypothetical projections and `--no-llm` runs isolated under `unscoped_hypothesis`.
- */
-export function syncChainHopsToCapabilityLedger(
-  storage: Store,
-  run: Run,
-  ledger: CapabilityLedger,
-  hops: readonly ChainHop[],
-  options: { llmMode?: FrontierLlmMode; existingFacts?: readonly Fact[] } = {},
-): number {
-  if (!hops.length) return 0
-  const llmMode: FrontierLlmMode = options.llmMode ?? 'deterministic-no-llm'
-  const index = buildHopRuntimeObservationIndex(storage, run.id, llmMode, options.existingFacts)
-
-  let synced = 0
-  for (const hop of hops.slice(0, 32)) {
-    const slot = hop.hopId.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[^A-Za-z0-9]+/, '').slice(0, 56) || 'hop'
-    const capId = formatDerivedCapabilityHandle(`r${hop.roundNo}`, slot)
-    if (ledger.getCapability(capId)) continue
-    const obs = inspectChainHopRuntimeObservation(hop, llmMode, index)
-    try {
-      ledger.addCapability({
-        capId,
-        kind: obs.kindOverride ?? resolveHopCapabilityKind(hop, `${hop.summary} ${hop.endpoint ?? ''}`),
-        promotionStatus: 'capability_only',
-        provenance: hop.verified ? 'derived_hop' : 'runtime_discovery',
-        tenantScope: obs.runtimeObserved ? 'runtime_observed' : 'unscoped_hypothesis',
-        actorPersona: hop.persona ?? 'attacker',
-        serviceOrigin: hop.origin,
-        surface: classifyHopSurface(hop),
-        parentHopReceiptIds: hop.verified ? [obs.safeHopId] : [],
-        artifactDigest: computeArtifactDigest(`${hop.hopId}|${hop.origin}|${hop.artifactRef}`),
-        artifactSummary: sanitizeCheckpointText(hop.summary, 220),
-        metadata: {
-          hopId: obs.safeHopId,
-          roundNo: hop.roundNo,
-          ...(obs.runtimeObserved ? { runtimeObserved: true } : {}),
-          ...(obs.exchangeId ? { exchangeId: obs.exchangeId } : {}),
-          ...(hop.endpoint ? { endpoint: hop.endpoint } : {}),
-          ...(hop.method ? { method: hop.method } : {}),
-          ...(hop.factIds[0] ? { factId: hop.factIds[0] } : {}),
-          ...(obs.fieldName ? { fieldName: obs.fieldName } : {}),
-          ...(obs.secretKind ? { secretKind: obs.secretKind } : {}),
-          ...(obs.label ? { label: obs.label } : {}),
-        },
-      })
-      synced += 1
-    } catch { /* ignore invalid/duplicate/secret-rejected hop mirrors */ }
-  }
-  return synced
 }
 
 /** Generically classify a capability into one of the four structural frontier shapes. */
