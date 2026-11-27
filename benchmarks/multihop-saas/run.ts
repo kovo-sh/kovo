@@ -362,6 +362,7 @@ export interface ProductTwinDecoy {
   enforcedAtHopId: string
   note: string
   endpoints: HardenedTwinEndpoint[]
+  postEnforcementEndpoints?: Array<{ method: string; path: string; routeKey: string; hopId: string }>
 }
 
 export interface MultihopProductBriefing {
@@ -672,6 +673,40 @@ function resolveTwinEndpoints(
   return out
 }
 
+function resolveTwinPostEnforcementEndpoints(
+  twin: TwinSpec,
+  chain: ChainSpec | undefined,
+  apiReference: readonly ApiRef[] | undefined,
+  decoyEndpoints: readonly HardenedTwinEndpoint[],
+): Array<{ method: string; path: string; routeKey: string; hopId: string }> {
+  if (!chain || !apiReference?.length) return []
+  const enforcedIdx = chain.hops.findIndex((h) => h.hopId === twin.enforcedAtHopId)
+  if (enforcedIdx < 0) return []
+  const byRouteKey = new Map<string, ApiRef>()
+  for (const ref of apiReference) byRouteKey.set(ref.routeKey, ref)
+  const decoyKeys = new Set(
+    decoyEndpoints.map((ep) => `${ep.method.toUpperCase()} ${normalizeEndpointPath(ep.path)}`),
+  )
+  const out: Array<{ method: string; path: string; routeKey: string; hopId: string }> = []
+  const seen = new Set<string>()
+  const addRouteKey = (routeKey: string, hopId: string): void => {
+    for (const ref of resolveRouteKeyRefs(routeKey, byRouteKey)) {
+      const method = ref.method.toUpperCase()
+      const key = `${method} ${normalizeEndpointPath(ref.path)}`
+      if (decoyKeys.has(key) || seen.has(key)) continue
+      seen.add(key)
+      out.push({ method, path: ref.path, routeKey, hopId })
+    }
+  }
+  const postHops = chain.hops.slice(enforcedIdx + 1)
+  for (const hop of postHops) addRouteKey(hop.routeKey, hop.hopId)
+  const lastHop = postHops[postHops.length - 1]
+  if (chain.terminal.routeKey && (!lastHop || chain.terminal.routeKey !== lastHop.routeKey)) {
+    addRouteKey(chain.terminal.routeKey, lastHop?.hopId ?? chain.id)
+  }
+  return out
+}
+
 function buildProductTwinDecoys(
   twins: readonly TwinSpec[],
   chains: readonly ChainSpec[],
@@ -681,6 +716,8 @@ function buildProductTwinDecoys(
   const chosen = selectedTwinId ? twins.filter((t) => t.id === selectedTwinId) : twins
   return chosen.map((twin) => {
     const baseChain = chains.find((c) => c.id === twin.baseChainId)
+    const endpoints = resolveTwinEndpoints(twin, baseChain, apiReference)
+    const postEnforcementEndpoints = resolveTwinPostEnforcementEndpoints(twin, baseChain, apiReference, endpoints)
     return {
       twinId: twin.id,
       chainId: twin.baseChainId,
@@ -689,7 +726,8 @@ function buildProductTwinDecoys(
       benignHopIds: [...twin.decoyHopIds],
       enforcedAtHopId: twin.enforcedAtHopId,
       note: twin.note,
-      endpoints: resolveTwinEndpoints(twin, baseChain, apiReference),
+      endpoints,
+      postEnforcementEndpoints,
     }
   })
 }
@@ -793,7 +831,6 @@ function findingMatchesTwin(
   const baseChainMatches = finding.chainId === twin.baseChainId
 
   if (options.isTwinMode && (baseChainMatches || vulnMatches)) return true
-  if (!options.baseChainConfirmed && (baseChainMatches || vulnMatches)) return true
   return false
 }
 
@@ -1250,6 +1287,56 @@ function resolveReceiptChainId(
   return bestChainId
 }
 
+function receiptReachesPostEnforcement(
+  receipt: ProductSubmittedCompositeProof,
+  decoy: ProductTwinDecoy,
+): boolean {
+  const postTemplates = decoy.postEnforcementEndpoints
+  if (!postTemplates?.length) return false
+  if (!receipt.confirmed || !receipt.attackerProvenanceValid || receipt.replayMode !== 'fresh_clean_replay') {
+    return false
+  }
+  const hops = receipt.receipt?.hops
+  if (receipt.hopCount < 2 || (hops !== undefined && hops.length < 2)) {
+    return false
+  }
+  const terminalHopId = receipt.receipt?.terminalImpact?.terminalHopId
+  const terminalHop = hops?.length
+    ? ((terminalHopId ? hops.find((h) => h.hopId === terminalHopId) : undefined) ?? hops[hops.length - 1])
+    : undefined
+
+  const terminalCandidates: ParsedEndpointCandidate[] = []
+  const seen = new Set<string>()
+  const addCandidate = (rawPath: string | null | undefined, explicitMethod?: string | null): void => {
+    const parsed = parseEndpointCandidate(rawPath, explicitMethod)
+    if (!parsed) return
+    const key = `${parsed.method ?? '*'} ${parsed.path}`
+    if (seen.has(key)) return
+    seen.add(key)
+    terminalCandidates.push(parsed)
+  }
+  addCandidate(receipt.verification?.terminalEndpoint, terminalHop?.target?.method)
+  addCandidate(terminalHop?.target?.pathAndQuery, terminalHop?.target?.method)
+
+  const matchesPost = (candidates: readonly ParsedEndpointCandidate[]): boolean =>
+    candidates.some((cand) => postTemplates.some((tmpl) => endpointMatchesTemplate(cand, tmpl)))
+
+  if (matchesPost(terminalCandidates)) return true
+
+  // Post-mutation GET readback tail (e.g. NX-C1 h1-h4 ending in PATCH /v1/scim/users/:id -> GET /v1/me):
+  // require >= 3 hops so at least one upstream hop remains before the penultimate mutation hop.
+  if (hops && hops.length >= 3) {
+    const lastHop = hops[hops.length - 1]!
+    const penultimateHop = hops[hops.length - 2]!
+    const lastParsed = parseEndpointCandidate(lastHop.target?.pathAndQuery, lastHop.target?.method)
+    const penultimateCand = parseEndpointCandidate(penultimateHop.target?.pathAndQuery, penultimateHop.target?.method)
+    if (lastParsed?.method === 'GET' && penultimateCand && matchesPost([penultimateCand])) {
+      return true
+    }
+  }
+  return false
+}
+
 function gradeProductRun(input: ProductGradeInput): ProductScorecard {
   const gt = input.groundTruth
   const oracleExport = input.oracleExport ?? groundTruthOracleMap.get(gt)?.()
@@ -1483,6 +1570,20 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
     }
   }
 
+  const confirmedModeAReceiptsByFindingId = new Map<string, ProductSubmittedCompositeProof[]>()
+  for (const receipt of receipts) {
+    if (
+      receipt.findingId
+      && receipt.confirmed
+      && receipt.attackerProvenanceValid
+      && receipt.replayMode === 'fresh_clean_replay'
+    ) {
+      const list = confirmedModeAReceiptsByFindingId.get(receipt.findingId) ?? []
+      list.push(receipt)
+      confirmedModeAReceiptsByFindingId.set(receipt.findingId, list)
+    }
+  }
+
   const resolvedTwins = resolveProductTwins(gt)
   const twinClaimFindingIds = new Set<string>()
   const hardenedTwins: ProductTwinVerdict[] = resolvedTwins.map((decoy) => {
@@ -1503,8 +1604,11 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
         // Vulnerable-mode shortcut on the base chain is a strict precision/shortcut FP, not a hardened twin hit.
         continue
       }
+      // In vulnerable mode, hardened twin profiles are NOT active; only attribute a receipt to a twin
+      // when the twin profile is actually running (`isTwinMode`) or the receipt explicitly claims `decoy.twinId`.
+      // Unconfirmed base-chain receipts in vulnerable mode stay strict unmatched FPs (precision penalty preserved).
       const receiptMatchesTwin = receipt.chainId === decoy.twinId
-        || ((receipt.chainId === decoy.baseChainId || matchedBaseChain) && (isTwinMode || !baseChainConfirmed))
+        || ((receipt.chainId === decoy.baseChainId || matchedBaseChain) && isTwinMode)
       if (receiptMatchesTwin) {
         if (!matchedIds.includes(receiptId)) matchedIds.push(receiptId)
         twinClaimFindingIds.add(receiptId)
@@ -1518,38 +1622,54 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
       if (!isTwinMode && confirmedFindingIds.has(id)) continue
       if (matchedIds.includes(id)) continue
       if (
-        !isTwinMode
-        && baseChainConfirmed
+        gt.labMode === 'vulnerable'
+        && !isTwinMode
         && f.twinId !== decoy.twinId
         && f.chainId !== decoy.twinId
       ) {
-        // Vulnerable mode with the base chain already two-side confirmed: exempt ONLY a verified
-        // duplicate Mode-A composite receipt resolving to `decoy.baseChainId` (ignoring self-declared
-        // `f.chainId` and never exempting findings matching any decoy endpoint outside the base chain's
-        // own templates or hitting decoy's enforced terminal without a confirmed base receipt).
-        const receiptConfirmedBase = Boolean(
+        // Vulnerable mode (twin profile is NOT active): exempt ONLY findings backed by a verified
+        // Mode-A composite receipt that genuinely proves either:
+        //  (a) a duplicate of an already two-side confirmed base chain (`decoy.baseChainId`), OR
+        //  (b) a post-enforcement vulnerable hop of `decoy.baseChainId` (strictly past `enforcedAtHopId`,
+        //      unreachable when the hardened twin profile is running — e.g. NX-C1 h4 PATCH /scim/users/:id
+        //      or PG-C3 h5 export download).
+        // Self-declared / unverified findings and decoy-hop-only findings are NEVER exempted, and exempted
+        // findings remain strict `unmatchedFalsePositives` so precision is never weakened.
+        const receiptConfirmedBase = baseChainConfirmed && Boolean(
           confirmedReceiptChainsByFindingId.get(id)?.has(decoy.baseChainId)
           || (f.id && confirmedReceiptChainsByFindingId.get(f.id)?.has(decoy.baseChainId))
           || (f.findingId && confirmedReceiptChainsByFindingId.get(f.findingId)?.has(decoy.baseChainId)),
         )
-        const eps = findingEndpoints(f)
-        const baseSpecTemplates = baseChainSpec
-          ? [...baseChainSpec.terminalEndpoints, ...baseChainSpec.upstreamHopEndpoints]
-          : []
-        const hitsDecoyOutsideBase = decoy.endpoints.some((twinEp) => {
-          const twinParsed = parseEndpointCandidate(twinEp.path, twinEp.method)
-          const inBaseSpec = Boolean(
-            twinParsed && baseSpecTemplates.some((tmpl) => endpointMatchesTemplate(twinParsed, tmpl)),
-          )
-          if (inBaseSpec) return false
-          return eps.some((ep) => {
-            const epMethod = ep.method?.trim().toUpperCase()
-            if (epMethod && twinEp.method && epMethod !== twinEp.method.toUpperCase()) return false
-            return pathMatchesTemplate(ep.path, twinEp.path)
+        const findingModeAReceipts = [
+          ...(confirmedModeAReceiptsByFindingId.get(id) ?? []),
+          ...(f.id && f.id !== id ? (confirmedModeAReceiptsByFindingId.get(f.id) ?? []) : []),
+          ...(f.findingId && f.findingId !== id && f.findingId !== f.id
+            ? (confirmedModeAReceiptsByFindingId.get(f.findingId) ?? [])
+            : []),
+        ]
+        const receiptProvesPostEnforcementBaseHop = findingModeAReceipts.some(
+          (r) => receiptReachesPostEnforcement(r, decoy),
+        )
+        if (receiptConfirmedBase || receiptProvesPostEnforcementBaseHop) {
+          const eps = findingEndpoints(f)
+          const baseSpecTemplates = baseChainSpec
+            ? [...baseChainSpec.terminalEndpoints, ...baseChainSpec.upstreamHopEndpoints]
+            : []
+          const hitsDecoyOutsideBase = decoy.endpoints.some((twinEp) => {
+            const twinParsed = parseEndpointCandidate(twinEp.path, twinEp.method)
+            const inBaseSpec = Boolean(
+              twinParsed && baseSpecTemplates.some((tmpl) => endpointMatchesTemplate(twinParsed, tmpl)),
+            )
+            if (inBaseSpec) return false
+            return eps.some((ep) => {
+              const epMethod = ep.method?.trim().toUpperCase()
+              if (epMethod && twinEp.method && epMethod !== twinEp.method.toUpperCase()) return false
+              return pathMatchesTemplate(ep.path, twinEp.path)
+            })
           })
-        })
-        if (receiptConfirmedBase && !hitsDecoyOutsideBase) {
-          continue
+          if (!hitsDecoyOutsideBase) {
+            continue
+          }
         }
       }
       if (isVulnerableShortcutBase) {
@@ -1619,6 +1739,13 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
         countedFindingIds.add(id)
         unmatchedFalsePositives += 1
       }
+    }
+    for (const receipt of receipts) {
+      if (!receipt.confirmed) continue
+      const id = receipt.findingId ?? `receipt:${receipt.chainId}`
+      if (countedFindingIds.has(id) || confirmedFindingIds.has(id) || twinClaimFindingIds.has(id)) continue
+      countedFindingIds.add(id)
+      unmatchedFalsePositives += 1
     }
   }
 

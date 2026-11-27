@@ -325,10 +325,13 @@ export async function handleBilling(
     order.captureSeq = treasuryCapture ? order.captureSeq + 1 : seen + 1
     order.settled = true
     order.status = 'settled'
+    const creditCents = Number.isFinite(order.amountCents) && order.amountCents > 0
+      ? order.amountCents
+      : state.plan.economics.raceCreditCents
     state.ledger.push({
       id: `mh_led_${state.ledger.length + 1}`,
       tenantId: order.tenantId,
-      amountCents: state.plan.economics.raceCreditCents,
+      amountCents: creditCents,
       memo: `capture:${order.id}`,
       runId,
       ts: Date.now(),
@@ -339,7 +342,7 @@ export async function handleBilling(
         tenantId: order.tenantId,
         credits: order.captureSeq,
         expectedCredits: 1,
-        creditedCents: state.plan.economics.raceCreditCents * order.captureSeq,
+        creditedCents: creditCents * order.captureSeq,
         sessionDigest: digest(session.token),
         runId,
       }, session.originPersona)
