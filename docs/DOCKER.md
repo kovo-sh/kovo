@@ -73,7 +73,7 @@ newgrp docker -c 'bash scripts/docker-compose-smoke.sh'
 
 ## Releasing a versioned tag (human-approved)
 
-Versioned releases are triggered via [`.github/workflows/release.yml`](../.github/workflows/release.yml) and gated by the GitHub **`release`** Protected Environment (Settings → Environments → `release` → Required reviewers). Direct `git push origin v*` tag pushes do **not** publish versioned container images.
+Versioned releases are triggered via [`.github/workflows/release.yml`](../.github/workflows/release.yml) and gated by the GitHub **`release`** Protected Environment (`RELEASE_APP_ID` + `RELEASE_APP_PRIVATE_KEY` environment secrets) plus a `v*` Tag Ruleset (`Restrict creations`, `Restrict updates`, `Restrict deletions`, bypassed only by the release GitHub App). Direct `git push origin v*` tag pushes are blocked and cannot publish versioned container images.
 
 1. Kick off the release workflow from the GitHub Actions UI (**Release Kovo → Run workflow**) or via CLI:
 
@@ -84,5 +84,5 @@ Versioned releases are triggered via [`.github/workflows/release.yml`](../.githu
    ```
 
 2. The **`prepare`** job validates the semver string, confirms the commit is on `main`, checks that `Verify Kovo` passed on that exact SHA, ensures the tag does not already exist, and posts a release preview in the workflow summary.
-3. The **`approve`** job pauses on the `release` environment until a required reviewer clicks **Review deployments → Approve and deploy**.
-4. Once approved, the workflow builds and publishes multi-arch `kovo` and `kovo-worker` images with SBOMs and provenance attestations, pushes the annotated `vX.Y.Z` git tag, and creates the GitHub Release with the published manifest digests.
+3. The **`approve-and-tag`** job pauses on the `release` environment until a required reviewer clicks **Review deployments → Approve and deploy**, then mints a short-lived `contents: write` token from the release GitHub App and pushes the annotated `vX.Y.Z` tag.
+4. Once tagged, **`publish-containers`** builds and publishes multi-arch `kovo` and `kovo-worker` images with SBOMs and provenance attestations, and **`publish-release`** creates the GitHub Release with the published manifest digests.

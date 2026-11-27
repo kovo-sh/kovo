@@ -165,63 +165,48 @@ jobs:
             echo "minor_tag=${minor_tag}"
           } >> "$GITHUB_OUTPUT"
 
-  approve:
-    name: Human release approval
+  approve-and-tag:
+    name: Human release approval & push tag
     needs: [prepare]
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     environment: release
     permissions:
       contents: read
     steps:
-      - name: Record approval
+      - name: Verify release GitHub App secrets are configured
         env:
-          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
-          PUBLISH_LATEST: ${{ needs.prepare.outputs.publish_latest }}
+          HAS_APP_ID: ${{ secrets.RELEASE_APP_ID != '' }}
+          HAS_APP_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY != '' }}
         run: |
           set -euo pipefail
-          echo "Release ${RELEASE_VERSION} (${RELEASE_SHA}) approved via protected 'release' environment."
-          {
-            echo "## Approval granted"
-            echo ""
-            echo "- **Version:** \`${RELEASE_VERSION}\`"
-            echo "- **Commit:** \`${RELEASE_SHA}\`"
-            echo "- **Updates \`:latest\`:** \`${PUBLISH_LATEST}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$HAS_APP_ID" != "true" || "$HAS_APP_KEY" != "true" ]]; then
+            echo "::error::Missing RELEASE_APP_ID or RELEASE_APP_PRIVATE_KEY in the 'release' GitHub Environment secrets. See docs/DOCKER.md for setup."
+            exit 1
+          fi
 
-  publish-containers:
-    name: Build & publish multi-arch containers
-    needs: [prepare, approve]
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
-    uses: ./.github/workflows/docker-publish.yml
-    with:
-      release_tag: ${{ needs.prepare.outputs.version }}
-      ref: ${{ needs.prepare.outputs.sha }}
-      publish_latest: ${{ needs.prepare.outputs.publish_latest == 'true' }}
+      - name: Mint short-lived release tagger GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
 
-  tag-and-release:
-    name: Push git tag & publish GitHub Release
-    needs: [prepare, approve, publish-containers]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
       - name: Checkout release commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
 
-      - name: Create and push git tag
+      - name: Create and push annotated git tag
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
           RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          PUBLISH_LATEST: ${{ needs.prepare.outputs.publish_latest }}
         run: |
           set -euo pipefail
           git fetch --tags origin
@@ -236,11 +221,41 @@ jobs:
             exit 1
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "kovo-release-bot[bot]"
+          git config user.email "kovo-release-bot[bot]@users.noreply.github.com"
           git tag -a "$RELEASE_VERSION" "$RELEASE_SHA" -m "Release ${RELEASE_VERSION}"
           git push origin "refs/tags/${RELEASE_VERSION}"
 
+          {
+            echo "## Approval granted & tag pushed"
+            echo ""
+            echo "- **Version:** \`${RELEASE_VERSION}\`"
+            echo "- **Commit:** \`${RELEASE_SHA}\`"
+            echo "- **Updates \`:latest\`:** \`${PUBLISH_LATEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-containers:
+    name: Build & publish multi-arch containers
+    needs: [prepare, approve-and-tag]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      release_tag: ${{ needs.prepare.outputs.version }}
+      ref: ${{ needs.prepare.outputs.sha }}
+      publish_latest: ${{ needs.prepare.outputs.publish_latest == 'true' }}
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [prepare, approve-and-tag, publish-containers]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -254,8 +269,8 @@ jobs:
           set -euo pipefail
           owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
 
-          if gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
-            release_url="$(gh release view "$RELEASE_VERSION" --json url --jq .url)"
+          if gh release view "$RELEASE_VERSION" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            release_url="$(gh release view "$RELEASE_VERSION" --repo "${GITHUB_REPOSITORY}" --json url --jq .url)"
             echo "GitHub Release ${RELEASE_VERSION} already exists: ${release_url}"
             exit 0
           fi
@@ -282,6 +297,7 @@ jobs:
 
           ARGS=(
             "$RELEASE_VERSION"
+            --repo "${GITHUB_REPOSITORY}"
             --verify-tag
             --title "$RELEASE_VERSION"
             --notes-file /tmp/release-notes.md
