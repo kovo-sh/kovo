@@ -5552,15 +5552,16 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const missionKind = parentChainHops.length > 0 && input.step.dependsOnFactIds.length > 0
         ? 'chain_step_2'
         : this.missionKindForStep(input.step, Boolean(parentDetLead))
-      // v7 whitebox hop: the persisted slice for this assignment's route reaches the brief.
-      // Compact by default; only chain / 4-hop assignments pay for the expanded slice.
+      // v7/v8: wire multi-origin & CapabilityLedger counts so grey-box briefs receive Mode-A proof contracts.
+      // Compact by default; chains, multi-origin/ledger runs, and multi-persona 4-hop slices expand to full.
+      const publicOrigins = [...new Set([...input.targetOrigins, ...input.run.candidates.filter(c => input.run.approved.includes(c.id)).map(c => c.origin)])]
+      const ledger = this.storage.capabilityLedger(input.run.id)
+      const sealedCapabilityCount = ledger.listCapabilities().length
       const codeSlice = this.host.codeSliceForAssignment(input.run, input.step, input.parentFacts)
       const codeExpansion: 'compact' | 'full' = missionKind === 'chain_step_2' ||
-        input.step.dependsOnStepIds.length > 0 ||
-        parentChainHops.length > 0 ||
-        (codeSlice?.hops.length ?? 0) >= 4
-        ? 'full'
-        : 'compact'
+        input.step.dependsOnStepIds.length > 0 || parentChainHops.length > 0 || publicOrigins.length >= 2 ||
+        sealedCapabilityCount > 0 || ((codeSlice?.hops.length ?? 0) >= 4 && input.personas.length > 0)
+        ? 'full' : 'compact'
       // Exact control/variant actors for the differential: low-privilege-first order so the
       // default/starting persona is always the lowest-privilege actor when one exists.
       const tierAPersonas = sortPersonasLowPrivFirst(input.personas)
@@ -5594,18 +5595,15 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         ?? parentChainHops.map(h => h.artifactRef).find(ref => ref.startsWith('cap:hop_'))
         ?? null
       let hopCheckpoint: HopCheckpointBrief | undefined
-      if (checkpointCapId) {
-        const ledger = this.storage.capabilityLedger(input.run.id)
-        if (ledger.getCapability(checkpointCapId)) {
-          hopCheckpoint = ledger.buildHopCheckpointBrief(checkpointCapId, MAX_CHECKPOINT_BRIEF_BYTES, {
-            ...(persistedBrief?.branchKey ? { branchKey: persistedBrief.branchKey } : {}),
-            ...(persistedBrief?.evi !== undefined ? { evi: persistedBrief.evi } : {}),
-            ...(persistedBrief?.mode ? { mode: persistedBrief.mode } : {}),
-            ...(persistedBrief?.fuseWithBranchKey ? { fuseWithBranchKey: persistedBrief.fuseWithBranchKey } : {}),
-            ...(persistedBrief?.nextGoal ? { nextGoal: persistedBrief.nextGoal } : {}),
-            ...(persistedBrief?.workflowNotebook ? { workflowNotebook: persistedBrief.workflowNotebook } : {}),
-          })
-        }
+      if (checkpointCapId && ledger.getCapability(checkpointCapId)) {
+        hopCheckpoint = ledger.buildHopCheckpointBrief(checkpointCapId, MAX_CHECKPOINT_BRIEF_BYTES, {
+          ...(persistedBrief?.branchKey ? { branchKey: persistedBrief.branchKey } : {}),
+          ...(persistedBrief?.evi !== undefined ? { evi: persistedBrief.evi } : {}),
+          ...(persistedBrief?.mode ? { mode: persistedBrief.mode } : {}),
+          ...(persistedBrief?.fuseWithBranchKey ? { fuseWithBranchKey: persistedBrief.fuseWithBranchKey } : {}),
+          ...(persistedBrief?.nextGoal ? { nextGoal: persistedBrief.nextGoal } : {}),
+          ...(persistedBrief?.workflowNotebook ? { workflowNotebook: persistedBrief.workflowNotebook } : {}),
+        })
       }
       if (!hopCheckpoint && persistedBrief) {
         hopCheckpoint = finalizeHopCheckpointBrief(persistedBrief, MAX_CHECKPOINT_BRIEF_BYTES).brief
@@ -5649,6 +5647,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           : {}),
         ...(codeSlice ? { codeSlice, codeExpansion } : {}),
         ...(hopCheckpoint ? { hopCheckpoint } : {}),
+        ...(publicOrigins.length >= 2 ? { publicOrigins } : {}),
+        ...(sealedCapabilityCount > 0 ? { sealedCapabilityCount } : {}),
         // Explicit proof obligation for a white-box assignment or a typed multi-round chain step.
         ...(codeSlice
           ? {

@@ -3,11 +3,11 @@ Tags: multihop, hop-checkpoint, composite-receipt, derived-custody, async-pivot
 Summary: Verify N-hop CompositeProofReceipt chains via ctx.chain, seal_capability, hmac_sign/jwt_sign, await_async, prove_composite.
 
 ## 1. Quick-Reference Contract
-1. **Origin:** ONE low-priv persona (`actor_low`/`actor_dual`, NEVER `actor_victim`/`owner`/`admin`); minted: `kind:"bearer_token"`, `{capability:{handle,target:"bearer"}}`, OMIT `as`.
-2. **Composite:** Prefer `ctx.chain`/`ctx.prove_composite` in ONE script; NEVER stop at stubs or use standalone `prove_race_burst`/`prove_access_boundary`/`prove_persisted_mutation` after setup hops.
-3. **Helpers:** `ctx.seal_capability` (`jsonPath`/`header`/`cookie`/`value`, NEVER `regex`), `ctx.hmac_sign`/`ctx.jwt_sign`, `ctx.await_async`, `ctx.prove_race_burst`.
-4. **Control/Econ:** Denied `role:"control"` pre-Stage 1 (`state_transition_binding`); `economic_conservation`: `baselineReadbackExchangeId`+`finalReadbackExchangeId`.
-5. **DAG/Twins:** Declare EVERY executed causal hop (Hop 1->terminal) in `hops[]`->`terminalHopId` via `causalEdges[]`; `fresh_clean_replay`+`ctx.result`; `invariant_enforced_hardened` if blocked.
+1. **Origin:** Low-priv (`actor_low`/`actor_dual` non-admin tenant; NEVER `actor_victim`/`owner`/`admin`); minted: `kind:"bearer_token"`, `{capability:{handle,target:"bearer"}}`, OMIT `as`.
+2. **One Script:** Explore via `kovo_http`; no seal-only `kovo_verify` — Hop 1->N+`ctx.chain().prove()`/`ctx.prove_composite` in ONE script (no link/token stubs or standalone `prove_*`).
+3. **Helpers:** `ctx.seal_capability` (`jsonPath`/`header`/`cookie`/`value`, no `regex`), `ctx.hmac_sign`/`ctx.jwt_sign`, `ctx.await_async`, `ctx.prove_race_burst`.
+4. **Class/Ablation:** Match `terminalVulnClass` (`dual_tenant_abac` only w/ctrl); ablation=SAME actor as `toHop`; econ: `baselineReadbackExchangeId`+`finalReadbackExchangeId`.
+5. **DAG/Twins:** `causalEdges` (`value_binding|derived_crypto_binding|state_transition_binding|async_pivot_binding`)->`terminalHopId`; `fresh_clean_replay`+`ctx.result`; `invariant_enforced_hardened`.
 
 ## 2. Working from a Pre-Hydrated `hopCheckpoint`
 Your `AssignmentBrief` may include a bounded (`<= 2 KB`) `hopCheckpoint` object:
@@ -55,12 +55,15 @@ A multi-hop finding confirms ONLY when `ctx.prove_composite` verifies a complete
 
 ```ts
 // PREFERRED one-shot Mode-A multi-hop builder (`ctx.chain` auto-wires hops & edges)
-const chain = ctx.chain({ chainId: 'chain-authz-pivot-1', terminalVulnClass: 'dual_tenant_abac' })
-const preDenied = await ctx.http_send('/api/v1/terminal', { as: 'actor_low', role: 'control' })
+// Explore with kovo_http first; NEVER call kovo_verify just to seal a single hop.
+// Pick terminalVulnClass matching actual impact: broken_access_control | privilege_escalation | stale_privilege_use | cross_tenant_export | ledger_overcredit | forged_settlement (only use dual_tenant_abac for cross-tenant ABAC with a terminal denied control).
+const actor = 'actor_low' // low-priv attacker persona; pre-chain/ablation control MUST use the SAME actor as toHop
+const chain = ctx.chain({ chainId: 'chain-authz-pivot-1', terminalVulnClass: 'broken_access_control' })
+const preDenied = await ctx.http_send('/api/v1/terminal', { as: actor, role: 'control' })
 chain.control(preDenied)
 
 const cap1 = await chain.hop('hop_1', { claimedDelta: 'Obtained scoped capability from Hop 1.' }, async () => {
-  const ex1 = await ctx.http_send('/api/v1/resource-meta', { as: 'actor_low', role: 'probe' })
+  const ex1 = await ctx.http_send('/api/v1/resource-meta', { as: actor, role: 'probe' })
   if (!(ex1.status >= 200 && ex1.status < 300)) throw new Error(`Hop 1 failed: ${ex1.status}`)
   return ctx.seal_capability({ exchange: ex1, hopReceiptId: 'hop_1', slot: 'scoped_tok', jsonPath: '$.token', kind: 'bearer_token' })
 })
@@ -73,28 +76,30 @@ await chain.prove({ claimedImpact: 'Unauthorized cross-tenant read confirmed via
 return ctx.result({ title: 'Multi-hop cross-tenant capability pivot' })
 ```
 
-- **Mandatory `ctx.prove_composite` Rule (No Standalone Terminal Helpers After Setup Hops):** ALWAYS finalize with `ctx.chain(...).prove(...)` or `ctx.prove_composite` — **NEVER** call standalone `ctx.prove_race_burst`, `ctx.prove_access_boundary`, or `ctx.prove_persisted_mutation` as your final proof — whenever your verification script executes prerequisite setup hops (e.g., disclosure/extraction, token/session acquisition, parser differential, cache prime, state rebind, or async job polling) before the terminal impact. Even when the terminal hop is a concurrent race burst, execute the race burst inside the chain and wrap ALL prerequisite setup hops plus the terminal race hop inside `ctx.prove_composite` (calling standalone `prove_race_burst` records `hopCount = 0` and fails multi-hop chain confirmation).
+- **Single-Script Mode-A Rule (Never Seal-Only `kovo_verify`):** NEVER call `kovo_verify` just to seal a single hop — explore routes/parameters with `kovo_http` first, then execute Hop 1 -> Hop N + `ctx.chain(...).prove()` (or `ctx.prove_composite`) inside **ONE single script**. **NEVER** call standalone `ctx.prove_race_burst`, `ctx.prove_access_boundary`, or `ctx.prove_persisted_mutation` as your final proof whenever your verification script executes prerequisite setup hops (e.g., disclosure/extraction, token/session acquisition, parser differential, cache prime, state rebind, or async job polling) before the terminal impact. Even when the terminal hop is a concurrent race burst, execute the race burst inside the chain and wrap ALL prerequisite setup hops plus the terminal race hop inside `ctx.prove_composite` (calling standalone `prove_race_burst` records `hopCount = 0` and fails multi-hop chain confirmation).
+- **Terminal Class Matching Rule (Never Hardcode `dual_tenant_abac`):** Set `terminalVulnClass` to the actual terminal impact class (e.g., `broken_access_control`, `privilege_escalation`, `stale_privilege_use`, `cross_tenant_export`, `ledger_overcredit`, `forged_settlement`, `economic_conservation`, `cryptographic_scope_replay`, `parser_cache_differential`, `cross_surface_pivot`); pass `dual_tenant_abac` **ONLY** when genuinely proving cross-tenant ABAC with a terminal denied control.
 - **Complete Causal Hop Declaration Rule (Hop 1 Through Terminal):** Declare **EVERY** causal hop your verification script executed — from Hop 1 (entry disclosure/extraction) through every intermediate pivot, token/invite resolve, parser differential, cache prime, state rebind, signing, or async-poll hop to the terminal hop — in `prove_composite.hops[]` and connect them end-to-end with `causalEdges[]`. Omitting Hop 1 or any intermediate setup hop yields an incomplete receipt even when all hops executed in the transcript.
 - **Strict-CamelCase Inline Schema (`prove_composite`):**
   - `hops[]`: `{ hopId, surface?, target: { origin, method, pathAndQuery }, exchangeIds, claimedDelta, producedCapabilities?, consumedCapabilities? }` — **`target` MUST be `{ origin, method, pathAndQuery }`, NOT a bare string, and `claimedDelta` is required!**
-  - `causalEdges[]`:
+  - `causalEdges[]` (valid `kind` enum: `value_binding | derived_crypto_binding | state_transition_binding | async_pivot_binding`):
     - `kind: 'value_binding'` requires `capabilityHandle` (or `valueDigest`);
-    - `kind: 'state_transition_binding'` requires `entityId` AND `ablationExchangeIds` (baseline exchange proving target fails before the state-mutating hop!);
+    - `kind: 'state_transition_binding'` requires `entityId` AND `ablationExchangeIds` (baseline exchange proving target fails before the state-mutating hop, executed as the **SAME actor/persona as `toHop`** without the upstream prerequisite/capability!);
     - `kind: 'derived_crypto_binding'` requires `sourceCapabilityId`;
     - `kind: 'async_pivot_binding'` requires `correlationId` + `channel`.
   - `terminalImpact`: `{ terminalHopId, claimedImpact, preChainControlExchangeIds, postChainReadbackExchangeIds, oracleInput? }`.
 
 ```ts
 // Mode-A defensive verification shape (all IDs reference host-signed transcript records)
-const preDenied = await ctx.http_send('/api/v1/terminal', { as: 'actor_low', role: 'control' })
-const ex1 = await ctx.http_send('/api/v1/resource-meta', { as: 'actor_low', role: 'probe' })
+const actor = 'actor_low' // SAME low-priv attacker persona for control/ablation and root probe
+const preDenied = await ctx.http_send('/api/v1/terminal', { as: actor, role: 'control' })
+const ex1 = await ctx.http_send('/api/v1/resource-meta', { as: actor, role: 'probe' })
 if (!(ex1.status >= 200 && ex1.status < 300)) throw new Error(`Hop 1 failed: ${ex1.status}`)
 const cap1 = await ctx.seal_capability({ exchange: ex1, hopReceiptId: '1', slot: 'scoped_tok', jsonPath: '$.token', kind: 'bearer_token' })
 const postReadback = await ctx.http_send('/api/v1/terminal', { capability: cap1.handle, role: 'probe' })
 await ctx.prove_composite({
   chainId: 'chain-authz-pivot-1',
-  terminalVulnClass: 'dual_tenant_abac', // canonical terminal class
-  replayMode: 'fresh_clean_replay',      // Mode A mandatory default
+  terminalVulnClass: 'broken_access_control', // match actual terminal impact (dual_tenant_abac ONLY for cross-tenant ABAC w/terminal denied control)
+  replayMode: 'fresh_clean_replay',           // Mode A mandatory default
   hops: [
     {
       hopId: 'hop_1',
@@ -190,17 +195,17 @@ return ctx.result({ title: '4-hop cross-service signing and async export pivot' 
 - Every non-root hop must connect causally via host-signed transcript evidence:
 1. **`value_binding`:** `{ kind: "value_binding", fromHopId, toHopId, capabilityHandle?, valueDigest?, sourceExchangeId?, targetExchangeId? }` — **requires `capabilityHandle` (or `valueDigest`)**: verbatim `cap:hop_<id>:<slot>` handle or `sha256(extractedValue)` observed in Hop `i` output and injected into Hop `j` request (`t_i <= t_j`).
 2. **`derived_crypto_binding`:** `{ kind: "derived_crypto_binding", fromHopId, toHopId, sourceCapabilityId, derivedCapabilityId?, alg? }` — backed by a host-signed `derivedFromCapabilityId` attestation from `ctx.hmac_sign`, `ctx.jwt_sign`, or host-tracked token exchange.
-3. **`state_transition_binding`:** `{ kind: "state_transition_binding", fromHopId, toHopId, entityId, ablationExchangeIds: [cleanAblation.exchangeId], mutationKind? }` — Hop `i` mutates shared entity/cache state without issuing a new token; **requires `entityId` AND `ablationExchangeIds` (baseline exchange proving target fails before the state-mutating hop!)** in a clean session (`cleanSession=true`) (`401`/`403`/`404`/`409`/`412`/`422`), whereas `Hop i -> Hop j` succeeds. **Clean-Control Order Rule:** ALWAYS execute `const cleanAblation = await ctx.http_send('/api/v1/target', { as: 'actor_low', role: 'control', entityId })` **BEFORE** Stage 1 mutates shared/cache state (or against a fresh untouched sibling entity with matching `entityId`) — running the control *after* Stage 1 marks the session dirty (`cleanSession=false`) and fails `state_transition_binding`.
+3. **`state_transition_binding`:** `{ kind: "state_transition_binding", fromHopId, toHopId, entityId, ablationExchangeIds: [cleanAblation.exchangeId], mutationKind? }` — Hop `i` mutates shared entity/cache state without issuing a new token; **requires `entityId` AND `ablationExchangeIds` (baseline exchange proving target fails before the state-mutating hop!)** in a clean session (`cleanSession=true`) (`401`/`403`/`404`/`409`/`412`/`422`), whereas `Hop i -> Hop j` succeeds. **Same-Actor & Clean-Control Order Rule:** The ablation control MUST run as the **SAME actor/persona as `toHop`** (without the upstream prerequisite/capability — never hardcode a different persona!), and ALWAYS execute `const cleanAblation = await ctx.http_send('/api/v1/target', { as: '<same_actor_as_toHop>', role: 'control', entityId })` **BEFORE** Stage 1 mutates shared/cache state (or against a fresh untouched sibling entity with matching `entityId`) — running the control *after* Stage 1 marks the session dirty (`cleanSession=false`) and fails `state_transition_binding`.
 4. **`async_pivot_binding`:** `{ kind: "async_pivot_binding", fromHopId, toHopId, correlationId, channel: "poll_convergence" | "oob_relay" | "browser_trace" | "async_job", pollRecordId? | oobEventId? | browserTraceId? }` — connects trigger Hop `i` to downstream effect Hop `j` with monotonic timestamps (`t_i <= t_j`) and run-scoped correlation.
 
 ### White-Box Single-Script Consolidation (N-Hop Causal Workflows)
-- Once source routes across services are known from code-audit facts, do **not** burn 10–15 turns probing isolated stages one by one. Write **ONE cohesive `kovo_verify` script** that runs:
-  1. **Clean Baseline Control (`role: "control"`):** BEFORE Stage 1 mutates any entity/cache state (or on a fresh untouched sibling entity), record both `preChainControlExchangeIds` and any `state_transition_binding` `ablationExchangeIds`.
+- Once source routes across services are known from code-audit facts, do **not** burn 10–15 turns probing isolated stages one by one. Explore with `kovo_http` first, NEVER call `kovo_verify` just to seal a single hop, and write **ONE cohesive `kovo_verify` script** that runs:
+  1. **Clean Baseline Control (`role: "control"`):** BEFORE Stage 1 mutates any entity/cache state (or on a fresh untouched sibling entity), record both `preChainControlExchangeIds` and any `state_transition_binding` `ablationExchangeIds` under the **SAME actor/persona as `toHop`**.
   2. **N-hop causal chain (Hop 1 -> ... -> terminal hop):** Seal each intermediate capability (`ctx.seal_capability`), bridge signing/token boundaries (`ctx.hmac_sign`/`ctx.jwt_sign`), poll async convergence (`ctx.await_async`), or test concurrent settlement bursts (`ctx.prove_race_burst`) in the same script.
-  3. **Terminal Verification (`ctx.prove_composite`):** Fetch the final foreign-tenant business record or persisted state-mutation readback (`postChainReadbackExchangeIds`) — never stopping at job creation, cache priming, or token/link stubs — then call `ctx.prove_composite` and `return ctx.result(...)`.
+  3. **Terminal Verification (`ctx.chain(...).prove` / `ctx.prove_composite`):** Fetch the final foreign-tenant business record or persisted state-mutation readback (`postChainReadbackExchangeIds`) — never stopping at job creation, cache priming, or token/link stubs — then call `ctx.chain(...).prove(...)` or `ctx.prove_composite` and `return ctx.result(...)`.
 
 ### Attacker-Origin Provenance & Replay Mode Discipline
-- **Attacker-Origin Provenance (Anti-Shortcutting & No Cross-Tenant Probe-Arm Collusion):** ALL probe-arm hops MUST execute strictly under a SINGLE starting low-privilege persona (e.g., `actor_low`, `actor_dual`, or `anonymous` / freshly derived credential), and every subsequent privileged step must use either that same starting persona or a capability derived inside the DAG. NEVER use a pre-seeded privileged/owner persona (`actor_victim`, `admin`) or a target-tenant persona on the probe arm to mint handles or tokens for your starting persona — target-tenant personas may appear ONLY in baseline, negative-control, or independent readback checks.
+- **Attacker-Origin Provenance (Anti-Shortcutting & No Cross-Tenant Probe-Arm Collusion):** ALL probe-arm hops MUST execute strictly under a SINGLE starting low-privilege persona (e.g., `actor_low`, `actor_dual` targeting its non-admin tenant, or `anonymous` / freshly derived credential), and every subsequent privileged step must use either that same starting persona or a capability derived inside the DAG. NEVER use a pre-seeded privileged/owner persona (`actor_victim`, `admin`) or a target-tenant persona on the probe arm to mint handles or tokens for your starting persona — reserve owner/admin personas for baseline/control comparison, and use mixed dual-tenant personas **ONLY** for cross-tenant chains targeting their non-admin tenant!
 - **No Premature Single-Hop Filing:** Never stop at an intermediate single-hop info-disclosure, handle, or directory leak when downstream cross-service, auth, or state-machine pivots are reachable — seal it with `ctx.seal_capability(...)` and continue through downstream hops to `ctx.prove_composite(...)`.
 - **Mode A (`fresh_clean_replay`, mandatory default):** Re-executes the full DAG plus ablation controls in a clean session with fresh nonces. Always design renewable setup/probes so Mode A passes deterministically.
 - **Mode B (`one_shot_transcript`):** Fail-closed fallback permitted only on irreversible non-benchmark production states where Mode A hits a verified consumed-state conflict (`409`/`410`) AND the original signed transcript has pre-chain denied control + 100% unbroken edge bindings + post-chain readback.
