@@ -489,8 +489,56 @@ function isInternalTransferRequest(request: unknown): boolean {
   return INTERNAL_TRANSFER_PAIRS.some(([from, to]) => keys.has(from) && keys.has(to))
 }
 
-export type V8OracleInferenceResult = { kind: 'matched'; family: V8OracleFamily } | { kind: 'ambiguous'; families: V8OracleFamily[] } | { kind: 'unmapped' }
+export type V8OracleInferenceResult = { kind: 'matched'; family: V8OracleFamily } | { kind: 'ambiguous'; families: V8OracleFamily[] } | { kind: 'conflicting'; keys: string[] } | { kind: 'unmapped' }
 const toCamelKey = (key: string): string => key.replace(/[_-]+([a-zA-Z0-9])/g, (_, ch: string) => ch.toUpperCase())
+function sameJsonVal(a: unknown, b: unknown, depth = 0): boolean {
+  if (Object.is(a, b)) return true
+  if (depth > 6 || a == null || b == null || typeof a !== typeof b || typeof a !== 'object') return false
+  if (Array.isArray(a) || Array.isArray(b)) return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => sameJsonVal(x, b[i], depth + 1))
+  const ka = Object.keys(a as Record<string, unknown>).filter(k => !FORBIDDEN_KEYS.has(k)).sort()
+  const kb = Object.keys(b as Record<string, unknown>).filter(k => !FORBIDDEN_KEYS.has(k)).sort()
+  return ka.length === kb.length && ka.every((k, i) => k === kb[i] && sameJsonVal((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k], depth + 1))
+}
+const isPlainRec = (v: unknown): v is Record<string, unknown> => Boolean(v && typeof v === 'object' && !Array.isArray(v))
+function findShallowKeyConflicts(obj: Record<string, unknown>, prefix: string, conflicts: Set<string>): void {
+  const seen = new Map<string, unknown>()
+  for (const [k, v] of Object.entries(obj)) {
+    if (FORBIDDEN_KEYS.has(k) || v === undefined) continue
+    const canon = (k.includes('_') || k.includes('-')) ? toCamelKey(k) : k
+    if (!canon || FORBIDDEN_KEYS.has(canon)) continue
+    if (seen.has(canon)) { if (!sameJsonVal(seen.get(canon), v)) conflicts.add(prefix ? `${prefix}.${canon}` : canon) }
+    else seen.set(canon, v)
+  }
+}
+/** Detect conflicting duplicate values across camelCase/snake_case/kebab-case key spellings (fail-closed). */
+export function findConflictingOracleInputKeys(rawInput: Record<string, unknown>): string[] {
+  const conflicts = new Set<string>()
+  findShallowKeyConflicts(rawInput, '', conflicts)
+  for (const [k, v] of Object.entries(rawInput)) {
+    if (FORBIDDEN_KEYS.has(k) || v == null) continue
+    const canon = (k.includes('_') || k.includes('-')) ? toCamelKey(k) : k
+    if (canon === 'balancesBefore' || canon === 'balancesAfter') continue
+    if (canon === 'hops' && Array.isArray(v)) {
+      v.forEach((item, i) => {
+        if (!isPlainRec(item)) return
+        findShallowKeyConflicts(item, `hops[${i}]`, conflicts)
+        for (const [hk, hv] of Object.entries(item)) {
+          const hc = (hk.includes('_') || hk.includes('-')) ? toCamelKey(hk) : hk
+          if ((hc === 'record' || hc === 'ablationControlDenied') && isPlainRec(hv)) findShallowKeyConflicts(hv, `hops[${i}].${hc}`, conflicts)
+        }
+      })
+    } else if (Array.isArray(v)) {
+      v.forEach((item, i) => { if (isPlainRec(item)) findShallowKeyConflicts(item, `${canon}[${i}]`, conflicts) })
+    } else if (isPlainRec(v)) {
+      findShallowKeyConflicts(v, canon, conflicts)
+      if (canon === 'terminalImpact') for (const [tk, tv] of Object.entries(v)) {
+        const tc = (tk.includes('_') || tk.includes('-')) ? toCamelKey(tk) : tk
+        if (tc === 'postImpactReadback' && isPlainRec(tv)) findShallowKeyConflicts(tv, `terminalImpact.${tc}`, conflicts)
+      }
+    }
+  }
+  return [...conflicts]
+}
 function normalizeShallowRecordKeys(obj: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(obj)) if (!FORBIDDEN_KEYS.has(k)) out[k] = v
@@ -503,8 +551,9 @@ function normalizeShallowRecordKeys(obj: Record<string, unknown>): Record<string
 const normalizeRecordRefValue = (val: unknown): unknown =>
   (!val || typeof val !== 'object' || Array.isArray(val) || ((val as Record<string, unknown>).exchange_id === undefined && (val as Record<string, unknown>).host_signature === undefined)) ? val : normalizeShallowRecordKeys(val as Record<string, unknown>)
 
-/** Normalize top-level and structural sub-object keys (`snake_case`/`kebab-case` -> `camelCase`) without mutating values or balance-map keys. */
+/** Normalize top-level and structural sub-object keys (`snake_case`/`kebab-case` -> `camelCase`) without mutating values or balance-map keys; fails closed (`{}`) on conflicting duplicate keys. */
 export function normalizeV8OracleInputKeys(rawInput: Record<string, unknown>): Record<string, unknown> {
+  if (findConflictingOracleInputKeys(rawInput).length > 0) return {}
   const out = normalizeShallowRecordKeys(rawInput)
   for (const [k, v] of Object.entries(out)) {
     if (k === 'balancesBefore' || k === 'balancesAfter') continue
@@ -534,6 +583,8 @@ const PARSER_CACHE_INF_KEYS = ['cleanControl', 'cleanControlExchangeId', 'differ
 
 /** Authoritative, fail-closed v8 oracle family inference evaluating all 6 families independently. */
 export function inferV8OracleFamilyDetailed(rawInput: Record<string, unknown>): V8OracleInferenceResult {
+  const conflicts = findConflictingOracleInputKeys(rawInput)
+  if (conflicts.length > 0) return { kind: 'conflicting', keys: conflicts }
   const norm = normalizeV8OracleInputKeys(rawInput), hasAny = (keys: readonly string[]) => keys.some(k => norm[k] !== undefined && norm[k] !== null)
   const mode = typeof norm.mode === 'string' ? norm.mode.trim().toLowerCase().replace(/[\s-]+/g, '_') : '', matches: V8OracleFamily[] = []
   if (DUAL_MODE_SET.has(mode) || hasAny(DUAL_ABAC_INF_KEYS)) matches.push('dual_tenant_abac')
@@ -594,7 +645,7 @@ export function hydrateV8OracleInput(
   fallbackSig: string,
   econCtx?: EconomicAutoHydrateContext,
 ): Record<string, unknown> {
-  const out: Record<string, unknown> = {}; rawInput = normalizeV8OracleInputKeys(rawInput)
+  const out: Record<string, unknown> = {}; if (findConflictingOracleInputKeys(rawInput).length > 0) return out; rawInput = normalizeV8OracleInputKeys(rawInput)
   const explicit = new Set<string>()
   const hydrateRole = (field: string, extraAlias?: string): void => {
     if (hydrateRoleField(out, rawInput, field, idx, fallbackSig, extraAlias)) explicit.add(field)
@@ -1194,6 +1245,10 @@ export function resolveV8OracleFamilyOrDiagnostic(
   explicitInput: Record<string, unknown> | undefined,
   legacyInfer?: (input: Record<string, unknown>) => V8OracleFamily | null,
 ): { ok: true; family: V8OracleFamily | null; inferred: boolean } | { ok: false; reason: string; rejectedBy: string; missingEvidence: string[] } {
+  if (explicitInput) {
+    const conflicts = findConflictingOracleInputKeys(explicitInput)
+    if (conflicts.length > 0) return { ok: false, reason: `v8_oracle_failed (conflicting_oracle_input_keys): terminalImpact.oracleInput contains conflicting duplicate values for normalized keys (${conflicts.join(', ')}) — supply each field under a single canonical spelling.`, rejectedBy: 'v8_oracle_conflicting_keys', missingEvidence: ['deduplicated_oracle_input_keys'] }
+  }
   if (oracleFamily) return { ok: true, family: oracleFamily, inferred: false }
   if (V8_VALID_FAMILY_SET.has(normCls)) return { ok: true, family: normCls as V8OracleFamily, inferred: false }
   if (!explicitInput) return { ok: true, family: null, inferred: false }
@@ -1235,12 +1290,38 @@ const dagReachesTerminal = (hops: readonly DagHopLike[], termHopId: string, outA
   return reach
 }
 const isDagExecArm = (e: DagEntryLike, isTerm = false): boolean => e.step.arm === 'probe' || (!isTerm && e.step.arm === 'setup')
+const isStrictHostChrono = (fTs: number, fSeq: number | undefined, tTs: number, tSeq: number | undefined): boolean =>
+  fTs < tTs || (fTs === tTs && typeof fSeq === 'number' && typeof tSeq === 'number' && Number.isFinite(fSeq) && Number.isFinite(tSeq) && fSeq < tSeq)
 const isHighEntropyUrlTok = (raw: string): boolean => {
   const t = raw.trim()
-  if (t.length < 8 || t.length > 2048 || /\s/.test(t) || /\[redacted/i.test(t) || DAG_ISO_DATE_RE.test(t)) return false
+  if (DAG_CAP_RE.test(t)) return true
+  if (t.length < 16 || t.length > 2048 || /\s/.test(t) || /\[redacted/i.test(t) || DAG_ISO_DATE_RE.test(t)) return false
   const c = new Map<string, number>(); for (const ch of t) c.set(ch, (c.get(ch) ?? 0) + 1)
   let h = 0; for (const n of c.values()) { const p = n / t.length; h -= p * Math.log2(p) }
-  return (/\d/.test(t) && /[a-z]/i.test(t) && c.size >= 4 && h >= 2.0) || (t.length >= 16 && c.size >= 8 && h >= 3.0)
+  return c.size >= 8 && h >= 3.0
+}
+function tokenAppearedBeforeSrc<T extends DagEntryLike>(
+  tok: string, digest: string, src: T, allEntries: readonly T[], hostTranscript: DagTranscriptLike<T>,
+  collectDigests: (e: T, side: 'request' | 'response') => Set<string>,
+): boolean {
+  const tl = tok.toLowerCase(), srcTs = src.timestampMs!
+  if (collectDigests(src, 'request').has(digest) || entryCarriesRequestToken(src, tok) || src.entityId?.trim().toLowerCase() === tl || src.correlationIds?.some(c => c.trim().toLowerCase() === tl)) return true
+  for (const other of allEntries) {
+    if (other.exchangeId === src.exchangeId) continue
+    if (isFiniteTs(other.timestampMs) && isStrictHostChrono(srcTs, src.seq, other.timestampMs, other.seq)) continue
+    if (other.entityId?.trim().toLowerCase() === tl || other.correlationIds?.some(c => c.trim().toLowerCase() === tl)) return true
+    if (collectDigests(other, 'request').has(digest) || collectDigests(other, 'response').has(digest) || entryCarriesRequestToken(other, tok)) return true
+    if (typeof other.step.body === 'string' && other.step.body.includes(tok)) return true
+  }
+  for (const o of hostTranscript.oobEvents ?? []) {
+    if (isFiniteTs(o.receivedAtMs) && o.receivedAtMs > srcTs) continue
+    if ([o.token, o.canaryId, o.callbackId, ...(o.correlationIds ?? [])].some(x => x?.trim().toLowerCase() === tl) || (o.observedValueDigests ?? []).some(x => x.toLowerCase() === digest)) return true
+  }
+  for (const tr of hostTranscript.browserTraces ?? []) {
+    if (isFiniteTs(tr.timestampMs) && tr.timestampMs > srcTs) continue
+    if ((tr.correlationIds ?? []).some(x => x.trim().toLowerCase() === tl) || (tr.observedValueDigests ?? []).some(x => x.toLowerCase() === digest)) return true
+  }
+  return false
 }
 
 /** Exclude strictly host-attested non-causal control/baseline/post-readback hops from causal DAG and hopCount. */
@@ -1335,42 +1416,39 @@ export function inferSupplementalHostCausalEdges<H extends DagHopLike, E extends
   if (dagReachesTerminal(receipt.hops, termHopId, outAdj).size === receipt.hops.length) {
     return extra.length === 0 ? { receipt, extraInferredEdges: [] } : { receipt: { ...receipt, causalEdges: [...receipt.causalEdges, ...extra] }, extraInferredEdges: extra }
   }
-  // 2. Single-owner sealed capabilities + Location redirect query/fragment tokens
-  const hopIdx = new Map(receipt.hops.map((h, i) => [h.hopId, i]))
-  const isChrono = (fHop: string, fTs: number, fSeq: number, tHop: string, tTs: number, tSeq: number) =>
-    fHop !== tHop && (fTs < tTs || (fTs === tTs && (fSeq < tSeq || (fSeq === tSeq && (hopIdx.get(fHop) ?? 0) < (hopIdx.get(tHop) ?? 0)))))
-  const capEmitters = new Map<string, Array<{ hopId: string; sourceId: string; isEx: boolean; ts: number; seq: number }>>()
-  const pushCap = (cap: string, em: { hopId: string; sourceId: string; isEx: boolean; ts: number; seq: number }) => {
+  // 2. Single-owner sealed capabilities + opaque first-appearance Location redirect tokens
+  const capEmitters = new Map<string, Array<{ hopId: string; sourceId: string; isEx: boolean; ts: number; seq: number | undefined }>>()
+  const pushCap = (cap: string, em: { hopId: string; sourceId: string; isEx: boolean; ts: number; seq: number | undefined }) => {
     if (!DAG_CAP_RE.test(cap)) return; let l = capEmitters.get(cap); if (!l) { l = []; capEmitters.set(cap, l) }; l.push(em)
   }
   for (const h of receipt.hops) {
     for (const id of h.exchangeIds) {
       if (ownerByEx.get(id) !== h.hopId) continue
       const e = entriesById.get(id); if (!e || !isDagExecArm(e, h.hopId === termHopId) || !isFiniteTs(e.timestampMs)) continue
-      for (const c of [...(e.emittedCapabilities ?? []), ...(e.cryptoAttestations ?? []).map(a => a.derivedCapabilityId).filter((x): x is string => Boolean(x))]) pushCap(c, { hopId: h.hopId, sourceId: id, isEx: true, ts: e.timestampMs, seq: e.seq ?? 0 })
+      for (const c of [...(e.emittedCapabilities ?? []), ...(e.cryptoAttestations ?? []).map(a => a.derivedCapabilityId).filter((x): x is string => Boolean(x))]) pushCap(c, { hopId: h.hopId, sourceId: id, isEx: true, ts: e.timestampMs, seq: e.seq })
     }
-    for (const id of h.oobEventIds) { if (ownerByOob.get(id) !== h.hopId) continue; const o = oobById.get(id); if (o?.delivered && isFiniteTs(o.receivedAtMs)) for (const c of o.emittedCapabilities ?? []) pushCap(c, { hopId: h.hopId, sourceId: id, isEx: false, ts: o.receivedAtMs, seq: -1 }) }
-    for (const id of h.browserTraceIds) { if (ownerByTr.get(id) !== h.hopId) continue; const t = tracesById.get(id); if (t && isFiniteTs(t.timestampMs)) for (const c of t.emittedCapabilities ?? []) pushCap(c, { hopId: h.hopId, sourceId: id, isEx: false, ts: t.timestampMs, seq: -1 }) }
+    for (const id of h.oobEventIds) { if (ownerByOob.get(id) !== h.hopId) continue; const o = oobById.get(id); if (o?.delivered && isFiniteTs(o.receivedAtMs)) for (const c of o.emittedCapabilities ?? []) pushCap(c, { hopId: h.hopId, sourceId: id, isEx: false, ts: o.receivedAtMs, seq: undefined }) }
+    for (const id of h.browserTraceIds) { if (ownerByTr.get(id) !== h.hopId) continue; const t = tracesById.get(id); if (t && isFiniteTs(t.timestampMs)) for (const c of t.emittedCapabilities ?? []) pushCap(c, { hopId: h.hopId, sourceId: id, isEx: false, ts: t.timestampMs, seq: undefined }) }
   }
   for (const toHop of receipt.hops) {
     for (const id of toHop.exchangeIds) {
       if (ownerByEx.get(id) !== toHop.hopId) continue
       const e = entriesById.get(id); if (!e || !isDagExecArm(e, toHop.hopId === termHopId) || !isFiniteTs(e.timestampMs)) continue
-      const act = actorOfEntry(e), toSeq = e.seq ?? 0
+      const act = actorOfEntry(e)
       for (const att of e.cryptoAttestations ?? []) {
         if (DAG_CAP_RE.test(att.derivedFromCapabilityId) && att.artifactDigest && DAG_SHA256_RE.test(att.artifactDigest.toLowerCase())) {
-          const em = (capEmitters.get(att.derivedFromCapabilityId) ?? []).find(x => isChrono(x.hopId, x.ts, x.seq, toHop.hopId, e.timestampMs!, toSeq) && !dagCanReach(outAdj, x.hopId, toHop.hopId))
+          const em = (capEmitters.get(att.derivedFromCapabilityId) ?? []).find(x => x.hopId !== toHop.hopId && isStrictHostChrono(x.ts, x.seq, e.timestampMs!, e.seq) && !dagCanReach(outAdj, x.hopId, toHop.hopId))
           if (em) tryAppend({ kind: 'derived_crypto_binding', fromHopId: em.hopId, toHopId: toHop.hopId, sourceCapabilityId: att.derivedFromCapabilityId, ...(att.derivedCapabilityId && DAG_CAP_RE.test(att.derivedCapabilityId) ? { derivedCapabilityId: att.derivedCapabilityId } : {}) })
         }
       }
       const consumed = new Set<string>([...(e.consumedCapabilities ?? []), ...(act && DAG_CAP_RE.test(act) ? [act] : []), ...(e.cryptoAttestations ?? []).map(a => a.derivedCapabilityId).filter((x): x is string => Boolean(x && DAG_CAP_RE.test(x)))])
       for (const cap of consumed) {
-        const em = (capEmitters.get(cap) ?? []).find(x => isChrono(x.hopId, x.ts, x.seq, toHop.hopId, e.timestampMs!, toSeq) && !dagCanReach(outAdj, x.hopId, toHop.hopId))
+        const em = (capEmitters.get(cap) ?? []).find(x => x.hopId !== toHop.hopId && isStrictHostChrono(x.ts, x.seq, e.timestampMs!, e.seq) && !dagCanReach(outAdj, x.hopId, toHop.hopId))
         if (em) tryAppend({ kind: 'value_binding', fromHopId: em.hopId, toHopId: toHop.hopId, capabilityHandle: cap, ...(em.isEx ? { sourceExchangeId: em.sourceId } : {}), targetExchangeId: id })
       }
     }
   }
-  const reachAfterCap = dagReachesTerminal(receipt.hops, termHopId, outAdj)
+  const reachAfterCap = dagReachesTerminal(receipt.hops, termHopId, outAdj), allTranscriptEntries = hostTranscript.entries ?? []
   for (const fromHop of receipt.hops) {
     if (reachAfterCap.has(fromHop.hopId)) continue
     for (const srcId of fromHop.exchangeIds) {
@@ -1379,14 +1457,14 @@ export function inferSupplementalHostCausalEdges<H extends DagHopLike, E extends
       const loc = Object.entries(src.step.responseHeaders ?? {}).find(([k]) => k.toLowerCase() === 'location')?.[1]?.trim() ?? ''
       if (!loc || (!loc.includes('?') && !loc.includes('#'))) continue
       const toks = new Set<string>(); collectUrlParamTokens(loc, toks)
-      const ownDigs = helpers.collectDigests(src, 'request'), excl = new Set([actorOfEntry(src), src.step.actor.tenant, src.origin].filter((x): x is string => Boolean(x?.trim())).map(x => x.trim().toLowerCase()))
-      const digs = [...toks].filter(t => !excl.has(t.toLowerCase()) && isHighEntropyUrlTok(t)).map(sha256Hex).filter(d => !ownDigs.has(d))
+      const excl = new Set([actorOfEntry(src), src.step.actor.tenant, src.origin].filter((x): x is string => Boolean(x?.trim())).map(x => x.trim().toLowerCase()))
+      const digs = [...toks].filter(t => !excl.has(t.toLowerCase()) && isHighEntropyUrlTok(t)).map(t => ({ t, d: sha256Hex(t) })).filter(({ t, d }) => !tokenAppearedBeforeSrc(t, d, src, allTranscriptEntries, hostTranscript, helpers.collectDigests)).map(({ d }) => d)
       if (digs.length === 0) continue
       for (const toHop of receipt.hops) {
         if (toHop.hopId === fromHop.hopId || dagCanReach(outAdj, fromHop.hopId, toHop.hopId)) continue
         for (const dstId of toHop.exchangeIds) {
           if (ownerByEx.get(dstId) !== toHop.hopId) continue
-          const dst = entriesById.get(dstId); if (!dst || !isDagExecArm(dst, toHop.hopId === termHopId) || !isFiniteTs(dst.timestampMs) || !isChrono(fromHop.hopId, src.timestampMs, src.seq ?? 0, toHop.hopId, dst.timestampMs, dst.seq ?? 0)) continue
+          const dst = entriesById.get(dstId); if (!dst || !isDagExecArm(dst, toHop.hopId === termHopId) || !isFiniteTs(dst.timestampMs) || !isStrictHostChrono(src.timestampMs, src.seq, dst.timestampMs, dst.seq)) continue
           const hit = digs.find(d => helpers.collectDigests(dst, 'request').has(d))
           if (hit && tryAppend({ kind: 'value_binding', fromHopId: fromHop.hopId, toHopId: toHop.hopId, valueDigest: hit, sourceExchangeId: srcId, targetExchangeId: dstId })) break
         }
@@ -1413,23 +1491,23 @@ function inferFixedPointStateTransitions<H extends DagHopLike, E extends DagEdge
       if (fromExs.length === 0) continue
       for (const hopB of receipt.hops.filter(h => h.hopId !== hopA.hopId && reaches.has(h.hopId))) {
         const toExs = hopB.exchangeIds.filter(id => ownerByEx.get(id) === hopB.hopId).map(id => entriesById.get(id)).filter((e): e is T => Boolean(e && isDagExecArm(e, hopB.hopId === termHopId) && is2xx(e.step.status) && isFiniteTs(e.timestampMs)))
-        const pair = fromExs.flatMap(f => toExs.filter(t => f.timestampMs! <= t.timestampMs!).map(t => ({ f, t })))[0]; if (!pair) continue
-        const pairExIds = new Set([...hopA.exchangeIds, ...hopB.exchangeIds]), cands = [...new Set([hopA.entityId, hopB.entityId, pair.f.entityId, pair.t.entityId].filter((x): x is string => Boolean(x?.trim())).map(x => x.trim()))]
-        const sharedEid = cands.find(eid => entryMatchesEntity(pair.f, eid) && entryMatchesEntity(pair.t, eid))
-        const fAct = helpers.probeActorOf(pair.f, capIdx), tAct = helpers.probeActorOf(pair.t, capIdx), toUsesCap = Boolean(actorOfEntry(pair.t)?.startsWith('cap:') || (pair.t.consumedCapabilities?.length ?? 0) > 0 || (pair.t.cryptoAttestations?.length ?? 0) > 0)
-        const sameAct = Boolean((fAct && tAct && fAct === tAct) || (!fAct && !tAct && pair.f.step.actor.auth === pair.t.step.actor.auth))
-        const chosenEid = sharedEid ?? ((sameAct || toUsesCap) ? (cands[0] ?? `state:${fAct ?? tAct ?? hopA.hopId}`) : null); if (!chosenEid) continue
-        const toFam = helpers.normRouteFam(pair.t.step.route ?? pair.t.step.pathAndQuery, chosenEid), logical = !sharedEid
+        const pair = fromExs.flatMap(f => toExs.filter(t => isStrictHostChrono(f.timestampMs!, f.seq, t.timestampMs!, t.seq)).map(t => ({ f, t })))[0]; if (!pair) continue
+        const pairExIds = new Set([...hopA.exchangeIds, ...hopB.exchangeIds])
+        const hostCands = [...new Set([pair.f.entityId, pair.t.entityId].filter((x): x is string => Boolean(x?.trim())).map(x => x.trim()))]
+        const sharedEid = hostCands.find(eid => entryMatchesEntity(pair.f, eid) && entryMatchesEntity(pair.t, eid))
+        if (!sharedEid) continue
+        const toUsesCap = Boolean(actorOfEntry(pair.t)?.startsWith('cap:') || (pair.t.consumedCapabilities?.length ?? 0) > 0 || (pair.t.cryptoAttestations?.length ?? 0) > 0)
+        const toFam = helpers.normRouteFam(pair.t.step.route ?? pair.t.step.pathAndQuery, sharedEid)
         const isCleanAb = (ab: T): boolean => {
           if (pairExIds.has(ab.exchangeId) || (!preCtrlIds.has(ab.exchangeId) && allHopExIds.has(ab.exchangeId)) || ab.cleanSession !== true || (ab.step.arm !== 'control' && ab.replayAttempt !== 'ablation_control') || typeof ab.step.status !== 'number' || !DAG_ABLATION_DENIED_STATUSES.has(ab.step.status)) return false
           const abRaw = actorOfEntry(ab), toRaw = actorOfEntry(pair.t), toAuth = Boolean(toRaw && !ANON_HANDLE_RE.test(toRaw))
           if (abRaw?.startsWith('cap:') && abRaw !== toRaw && !helpers.isLoginCap(abRaw, capIdx)) return false
-          if (!toUsesCap && toAuth && (logical ? !helpers.sameCredIdentity(ab, pair.t, capIdx) : (abRaw !== null && !helpers.sameCredIdentity(ab, pair.t, capIdx)))) return false
-          const sameFam = Boolean(toFam) && helpers.normRouteFam(ab.step.route ?? ab.step.pathAndQuery, ab.entityId ?? chosenEid) === toFam
-          return logical ? sameFam : (entryMatchesEntity(ab, chosenEid) || sameFam)
+          if (!toUsesCap && toAuth && abRaw !== null && !helpers.sameCredIdentity(ab, pair.t, capIdx)) return false
+          const sameFam = Boolean(toFam) && helpers.normRouteFam(ab.step.route ?? ab.step.pathAndQuery, ab.entityId ?? sharedEid) === toFam
+          return entryMatchesEntity(ab, sharedEid) || sameFam
         }
         const ab = allEntries.find(e => preCtrlIds.has(e.exchangeId) && isCleanAb(e)) ?? allEntries.find(e => e.replayAttempt === 'ablation_control' && isCleanAb(e)) ?? allEntries.find(isCleanAb)
-        if (ab && tryAppend({ kind: 'state_transition_binding', fromHopId: hopA.hopId, toHopId: hopB.hopId, entityId: chosenEid, ablationExchangeIds: [ab.exchangeId] })) { changed = true; break }
+        if (ab && tryAppend({ kind: 'state_transition_binding', fromHopId: hopA.hopId, toHopId: hopB.hopId, entityId: sharedEid, ablationExchangeIds: [ab.exchangeId] })) { changed = true; break }
       }
     }
     if (!changed) break

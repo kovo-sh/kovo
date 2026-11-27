@@ -37,7 +37,9 @@ import {
 import type { ImpactStep } from '../src/server/oracle-invariants.ts'
 import '../src/server/terminal-oracle-registry.ts'
 import {
+  findConflictingOracleInputKeys,
   hydrateV8OracleInput,
+  inferSupplementalHostCausalEdges,
   inferV8OracleFamilyDetailed,
   normalizeV8OracleInputKeys,
   type HydratableTranscriptIndex,
@@ -433,16 +435,15 @@ test('Fix 2a: host-verified control & post-chain readback hops do not break dag_
     chainId: 'fix2a-ctrl-and-readback-hops',
     terminalVulnClass: 'privilege_escalation',
     hops: [
-      { hopId: 'hop_0_ctrl', role: 'control', isControl: true, surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/roles/assign' }, exchangeIds: ['dh-ctrl'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Denied pre-chain baseline control', producedCapabilities: [], consumedCapabilities: [] },
+      { hopId: 'hop_0_ctrl', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/roles/assign' }, exchangeIds: ['dh-ctrl'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Denied pre-chain baseline control', producedCapabilities: [], consumedCapabilities: [] },
       { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/invites/accept' }, exchangeIds: ['dh-h1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Accepted invite capability', producedCapabilities: [cap], consumedCapabilities: [] },
       { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/roles/assign' }, exchangeIds: ['dh-h2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Assigned admin role', producedCapabilities: [], consumedCapabilities: [cap] },
-      { hopId: 'hop_3_readback', role: 'readback', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/users/member_a/roles' }, exchangeIds: ['dh-rb'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Verified persisted admin role', producedCapabilities: [], consumedCapabilities: [] },
+      { hopId: 'hop_3_readback', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/users/member_a/roles' }, exchangeIds: ['dh-rb'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Verified persisted admin role', producedCapabilities: [], consumedCapabilities: [] },
     ],
     causalEdges: [{ kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: cap }],
     terminalImpact: {
       terminalHopId: 'hop_2',
       terminalExchangeId: 'dh-h2',
-      controlHopId: 'hop_0_ctrl',
       summary: 'Escalated member role to admin and confirmed persisted state via readback.',
       claimedImpact: 'Escalated member role to admin and confirmed persisted state via readback.',
       preChainControlExchangeIds: [], // intentionally omitted to also verify denied control promotion from hop_0_ctrl
@@ -479,7 +480,7 @@ test('Fix 2b (anti-bypass): control hop cannot inflate 1-hop chain to 2-hop; spo
       chainId: 'fix2b-no-inflate',
       terminalVulnClass: 'dual_tenant_abac',
       hops: [
-        { hopId: 'hop_ctrl', role: 'control', isControl: true, surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/orgs/org_b/secrets' }, exchangeIds: ['ab-ctrl'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Control check', producedCapabilities: [], consumedCapabilities: [] },
+        { hopId: 'hop_ctrl', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/orgs/org_b/secrets' }, exchangeIds: ['ab-ctrl'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Control check', producedCapabilities: [], consumedCapabilities: [] },
         { hopId: 'hop_term', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/orgs/org_b/secrets' }, exchangeIds: ['ab-term'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Read secrets', producedCapabilities: [], consumedCapabilities: [] },
       ],
       causalEdges: [],
@@ -747,4 +748,512 @@ test('Fix 2c: supplemental host-observed causal inference connects oob_relay, br
   }, dtIdx, 'sig')
   assert.equal(hydDt.mode, 'dual_org_cache_bleed')
   assert.equal((hydDt.bledAccess as { id?: string } | undefined)?.id, stH3.exchangeId)
+})
+
+// ============================================================================
+// 3. R3-05 Independent Review Security Class Guards (Must-Fix #1-#5, #7)
+// ============================================================================
+
+test('R3-05 Guard #1 & #2: no entity-less logical state_transition inference; inferred non-cap edges cannot satisfy dual_tenant_abac multiHopDualDag', () => {
+  const dagHelpers = {
+    collectDigests: () => new Set<string>(),
+    normRouteFam: (p: string | null | undefined) => (p ?? '').split('?')[0] ?? '',
+    sameCredIdentity: (a: HostTranscriptEntry, b: HostTranscriptEntry) => (a.actorPersona ?? a.step.actor.handle) === (b.actorPersona ?? b.step.actor.handle),
+    probeActorOf: (e: HostTranscriptEntry) => e.actorPersona ?? e.step.actor.handle ?? null,
+    isLoginCap: () => false,
+  }
+
+  // #1a: inferSupplementalHostCausalEdges MUST NOT fabricate state_transition_binding from worker-only hop.entityId or synthetic state:<actor>
+  const ctrl = signedEntry('g1-ctrl', makeStep({
+    id: 'g1-ctrl', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/v1/orgs/org_b/secrets',
+    json: { error: 'forbidden' },
+  }), { seq: 1, timestampMs: 900, replayAttempt: 'ablation_control' })
+  const orphanWrite = signedEntry('g1-pref', makeStep({
+    id: 'g1-pref', arm: 'probe', method: 'POST', status: 200, pathAndQuery: '/api/v1/preferences',
+    json: { theme: 'dark' },
+  }), { seq: 2, timestampMs: 1000 })
+  const termRead = signedEntry('g1-term', makeStep({
+    id: 'g1-term', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/orgs/org_b/secrets',
+    json: { tenantId: 'org_b', apiKey: 'secret-val-999' },
+  }), { seq: 3, timestampMs: 1100 })
+
+  const noHostEntInf = inferSupplementalHostCausalEdges(
+    {
+      hops: [
+        { hopId: 'hop_1', exchangeIds: ['g1-pref'], oobEventIds: [], browserTraceIds: [], entityId: 'worker_fake_ent' },
+        { hopId: 'hop_2', exchangeIds: ['g1-term'], oobEventIds: [], browserTraceIds: [], entityId: 'worker_fake_ent' },
+      ],
+      causalEdges: [],
+      terminalImpact: { terminalHopId: 'hop_2', preChainControlExchangeIds: ['g1-ctrl'], postChainReadbackExchangeIds: [] },
+    },
+    { entries: [ctrl, orphanWrite, termRead] },
+    dagHelpers,
+  )
+  assert.equal(noHostEntInf.extraInferredEdges.length, 0, 'entity-less same-actor orphan write must not infer state_transition_binding')
+
+  // #1b: Same-ms host-matched shared entity WITHOUT strict host seq ordering MUST NOT infer state_transition_binding
+  const eqH1 = signedEntry('g1-eq-h1', makeStep({
+    id: 'g1-eq-h1', arm: 'probe', method: 'POST', status: 200, pathAndQuery: '/api/v1/items/ent_eq/update',
+    json: { id: 'ent_eq', updated: true },
+  }), { seq: 5, timestampMs: 1000, entityId: 'ent_eq' })
+  const eqH2 = signedEntry('g1-eq-h2', makeStep({
+    id: 'g1-eq-h2', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/orgs/org_b/secrets/ent_eq',
+    json: { id: 'ent_eq', tenantId: 'org_b', secretKey: 'sk-9988' },
+  }), { seq: 5, timestampMs: 1000, entityId: 'ent_eq' })
+  const eqCtrl = signedEntry('g1-eq-ctrl', makeStep({
+    id: 'g1-eq-ctrl', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/v1/orgs/org_b/secrets/ent_eq',
+    json: { error: 'forbidden' },
+  }), { seq: 1, timestampMs: 900, replayAttempt: 'ablation_control', entityId: 'ent_eq' })
+  const eqInf = inferSupplementalHostCausalEdges(
+    {
+      hops: [
+        { hopId: 'hop_1', exchangeIds: ['g1-eq-h1'], oobEventIds: [], browserTraceIds: [] },
+        { hopId: 'hop_2', exchangeIds: ['g1-eq-h2'], oobEventIds: [], browserTraceIds: [] },
+      ],
+      causalEdges: [],
+      terminalImpact: { terminalHopId: 'hop_2', preChainControlExchangeIds: ['g1-eq-ctrl'], postChainReadbackExchangeIds: [] },
+    },
+    { entries: [eqCtrl, eqH1, eqH2] },
+    dagHelpers,
+  )
+  assert.equal(eqInf.extraInferredEdges.length, 0, 'same-ms equal-seq pair must not infer state_transition_binding')
+
+  // Contrast #1c: same-ms host-matched shared entity WITH strictly increasing host seq (5 < 6) DOES infer cleanly
+  const seqOkH2 = signedEntry('g1-eq-h2-ok', makeStep({
+    id: 'g1-eq-h2-ok', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/orgs/org_b/secrets/ent_eq',
+    json: { id: 'ent_eq', tenantId: 'org_b', secretKey: 'sk-9988' },
+  }), { seq: 6, timestampMs: 1000, entityId: 'ent_eq' })
+  const seqOkInf = inferSupplementalHostCausalEdges(
+    {
+      hops: [
+        { hopId: 'hop_1', exchangeIds: ['g1-eq-h1'], oobEventIds: [], browserTraceIds: [] },
+        { hopId: 'hop_2', exchangeIds: ['g1-eq-h2-ok'], oobEventIds: [], browserTraceIds: [] },
+      ],
+      causalEdges: [],
+      terminalImpact: { terminalHopId: 'hop_2', preChainControlExchangeIds: ['g1-eq-ctrl'], postChainReadbackExchangeIds: [] },
+    },
+    { entries: [eqCtrl, eqH1, seqOkH2] },
+    dagHelpers,
+  )
+  assert.equal(seqOkInf.extraInferredEdges.length, 1)
+  assert.equal(seqOkInf.extraInferredEdges[0]!.kind, 'state_transition_binding')
+
+  // #2a: Host-inferred Location-digest value_binding (no capabilityHandle, no explicit causalEdges) MUST NOT satisfy dual_tenant_abac multiHopDualDag
+  const dualActor = { handle: 'dual_user', role: 'member' as const, tenant: 'org_b', auth: 'bearer' as const, sameSite: null }
+  const opaqueTok = 'op_9a8b7c6d5e4f3a2b1c0d'
+  const dCtrl = signedEntry('g2-ctrl', makeStep({
+    id: 'g2-ctrl', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/v1/orgs/org_b/records',
+    actor: dualActor, json: { error: 'forbidden' },
+  }), { seq: 1, timestampMs: 900, actorPersona: 'dual_user', actorRoleLabel: 'admin (org_a); member (org_b)' })
+  const dH1 = signedEntry('g2-h1', makeStep({
+    id: 'g2-h1', arm: 'probe', method: 'GET', status: 302, pathAndQuery: '/api/v1/orgs/org_a/export-start',
+    actor: dualActor, responseHeaders: { location: `/api/v1/orgs/org_b/records?ticket=${opaqueTok}` }, body: '',
+  }), { seq: 2, timestampMs: 1000, actorPersona: 'dual_user', actorRoleLabel: 'admin (org_a); member (org_b)' })
+  const dH2 = signedEntry('g2-h2', makeStep({
+    id: 'g2-h2', arm: 'probe', method: 'GET', status: 200, pathAndQuery: `/api/v1/orgs/org_b/records?ticket=${opaqueTok}`,
+    actor: dualActor, json: { tenantId: 'org_b', confidentialRecord: 'secret-row-77' },
+  }), { seq: 3, timestampMs: 1100, actorPersona: 'dual_user', actorRoleLabel: 'admin (org_a); member (org_b)' })
+  const dualLocRes = verifyCompositeReceipt(
+    {
+      chainId: 'r305-g2-inferred-loc-no-multihop-dual',
+      terminalVulnClass: 'dual_tenant_abac',
+      hops: [
+        { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/orgs/org_a/export-start' }, exchangeIds: ['g2-h1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Started redirect', producedCapabilities: [], consumedCapabilities: [] },
+        { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: `/api/v1/orgs/org_b/records?ticket=${opaqueTok}` }, exchangeIds: ['g2-h2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Read org_b record', producedCapabilities: [], consumedCapabilities: [] },
+      ],
+      causalEdges: [],
+      terminalImpact: {
+        terminalHopId: 'hop_2',
+        terminalExchangeId: 'g2-h2',
+        summary: 'Inferred Location-digest edge without capability handle must not satisfy dual_tenant_abac multiHopDualDag.',
+        claimedImpact: 'Inferred Location-digest edge without capability handle must not satisfy dual_tenant_abac multiHopDualDag.',
+        preChainControlExchangeIds: ['g2-ctrl'],
+        postChainReadbackExchangeIds: [],
+      },
+      replayMode: 'fresh_clean_replay',
+    },
+    { entries: [dCtrl, dH1, dH2] },
+    { signingKey: SIGNING_KEY, attackerPersonas: ['dual_user'], dualTenantAbacPersonas: ['dual_user'], personaRoleLabels: { dual_user: 'admin (org_a); member (org_b)' } },
+  )
+  assert.equal(dualLocRes.confirmed, false, 'digest-only inferred Location edge must not satisfy dual_tenant_abac multiHopDualDag')
+
+  // #2b: Host-inferred logical state_transition_binding (no explicit edge, no value/cap binding) MUST NOT satisfy dual_tenant_abac multiHopDualDag
+  const dPost = signedEntry('g2-post', makeStep({
+    id: 'g2-post', arm: 'probe', method: 'POST', status: 200, pathAndQuery: '/api/v1/orgs/org_a/prefs',
+    actor: dualActor, json: { saved: true },
+  }), { seq: 2, timestampMs: 1000, actorPersona: 'dual_user', actorRoleLabel: 'admin (org_a); member (org_b)' })
+  const dGet = signedEntry('g2-get', makeStep({
+    id: 'g2-get', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/orgs/org_b/records',
+    actor: dualActor, json: { tenantId: 'org_b', confidentialRecord: 'secret-row-78' },
+  }), { seq: 3, timestampMs: 1100, actorPersona: 'dual_user', actorRoleLabel: 'admin (org_a); member (org_b)' })
+  const dualLogicalRes = verifyCompositeReceipt(
+    {
+      chainId: 'r305-g2-inferred-logical-no-multihop-dual',
+      terminalVulnClass: 'dual_tenant_abac',
+      hops: [
+        { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/orgs/org_a/prefs' }, exchangeIds: ['g2-post'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Prefs write', producedCapabilities: [], consumedCapabilities: [] },
+        { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/orgs/org_b/records' }, exchangeIds: ['g2-get'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Read org_b record', producedCapabilities: [], consumedCapabilities: [] },
+      ],
+      causalEdges: [],
+      terminalImpact: {
+        terminalHopId: 'hop_2',
+        terminalExchangeId: 'g2-get',
+        summary: 'Inferred logical state transition edge must not satisfy dual_tenant_abac multiHopDualDag.',
+        claimedImpact: 'Inferred logical state transition edge must not satisfy dual_tenant_abac multiHopDualDag.',
+        preChainControlExchangeIds: ['g2-ctrl'],
+        postChainReadbackExchangeIds: [],
+        oracleInput: { foreignTenant: 'org_b', actorTenant: 'org_a' },
+      },
+      replayMode: 'fresh_clean_replay',
+    },
+    { entries: [dCtrl, dPost, dGet] },
+    { signingKey: SIGNING_KEY, attackerPersonas: ['dual_user'], dualTenantAbacPersonas: ['dual_user'], personaRoleLabels: { dual_user: 'admin (org_a); member (org_b)' } },
+  )
+  assert.equal(dualLogicalRes.confirmed, false, 'inferred logical state_transition_binding must not satisfy dual_tenant_abac multiHopDualDag')
+})
+
+test('R3-05 Guard #3 & #4: Location tokens must be opaque (>=16 chars, >=3.0 entropy) and first-seen in src response; isChrono requires host seq (no hopIdx tiebreak)', () => {
+  const ctrl = signedEntry('g3-ctrl', makeStep({
+    id: 'g3-ctrl', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/v1/orgs/org_b/vault',
+    json: { error: 'forbidden' },
+  }), { seq: 1, timestampMs: 800 })
+
+  // #3a: Low-entropy / short (<16) Location label (`ledger2024q3`) MUST reject at dag_topology
+  const shortH1 = signedEntry('g3-short-h1', makeStep({
+    id: 'g3-short-h1', arm: 'probe', method: 'GET', status: 302, pathAndQuery: '/api/v1/prefs/export',
+    responseHeaders: { location: '/callback?report=ledger2024q3&tab=summary' }, body: '',
+  }), { seq: 2, timestampMs: 1000 })
+  const shortH2 = signedEntry('g3-short-h2', makeStep({
+    id: 'g3-short-h2', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/orgs/org_b/vault?report=ledger2024q3',
+    json: { tenantId: 'org_b', secret: 'val-1' },
+  }), { seq: 3, timestampMs: 1100 })
+  const shortRes = verifyCompositeReceipt(
+    {
+      chainId: 'r305-g3-short-loc',
+      terminalVulnClass: 'cross_tenant_read',
+      hops: [
+        { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/prefs/export' }, exchangeIds: ['g3-short-h1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Prefs redirect', producedCapabilities: [], consumedCapabilities: [] },
+        { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/orgs/org_b/vault?report=ledger2024q3' }, exchangeIds: ['g3-short-h2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Vault read', producedCapabilities: [], consumedCapabilities: [] },
+      ],
+      causalEdges: [],
+      terminalImpact: {
+        terminalHopId: 'hop_2',
+        terminalExchangeId: 'g3-short-h2',
+        summary: 'Short non-secret Location label must not infer value_binding.',
+        claimedImpact: 'Short non-secret Location label must not infer value_binding.',
+        preChainControlExchangeIds: ['g3-ctrl'],
+        postChainReadbackExchangeIds: [],
+      },
+      replayMode: 'fresh_clean_replay',
+    },
+    { entries: [ctrl, shortH1, shortH2] },
+    { signingKey: SIGNING_KEY, attackerPersonas: ['member_a'] },
+  )
+  assert.equal(shortRes.confirmed, false, 'short Location label must not infer value_binding')
+  assert.equal(shortRes.failedStage, 'dag_topology')
+
+  // #3b: High-entropy Location token that ALREADY appeared in an earlier transcript entry MUST reject at dag_topology
+  const preSeenTok = 'tk_9f8e7d6c5b4a3210XyZw'
+  const earlierSeed = signedEntry('g3-earlier', makeStep({
+    id: 'g3-earlier', arm: 'probe', method: 'GET', status: 200, pathAndQuery: `/api/v1/public/catalog?ref=${preSeenTok}`,
+    json: { items: [] },
+  }), { seq: 1, timestampMs: 900 })
+  const reuseH1 = signedEntry('g3-reuse-h1', makeStep({
+    id: 'g3-reuse-h1', arm: 'probe', method: 'GET', status: 302, pathAndQuery: '/api/v1/redirect',
+    responseHeaders: { location: `/callback?code=${preSeenTok}&state=st_1122` }, body: '',
+  }), { seq: 2, timestampMs: 1000 })
+  const reuseH2 = signedEntry('g3-reuse-h2', makeStep({
+    id: 'g3-reuse-h2', arm: 'probe', method: 'GET', status: 200, pathAndQuery: `/api/v1/orgs/org_b/vault?code=${preSeenTok}`,
+    json: { tenantId: 'org_b', secret: 'val-2' },
+  }), { seq: 3, timestampMs: 1100 })
+  const preSeenRes = verifyCompositeReceipt(
+    {
+      chainId: 'r305-g3-preseen-loc',
+      terminalVulnClass: 'cross_tenant_read',
+      hops: [
+        { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/redirect' }, exchangeIds: ['g3-reuse-h1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Redirect', producedCapabilities: [], consumedCapabilities: [] },
+        { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: `/api/v1/orgs/org_b/vault?code=${preSeenTok}` }, exchangeIds: ['g3-reuse-h2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Vault read', producedCapabilities: [], consumedCapabilities: [] },
+      ],
+      causalEdges: [],
+      terminalImpact: {
+        terminalHopId: 'hop_2',
+        terminalExchangeId: 'g3-reuse-h2',
+        summary: 'Token already present in earlier transcript entry must not infer Location value_binding.',
+        claimedImpact: 'Token already present in earlier transcript entry must not infer Location value_binding.',
+        preChainControlExchangeIds: ['g3-ctrl'],
+        postChainReadbackExchangeIds: [],
+      },
+      replayMode: 'fresh_clean_replay',
+    },
+    { entries: [ctrl, earlierSeed, reuseH1, reuseH2] },
+    { signingKey: SIGNING_KEY, attackerPersonas: ['member_a'] },
+  )
+  assert.equal(preSeenRes.confirmed, false, 'pre-existing transcript token in Location must not infer value_binding')
+  assert.equal(preSeenRes.failedStage, 'dag_topology')
+
+  // #3c: High-entropy Location token echoed from src's OWN request URL MUST reject at dag_topology
+  const ownTok = 'ow_8a7b6c5d4e3f2a1b9c8d'
+  const echoH1 = signedEntry('g3-echo-h1', makeStep({
+    id: 'g3-echo-h1', arm: 'probe', method: 'GET', status: 302, pathAndQuery: `/api/v1/redirect?nonce=${ownTok}`,
+    responseHeaders: { location: `/callback?code=${ownTok}&state=st_1122` }, body: '',
+  }), { seq: 2, timestampMs: 1000 })
+  const echoH2 = signedEntry('g3-echo-h2', makeStep({
+    id: 'g3-echo-h2', arm: 'probe', method: 'GET', status: 200, pathAndQuery: `/api/v1/orgs/org_b/vault?code=${ownTok}`,
+    json: { tenantId: 'org_b', secret: 'val-3' },
+  }), { seq: 3, timestampMs: 1100 })
+  const echoRes = verifyCompositeReceipt(
+    {
+      chainId: 'r305-g3-echo-loc',
+      terminalVulnClass: 'cross_tenant_read',
+      hops: [
+        { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: `/api/v1/redirect?nonce=${ownTok}` }, exchangeIds: ['g3-echo-h1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Echoed redirect', producedCapabilities: [], consumedCapabilities: [] },
+        { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: `/api/v1/orgs/org_b/vault?code=${ownTok}` }, exchangeIds: ['g3-echo-h2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Vault read', producedCapabilities: [], consumedCapabilities: [] },
+      ],
+      causalEdges: [],
+      terminalImpact: {
+        terminalHopId: 'hop_2',
+        terminalExchangeId: 'g3-echo-h2',
+        summary: 'Token echoed from src request into Location header must not infer value_binding.',
+        claimedImpact: 'Token echoed from src request into Location header must not infer value_binding.',
+        preChainControlExchangeIds: ['g3-ctrl'],
+        postChainReadbackExchangeIds: [],
+      },
+      replayMode: 'fresh_clean_replay',
+    },
+    { entries: [ctrl, echoH1, echoH2] },
+    { signingKey: SIGNING_KEY, attackerPersonas: ['member_a'] },
+  )
+  assert.equal(echoRes.confirmed, false, 'request-echoed Location token must not infer value_binding')
+  assert.equal(echoRes.failedStage, 'dag_topology')
+
+  // #4: Equal timestampMs + equal/missing seq MUST NOT tie-break via receipt.hops array order!
+  const tieCap = 'cap:hop_1:tie_seq_cap'
+  const tieDagHelpers = {
+    collectDigests: () => new Set<string>(),
+    normRouteFam: (p: string | null | undefined) => (p ?? '').split('?')[0] ?? '',
+    sameCredIdentity: () => true,
+    probeActorOf: (e: HostTranscriptEntry) => e.actorPersona ?? e.step.actor.handle ?? null,
+    isLoginCap: () => false,
+  }
+  const tieH1 = signedEntry('g4-h1', makeStep({
+    id: 'g4-h1', arm: 'probe', method: 'POST', status: 200, pathAndQuery: '/api/v1/tokens/mint',
+    json: { issued: true },
+  }), { seq: 4, timestampMs: 1000, emittedCapabilities: [tieCap] })
+  const tieH2 = signedEntry('g4-h2', makeStep({
+    id: 'g4-h2', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/orgs/org_b/vault',
+    json: { tenantId: 'org_b', secret: 'val-tie' },
+  }), { seq: 4, timestampMs: 1000, consumedCapabilities: [tieCap] })
+  const noSeqH1: HostTranscriptEntry = { ...tieH1, seq: undefined }
+  const noSeqH2: HostTranscriptEntry = { ...tieH2, seq: undefined }
+  const tieInf = inferSupplementalHostCausalEdges(
+    {
+      hops: [
+        { hopId: 'hop_1', exchangeIds: ['g4-h1'], oobEventIds: [], browserTraceIds: [] },
+        { hopId: 'hop_2', exchangeIds: ['g4-h2'], oobEventIds: [], browserTraceIds: [] },
+      ],
+      causalEdges: [],
+      terminalImpact: { terminalHopId: 'hop_2', preChainControlExchangeIds: ['g3-ctrl'], postChainReadbackExchangeIds: [] },
+    },
+    { entries: [ctrl, tieH1, tieH2] },
+    tieDagHelpers,
+  )
+  assert.equal(tieInf.extraInferredEdges.length, 0, 'equal ts + equal seq must not tie-break by hopIdx')
+  const noSeqInf = inferSupplementalHostCausalEdges(
+    {
+      hops: [
+        { hopId: 'hop_1', exchangeIds: ['g4-h1'], oobEventIds: [], browserTraceIds: [] },
+        { hopId: 'hop_2', exchangeIds: ['g4-h2'], oobEventIds: [], browserTraceIds: [] },
+      ],
+      causalEdges: [],
+      terminalImpact: { terminalHopId: 'hop_2', preChainControlExchangeIds: ['g3-ctrl'], postChainReadbackExchangeIds: [] },
+    },
+    { entries: [ctrl, noSeqH1, noSeqH2] },
+    tieDagHelpers,
+  )
+  assert.equal(noSeqInf.extraInferredEdges.length, 0, 'equal ts + missing seq must not tie-break by hopIdx')
+
+  // End-to-end Location token at equal ts + equal seq MUST also reject at dag_topology (no hopIdx tie-break)
+  const tieLocTok = 'lt_9f8e7d6c5b4a3210XyZw'
+  const tieLocH1 = signedEntry('g4-loc-h1', makeStep({
+    id: 'g4-loc-h1', arm: 'probe', method: 'GET', status: 302, pathAndQuery: '/api/v1/redirect',
+    responseHeaders: { location: `/callback?code=${tieLocTok}&state=st_tie` }, body: '',
+  }), { seq: 4, timestampMs: 1000 })
+  const tieLocH2 = signedEntry('g4-loc-h2', makeStep({
+    id: 'g4-loc-h2', arm: 'probe', method: 'POST', status: 200, pathAndQuery: '/api/v1/orgs/org_b/vault',
+    requestJson: { code: tieLocTok }, json: { tenantId: 'org_b', secret: 'val-tie-loc' },
+  }), { seq: 4, timestampMs: 1000 })
+  const tieLocRes = verifyCompositeReceipt(
+    {
+      chainId: 'r305-g4-e2e-loc-equal-seq',
+      terminalVulnClass: 'cross_tenant_read',
+      hops: [
+        { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/redirect' }, exchangeIds: ['g4-loc-h1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Redirect', producedCapabilities: [], consumedCapabilities: [] },
+        { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/orgs/org_b/vault' }, exchangeIds: ['g4-loc-h2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Vault read', producedCapabilities: [], consumedCapabilities: [] },
+      ],
+      causalEdges: [],
+      terminalImpact: {
+        terminalHopId: 'hop_2',
+        terminalExchangeId: 'g4-loc-h2',
+        summary: 'Equal ts and equal seq Location redirect must not tie-break via hopIdx.',
+        claimedImpact: 'Equal ts and equal seq Location redirect must not tie-break via hopIdx.',
+        preChainControlExchangeIds: ['g3-ctrl'],
+        postChainReadbackExchangeIds: [],
+      },
+      replayMode: 'fresh_clean_replay',
+    },
+    { entries: [ctrl, tieLocH1, tieLocH2] },
+    { signingKey: SIGNING_KEY, attackerPersonas: ['member_a'] },
+  )
+  assert.equal(tieLocRes.confirmed, false, 'equal ts + equal seq Location token must not tie-break by hopIdx')
+  assert.equal(tieLocRes.failedStage, 'dag_topology')
+
+  // Contrast: same timestampMs WITH strictly increasing host seq (4 < 5) infers cleanly and confirms!
+  const ordH2 = signedEntry('g4-h2-ord', makeStep({
+    id: 'g4-h2-ord', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/orgs/org_b/vault',
+    json: { tenantId: 'org_b', secret: 'val-ord' },
+  }), { seq: 5, timestampMs: 1000, consumedCapabilities: [tieCap] })
+  const ordInf = inferSupplementalHostCausalEdges(
+    {
+      hops: [
+        { hopId: 'hop_1', exchangeIds: ['g4-h1'], oobEventIds: [], browserTraceIds: [] },
+        { hopId: 'hop_2', exchangeIds: ['g4-h2-ord'], oobEventIds: [], browserTraceIds: [] },
+      ],
+      causalEdges: [],
+      terminalImpact: { terminalHopId: 'hop_2', preChainControlExchangeIds: ['g3-ctrl'], postChainReadbackExchangeIds: [] },
+    },
+    { entries: [ctrl, tieH1, ordH2] },
+    tieDagHelpers,
+  )
+  assert.equal(ordInf.extraInferredEdges.length, 1, 'same ts + strictly increasing host seq must infer cap edge')
+  const ordRes = verifyCompositeReceipt(
+    {
+      chainId: 'r305-g4-host-seq-ordered',
+      terminalVulnClass: 'cross_tenant_read',
+      hops: [
+        { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/tokens/mint' }, exchangeIds: ['g4-h1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Mint cap', producedCapabilities: [tieCap], consumedCapabilities: [] },
+        { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/orgs/org_b/vault' }, exchangeIds: ['g4-h2-ord'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Use cap', producedCapabilities: [], consumedCapabilities: [tieCap] },
+      ],
+      causalEdges: [],
+      terminalImpact: {
+        terminalHopId: 'hop_2',
+        terminalExchangeId: 'g4-h2-ord',
+        summary: 'Same timestampMs with strictly increasing host seq infers capability edge cleanly.',
+        claimedImpact: 'Same timestampMs with strictly increasing host seq infers capability edge cleanly.',
+        preChainControlExchangeIds: ['g3-ctrl'],
+        postChainReadbackExchangeIds: [],
+      },
+      replayMode: 'fresh_clean_replay',
+    },
+    { entries: [ctrl, tieH1, ordH2] },
+    { signingKey: SIGNING_KEY, attackerPersonas: ['member_a'] },
+  )
+  assert.equal(ordRes.confirmed, true, `host seq-ordered same-ms cap edge must confirm, got: ${ordRes.reason}`)
+})
+
+test('R3-05 Guard #5 & #7: conflicting camel/snake/kebab oracleInput keys fail closed; excluded control hop on wrong route/persona cannot satisfy terminalCtrl', () => {
+  // #5: Conflicting duplicates fail closed across normalize, infer, hydrate, and verifyCompositeReceipt (with AND without oracleFamily)
+  const conflictCamelSnake = { baselineReadback: 'ex-1', baseline_readback: 'ex-2', finalReadback: 'ex-3', actionExchangeIds: ['ex-4'] }
+  const conflictSnakeKebab = { baseline_readback: 'ex-1', 'baseline-readback': 'ex-2', final_readback: 'ex-3' }
+  const identicalDup = { baselineReadback: 'ex-1', baseline_readback: 'ex-1' }
+  assert.deepEqual(findConflictingOracleInputKeys(conflictCamelSnake), ['baselineReadback'])
+  assert.deepEqual(findConflictingOracleInputKeys(conflictSnakeKebab), ['baselineReadback'])
+  assert.deepEqual(findConflictingOracleInputKeys(identicalDup), [])
+  assert.deepEqual(normalizeV8OracleInputKeys(conflictCamelSnake), {})
+  assert.deepEqual(normalizeV8OracleInputKeys(conflictSnakeKebab), {})
+  assert.deepEqual(inferV8OracleFamilyDetailed(conflictCamelSnake), { kind: 'conflicting', keys: ['baselineReadback'] })
+  assert.deepEqual(hydrateV8OracleInput('economic_conservation', conflictCamelSnake, { entriesById: new Map() }, 'sig'), {})
+
+  const pcCtrl = signedEntry('g5-ctrl', makeStep({
+    id: 'g5-ctrl', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/v1/admin/ledger',
+    json: { error: 'forbidden' },
+  }), { seq: 1, timestampMs: 900 })
+  const pcProbe = signedEntry('g5-probe', makeStep({
+    id: 'g5-probe', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/public/../admin/ledger',
+    json: { tenantId: 'org_b', balanceCents: 990000 },
+  }), { seq: 2, timestampMs: 1000 })
+  for (const explicitFam of [undefined, 'parser_cache_differential'] as const) {
+    const r = verifyCompositeReceipt(
+      {
+        chainId: `r305-g5-conflict-${explicitFam ?? 'inferred'}`,
+        terminalVulnClass: 'cache_poisoning',
+        hops: [
+          { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/public/../admin/ledger' }, exchangeIds: ['g5-probe'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Probe', producedCapabilities: [], consumedCapabilities: [] },
+        ],
+        causalEdges: [],
+        terminalImpact: {
+          terminalHopId: 'hop_1',
+          terminalExchangeId: 'g5-probe',
+          summary: 'Conflicting duplicate camelCase and snake_case oracleInput keys must fail closed.',
+          claimedImpact: 'Conflicting duplicate camelCase and snake_case oracleInput keys must fail closed.',
+          preChainControlExchangeIds: ['g5-ctrl'],
+          postChainReadbackExchangeIds: [],
+          ...(explicitFam ? { oracleFamily: explicitFam } : {}),
+          oracleInput: {
+            mode: 'parser_differential',
+            differentialKind: 'path_normalization',
+            cleanControl: 'g5-ctrl',
+            clean_control: 'g5-other-ctrl',
+            differentialProbe: 'g5-probe',
+          },
+        },
+        replayMode: 'fresh_clean_replay',
+      },
+      { entries: [pcCtrl, pcProbe] },
+      { signingKey: SIGNING_KEY, attackerPersonas: ['member_a'] },
+    )
+    assert.equal(r.confirmed, false, `conflicting keys (${explicitFam ?? 'inferred'}) must reject`)
+    assert.equal(r.rejectedBy, 'v8_oracle_conflicting_keys')
+    assert.match(r.reason, /conflicting_oracle_input_keys/)
+  }
+
+  // #7: Excluded denied control hop on a DIFFERENT route OR DIFFERENT persona still CANNOT satisfy terminalCtrl!
+  const cap = 'cap:hop_1:g7_cap'
+  const wrongRouteCtrl = signedEntry('g7-wrong-route', makeStep({
+    id: 'g7-wrong-route', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/v1/unrelated/endpoint',
+    json: { error: 'forbidden' },
+  }), { seq: 1, timestampMs: 850 })
+  const wrongPersonaCtrl = signedEntry('g7-wrong-persona', makeStep({
+    id: 'g7-wrong-persona', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/v1/orgs/org_b/vault',
+    actor: { handle: 'other_member', role: 'member', tenant: 'org_c', auth: 'bearer', sameSite: null },
+    json: { error: 'forbidden' },
+  }), { seq: 1, timestampMs: 860, actorPersona: 'other_member', actorRoleLabel: 'member (org_c)' })
+  const g7H1 = signedEntry('g7-h1', makeStep({
+    id: 'g7-h1', arm: 'probe', method: 'POST', status: 200, pathAndQuery: '/api/v1/tokens/mint',
+    json: { ok: true },
+  }), { seq: 2, timestampMs: 1000, emittedCapabilities: [cap] })
+  const g7H2 = signedEntry('g7-h2', makeStep({
+    id: 'g7-h2', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/orgs/org_b/vault',
+    json: { tenantId: 'org_b', secretKey: 'sk-g7' },
+  }), { seq: 3, timestampMs: 1100, consumedCapabilities: [cap] })
+
+  for (const [label, badCtrl, path] of [
+    ['wrong-route', wrongRouteCtrl, '/api/v1/unrelated/endpoint'],
+    ['wrong-persona', wrongPersonaCtrl, '/api/v1/orgs/org_b/vault'],
+  ] as const) {
+    const r = verifyCompositeReceipt(
+      {
+        chainId: `r305-g7-${label}`,
+        terminalVulnClass: 'cross_tenant_read',
+        hops: [
+          { hopId: 'hop_ctrl', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: path }, exchangeIds: [badCtrl.exchangeId], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Denied control on wrong target/persona', producedCapabilities: [], consumedCapabilities: [] },
+          { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/tokens/mint' }, exchangeIds: ['g7-h1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Mint cap', producedCapabilities: [cap], consumedCapabilities: [] },
+          { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/orgs/org_b/vault' }, exchangeIds: ['g7-h2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Read vault', producedCapabilities: [], consumedCapabilities: [cap] },
+        ],
+        causalEdges: [{ kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: cap }],
+        terminalImpact: {
+          terminalHopId: 'hop_2',
+          terminalExchangeId: 'g7-h2',
+          summary: 'Excluded denied control hop on wrong route or persona must not satisfy terminalCtrl.',
+          claimedImpact: 'Excluded denied control hop on wrong route or persona must not satisfy terminalCtrl.',
+          preChainControlExchangeIds: [],
+          postChainReadbackExchangeIds: [],
+        },
+        replayMode: 'fresh_clean_replay',
+      },
+      { entries: [badCtrl, g7H1, g7H2] },
+      { signingKey: SIGNING_KEY, attackerPersonas: ['member_a'] },
+    )
+    assert.equal(r.confirmed, false, `excluded denied control (${label}) MUST NOT satisfy terminalCtrl`)
+    assert.equal(r.failedStage, 'terminal_impact')
+  }
 })

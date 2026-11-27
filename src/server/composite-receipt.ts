@@ -36,7 +36,7 @@ export const hopReceiptSchema = z.object({
   target: z.object({ origin: scopedAssetOrigin, method: z.string().trim().regex(/^[A-Z]{1,10}$/).optional(), pathAndQuery: nonEmpty(4096).optional(), param: nonEmpty(128).optional() }),
   exchangeIds: idList(32), oobEventIds: idList(16), browserTraceIds: idList(16), claimedDelta: nonEmpty(1200),
   producedCapabilities: z.array(capabilityHandleSchema).max(16).default([]), consumedCapabilities: z.array(capabilityHandleSchema).max(16).default([]),
-  entityId: nonEmpty(256).optional(), canaryToken: nonEmpty(256).optional(), proofReceipt: proofReceiptSchema.optional(), role: z.enum(['setup', 'control', 'probe', 'cleanup', 'baseline', 'readback']).optional(), isControl: z.boolean().optional(),
+  entityId: nonEmpty(256).optional(), canaryToken: nonEmpty(256).optional(), proofReceipt: proofReceiptSchema.optional(),
 })
 export type HopReceipt = z.output<typeof hopReceiptSchema>
 
@@ -66,7 +66,7 @@ export const terminalImpactSchema = z.object({
   terminalHopId: receiptIdSchema, claimedImpact: z.string().trim().max(1200).optional(), summary: z.string().trim().max(1200).optional(),
   terminalExchangeId: receiptIdSchema.optional(), proofReceipt: proofReceiptSchema.optional(),
   oracleFamily: z.enum(V8_ORACLE_FAMILIES).optional(), oracleInput: z.record(z.string(), z.unknown()).optional(),
-  preChainControlExchangeIds: idList(16), postChainReadbackExchangeIds: idList(16), modeAFailureExchangeId: receiptIdSchema.optional(), controlHopId: receiptIdSchema.optional(), baselineHopId: receiptIdSchema.optional(),
+  preChainControlExchangeIds: idList(16), postChainReadbackExchangeIds: idList(16), modeAFailureExchangeId: receiptIdSchema.optional(),
 }).transform(ti => { const ci = ti.claimedImpact && ti.claimedImpact.length > 0 ? ti.claimedImpact : (ti.summary ?? ''); return { ...ti, claimedImpact: ci, ...(ti.summary === undefined && ci.length > 0 ? { summary: ci } : {}) } })
 export type TerminalImpact = z.output<typeof terminalImpactSchema>
 
@@ -600,7 +600,7 @@ function dispatchDefaultV8Oracle(
 
 function verifyTerminalImpactGate(
   receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, factLog: HostFactLog, verifiedEdges: VerifiedEdgeResult[],
-  hostTranscript: HostSignedTranscript, attackerTenants: ReadonlySet<string>, explicitEdgeCount: number, capIdx: CapOriginIndex, options: CompositeVerifyOptions,
+  hostTranscript: HostSignedTranscript, attackerTenants: ReadonlySet<string>, explicitEdgeCount: number, suppStart: number, capIdx: CapOriginIndex, options: CompositeVerifyOptions,
 ): { ok: true; terminalVerification?: ReceiptVerification; terminalOracleFamily?: V8OracleFamily | string; terminalEndpoint?: string } | { ok: false; reason: string; rejectedBy?: string; missingEvidence?: string[]; terminalVerification?: ReceiptVerification } {
   const ti = receipt.terminalImpact, effSummary = ti.summary !== undefined ? ti.summary : ti.claimedImpact
   if (effSummary.replace(/\s+/g, '').length < 12) return { ok: false, reason: 'terminal_impact_summary_missing: terminalImpact.summary must be a meaningful non-empty description (>= 12 non-whitespace chars).', rejectedBy: 'terminal_impact_summary_missing', missingEvidence: ['terminal_impact_summary_missing'] }
@@ -653,7 +653,7 @@ function verifyTerminalImpactGate(
   if (termEx && (termEx.evidenceRole === 'host_capability_op' || termEx.evidenceRole === 'host_crypto_op')) return failUnproven()
   const hasPostMutation = Boolean(postMutRb), termHopSet = new Set(termHop.exchangeIds), nonTermExSet = new Set(receipt.hops.filter(h => h.hopId !== termHop.hopId).flatMap(h => h.exchangeIds).filter(id => !termHopSet.has(id)))
   const termRawActor = termEx ? actorOf(termEx) : null, termAuthd = Boolean(termRawActor && !ANON_ACTOR_RE.test(termRawActor))
-  const hasVerifiedTermEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.verified), hasExplicitVerifiedTermEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.verified && e.edgeIndex < explicitEdgeCount), hasTermDerivedCrypto = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'derived_crypto_binding' && e.verified)
+  const hasVerifiedTermEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.verified && (e.edgeIndex < explicitEdgeCount || e.kind === 'derived_crypto_binding' || (e.kind === 'value_binding' && Boolean((receipt.causalEdges[e.edgeIndex] as { capabilityHandle?: string } | undefined)?.capabilityHandle || e.edgeIndex < suppStart)))), hasExplicitVerifiedTermEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.verified && e.edgeIndex < explicitEdgeCount), hasTermDerivedCrypto = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'derived_crypto_binding' && e.verified)
   const upstreamEntries = receipt.hops.filter(h => h.hopId !== termHop.hopId).flatMap(h => h.exchangeIds).map(id => idx.entriesById.get(id)!).filter(e => Boolean(e && isExecArm(e) && is2xx(e.step.status)))
   const { ownTenantOnly, hasForeignTenantData, crossTenantSatisfied } = analyzeCrossTenantTerminalEvidence(termEx, attackerTenants, isStub, hasBody, upstreamEntries, hasPostMutation, receipt.hops.length >= 2 && hasExplicitVerifiedTermEdge)
   const termAblationIds = new Set(verifiedEdges.filter(ve => ve.verified && ve.kind === 'state_transition_binding' && ve.toHopId === termHop.hopId).map(ve => (ve.evidence as { ablationExchangeId?: string } | undefined)?.ablationExchangeId).filter((id): id is string => Boolean(id)))
@@ -724,7 +724,7 @@ export function verifyCompositeReceipt(rawReceipt: unknown, hostTranscript: Host
   const targetRes = verifyHopTargetsAgainstExchanges(receipt, idx.entriesById, idx.tracesById, idx.oobById); if (!targetRes.ok) return fail('transcript_integrity', targetRes.reason, verifiedEdges)
   const provRes = verifyAttackerProvenance(receipt, dag, idx, options, capIdx, verifiedEdges); if (!provRes.ok) return fail('attacker_provenance', provRes.reason, verifiedEdges)
   const replayRes = verifyReplayMode(receipt, dag, idx, options); if (!replayRes.ok) return fail('replay_mode', replayRes.reason, verifiedEdges)
-  const termRes = verifyTerminalImpactGate(receipt, dag, idx, factLog, verifiedEdges, hostTranscript, provRes.attackerTenants, explicitEdgeCount, capIdx, options)
+  const termRes = verifyTerminalImpactGate(receipt, dag, idx, factLog, verifiedEdges, hostTranscript, provRes.attackerTenants, explicitEdgeCount, causalReceipt.causalEdges.length, capIdx, options)
   if (!termRes.ok) return fail('terminal_impact', termRes.reason, verifiedEdges, termRes.terminalVerification, termRes.rejectedBy, termRes.missingEvidence)
   const terminalOrigin = deriveSignedTerminalOrigin(receipt, idx.entriesById)
   const termMeta = { ...(termRes.terminalOracleFamily ? { terminalOracleFamily: termRes.terminalOracleFamily } : {}), ...(termRes.terminalEndpoint ? { terminalEndpoint: termRes.terminalEndpoint } : {}), ...(terminalOrigin ? { terminalOrigin } : {}) }
