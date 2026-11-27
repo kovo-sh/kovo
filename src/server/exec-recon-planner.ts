@@ -48,7 +48,7 @@ import {
   type PublicObservation,
 } from './broker.ts'
 import { CapabilityLedger, DERIVED_CAPABILITY_HANDLE_RE, computeArtifactDigest, finalizeHopCheckpointBrief, formatDerivedCapabilityHandle, sanitizeCheckpointHandleRef, sanitizeCheckpointText, type AddCapabilityInput, type CapabilityKind, type CapabilitySurface, type HopCheckpointBrief, type HopWorkflowNotebook } from './capability-ledger.ts'
-import { hasAgenticSealedCapabilities, materializeCapabilityConsumerFrontierSteps, type FrontierLlmMode } from './capability-consumer-frontier.ts'
+import { buildHopRuntimeObservationIndex, hasAgenticSealedCapabilities, inspectChainHopRuntimeObservation, materializeCapabilityConsumerFrontierSteps, type FrontierLlmMode } from './capability-consumer-frontier.ts'
 import { extractCoverageEvidenceMetadata, normalizeOriginForCoverage } from './coverage-category.ts'
 import { extractSpecDedupeFields, normalizeEndpointTemplate } from './dedupe.ts'
 import { normalizeRouteTemplate } from './route-template.ts'
@@ -3737,11 +3737,13 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   }
 
   /** Sync extracted typed ChainHops into CapabilityLedger as quarantined capability_only nodes. */
-  private syncChainHopsToLedger(ledger: CapabilityLedger, hops: readonly ChainHop[]): void {
+  private syncChainHopsToLedger(run: Run, ledger: CapabilityLedger, hops: readonly ChainHop[], llmMode: FrontierLlmMode, existingFacts?: readonly Fact[]): void {
+    const obsIndex = buildHopRuntimeObservationIndex(this.storage, run.id, llmMode, existingFacts)
     for (const hop of hops.slice(0, 32)) {
       const slot = hop.hopId.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[^A-Za-z0-9]+/, '').slice(0, 56) || 'hop'
       const capId = formatDerivedCapabilityHandle(`r${hop.roundNo}`, slot)
       if (ledger.getCapability(capId)) continue
+      const obs = inspectChainHopRuntimeObservation(hop, llmMode, obsIndex)
       const surface: CapabilitySurface = hop.artifactKind === 'stored_write_handle' ? 'browser'
         : hop.artifactKind === 'ssrf_redirect_target' ? 'webhook'
         : hop.artifactKind === 'workflow_state_handle' ? 'async_job'
@@ -3749,22 +3751,19 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       try {
         ledger.addCapability({
           capId,
-          kind: hopKindToCapabilityKind(hop.artifactKind),
-          promotionStatus: 'capability_only',
+          kind: obs.kindOverride ?? hopKindToCapabilityKind(hop.artifactKind), promotionStatus: 'capability_only',
           provenance: hop.verified ? 'derived_hop' : 'runtime_discovery',
-          tenantScope: 'unscoped_hypothesis',
-          actorPersona: hop.persona ?? 'attacker',
-          serviceOrigin: hop.origin,
-          surface,
-          parentHopReceiptIds: hop.verified ? [hop.hopId] : [],
+          tenantScope: obs.runtimeObserved ? 'runtime_observed' : 'unscoped_hypothesis',
+          actorPersona: hop.persona ?? 'attacker', serviceOrigin: hop.origin, surface,
+          parentHopReceiptIds: hop.verified ? [obs.safeHopId] : [],
           artifactDigest: computeArtifactDigest(`${hop.hopId}|${hop.origin}|${hop.artifactRef}`),
-          artifactSummary: hop.summary.slice(0, 220),
+          artifactSummary: sanitizeCheckpointText(hop.summary, 220),
           metadata: {
-            hopId: hop.hopId,
-            roundNo: hop.roundNo,
-            ...(hop.endpoint ? { endpoint: hop.endpoint } : {}),
-            ...(hop.method ? { method: hop.method } : {}),
+            hopId: obs.safeHopId, roundNo: hop.roundNo, ...(obs.runtimeObserved ? { runtimeObserved: true } : {}),
+            ...(obs.exchangeId ? { exchangeId: obs.exchangeId } : {}),
+            ...(hop.endpoint ? { endpoint: hop.endpoint } : {}), ...(hop.method ? { method: hop.method } : {}),
             ...(hop.factIds[0] ? { factId: hop.factIds[0] } : {}),
+            ...(obs.fieldName ? { fieldName: obs.fieldName } : {}), ...(obs.secretKind ? { secretKind: obs.secretKind } : {}), ...(obs.label ? { label: obs.label } : {}),
           },
         })
       } catch { /* ignore invalid/duplicate/secret-rejected hop mirrors */ }
@@ -6625,7 +6624,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const hops = snapshot?.hops ?? coordinator.extractChainHops(roundNo)
     const ledger = this.storage.capabilityLedger(run.id)
     const controller = this.frontierControllerFor(run.id)
-    this.syncChainHopsToLedger(ledger, hops)
+    const llmMode: FrontierLlmMode = snapshot?.llmMode ?? (privateModelProfiles(this.storage).length > 0 ? 'agentic' : 'deterministic-no-llm')
+    this.syncChainHopsToLedger(run, ledger, hops, llmMode, snapshot?.existingFacts)
     const sourceMounted = snapshot?.sourceMounted ?? (this.host.projectReposMount(run.projectId).mountedRepos.length > 0)
     const apiDependencies = snapshot?.apiDependencies ?? this.collectCoordinatorApiDependencies(run)
     const hypotheses = coordinator.planChainRound({
@@ -6665,10 +6665,10 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       })
     }
     const frontierLimit = Math.min(6, Math.max(0, remaining - chainEnqueued))
-    const frontierCreated = frontierLimit > 0 && snapshot?.llmMode !== 'deterministic-no-llm' && hasAgenticSealedCapabilities(ledger)
+    const frontierCreated = frontierLimit > 0 && llmMode !== 'deterministic-no-llm' && hasAgenticSealedCapabilities(ledger, { llmMode })
       ? materializeCapabilityConsumerFrontierSteps(this.storage, run, {
         activeOrigins: this.activeApprovedOrigins(run, this.host.approvedOriginsSet(run)),
-        llmMode: snapshot?.llmMode, maxSteps: frontierLimit, existingSteps: chainEnqueued > 0 ? this.storage.listChainSteps(run.id, run.goalRevision) : existing,
+        llmMode, maxSteps: frontierLimit, existingSteps: chainEnqueued > 0 ? this.storage.listChainSteps(run.id, run.goalRevision) : existing,
         existingFacts: snapshot?.existingFacts, confirmedRefs: this.alreadyConfirmedRefs(run, 100), routeStep: routeStepToSpecialist,
       }) : []
     for (const step of frontierCreated) {

@@ -18,12 +18,16 @@ import { classifyPersonaPrivilege } from './assignment-brief.ts'
 import {
   CAPABILITY_KINDS,
   DERIVED_CAPABILITY_HANDLE_RE,
+  computeArtifactDigest,
+  formatDerivedCapabilityHandle,
   sanitizeCheckpointText,
   type CapabilityKind,
   type CapabilityLedger,
   type CapabilityNode,
+  type CapabilitySurface,
   type NegativeEdge,
 } from './capability-ledger.ts'
+import type { ChainHop } from './graph-coordinator.ts'
 import { resolveRunPersonas } from './persona-vault.ts'
 import { normalizeRouteTemplate } from './route-template.ts'
 import type { ChainStep, Fact, Run, Store } from './store.ts'
@@ -62,6 +66,7 @@ export interface FrontierCapabilityInput {
   targetPath?: string | null
   derivedFromAttackerPersona?: string | null
   factId?: string | null
+  runtimeObserved?: boolean
 }
 
 export interface FrontierEndpointInput {
@@ -137,6 +142,7 @@ export interface RankedCapabilityConsumerPair {
     actingPersona: string
     label: string
     factId: string | null
+    runtimeObserved?: boolean
   }
   consumer: {
     origin: string
@@ -191,6 +197,9 @@ const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 const HEALTH_OR_STATIC_RE = /^\/(?:health|healthz|ready|readyz|live|livez|metrics|ping|favicon\.ico|robots\.txt|assets|static)(?:\/|$)/i
 const SKIP_SEGMENTS = new Set(['api', 'v1', 'v2', 'v3', 'v4', 'rest', 'public', 'internal', 'service', 'services', 'app', 'oauth', 'oauth2', 'oidc', 'auth'])
 const NON_AGENTIC_PROVENANCES = new Set(['static_analysis', 'attacker_seed', 'floor_observation'])
+const NON_AGENTIC_FACT_SUBKINDS = new Set(['code_audit_suspect', 'det_lead', 'hop_checkpoint', 'floor_lead', 'static_suspect'])
+const NON_AGENTIC_FACT_SOURCES = new Set(['static_analysis', 'code_audit', 'deterministic_floor', 'floor_observation', 'phase0', 'openapi', 'repo_ast', 'attacker_seed', 'synthetic', 'deterministic-no-llm'])
+const LIVE_AGENTIC_FACT_KINDS = new Set(['secret', 'object_ref', 'auth', 'cookie', 'redirect', 'config', 'policy_gap', 'note', 'dom'])
 const GENERIC_ACTOR_LABELS = new Set(['', 'worker', 'unknown', 'anonymous', 'system', 'host'])
 
 const SIGNING_SECRET_RE = /(?:^|[^a-z0-9])(?:signing[_-]?(?:secret|key|salt|material)|hmac[_-]?(?:secret|key|salt)?|webhook[_-]?(?:secret|key|signing|salt)|(?:sig|signature|mac|digest|verify)[_-]?(?:secret|key|salt)|private[_-]?key|shared[_-]?secret|jwt[_-]?(?:secret|key)|client[_-]?secret|master[_-]?key|secret[_-]?key|signing|salt)(?:[^a-z0-9]|$)/i
@@ -283,27 +292,266 @@ function extractCapabilityNouns(cap: FrontierCapabilityInput): Set<string> {
   return out
 }
 
-/** True iff a `CapabilityLedger` node represents an agentic runtime-sealed capability (never a pre-floor seed, static stub, or planner hop projection). */
-export function isAgenticSealedCapabilityNode(
-  node: Pick<CapabilityNode, 'capId' | 'kind' | 'provenance' | 'temporalState' | 'metadata'> & { tenantScope?: string },
+function hasBaseAgenticCapabilityEligibility(
+  node: Pick<CapabilityNode, 'capId' | 'kind' | 'provenance' | 'temporalState' | 'metadata'>,
 ): boolean {
   if (!DERIVED_CAPABILITY_HANDLE_RE.test(node.capId)) return false
   if (node.capId.startsWith('cap:hop_synth:') || node.capId.startsWith('cap:hop_seed_')) return false
   if (NON_AGENTIC_PROVENANCES.has(node.provenance)) return false
   if (node.kind === 'policy_asymmetry') return false
   if (node.temporalState === 'expired') return false
-  if (node.tenantScope === 'unscoped_hypothesis') return false
   if (node.metadata && (
     typeof node.metadata.synthCapId === 'string'
     || typeof node.metadata.hypothesisId === 'string'
-    || (typeof node.metadata.hopId === 'string' && typeof node.metadata.roundNo === 'number')
+    || node.metadata.consumerTarget === true
+    || node.metadata.source === 'deterministic-no-llm'
   )) return false
   return true
 }
 
-/** Fast check for whether the run's `CapabilityLedger` contains at least one agentic sealed capability. */
-export function hasAgenticSealedCapabilities(ledger: Pick<CapabilityLedger, 'listCapabilities'>): boolean {
+/** True iff a `CapabilityLedger` node is a live agentic runtime-observed capability hop (`metadata.runtimeObserved === true`). */
+export function isAgenticRuntimeCapabilityNode(
+  node: Pick<CapabilityNode, 'capId' | 'kind' | 'provenance' | 'temporalState' | 'metadata'> & { tenantScope?: string },
+): boolean {
+  if (!hasBaseAgenticCapabilityEligibility(node)) return false
+  return node.metadata?.runtimeObserved === true
+}
+
+/** True iff a `CapabilityLedger` node represents an agentic runtime-sealed or live runtime-observed capability (never a pre-floor seed, static stub, or hypothetical projection). */
+export function isAgenticSealedCapabilityNode(
+  node: Pick<CapabilityNode, 'capId' | 'kind' | 'provenance' | 'temporalState' | 'metadata'> & { tenantScope?: string },
+): boolean {
+  if (!hasBaseAgenticCapabilityEligibility(node)) return false
+  if (node.metadata?.runtimeObserved === true) return true
+  if (node.tenantScope === 'unscoped_hypothesis') return false
+  if (node.metadata && typeof node.metadata.hopId === 'string' && typeof node.metadata.roundNo === 'number') {
+    return false
+  }
+  return true
+}
+
+/** Fast check for whether the run's `CapabilityLedger` contains at least one agentic sealed or live runtime-observed capability. */
+export function hasAgenticSealedCapabilities(
+  ledger: Pick<CapabilityLedger, 'listCapabilities'>,
+  options?: { llmMode?: FrontierLlmMode },
+): boolean {
+  if (options?.llmMode === 'deterministic-no-llm') return false
   return ledger.listCapabilities().some(isAgenticSealedCapabilityNode)
+}
+
+function classifyHopSurface(hop: ChainHop): CapabilitySurface {
+  if (hop.artifactKind === 'stored_write_handle') return 'browser'
+  if (hop.artifactKind === 'ssrf_redirect_target') return 'webhook'
+  if (hop.artifactKind === 'workflow_state_handle') return 'async_job'
+  const ep = (hop.endpoint ?? '/').toLowerCase()
+  if (/\/(?:graphql|gql)\b/.test(ep)) return 'graphql'
+  if (/\/(?:webhooks?|hooks?|callback)\b/.test(ep)) return 'webhook'
+  if (/\/(?:jobs?|exports?|tasks?|builds?|pipelines?|runs?|async)\b/.test(ep)) return 'async_job'
+  if (/\/(?:storage|files?|artifacts?|downloads?|uploads?|media)\b/.test(ep)) return 'storage'
+  return 'http'
+}
+
+function resolveHopCapabilityKind(hop: ChainHop, textCorpus: string): CapabilityKind {
+  if (hop.artifactKind === 'token_ref') {
+    return SIGNING_SECRET_RE.test(textCorpus) ? 'signing_material' : 'scoped_token'
+  }
+  if (hop.artifactKind === 'ssrf_redirect_target') {
+    return SIGNED_URL_FIELD_RE.test(textCorpus) ? 'signed_artifact_or_url' : 'internal_reach_handle'
+  }
+  if (hop.artifactKind === 'workflow_state_handle') {
+    return SIGNED_URL_FIELD_RE.test(textCorpus) ? 'signed_artifact_or_url' : 'state_handle'
+  }
+  if (hop.artifactKind === 'leaked_id') return 'opaque_object_ref'
+  if (hop.artifactKind === 'role_transition') return 'identity_session'
+  return 'write_sink_handle'
+}
+
+function extractSafeHopFactCue(
+  hop: ChainHop,
+  backingFacts: readonly Fact[],
+  observed2xxIds: ReadonlySet<string>,
+  observed2xxOrigins: ReadonlySet<string>,
+): { runtimeObserved: boolean; exchangeId?: string; fieldName?: string; secretKind?: string; label?: string; textCorpus: string } {
+  const textParts = [hop.summary, hop.endpoint ?? '', hop.artifactRef]
+  if (hop.factIds.length === 0 || hop.artifactRef.startsWith('suspect:')) {
+    return { runtimeObserved: false, textCorpus: textParts.join(' ') }
+  }
+  const sourceFacts = backingFacts.filter(f => !f.tainted && f.data?.subkind !== 'chain_hop' && f.data?.kind !== 'chain_hop')
+  const inspectFacts = sourceFacts.length > 0 ? sourceFacts : backingFacts.filter(f => !f.tainted)
+  let runtimeObserved = false
+  let exchangeId: string | undefined
+  let fieldName: string | undefined
+  let secretKind: string | undefined
+  let label: string | undefined
+
+  for (const fact of inspectFacts) {
+    const data = (fact.data ?? {}) as Record<string, unknown>
+    const subkind = typeof data.subkind === 'string' ? data.subkind.trim().toLowerCase() : ''
+    const source = typeof data.source === 'string' ? data.source.trim().toLowerCase() : ''
+    if (
+      (fact.kind as string) === 'code_audit_suspect'
+      || NON_AGENTIC_FACT_SUBKINDS.has(subkind)
+      || NON_AGENTIC_FACT_SOURCES.has(source)
+      || data.hypothetical === true
+      || data.synthetic === true
+      || data.staticOnly === true
+    ) continue
+
+    textParts.push(fact.summary)
+    for (const k of ['fieldName', 'slot', 'resourceKey', 'secretKind', 'label', 'tokenKind']) {
+      if (typeof data[k] === 'string' && (data[k] as string).trim()) textParts.push(data[k] as string)
+    }
+    if (!fieldName) {
+      const rawField = [data.fieldName, data.slot, data.resourceKey].find(v => typeof v === 'string' && v.trim()) as string | undefined
+      if (rawField) fieldName = sanitizeCheckpointText(rawField, 48)
+    }
+    if (!secretKind && typeof data.secretKind === 'string' && data.secretKind.trim()) {
+      secretKind = sanitizeCheckpointText(data.secretKind, 36)
+    }
+    if (!label && typeof data.label === 'string' && data.label.trim()) {
+      label = sanitizeCheckpointText(data.label, 48)
+    }
+
+    const factExIds = [
+      ...(Array.isArray(fact.exchangeIds) ? fact.exchangeIds : []),
+      ...(typeof data.exchangeId === 'string' ? [data.exchangeId] : []),
+      ...(Array.isArray(data.exchangeIds) ? data.exchangeIds.filter((v): v is string => typeof v === 'string') : []),
+    ].map(s => s.trim()).filter(Boolean)
+    const matchedExId = factExIds.find(id => observed2xxIds.size === 0 || observed2xxIds.has(id)) ?? factExIds[0]
+    if (matchedExId && !exchangeId) exchangeId = matchedExId
+
+    const hasConcreteArtifact = Boolean(
+      matchedExId
+      || hop.verified
+      || data.verified === true
+      || observed2xxOrigins.has(hop.origin)
+      || fact.kind === 'secret'
+      || fact.kind === 'object_ref'
+      || typeof data.resourceId === 'string'
+      || typeof data.workflowHandle === 'string'
+      || typeof data.stateHandle === 'string'
+      || typeof data.fieldName === 'string'
+      || typeof data.secretKind === 'string'
+      || typeof data.downloadUrl === 'string'
+      || typeof data.signedUrl === 'string',
+    )
+    if (LIVE_AGENTIC_FACT_KINDS.has(fact.kind) && hasConcreteArtifact) {
+      runtimeObserved = true
+    }
+  }
+  return { runtimeObserved, exchangeId, fieldName, secretKind, label, textCorpus: textParts.join(' ') }
+}
+
+/** Preload 2xx broker exchanges and untainted facts once per `syncChainHopsToLedger` batch. */
+export function buildHopRuntimeObservationIndex(
+  storage: Store,
+  runId: string,
+  llmMode: FrontierLlmMode,
+  existingFacts?: readonly Fact[],
+): { factById: Map<string, Fact>; observed2xxIds: Set<string>; observed2xxOrigins: Set<string> } {
+  const factById = new Map<string, Fact>()
+  const observed2xxIds = new Set<string>()
+  const observed2xxOrigins = new Set<string>()
+  if (llmMode !== 'agentic') return { factById, observed2xxIds, observed2xxOrigins }
+  const facts = existingFacts ?? storage.listFacts(runId, { includeTainted: false, limit: 300, offset: 0 })
+  for (const f of facts) factById.set(f.id, f)
+  try {
+    const rows = storage.client.prepare(`
+      SELECT id, origin FROM broker_exchanges
+      WHERE run_id = ? AND status BETWEEN 200 AND 299
+      ORDER BY created_at DESC LIMIT 300
+    `).all(runId) as Array<{ id: string; origin: string }>
+    for (const r of rows) {
+      if (r.id) observed2xxIds.add(r.id)
+      if (r.origin) observed2xxOrigins.add(r.origin)
+    }
+  } catch { /* best-effort runtime check */ }
+  return { factById, observed2xxIds, observed2xxOrigins }
+}
+
+/** Sanitize a `ChainHop` identifier so opaque `secret:<factId>` refs never trip raw-secret metadata guards. */
+export function sanitizeLedgerHopId(hopId: string): string {
+  return sanitizeCheckpointText(
+    hopId.replace(/(?:^|:)(?:secret|jwt|token|key|password|passwd|credential):/gi, ':ref_'),
+    120,
+  )
+}
+
+/** Classify whether a `ChainHop` is backed by a live agentic runtime observation (never static/hypothetical or `--no-llm`). */
+export function inspectChainHopRuntimeObservation(
+  hop: ChainHop,
+  llmMode: FrontierLlmMode,
+  index: { factById: ReadonlyMap<string, Fact>; observed2xxIds: ReadonlySet<string>; observed2xxOrigins: ReadonlySet<string> },
+): { runtimeObserved: boolean; safeHopId: string; kindOverride?: CapabilityKind; exchangeId?: string; fieldName?: string; secretKind?: string; label?: string } {
+  const safeHopId = sanitizeLedgerHopId(hop.hopId)
+  if (llmMode !== 'agentic') return { runtimeObserved: false, safeHopId }
+  const backingFacts = hop.factIds.map(id => index.factById.get(id)).filter((f): f is Fact => Boolean(f))
+  const cue = extractSafeHopFactCue(hop, backingFacts, index.observed2xxIds, index.observed2xxOrigins)
+  const kindOverride = cue.runtimeObserved ? resolveHopCapabilityKind(hop, cue.textCorpus) : undefined
+  return {
+    runtimeObserved: cue.runtimeObserved,
+    safeHopId,
+    ...(kindOverride ? { kindOverride } : {}),
+    ...(cue.exchangeId ? { exchangeId: cue.exchangeId } : {}),
+    ...(cue.fieldName ? { fieldName: cue.fieldName } : {}),
+    ...(cue.secretKind ? { secretKind: cue.secretKind } : {}),
+    ...(cue.label ? { label: cue.label } : {}),
+  }
+}
+
+/**
+ * Sync extracted typed `ChainHop`s into `CapabilityLedger` as quarantined `capability_only` nodes.
+ * Strictly marks live agentic runtime-observed hops with `metadata.runtimeObserved = true` ONLY when
+ * `llmMode === 'agentic'` and backed by a live non-static agentic fact / 2xx exchange, keeping
+ * static/hypothetical projections and `--no-llm` runs isolated under `unscoped_hypothesis`.
+ */
+export function syncChainHopsToCapabilityLedger(
+  storage: Store,
+  run: Run,
+  ledger: CapabilityLedger,
+  hops: readonly ChainHop[],
+  options: { llmMode?: FrontierLlmMode; existingFacts?: readonly Fact[] } = {},
+): number {
+  if (!hops.length) return 0
+  const llmMode: FrontierLlmMode = options.llmMode ?? 'deterministic-no-llm'
+  const index = buildHopRuntimeObservationIndex(storage, run.id, llmMode, options.existingFacts)
+
+  let synced = 0
+  for (const hop of hops.slice(0, 32)) {
+    const slot = hop.hopId.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[^A-Za-z0-9]+/, '').slice(0, 56) || 'hop'
+    const capId = formatDerivedCapabilityHandle(`r${hop.roundNo}`, slot)
+    if (ledger.getCapability(capId)) continue
+    const obs = inspectChainHopRuntimeObservation(hop, llmMode, index)
+    try {
+      ledger.addCapability({
+        capId,
+        kind: obs.kindOverride ?? resolveHopCapabilityKind(hop, `${hop.summary} ${hop.endpoint ?? ''}`),
+        promotionStatus: 'capability_only',
+        provenance: hop.verified ? 'derived_hop' : 'runtime_discovery',
+        tenantScope: obs.runtimeObserved ? 'runtime_observed' : 'unscoped_hypothesis',
+        actorPersona: hop.persona ?? 'attacker',
+        serviceOrigin: hop.origin,
+        surface: classifyHopSurface(hop),
+        parentHopReceiptIds: hop.verified ? [obs.safeHopId] : [],
+        artifactDigest: computeArtifactDigest(`${hop.hopId}|${hop.origin}|${hop.artifactRef}`),
+        artifactSummary: sanitizeCheckpointText(hop.summary, 220),
+        metadata: {
+          hopId: obs.safeHopId,
+          roundNo: hop.roundNo,
+          ...(obs.runtimeObserved ? { runtimeObserved: true } : {}),
+          ...(obs.exchangeId ? { exchangeId: obs.exchangeId } : {}),
+          ...(hop.endpoint ? { endpoint: hop.endpoint } : {}),
+          ...(hop.method ? { method: hop.method } : {}),
+          ...(hop.factIds[0] ? { factId: hop.factIds[0] } : {}),
+          ...(obs.fieldName ? { fieldName: obs.fieldName } : {}),
+          ...(obs.secretKind ? { secretKind: obs.secretKind } : {}),
+          ...(obs.label ? { label: obs.label } : {}),
+        },
+      })
+      synced += 1
+    } catch { /* ignore invalid/duplicate/secret-rejected hop mirrors */ }
+  }
+  return synced
 }
 
 /** Generically classify a capability into one of the four structural frontier shapes. */
@@ -647,17 +895,22 @@ function buildNextHopInstruction(
   capId: string,
   actingPersona: string,
   consumer: IndexedConsumer,
+  runtimeObserved = false,
+  producerDesc?: string | null,
 ): string {
   const target = `${consumer.method} ${consumer.origin}${consumer.normPath}`
+  const sealHint = runtimeObserved && producerDesc
+    ? ` If unsealed, first capture via kovo_verify seal_capability on ${producerDesc}.`
+    : ''
   switch (affordance) {
     case 'derive_signature':
-      return `Use kovo_verify with hmac_sign / jwt_sign over sealed handle ${capId} as ${actingPersona} to test standard signing schemes (HMAC-SHA256 hex/base64 over raw JSON body, timestamp.body, or canonical params; HS256 JWT) against ${target}, and compare against a clean unsigned/invalid-signature denied control (401/403).`
+      return `Use kovo_verify with hmac_sign / jwt_sign over sealed handle ${capId} as ${actingPersona} to test standard signing schemes (HMAC-SHA256 hex/base64 over raw JSON body, timestamp.body, or canonical params; HS256 JWT) against ${target}, and compare against a clean unsigned/invalid-signature denied control (401/403).${sealHint}`
     case 'pivot_with_credential':
-      return `Use kovo_verify to inject sealed credential handle ${capId} (Bearer/header/cookie) as ${actingPersona} against denied endpoint ${target}, comparing the base persona's 401/403 control against the credential-bearing variant.`
+      return `Use kovo_verify to inject sealed credential handle ${capId} (Bearer/header/cookie) as ${actingPersona} against denied endpoint ${target}, comparing the base persona's 401/403 control against the credential-bearing variant.${sealHint}`
     case 'consume_entity_id':
-      return `Use kovo_verify to supply the discovered entity/job ID from ${capId} into sibling route ${target} as ${actingPersona}, verifying authorization and tenant isolation against a clean denied control.`
+      return `Use kovo_verify to supply the discovered entity/job ID from ${capId} into sibling route ${target} as ${actingPersona}, verifying authorization and tenant isolation against a clean denied control.${sealHint}`
     case 'redeem_signed_url':
-      return `Use kovo_verify to redeem/fetch the signed download/export URL from ${capId} at ${target} as ${actingPersona}, comparing unauthorized/cross-tenant access against a clean denied control.`
+      return `Use kovo_verify to redeem/fetch the signed download/export URL from ${capId} at ${target} as ${actingPersona}, comparing unauthorized/cross-tenant access against a clean denied control.${sealHint}`
   }
 }
 
@@ -806,6 +1059,7 @@ export function rankCapabilityConsumerPairs(input: RankCapabilityConsumerPairsIn
           actingPersona,
           label,
           factId: cap.factId ?? null,
+          ...(cap.runtimeObserved ? { runtimeObserved: true } : {}),
         },
         consumer: {
           origin: consumer.origin,
@@ -820,7 +1074,14 @@ export function rankCapabilityConsumerPairs(input: RankCapabilityConsumerPairsIn
         crossOrigin: cap.origin !== consumer.origin,
         score: match.score,
         reasons: match.reasons,
-        nextHopInstruction: buildNextHopInstruction(match.affordance, cap.capId, actingPersona, consumer),
+        nextHopInstruction: buildNextHopInstruction(
+          match.affordance,
+          cap.capId,
+          actingPersona,
+          consumer,
+          Boolean(cap.runtimeObserved),
+          prodNorm ? `${prodMethod ? `${prodMethod} ` : ''}${cap.origin}${prodNorm}` : null,
+        ),
       })
     }
   }
@@ -929,8 +1190,13 @@ function collectLedgerFrontierCapabilities(
   ledger: CapabilityLedger,
   facts: readonly Fact[],
   personas: readonly FrontierPersonaInput[],
+  llmMode: FrontierLlmMode = 'agentic',
 ): FrontierCapabilityInput[] {
-  const nodes = ledger.listCapabilities().filter(isAgenticSealedCapabilityNode)
+  if (llmMode === 'deterministic-no-llm') return []
+  const nodes = ledger.listCapabilities().filter(node =>
+    isAgenticSealedCapabilityNode(node)
+    && (!isAgenticRuntimeCapabilityNode(node) || llmMode === 'agentic'),
+  )
   if (!nodes.length) return []
 
   const nonElevated = personas
@@ -998,6 +1264,7 @@ function collectLedgerFrontierCapabilities(
       targetPath: typeof meta.targetPath === 'string' ? meta.targetPath : null,
       derivedFromAttackerPersona,
       factId: (typeof meta.factId === 'string' ? meta.factId : factMeta?.factId) ?? null,
+      ...(meta.runtimeObserved === true ? { runtimeObserved: true } : {}),
     }
   })
 }
@@ -1049,13 +1316,14 @@ export function materializeCapabilityConsumerFrontierSteps(
   if (maxSteps <= 0) return []
 
   const ledger = storage.capabilityLedger(run.id)
-  if (!hasAgenticSealedCapabilities(ledger)) return []
+  const effectiveLlmMode: FrontierLlmMode = options.llmMode ?? 'agentic'
+  if (!hasAgenticSealedCapabilities(ledger, { llmMode: effectiveLlmMode })) return []
 
   const approvedOrder = new Map(run.approvedPersonaIds.map((id, idx) => [id, idx]))
   const personas: FrontierPersonaInput[] = [...resolveRunPersonas(storage, run.projectId, run.approvedPersonaIds).values()]
     .map((p, idx) => ({ handle: p.handle, roleLabel: p.roleLabel, configIndex: approvedOrder.get(p.id) ?? idx }))
   const facts = options.existingFacts ?? storage.listFacts(run.id, { includeTainted: false, limit: 250, offset: 0 })
-  const capabilities = collectLedgerFrontierCapabilities(ledger, facts, personas)
+  const capabilities = collectLedgerFrontierCapabilities(ledger, facts, personas, effectiveLlmMode)
   if (!capabilities.length) return []
 
   const paramsByEp = new Map<string, { names: string[]; hasObjId: boolean }>()
