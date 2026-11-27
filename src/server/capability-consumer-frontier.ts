@@ -254,14 +254,21 @@ function extractCapabilityNouns(cap: FrontierCapabilityInput): Set<string> {
   return out
 }
 
-/** True iff a `CapabilityLedger` node represents an agentic runtime-sealed capability (never a pre-floor seed or static stub). */
-export function isAgenticSealedCapabilityNode(node: Pick<CapabilityNode, 'capId' | 'kind' | 'provenance' | 'temporalState' | 'metadata'>): boolean {
+/** True iff a `CapabilityLedger` node represents an agentic runtime-sealed capability (never a pre-floor seed, static stub, or planner hop projection). */
+export function isAgenticSealedCapabilityNode(
+  node: Pick<CapabilityNode, 'capId' | 'kind' | 'provenance' | 'temporalState' | 'metadata'> & { tenantScope?: string },
+): boolean {
   if (!DERIVED_CAPABILITY_HANDLE_RE.test(node.capId)) return false
   if (node.capId.startsWith('cap:hop_synth:') || node.capId.startsWith('cap:hop_seed_')) return false
   if (NON_AGENTIC_PROVENANCES.has(node.provenance)) return false
   if (node.kind === 'policy_asymmetry') return false
   if (node.temporalState === 'expired') return false
-  if (node.metadata && (typeof node.metadata.synthCapId === 'string' || typeof node.metadata.hypothesisId === 'string')) return false
+  if (node.tenantScope === 'unscoped_hypothesis') return false
+  if (node.metadata && (
+    typeof node.metadata.synthCapId === 'string'
+    || typeof node.metadata.hypothesisId === 'string'
+    || (typeof node.metadata.hopId === 'string' && typeof node.metadata.roundNo === 'number')
+  )) return false
   return true
 }
 

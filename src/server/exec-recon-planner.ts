@@ -6626,17 +6626,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const ledger = this.storage.capabilityLedger(run.id)
     const controller = this.frontierControllerFor(run.id)
     this.syncChainHopsToLedger(ledger, hops)
-    const frontierCreated = snapshot?.llmMode !== 'deterministic-no-llm' && hasAgenticSealedCapabilities(ledger)
-      ? materializeCapabilityConsumerFrontierSteps(this.storage, run, {
-        activeOrigins: this.activeApprovedOrigins(run, this.host.approvedOriginsSet(run)),
-        llmMode: snapshot?.llmMode, maxSteps: Math.min(6, remaining), existingSteps: existing,
-        existingFacts: snapshot?.existingFacts, confirmedRefs: this.alreadyConfirmedRefs(run, 100), routeStep: routeStepToSpecialist,
-      }) : []
-    for (const step of frontierCreated) {
-      const m = /->\s*consumer\s+(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(https?:\/\/[^\s/]+)(\/[^\s[\]]+)/i.exec(step.hypothesis)
-      if (m?.[1] && m?.[2] && m?.[3]) this.registerStepTargets(run.id, step.id, [{ origin: m[2], method: m[1].toUpperCase(), route: m[3], vulnClass: step.category }])
-    }
-    if (frontierCreated.length && funnel) { funnel.planned += frontierCreated.length; funnel.enqueued += frontierCreated.length }
     const sourceMounted = snapshot?.sourceMounted ?? (this.host.projectReposMount(run.projectId).mountedRepos.length > 0)
     const apiDependencies = snapshot?.apiDependencies ?? this.collectCoordinatorApiDependencies(run)
     const hypotheses = coordinator.planChainRound({
@@ -6644,40 +6633,51 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       apiDependencies,
       sourceMounted,
       maxHops: 6,
-      limit: Math.min(12, Math.max(0, remaining - frontierCreated.length)),
+      limit: Math.min(12, remaining),
       capabilityLedger: ledger,
       frontierScheduler: controller.scheduler,
       waveNo: roundNo,
     })
-    if (!hypotheses.length) return frontierCreated.length
-    const existingFacts = snapshot?.existingFacts ?? this.pageAll((offset, limit) =>
-      this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
-    const hopFactById = this.persistChainHopFacts(run, hops, existingFacts)
-    const liveFactIds = new Set<string>([...factIds, ...hopFactById.values()])
-    // Attach persisted chain_hop fact IDs onto parentEvidenceIds so follow-on briefs receive them
-    // while always preserving the originating fact IDs.
-    const enrichedHypotheses = hypotheses.map(hypothesis => {
-      const hopFactIds = (hypothesis.chainHops ?? [])
-        .map(hop => hopFactById.get(hop.hopId))
-        .filter((id): id is string => Boolean(id))
-      return hopFactIds.length
-        ? { ...hypothesis, parentEvidenceIds: [...new Set([...hypothesis.parentEvidenceIds, ...hopFactIds])] }
-        : hypothesis
-    })
-    const plan = coordinator.dispatchInvestigations(chainHypothesisDispatchSteps(enrichedHypotheses), { maxSteps: Math.max(0, remaining - frontierCreated.length) })
-    const counts = this.persistDispatchPlan(run, plan, liveFactIds)
-    if (funnel) addFunnelCounts(funnel, counts)
-    this.storage.event(run.id, 'chain.round', `Chain round dispatched ${counts.enqueued} hypothesis(es) with ${hops.length} typed hop artifact(s).`, {
-      hypotheses: hypotheses.length, dispatched: counts.enqueued, rejected: plan.rejected.length,
-      crossOrigin: hypotheses.filter(hypothesis => hypothesis.scope === 'cross_origin').length,
-      primitives: [...new Set(hypotheses.flatMap(hypothesis => hypothesis.primitiveKinds))],
-      chainHopCount: hops.length,
-      hopArtifactKinds: [...new Set(hops.map(hop => hop.artifactKind))],
-      maxChainHops: hypotheses.reduce((max, h) => Math.max(max, h.hops), 0),
-    })
-    return frontierCreated.length + counts.enqueued
+    let chainEnqueued = 0
+    if (hypotheses.length) {
+      const existingFacts = snapshot?.existingFacts ?? this.pageAll((offset, limit) =>
+        this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
+      const hopFactById = this.persistChainHopFacts(run, hops, existingFacts)
+      const liveFactIds = new Set<string>([...factIds, ...hopFactById.values()])
+      const enrichedHypotheses = hypotheses.map(hypothesis => {
+        const hopFactIds = (hypothesis.chainHops ?? [])
+          .map(hop => hopFactById.get(hop.hopId))
+          .filter((id): id is string => Boolean(id))
+        return hopFactIds.length
+          ? { ...hypothesis, parentEvidenceIds: [...new Set([...hypothesis.parentEvidenceIds, ...hopFactIds])] }
+          : hypothesis
+      })
+      const plan = coordinator.dispatchInvestigations(chainHypothesisDispatchSteps(enrichedHypotheses), { maxSteps: remaining })
+      const counts = this.persistDispatchPlan(run, plan, liveFactIds)
+      if (funnel) addFunnelCounts(funnel, counts)
+      chainEnqueued = counts.enqueued
+      this.storage.event(run.id, 'chain.round', `Chain round dispatched ${counts.enqueued} hypothesis(es) with ${hops.length} typed hop artifact(s).`, {
+        hypotheses: hypotheses.length, dispatched: counts.enqueued, rejected: plan.rejected.length,
+        crossOrigin: hypotheses.filter(hypothesis => hypothesis.scope === 'cross_origin').length,
+        primitives: [...new Set(hypotheses.flatMap(hypothesis => hypothesis.primitiveKinds))],
+        chainHopCount: hops.length, hopArtifactKinds: [...new Set(hops.map(hop => hop.artifactKind))],
+        maxChainHops: hypotheses.reduce((max, h) => Math.max(max, h.hops), 0),
+      })
+    }
+    const frontierLimit = Math.min(6, Math.max(0, remaining - chainEnqueued))
+    const frontierCreated = frontierLimit > 0 && snapshot?.llmMode !== 'deterministic-no-llm' && hasAgenticSealedCapabilities(ledger)
+      ? materializeCapabilityConsumerFrontierSteps(this.storage, run, {
+        activeOrigins: this.activeApprovedOrigins(run, this.host.approvedOriginsSet(run)),
+        llmMode: snapshot?.llmMode, maxSteps: frontierLimit, existingSteps: chainEnqueued > 0 ? this.storage.listChainSteps(run.id, run.goalRevision) : existing,
+        existingFacts: snapshot?.existingFacts, confirmedRefs: this.alreadyConfirmedRefs(run, 100), routeStep: routeStepToSpecialist,
+      }) : []
+    for (const step of frontierCreated) {
+      const m = /->\s*consumer\s+(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(https?:\/\/[^\s/]+)(\/[^\s[\]]+)/i.exec(step.hypothesis)
+      if (m?.[1] && m?.[2] && m?.[3]) this.registerStepTargets(run.id, step.id, [{ origin: m[2], method: m[1].toUpperCase(), route: m[3], vulnClass: step.category }])
+    }
+    if (frontierCreated.length && funnel) { funnel.planned += frontierCreated.length; funnel.enqueued += frontierCreated.length }
+    return chainEnqueued + frontierCreated.length
   }
-
 
   async runChainPlanner(run: Run, profiles: readonly ResolvedModelProfile[], task: CoordinatorTask) {
     const fresh = this.storage.run(run.id)
