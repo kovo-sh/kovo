@@ -1,133 +1,133 @@
 import { randomUUID } from 'node:crypto'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { and, eq } from 'drizzle-orm'
-import {
-  maxInlineVerifyRetries,
-  type CheckCoverage, type CodeLocation,
-} from '../domain.ts'
+import { maxInlineVerifyRetries, type CheckCoverage, type CodeLocation } from '../domain.ts'
 import { declarativeReplaySpecSchema, replaySpecOrigins, type DeclarativeReplaySpec } from '../replay-spec.ts'
-import {
-  ActiveClock,
-  getRunClock,
-  registerAssignmentClock,
-  type DeadlineTimerHandle,
-} from './active-clock.ts'
+import { ActiveClock, getRunClock, registerAssignmentClock, type DeadlineTimerHandle } from './active-clock.ts'
 import { createCheckpointOnlySessionGuard } from './agent-prompts.ts'
 import {
-  KOVO_VERIFY_TS_ONLY_ERROR,
-  createBoardTools,
-  filterHandlersForSpecialist,
-  injectBoardTurnInstructions,
-  listSkills,
-  loadSkill,
-  parseNegativeEdgeGapReason,
-  resolveSpecialistProfile,
-  routeStepToSpecialist,
-  runAgentSession,
-  selectPreInjectionSkills,
-  summarizeKovoVerifyOutcome,
-  workerInvestigationPrompt,
-  type AgentSessionHandle,
-  type GapValidationEvent,
-  type KovoVerifyArgs,
-  type KovoVerifyRuntime,
-  type ProofObligationEvent,
-  type WorkerToolHandlers,
+  KOVO_VERIFY_TS_ONLY_ERROR, createBoardTools, filterHandlersForSpecialist, injectBoardTurnInstructions,
+  listSkills, loadSkill, parseNegativeEdgeGapReason, resolveSpecialistProfile, routeStepToSpecialist,
+  runAgentSession, selectPreInjectionSkills, summarizeKovoVerifyOutcome, workerInvestigationPrompt,
+  type AgentSessionHandle, type GapValidationEvent, type KovoVerifyArgs, type KovoVerifyRuntime,
+  type ProofObligationEvent, type WorkerToolHandlers,
 } from './agent-session.ts'
-import {
-  detectKovoVerifyScriptAliases,
-  recordKovoVerifyAliasUsage,
-  type KovoVerifyAliasKey,
-} from './verify-runner.ts'
+import { detectKovoVerifyScriptAliases, recordKovoVerifyAliasUsage, type KovoVerifyAliasKey } from './verify-runner.ts'
 import type { AgentTrace } from './agent-trace.ts'
-import {
-  BrokerDenied,
-  type BrokerExchangeResult,
-  type Grant,
-} from './broker.ts'
+import { BrokerDenied, type BrokerExchangeResult, type Grant } from './broker.ts'
 import { DERIVED_CAPABILITY_HANDLE_RE, type NegativeEdge } from './capability-ledger.ts'
+import type { CompositeProofReceipt, CompositeReceiptVerification, HostSignedTranscript } from './composite-receipt.ts'
 import { extractCoverageEvidenceMetadata } from './coverage-category.ts'
 import { queryCves } from './cve-broker.ts'
 import { vaultScrubDescriptors, type DerivedCapabilityVault } from './derived-custody.ts'
 import { createEgressSanitizer } from './egress-sanitizer.ts'
-import {
-  createProviderLlmCall,
-  evaluateSubmissionDedupe,
-  extractSpecDedupeFields,
-  normalizeEndpointTemplate,
-} from './dedupe.ts'
+import { createProviderLlmCall, evaluateSubmissionDedupe, extractSpecDedupeFields, normalizeEndpointTemplate } from './dedupe.ts'
 import type { ExecBoardManager } from './exec-board.ts'
 import {
   ProviderNoTokenWatchdog, createAutoDisposedRunState, type RunOrchestrationStateStore,
-  buildBolaTestQueue,
-  classifyWorkerErrorToStepStatus,
-  collectAllPages,
-  computeDynamicStepBudget,
-  evaluateTransientProviderRetry,
-  extractAssignedTargetRoutes,
-  hardChainStepsCeiling,
-  isMultiHopChainStep,
-  isRetryableChainStepStatus,
-  mapSessionStatusToStepStatus,
-  percentile,
-  providerStallAbortMs,
-  reinvestigationKey,
-  resolveWorkerSettlementMs,
-  selectAssignmentBolaQueueItems,
-  shouldRetryStalledAssignment,
-  type AssignmentBudget,
+  buildBolaTestQueue, classifyWorkerErrorToStepStatus, collectAllPages, computeDynamicStepBudget,
+  evaluateTransientProviderRetry, extractAssignedTargetRoutes, hardChainStepsCeiling,
+  isMultiHopChainStep, isRetryableChainStepStatus, mapSessionStatusToStepStatus,
+  percentile, providerStallAbortMs, reinvestigationKey, resolveWorkerSettlementMs,
+  selectAssignmentBolaQueueItems, shouldRetryStalledAssignment, type AssignmentBudget,
 } from './exec-dispatch.ts'
 import {
-  ExecServiceModule,
-  buildChainFindingBase,
-  buildExistingFindingRefs,
-  createExchangeRecorder,
-  findFindingRow,
-  llmRunHooks,
-  publicPersonasFromGrant,
-  retryLimitExceededFeedback,
-  type ExecActiveJob,
-  type ExecCoreServices,
+  ExecServiceModule, buildChainFindingBase, buildExistingFindingRefs, createExchangeRecorder,
+  findFindingRow, llmRunHooks, publicPersonasFromGrant, retryLimitExceededFeedback,
+  type ExecActiveJob, type ExecCoreServices,
 } from './exec-exchange.ts'
 import { DETERMINISTIC_PARAM_HINT_RE } from './exec-floor-lane.ts'
-import {
-  isPersistentWorkflowContinuationStep,
-  sortPersonasLowPrivFirst,
-  type ExecReconPlanner,
-} from './exec-recon-planner.ts'
+import { isPersistentWorkflowContinuationStep, sortPersonasLowPrivFirst, type ExecReconPlanner } from './exec-recon-planner.ts'
 import { FindingsRepository } from './store-findings.ts'
 import {
-  STATIC_AST_LIVE_TARGET_REJECT_MESSAGE,
-  guardConfirmedFindingMutation,
-  isLiveRuntimeVerificationRun,
-  type ExecVerifier,
-  type InlineDeferredFindingCandidate,
+  STATIC_AST_LIVE_TARGET_REJECT_MESSAGE, guardConfirmedFindingMutation, isLiveRuntimeVerificationRun,
+  type ExecVerifier, type InlineDeferredFindingCandidate,
 } from './exec-verify.ts'
 import { resolveProfilePoolForRole, type ResolvedModelProfile } from './model-settings.ts'
 import type { PersonaAuthManager, PersonaSessionClone } from './persona-auth.ts'
 import { crawlStateGraph } from './phase0-recon.ts'
 import { resolveProviderRuntimePolicy } from './provider-runtime-policy.ts'
 import { createProviderStreamTelemetry, resolveProfileNoTokenWatchdogMs } from './provider-stream.ts'
-import {
-  BudgetExceededError,
-  ProviderFailureError,
-  QuotaExhaustedError,
-  classifyProviderFailure,
-  evaluateRoleProviderCircuit,
-} from './provider.ts'
+import { BudgetExceededError, ProviderFailureError, QuotaExhaustedError, classifyProviderFailure, evaluateRoleProviderCircuit } from './provider.ts'
 import { redact, type NamedSecret } from './redact.ts'
 import { defaultRetryGovernor, peekLatestProviderFailureForProfile } from './retry-governor.ts'
 import { sanitizeWorkerFactData } from './run-actor.ts'
 import { resolveRunSafetyBudgets } from './run-safety-budgets.ts'
 import { brokerExchanges, type ChainStepTerminalStatus } from './schema.ts'
-import type {
-  Assignment,
-  BoardMessageRow,
-  ChainStep,
-  Run,
-} from './store.ts'
+import type { Assignment, BoardMessageRow, ChainStep, Run } from './store.ts'
 import { probeDifferential, probeSurface } from './surface-engine.ts'
 import { recordProviderUsageTelemetry } from './token-telemetry.ts'
 import { buildWarmPoolPolicy, type WorkerBackend } from './worker-backend.ts'
+
+const CORPUS_SENSITIVE_HEADER_RE = /^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|x-auth-token|x-access-token|x-csrf-token|x-xsrf-token|x-session-token|x-secret|x-webhook-secret)$/i
+const CORPUS_SECRET_VALUE_RE = /-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\n]*PRIVATE KEY-----|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9._-]+|\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}|\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,})\b/gi
+const CORPUS_QUERY_SECRET_RE = /([?&](?:token|access_token|refresh_token|api_key|apikey|secret|password|passwd|session_id)=)[^&#\s]+/gi
+
+function scrubCorpusString(input: string, secrets: readonly NamedSecret[]): string {
+  let out = input
+  for (const s of secrets) {
+    if (s.value && s.value.length >= 4 && out.includes(s.value)) out = out.split(s.value).join('<scrubbed>')
+  }
+  return redact(out.replace(CORPUS_SECRET_VALUE_RE, '<scrubbed>').replace(CORPUS_QUERY_SECRET_RE, '$1<scrubbed>'))
+    .replace(/\[redacted(?::[^\]]*)?\]/gi, '<scrubbed>')
+}
+
+function scrubCorpusValue(value: unknown, secrets: readonly NamedSecret[], depth = 0): unknown {
+  if (depth > 8 || value == null) return value
+  if (typeof value === 'string') return scrubCorpusString(value, secrets)
+  if (Array.isArray(value)) return value.map(item => scrubCorpusValue(item, secrets, depth + 1))
+  if (typeof value !== 'object') return value
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (k === 'hostSignature') continue
+    if ((k === 'requestHeaders' || k === 'responseHeaders') && v && typeof v === 'object' && !Array.isArray(v)) {
+      const cleanHdrs: Record<string, string> = {}
+      for (const [hk, hv] of Object.entries(v as Record<string, unknown>)) {
+        if (!CORPUS_SENSITIVE_HEADER_RE.test(hk) && typeof hv === 'string') cleanHdrs[hk] = scrubCorpusString(hv, secrets)
+      }
+      out[k] = cleanHdrs
+    } else {
+      out[k] = scrubCorpusValue(v, secrets, depth + 1)
+    }
+  }
+  return out
+}
+
+/** Opt-in (`KOVO_CAPTURE_VERIFY_CORPUS_DIR`) sanitized CompositeProofReceipt + HostSignedTranscript corpus writer. */
+export function captureVerifyCorpusRecord(params: {
+  captureDir?: string
+  app: string
+  runId: string
+  assignmentId?: string
+  receipt: CompositeProofReceipt
+  verification: CompositeReceiptVerification
+  hostTranscript: HostSignedTranscript
+  personaRoleLabels?: Record<string, string>
+  secrets?: readonly NamedSecret[]
+  onError?: (err: unknown) => void
+}): string | null {
+  const dir = (params.captureDir ?? process.env.KOVO_CAPTURE_VERIFY_CORPUS_DIR ?? '').trim()
+  if (!dir) return null
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const secrets = params.secrets ?? [], safeRun = params.runId.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64) || 'run'
+    const filePath = join(dir, `${safeRun}_${Date.now()}_${randomUUID().slice(0, 8)}.json`)
+    const payload = {
+      schemaVersion: 1, capturedAt: new Date().toISOString(), app: params.app.trim() || 'unknown', runId: params.runId,
+      ...(params.assignmentId ? { assignmentId: params.assignmentId } : {}),
+      receipt: scrubCorpusValue(params.receipt, secrets), transcript: scrubCorpusValue(params.hostTranscript, secrets),
+      ...(params.personaRoleLabels && Object.keys(params.personaRoleLabels).length > 0 ? { verifyOptions: { personaRoleLabels: params.personaRoleLabels } } : {}),
+      verdict: {
+        confirmed: params.verification.confirmed, failedStage: params.verification.failedStage ?? null, rejectedBy: params.verification.rejectedBy ?? null,
+        reason: scrubCorpusString(params.verification.reason, secrets).slice(0, 400),
+        terminalOracleFamily: params.verification.terminalOracleFamily ?? null, terminalEndpoint: params.verification.terminalEndpoint ?? null,
+      },
+    }
+    writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+    return filePath
+  } catch (err) { params.onError?.(err); return null }
+}
 
 type Active = ExecActiveJob
 
@@ -2475,21 +2475,13 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               ? AbortSignal.any([job.controller.signal, toolSignal])
               : job.controller.signal
             const proof = await this.host.verifier.runAgentScriptProof({
-              script,
-              runtime,
-              ...(args.title?.trim() ? { title: args.title.trim() } : {}),
-              grant,
-              runId: curRun.id,
-              assignmentId: job.assignment.id,
-              targetOrigins: [...approved].slice(0, 8),
-              signal: verifySignal,
-              capabilityVault: runVault,
+              script, runtime, ...(args.title?.trim() ? { title: args.title.trim() } : {}),
+              grant, runId: curRun.id, assignmentId: job.assignment.id,
+              targetOrigins: [...approved].slice(0, 8), signal: verifySignal, capabilityVault: runVault,
               ...(args.timeoutMs ? { timeoutMs: args.timeoutMs } : {}),
             })
             const ledgerSync = this.host.verifier.syncVerifyArtifactsToLedger({
-              runId: curRun.id,
-              proof,
-              defaultOrigin: [...approved][0] ?? '',
+              runId: curRun.id, proof, defaultOrigin: [...approved][0] ?? '',
             })
             for (const sealed of ledgerSync.sealedCapabilities) {
               if (sealed.handle && !sessionSealedCapHandles.includes(sealed.handle)) {
@@ -2505,11 +2497,19 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               hopCount: proof.compositeReceipt.receipt.hops.length,
               replayMode: proof.compositeReceipt.receipt.replayMode,
               confirmed: proof.compositeReceipt.verification.confirmed,
-              ...(proof.compositeReceipt.verification.failedStage
-                ? { failedStage: proof.compositeReceipt.verification.failedStage }
-                : {}),
+              ...(proof.compositeReceipt.verification.failedStage ? { failedStage: proof.compositeReceipt.verification.failedStage } : {}),
               verifiedEdgeCount: proof.compositeReceipt.verification.verifiedEdges.filter(e => e.verified).length,
             } : undefined
+            if (proof.compositeReceipt && proof.hostTranscript) {
+              const personaRoleLabels = grant.personas
+                ? Object.fromEntries([...grant.personas.entries()].filter(([, p]) => Boolean(p.roleLabel?.trim())).map(([h, p]) => [h, p.roleLabel!]))
+                : undefined
+              captureVerifyCorpusRecord({
+                app: [...approved][0] ?? curRun.projectId, runId: curRun.id, assignmentId: job.assignment.id,
+                receipt: proof.compositeReceipt.receipt, verification: proof.compositeReceipt.verification, hostTranscript: proof.hostTranscript,
+                ...(personaRoleLabels ? { personaRoleLabels } : {}), secrets: [...currentSecrets(), ...vaultScrubDescriptors(runVault)],
+              })
+            }
             if (!proof.verdict.confirmed) {
               return checkpointOnlyGuard.summarizeOutcome({
                 verdict: proof.verdict,
