@@ -242,14 +242,15 @@ test('resolveWorkerWallClockMs scales multi-hop chain steps (180s/270s/300s/240s
   assert.equal(extractContinuationDepth(continuationStep), 1)
   assert.equal(isMultiHopChainStep(singleRouteStep), false)
 
-  // Multi-hop chain scaling: clamp(180s, 300s, floor(runDurationMs * 0.30)), default 240s
+  // Multi-hop chain scaling: clamp(180s, 210s, floor(runDurationMs * 0.30)), default 210s
   assert.equal(resolveWorkerWallClockMs(multiHopStep, 600_000), 180_000)   // 10m -> 180s
-  assert.equal(resolveWorkerWallClockMs(multiHopStep, 900_000), 270_000)   // 15m -> 270s
-  assert.equal(resolveWorkerWallClockMs(multiHopStep, 1_800_000), 300_000) // 30m -> 300s
+  assert.equal(resolveWorkerWallClockMs(multiHopStep, 660_000), 198_000)   // 11m -> 198s
+  assert.equal(resolveWorkerWallClockMs(multiHopStep, 900_000), 210_000)   // 15m -> 210s cap
+  assert.equal(resolveWorkerWallClockMs(multiHopStep, 1_800_000), 210_000) // 30m -> 210s cap
   assert.equal(resolveWorkerWallClockMs(multiHopStep, 300_000), 180_000)   // 5m  -> 180s floor
-  assert.equal(resolveWorkerWallClockMs(multiHopStep, undefined), 240_000) // unset -> 240s default
-  assert.equal(resolveWorkerWallClockMs(multiHopStep, 0), 240_000)
-  assert.equal(resolveWorkerWallClockMs(continuationStep, 900_000), 270_000)
+  assert.equal(resolveWorkerWallClockMs(multiHopStep, undefined), 210_000) // unset -> 210s default
+  assert.equal(resolveWorkerWallClockMs(multiHopStep, 0), 210_000)
+  assert.equal(resolveWorkerWallClockMs(continuationStep, 900_000), 210_000)
 
   // Single-route sweeps stay fast at 120s regardless of run duration
   assert.equal(resolveWorkerWallClockMs(singleRouteStep, 600_000), 120_000)
@@ -259,9 +260,8 @@ test('resolveWorkerWallClockMs scales multi-hop chain steps (180s/270s/300s/240s
 
   // Multi-hop settlement: max(wallMs - 25s, wallMs * 0.82)
   assert.equal(resolveWorkerSettlementMs(180_000, true), 155_000)
+  assert.equal(resolveWorkerSettlementMs(210_000, true), 185_000)
   assert.equal(resolveWorkerSettlementMs(240_000, true), 215_000)
-  assert.equal(resolveWorkerSettlementMs(270_000, true), 245_000)
-  assert.equal(resolveWorkerSettlementMs(300_000, true), 275_000)
   assert.equal(resolveWorkerSettlementMs(100_000, true), 82_000)
   assert.equal(resolveWorkerSettlementMs(120_000, false), 105_000)
 
@@ -276,8 +276,8 @@ test('resolveWorkerWallClockMs scales multi-hop chain steps (180s/270s/300s/240s
     baseWallClockMs: 160_000,
   })
   assert.equal(chainBudget15m.kind, 'chain')
-  assert.equal(chainBudget15m.wallClockMs, 270_000)
-  assert.equal(chainBudget15m.wallClockSettlementMs, 245_000)
+  assert.equal(chainBudget15m.wallClockMs, 210_000)
+  assert.equal(chainBudget15m.wallClockSettlementMs, 185_000)
 
   const singleBudget15m = planAssignmentBudget({
     routes: ['/api/v1/items/:id'],
@@ -359,8 +359,8 @@ test('Execution emits 270s wall-clock budget for multi-hop chain step vs 120s fo
   assert.ok(routeStarted, 'expected worker.started event for single-route step')
   const chainBudget = (chainStarted.detail as { assignmentBudget?: { wallClockMs?: number; wallClockSettlementMs?: number } }).assignmentBudget
   const routeBudget = (routeStarted.detail as { assignmentBudget?: { wallClockMs?: number } }).assignmentBudget
-  assert.equal(chainBudget?.wallClockMs, 270_000, '15m multi-hop chain step must receive 270s wall-clock budget')
-  assert.equal(chainBudget?.wallClockSettlementMs, 245_000, '15m multi-hop chain step must settle at 245s (25s before rotation)')
+  assert.equal(chainBudget?.wallClockMs, 210_000, '15m multi-hop chain step must receive 210s wall-clock cap')
+  assert.equal(chainBudget?.wallClockSettlementMs, 185_000, '15m multi-hop chain step must settle at 185s (25s before rotation)')
   assert.equal(routeBudget?.wallClockMs, 120_000, 'single-route step must keep fast 120s rotation window')
 })
 

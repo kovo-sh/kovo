@@ -266,22 +266,27 @@ describe('P2 #7.1: computeEffectiveWorkerElapsedMs pure math & finite caps', () 
 // ============================================================================
 
 describe('P2 #7.2: computeWorkerWallClockPlan & resolveWorkerVerifyGrace', () => {
-  test('computeWorkerWallClockPlan sets finite 2x hard wall-clock ceiling and +60s expanded verify grace', () => {
+  test('computeWorkerWallClockPlan sets bounded <=1.35x hard wall-clock ceiling (capped at +60s) and expanded verify grace', () => {
     const plan = computeWorkerWallClockPlan({ wallClockMs: 90_000, isMultiHop: false })
     assert.equal(plan.remainingBudgetMs, 90_000)
-    assert.equal(plan.maxStallCreditMs, 90_000)
-    assert.equal(plan.hardWallClockCeilingMs, 180_000)
-    assert.equal(plan.expandedVerifyGraceMs, EXPANDED_VERIFY_GRACE_MS)
+    assert.equal(plan.maxStallCreditMs, 31_500)
+    assert.equal(plan.hardWallClockCeilingMs, 121_500)
+    assert.equal(plan.expandedVerifyGraceMs, 31_500)
     assert.ok(plan.verifyGraceMs >= DEFAULT_VERIFY_GRACE_MIN_MS && plan.verifyGraceMs <= DEFAULT_VERIFY_GRACE_MAX_MS)
+
+    const multiPlan = computeWorkerWallClockPlan({ wallClockMs: 180_000, isMultiHop: true })
+    assert.equal(multiPlan.maxStallCreditMs, 60_000)
+    assert.equal(multiPlan.hardWallClockCeilingMs, 240_000)
+    assert.equal(multiPlan.expandedVerifyGraceMs, EXPANDED_VERIFY_GRACE_MS)
   })
 
-  test('grants expanded +60s verify grace for kovo_verify, live sealed capability, or hop_checkpoint', () => {
-    const plan = computeWorkerWallClockPlan({ wallClockMs: 90_000, isMultiHop: false })
+  test('grants expanded +60s verify grace for in-flight/progressed kovo_verify, live sealed capability, or hop_checkpoint', () => {
+    const plan = computeWorkerWallClockPlan({ wallClockMs: 180_000, isMultiHop: true })
 
     const inKovoVerify = resolveWorkerVerifyGrace({
       plan,
-      sessionActiveElapsedMs: 90_000,
-      inFlightProofCall: false,
+      sessionActiveElapsedMs: 180_000,
+      inFlightProofCall: true,
       enteredKovoVerify: true,
       hasLiveSealedCapability: false,
       hasHopCheckpoint: false,
@@ -291,9 +296,23 @@ describe('P2 #7.2: computeWorkerWallClockPlan & resolveWorkerVerifyGrace', () =>
     assert.equal(inKovoVerify.reason, 'expanded_verify')
     assert.equal(inKovoVerify.graceMs, 60_000)
 
+    const progressedKovoVerify = resolveWorkerVerifyGrace({
+      plan,
+      sessionActiveElapsedMs: 180_000,
+      inFlightProofCall: false,
+      enteredKovoVerify: true,
+      kovoVerifyProgressed: true,
+      hasLiveSealedCapability: false,
+      hasHopCheckpoint: false,
+      inSettlementStream: false,
+    })
+    assert.equal(progressedKovoVerify.verifyGraceApplied, true)
+    assert.equal(progressedKovoVerify.reason, 'expanded_verify')
+    assert.equal(progressedKovoVerify.graceMs, 60_000)
+
     const withSealedCap = resolveWorkerVerifyGrace({
       plan,
-      sessionActiveElapsedMs: 90_000,
+      sessionActiveElapsedMs: 180_000,
       inFlightProofCall: false,
       enteredKovoVerify: false,
       hasLiveSealedCapability: true,
@@ -306,7 +325,7 @@ describe('P2 #7.2: computeWorkerWallClockPlan & resolveWorkerVerifyGrace', () =>
 
     const withHopCheckpoint = resolveWorkerVerifyGrace({
       plan,
-      sessionActiveElapsedMs: 90_000,
+      sessionActiveElapsedMs: 180_000,
       inFlightProofCall: false,
       enteredKovoVerify: false,
       hasLiveSealedCapability: false,
@@ -319,12 +338,12 @@ describe('P2 #7.2: computeWorkerWallClockPlan & resolveWorkerVerifyGrace', () =>
   })
 
   test('clamps expanded verify grace to remaining hard ceiling headroom and returns 0 at hard cap', () => {
-    const plan = computeWorkerWallClockPlan({ wallClockMs: 90_000, isMultiHop: false })
+    const plan = computeWorkerWallClockPlan({ wallClockMs: 180_000, isMultiHop: true })
 
-    // Stall credit already moved soft expiration to 150s -> only 30s left before 180s hard cap.
+    // Stall credit already moved soft expiration to 210s -> only 30s left before 240s hard cap.
     const clamped = resolveWorkerVerifyGrace({
       plan,
-      sessionActiveElapsedMs: 150_000,
+      sessionActiveElapsedMs: 210_000,
       inFlightProofCall: true,
       enteredKovoVerify: true,
       hasLiveSealedCapability: true,
@@ -335,10 +354,10 @@ describe('P2 #7.2: computeWorkerWallClockPlan & resolveWorkerVerifyGrace', () =>
     assert.equal(clamped.graceMs, 30_000, 'grace must be clamped by remaining hard ceiling headroom')
     assert.equal(clamped.hardCeilingRemainingMs, 30_000)
 
-    // At hard ceiling (180s), zero grace is granted regardless of proof state.
+    // At hard ceiling (240s), zero grace is granted regardless of proof state.
     const atHardCap = resolveWorkerVerifyGrace({
       plan,
-      sessionActiveElapsedMs: 180_000,
+      sessionActiveElapsedMs: 240_000,
       inFlightProofCall: true,
       enteredKovoVerify: true,
       hasLiveSealedCapability: true,
@@ -438,8 +457,10 @@ describe('P2 #7.4: Integration tests with mock stalled/retrying provider', () =>
     // On 2-vCPU CI runners, widen the mock 429 stall + base budget proportionally so event-loop
     // jitter and pre-session setup cannot push active turn time past the base budget or hard cap,
     // while keeping total wall > baseWallClockMs (proving stall credit prevented rotation).
-    const first429DelayMs = process.env.CI ? 1_300 : 350
-    const baseWallClockMs = process.env.CI ? 2_000 : 1_150
+    const first429DelayMs = process.env.CI ? 900 : 400
+    const baseWallClockMs = process.env.CI ? 4_000 : 2_400
+    const activeTurnDelayMs = process.env.CI ? 1_100 : 650
+    const finalTurnDelayMs = process.env.CI ? 700 : 450
     const server = createServer((req, res) => {
       req.resume()
       requestCount += 1
@@ -456,12 +477,13 @@ describe('P2 #7.4: Integration tests with mock stalled/retrying provider', () =>
       logicalTurn += 1
       res.writeHead(200, { 'content-type': 'text/event-stream' })
       if (logicalTurn === 1 || logicalTurn === 2) {
-        // Two active exploration turns (~220ms each) before turn 3 completes (~120ms).
+        // Two active exploration turns before turn 3 completes so total wall > baseWallClockMs
+        // while active work < baseWallClockMs and total wall < 1.35x hard ceiling.
         setTimeout(() => {
           res.end(responsesToolCallTurn(`call_ev_${logicalTurn}`, 'derive_evidence', {
             command: `echo turn-${logicalTurn}`,
           }))
-        }, 220)
+        }, activeTurnDelayMs)
         return
       }
       setTimeout(() => {
@@ -469,7 +491,7 @@ describe('P2 #7.4: Integration tests with mock stalled/retrying provider', () =>
           status: 'ruled_out',
           summary: 'Completed 3 active turns after transient 429 provider backoff.',
         }))
-      }, 120)
+      }, finalTurnDelayMs)
     }).listen(0, '127.0.0.1')
     await once(server, 'listening')
     t.after(async () => {
@@ -583,10 +605,10 @@ describe('P2 #7.4: Integration tests with mock stalled/retrying provider', () =>
     priv.active.delete(worker.id)
     const wallElapsedMs = Date.now() - startedAt
 
-    // Must NOT hang past 2x hard cap (700ms) + teardown jitter.
+    // Must NOT hang past <= 1.35x hard cap (350ms + 122ms = 472ms) + teardown jitter.
     const hardCapMaxElapsedMs = process.env.CI ? 3_500 : 1_600
-    assert.ok(wallElapsedMs >= 500, `expected stall credit to delay rotation past base 350ms, rotated at ${wallElapsedMs}ms`)
-    assert.ok(wallElapsedMs < hardCapMaxElapsedMs, `expected hard cap rotation near 2x base (700ms), took ${wallElapsedMs}ms`)
+    assert.ok(wallElapsedMs >= 420, `expected stall credit to delay rotation past base 350ms, rotated at ${wallElapsedMs}ms`)
+    assert.ok(wallElapsedMs < hardCapMaxElapsedMs, `expected hard cap rotation near 1.35x base (472ms), took ${wallElapsedMs}ms`)
 
     const rotatedEvents = store.eventsAfter(runId, 0, 200).filter(e => e.kind === 'worker.wall_clock_rotated')
     assert.equal(rotatedEvents.length, 1, 'expected exactly one worker.wall_clock_rotated event at hard cap')
@@ -598,7 +620,7 @@ describe('P2 #7.4: Integration tests with mock stalled/retrying provider', () =>
     }
     assert.ok((detail.providerStallWaitMs ?? 0) > 200, `expected providerStallWaitMs > 200, got ${detail.providerStallWaitMs}`)
     assert.ok((detail.creditedStallWaitMs ?? 0) > 0, `expected creditedStallWaitMs > 0, got ${detail.creditedStallWaitMs}`)
-    assert.ok((detail.hardWallClockCeilingMs ?? 0) <= 700, `expected hardWallClockCeilingMs <= 700, got ${detail.hardWallClockCeilingMs}`)
+    assert.ok((detail.hardWallClockCeilingMs ?? 0) <= 472, `expected hardWallClockCeilingMs <= 472, got ${detail.hardWallClockCeilingMs}`)
     assert.equal(detail.verifyGraceApplied, false)
   })
 

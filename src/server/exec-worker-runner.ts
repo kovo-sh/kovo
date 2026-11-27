@@ -246,6 +246,7 @@ export interface WorkerVerifyGraceInput {
   sessionActiveElapsedMs: number
   inFlightProofCall: boolean
   enteredKovoVerify: boolean
+  kovoVerifyProgressed?: boolean
   hasLiveSealedCapability: boolean
   hasHopCheckpoint: boolean
   inSettlementStream: boolean
@@ -263,12 +264,11 @@ export interface WorkerVerifyGraceDecision {
  * Compute bounded wall-clock settlement, stall-credit ceiling, and verify-grace windows for an
  * investigation worker.
  *
- * - Normal production budgets (>= 20s) receive a 20s–45s verify grace for in-flight proof calls,
- *   an expanded +60s bounded verify grace when the worker has already entered `kovo_verify` or
- *   holds a live sealed capability / active `hop_checkpoint`, plus a bounded 10s–20s
- *   settlement-stream grace if actively generating its final verification call.
- * - `maxStallCreditMs` is strictly capped at `remainingBudgetMs` so `hardWallClockCeilingMs`
- *   never exceeds `2x` base wall-clock budget (zero infinite hangs).
+ * - Normal production budgets (>= 20s) receive a 20s–45s active-proof grace, an expanded +60s
+ *   verify grace ONLY for an in-flight/progressed `kovo_verify` call or live sealed capability /
+ *   active `hop_checkpoint`, plus a bounded 10s–20s settlement-stream grace.
+ * - `maxStallCreditMs` is strictly capped at `min(60s, floor(remainingBudgetMs * 0.35))` so
+ *   `hardWallClockCeilingMs` never exceeds `1.35x` base (<= 270s for 210s base).
  * - Short test budgets (< 20s) preserve fast proportional scaling with zero settlement-stream
  *   extension so unit/integration rotation tests stay strictly bounded.
  */
@@ -282,7 +282,7 @@ export function computeWorkerWallClockPlan(input: {
   const preSessionElapsedMs = Math.max(0, Math.floor(input.preSessionElapsedMs ?? 0))
   const remainingBudgetMs = Math.max(1, wallClockMs - preSessionElapsedMs)
   const isMultiHop = Boolean(input.isMultiHop)
-  const maxStallCreditMs = remainingBudgetMs
+  const maxStallCreditMs = Math.min(60_000, Math.floor((remainingBudgetMs * 35) / 100))
   const hardWallClockCeilingMs = remainingBudgetMs + maxStallCreditMs
 
   const baseSettlementMs = resolveWorkerSettlementMs(wallClockMs, isMultiHop)
@@ -336,7 +336,7 @@ export function resolveWorkerVerifyGrace(input: WorkerVerifyGraceInput): WorkerV
     return { graceMs: 0, reason: 'none', verifyGraceApplied: false, hardCeilingRemainingMs: 0 }
   }
   const hasExpandedContext = Boolean(
-    input.enteredKovoVerify
+    (input.enteredKovoVerify && (input.inFlightProofCall || input.kovoVerifyProgressed))
     || input.hasLiveSealedCapability
     || input.hasHopCheckpoint,
   )
@@ -1392,7 +1392,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
     const checkpointOnlyGuard = createCheckpointOnlySessionGuard()
     let confirmedDuringAssignment = false
     let gapCodedDuringAssignment = false
-    let enteredKovoVerify = false
+    let enteredKovoVerify = false, kovoVerifyProgressed = false
     let inFlightProofCalls = 0
     let onProofCallEnter: (() => void) | undefined
     let onProofCallExit: (() => void) | undefined
@@ -2427,8 +2427,6 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
 
         ...(this.host.verifier.backendSupportsVerifyScript() ? {
           kovo_verify: async (args: KovoVerifyArgs, toolSignal?: AbortSignal) => {
-            enteredKovoVerify = true
-            return trackProofCall(async () => {
             const curRun = this.host.check(job)
             const rawRuntime = args.runtime as string | undefined
             if ((rawRuntime !== undefined && rawRuntime !== 'ts') || (typeof args.scriptPath === 'string' && /\.py$/i.test(args.scriptPath.trim()))) {
@@ -2446,6 +2444,8 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             if (checkpointOnlyGuard.shouldBlockCheckpointOnlyScript(script)) {
               return checkpointOnlyGuard.buildBlockedOutcome()
             }
+            enteredKovoVerify = true
+            return trackProofCall(async () => {
             const aliasHits: KovoVerifyAliasKey[] = [
               ...(args.aliasUsed === 'code'
                 ? ['tool_arg:code' as const]
@@ -2485,6 +2485,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             if (ledgerSync.newCapabilityCount > 0 || ledgerSync.newEdgeCount > 0) {
               this.host.schedulePlanner(curRun.id)
             }
+            if (proof.verdict.confirmed || ledgerSync.sealedCapabilities.length > 0 || ledgerSync.verifiedHops.length > 0 || Boolean(proof.receipt || proof.compositeReceipt)) kovoVerifyProgressed = true
             const compositeReceipt = proof.compositeReceipt ? {
               chainId: proof.compositeReceipt.receipt.chainId,
               terminalVulnClass: proof.compositeReceipt.receipt.terminalVulnClass,
@@ -2627,13 +2628,11 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       const sessionSettlementMs = Math.max(1, effectiveSettlementMs - preSessionElapsedMs)
 
       // Pause-aware, stall-credit-aware verify-grace supervision (backed strictly by `assignmentClock`):
-      // - Provider HTTP retries, 429/5xx backoff, and stalled stream timeouts are deducted from
-      //   soft wall-clock elapsed time via `computeEffectiveWorkerElapsedMs`, capped at
-      //   `wallPlan.maxStallCreditMs` (`<= baseWallClockMs`) so total active time never exceeds
-      //   `wallPlan.hardWallClockCeilingMs` (`2x` base budget).
-      // - When soft budget expires and the worker has already entered `kovo_verify` OR holds a
-      //   live sealed capability / active `hop_checkpoint`, grant an expanded bounded verify-grace
-      //   window (+60s in production, clamped by remaining headroom to `hardWallClockCeilingMs`).
+      // - Provider HTTP retries, 429/5xx backoff, and stalled stream timeouts are deducted from soft
+      //   wall-clock elapsed time via `computeEffectiveWorkerElapsedMs`, capped at `wallPlan.maxStallCreditMs`
+      //   (`<= min(60s, 35% of base)`) so total active time never exceeds `wallPlan.hardWallClockCeilingMs` (<= 1.35x base).
+      // - When soft budget expires, grant expanded verify grace (+60s, clamped to hard ceiling) only for an
+      //   in-flight/progressed `kovo_verify`, live sealed capability, or active `hop_checkpoint`.
       // - Otherwise apply standard active-proof or settlement-stream grace, or rotate immediately.
       const sessionRotateController = new AbortController()
       const onOuterJobAbort = () => sessionRotateController.abort(job.controller.signal.reason)
@@ -2721,7 +2720,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             plan: wallPlan,
             sessionActiveElapsedMs: sessionActiveElapsedMs(),
             inFlightProofCall: inFlightProofCalls > 0,
-            enteredKovoVerify,
+            enteredKovoVerify, kovoVerifyProgressed,
             hasLiveSealedCapability: hasLiveSealedCapability(),
             hasHopCheckpoint,
             inSettlementStream: enteredSettlement && generatingTurn,
@@ -2733,21 +2732,22 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         }
       }
       onProofCallExit = () => {
-        if (
-          baseWallClockExpired
-          && inFlightProofCalls === 0
-          && !localWallClockRotated
-          && verifyGraceReason === 'active_proof'
-        ) {
+        const shouldRotateOnExit = () => verifyGraceReason === 'active_proof'
+          || (verifyGraceReason === 'expanded_verify'
+            && !kovoVerifyProgressed
+            && !hasLiveSealedCapability()
+            && !hasHopCheckpoint)
+        if (baseWallClockExpired && inFlightProofCalls === 0
+          && !localWallClockRotated && shouldRotateOnExit()) {
           queueMicrotask(() => {
-            if (inFlightProofCalls === 0 && !localWallClockRotated && verifyGraceReason === 'active_proof') {
+            if (inFlightProofCalls === 0 && !localWallClockRotated && shouldRotateOnExit()) {
               triggerLocalRotation()
             }
           })
         }
       }
 
-      // Finite hard absolute ceiling (2x base budget) — never bypassed by stall credit or verify grace.
+      // Finite hard absolute ceiling (<= 1.35x base, capped at +60s) — never bypassed by stall credit or verify grace.
       hardCeilingTimer = assignmentClock.createDeadlineTimer(wallPlan.hardWallClockCeilingMs, () => {
         hardCeilingTimer = undefined
         baseWallClockExpired = true
@@ -2772,7 +2772,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             plan: wallPlan,
             sessionActiveElapsedMs: activeMs,
             inFlightProofCall: inFlightProofCalls > 0,
-            enteredKovoVerify,
+            enteredKovoVerify, kovoVerifyProgressed,
             hasLiveSealedCapability: hasLiveSealedCapability(),
             hasHopCheckpoint,
             inSettlementStream: enteredSettlement && generatingTurn,

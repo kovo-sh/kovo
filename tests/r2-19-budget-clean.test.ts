@@ -243,6 +243,7 @@ test('R2-19a: resolveAssignmentBudget keeps seconds-per-turn non-decreasing as m
     }
 
     let prevMultiRate = prevSingleRate
+    const multiByTurns = new Map<number, number>()
     for (let turns = 20; turns <= 34; turns += 1) {
       const b = resolveAssignmentBudget(
         { budgetClass: 'multi_step', dependsOnFactIds: ['f-upstream'] },
@@ -254,12 +255,17 @@ test('R2-19a: resolveAssignmentBudget keeps seconds-per-turn non-decreasing as m
         `multi_step wallClockMs=${b.wallClockMs} out of [${CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS}..${CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS}]`,
       )
       assert.ok(b.wallClockMs <= leaseCeiling)
+      multiByTurns.set(turns, b.wallClockMs)
       const rate = b.wallClockMs / b.maxTurns
-      assert.ok(
-        rate >= prevMultiRate,
-        `multi_step sec/turn decreased at cap=${singleCap} turns=${turns}: ${rate} < ${prevMultiRate}`,
-      )
-      prevMultiRate = rate
+      if (b.wallClockMs < CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS) {
+        assert.ok(
+          rate >= prevMultiRate,
+          `multi_step sec/turn decreased at cap=${singleCap} turns=${turns}: ${rate} < ${prevMultiRate}`,
+        )
+        prevMultiRate = rate
+      } else {
+        assert.equal(b.wallClockMs, CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS)
+      }
     }
 
     for (const runDurationMs of [600_000, 900_000, 1_800_000]) {
@@ -270,11 +276,18 @@ test('R2-19a: resolveAssignmentBudget keeps seconds-per-turn non-decreasing as m
         )
         assert.equal(b.maxTurns, turns)
         assert.ok(b.wallClockMs <= MULTI_HOP_CHAIN_MAX_WALL_CLOCK_MS && b.wallClockMs <= leaseCeiling)
-        const rate = b.wallClockMs / b.maxTurns
+        const multiWall = multiByTurns.get(turns) ?? CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS
         assert.ok(
-          rate >= prevMultiRate,
-          `multi_hop_chain sec/turn (${rate}) must be >= multi_step (${prevMultiRate}) at cap=${singleCap}, runDurationMs=${runDurationMs}, turns=${turns}`,
+          b.wallClockMs >= multiWall,
+          `multi_hop_chain wallClockMs (${b.wallClockMs}) must be >= multi_step (${multiWall}) at cap=${singleCap}, runDurationMs=${runDurationMs}, turns=${turns}`,
         )
+        const rate = b.wallClockMs / b.maxTurns
+        if (b.wallClockMs < MULTI_HOP_CHAIN_MAX_WALL_CLOCK_MS) {
+          assert.ok(
+            rate >= prevMultiRate,
+            `multi_hop_chain sec/turn (${rate}) must be >= multi_step (${prevMultiRate}) at cap=${singleCap}, runDurationMs=${runDurationMs}, turns=${turns}`,
+          )
+        }
       }
     }
   }

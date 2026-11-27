@@ -383,10 +383,12 @@ test('occurred context builders: confirmed refs, leads and <=1.5 KB assignment b
   assert.ok(brief!.includes(origin))
 
   const singleBudget = resolveAssignmentBudget({ budgetClass: 'single_step' }, { baseMaxTurns: 9 })
+  const multiUncapped = resolveAssignmentBudget({ budgetClass: 'multi_step' }, { baseMaxTurns: 24 })
   const multiBudget = resolveAssignmentBudget({ budgetClass: 'multi_step' }, { baseMaxTurns: 30 })
   assert.ok(singleBudget.wallClockMs <= SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS)
   assert.ok(multiBudget.wallClockMs <= CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS)
-  assert.ok(multiBudget.wallClockMs / multiBudget.maxTurns >= singleBudget.wallClockMs / singleBudget.maxTurns)
+  assert.ok(multiBudget.wallClockMs > singleBudget.wallClockMs)
+  assert.ok(multiUncapped.wallClockMs / multiUncapped.maxTurns >= singleBudget.wallClockMs / singleBudget.maxTurns)
 })
 
 test('tracing is OFF by default and emits lifecycle/planner/checkpoint records when enabled', async (t) => {

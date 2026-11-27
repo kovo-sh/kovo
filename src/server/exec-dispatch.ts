@@ -3808,11 +3808,11 @@ export function isMultiStepAssignment(input: {
 }
 /** Multi-step chains that cite parent evidence keep the long cap (bounded below; allows non-decreasing sec/turn up to 34 turns). */
 export const CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS = 120_000
-export const CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS = 240_000
-/** Proportional wall-clock bounds for multi-hop `chain` / continuation workers (180s–300s). */
+export const CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS = 180_000
+/** Proportional wall-clock bounds for multi-hop `chain` / continuation workers (180s–210s). */
 export const MULTI_HOP_CHAIN_MIN_WALL_CLOCK_MS = 180_000
-export const MULTI_HOP_CHAIN_MAX_WALL_CLOCK_MS = 300_000
-export const MULTI_HOP_CHAIN_DEFAULT_WALL_CLOCK_MS = 240_000
+export const MULTI_HOP_CHAIN_MAX_WALL_CLOCK_MS = 210_000
+export const MULTI_HOP_CHAIN_DEFAULT_WALL_CLOCK_MS = 210_000
 export const MULTI_HOP_CHAIN_WALL_CLOCK_SHARE = 0.30
 /** Settlement buffer for multi-hop `chain` workers (`max(wall - 25s, wall * 0.82)`). */
 export const MULTI_HOP_CHAIN_SETTLEMENT_BUFFER_MS = 25_000
