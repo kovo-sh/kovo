@@ -2203,7 +2203,7 @@ export function workerInvestigationPrompt(input: {
   unconfirmedHardSurface?: readonly UnconfirmedSurfaceRef[]
   detLeads?: readonly DetLeadSummary[]
   detLeadLimit?: number
-  assignmentBrief?: string
+  assignmentBrief?: string; decoupledProofPipeline?: boolean
 }): string {
   const specialistConfig = input.step.specialistProfile
     ? SPECIALIST_PROFILES[input.step.specialistProfile]
@@ -2248,7 +2248,7 @@ export function workerInvestigationPrompt(input: {
       ...(!isMultiHopStep ? { pushToTerminalImpact: 'Never prove own-tenant reads or stop at invite/token/metadata/job/export-handle mints; confirm cross-tenant/victim impact on terminalHopId. Dual-tenant->dual_tenant_abac.' } : {}),
       closureEvidence: 'For authz/workflow/business-logic/chain/race (>=2 personas or multi-step), never mark "ruled_out"/"no_issue_found" from a single 403/404 probe without /repos file:line or >=2 personas/steps; else run the missing check or record "needs_follow_up".',
     },
-    ...(isMultiHopStep
+    ...(isMultiHopStep && !input.decoupledProofPipeline
       ? {
           multiHopDirectives: {
             scopeAnchor: 'Stay strictly anchored to your assigned chain/suspect endpoints and pivot across hops of THAT hypothesis.\nDo not spend turns re-confirming an unrelated endpoint already covered by another finding or step (see alreadyConfirmed).',
@@ -2354,10 +2354,10 @@ function previewText(value: unknown, maxBytes = proofRepairBodyPreviewBytes): st
 /** Resolve system instructions for a scenario, pinning `kovo_verify` as primary when active. */
 export function workerSessionInstructions(
   scenario: AgentScenario,
-  options?: { hasKovoVerify?: boolean },
+  options?: { hasKovoVerify?: boolean; decoupledProofPipeline?: boolean },
 ): string {
   const base = scenarioInstructions[scenario]
-  if (scenario === 'worker-investigation' && options?.hasKovoVerify) {
+  if (scenario === 'worker-investigation' && options?.hasKovoVerify && !options?.decoupledProofPipeline) {
     return `${base}\nPRIMARY PROOF CONTRACT: \`kovo_verify\` is active — pass \`script\` inline (auto-persists confirmed findings with \`proof_kind="agent_script"\`; prefer over legacy \`propose_chain_finding\`, which is \`static_ast_proof\` only). Do NOT call legacy \`verify_replay_spec\` or \`propose_chain_finding\` with \`http_chain\`.\n${KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN}`
   }
   return base

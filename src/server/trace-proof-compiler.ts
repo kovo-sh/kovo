@@ -254,6 +254,148 @@ const appendEncodedKv = (parts: Array<{ lit?: string; expr?: string }>, pairs: A
   })
 }
 
+interface BindingState {
+  plans: StepPlan[]
+  allowedSet: ReadonlySet<string> | undefined
+  blocked: ReadonlySet<string>
+  warnings: string[]
+  inferredBindings: BindingRecord[]
+  sealMap: Map<string, SealSpec>
+  varMap: Map<string, VarSpec>
+  valueIndex: Map<string, ExtractedSource>
+  sealN: number
+  varN: number
+}
+
+function getOrCreateSeal(st: BindingState, source: ExtractedSource, kind: SealKind, extra?: { defaultHeaderName?: string; defaultCookieName?: string }): SealSpec {
+  const key = `${source.stepIdx}|${source.kind}|${source.selector}|${kind}`, hit = st.sealMap.get(key)
+  if (hit) return hit
+  const s: SealSpec = { varName: `cap_${++st.sealN}`, slot: `cap_${st.sealN}`, source, kind, ...extra }
+  st.sealMap.set(key, s); st.plans[source.stepIdx]!.seals.push(s)
+  if (source.kind === 'locationQuery') st.plans[source.stepIdx]!.forceNoFollowRedirects = true
+  return s
+}
+
+function getOrCreateVar(st: BindingState, source: ExtractedSource): VarSpec {
+  const key = `${source.stepIdx}|${source.kind}|${source.selector}`, hit = st.varMap.get(key)
+  if (hit) return hit
+  const v: VarSpec = { varName: `v_${++st.varN}`, source }
+  st.varMap.set(key, v); st.plans[source.stepIdx]!.vars.push(v); return v
+}
+
+function bindLeafValue(st: BindingState, plan: StepPlan, src: ExtractedSource, toStep: number, target: string, encode: boolean, sealIt: boolean): string | undefined {
+  plan.usesDynamicUrlOrBody = true; plan.dynamicDepSteps.add(src.stepIdx)
+  if (sealIt && canSeal(src.value, st.blocked)) {
+    const s = getOrCreateSeal(st, src, 'generic_secret'); plan.hasSealedUrlOrBodyDep = true
+    st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target }); return `${s.varName}.handle`
+  }
+  if (src.kind === 'jsonPath') {
+    const v = getOrCreateVar(st, src)
+    st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'var', selector: src.selector, target })
+    return encode ? `encodeURIComponent(String(${v.varName}))` : v.varName
+  }
+  return undefined
+}
+
+function bindStepPlan(st: BindingState, plan: StepPlan, toStep: number, maxProdIdx: number): void {
+  const ex = plan.exchange
+  if (ex.persona && st.allowedSet && !st.allowedSet.has(ex.persona)) st.warnings.push(`Step ${plan.hopId} references persona "${ex.persona}" outside allowedPersonas.`)
+  const lookup = (val: string) => { const h = st.valueIndex.get(val.trim()); return h && h.stepIdx < maxProdIdx ? h : undefined }
+  const hdrEntries: Array<[string, string]> = [], handled = new Set<string>(), reqHdrs = Object.entries(ex.requestHeaders ?? {})
+
+  for (const [k, v] of reqHdrs) {
+    const l = k.toLowerCase()
+    if (l === 'authorization') {
+      const m = /^bearer\s+(.+)$/i.exec(v.trim()), src = lookup(m ? m[1]! : v) ?? (m ? lookup(v) : undefined)
+      if (src && canSeal(src.value, st.blocked)) {
+        const s = getOrCreateSeal(st, src, 'bearer_token'); plan.primaryCapability = { capVar: s.varName, target: 'bearer' }; plan.omitPersona = true; handled.add('authorization')
+        st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target: 'header:authorization:bearer' })
+      }
+    } else if (l === 'cookie') {
+      for (const seg of v.split(';')) {
+        const eq = seg.indexOf('='); if (eq <= 0) continue
+        const cName = seg.slice(0, eq).trim(), src = lookup(seg.slice(eq + 1))
+        if (src && canSeal(src.value, st.blocked)) {
+          const s = getOrCreateSeal(st, src, 'cookie', { defaultCookieName: cName })
+          if (!plan.primaryCapability) { plan.primaryCapability = { capVar: s.varName, target: 'cookie', cookieName: cName }; plan.omitPersona = true }
+          else hdrEntries.push([k, `\`${cName}=\${${s.varName}.handle}\``])
+          handled.add('cookie'); st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target: `cookie:${cName}` }); break
+        }
+      }
+    }
+  }
+  for (const [k, v] of reqHdrs) {
+    const l = k.toLowerCase()
+    if (handled.has(l) || HOP_BY_HOP.has(l) || l.startsWith('sec-fetch-') || l.startsWith('sec-ch-')) continue
+    if (l === 'authorization' || l === 'cookie' || l === 'proxy-authorization') {
+      if (!ex.persona && !plan.primaryCapability) st.warnings.push(`Step ${plan.hopId} had unlinked literal "${k}" header; stripped for hygiene.`)
+      continue
+    }
+    const src = SKIP_TAINT_HDRS.has(l) ? undefined : lookup(v)
+    if (src && canSeal(src.value, st.blocked)) {
+      const s = getOrCreateSeal(st, src, 'header_secret', { defaultHeaderName: k })
+      if (!plan.primaryCapability) { plan.primaryCapability = { capVar: s.varName, target: 'header', headerName: k }; if (AUTH_HDR_RE.test(l) || !ex.persona) plan.omitPersona = true }
+      else hdrEntries.push([k, `${s.varName}.handle`])
+      st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target: `header:${l}` })
+    } else hdrEntries.push([k, JSON.stringify(v)])
+  }
+  if (hdrEntries.length) plan.headersExpr = `{ ${hdrEntries.map(([k, v]) => `${JSON.stringify(k)}: ${v}`).join(', ')} }`
+
+  const rawPq = ex.pathAndQuery?.startsWith('/') ? ex.pathAndQuery : `/${ex.pathAndQuery ?? ''}`
+  const qIdx = rawPq.indexOf('?'), rawPath = qIdx >= 0 ? rawPq.slice(0, qIdx) : rawPq, rawQuery = qIdx >= 0 ? rawPq.slice(qIdx + 1) : ''
+  const pathParts: Array<{ lit?: string; expr?: string }> = [], deltaSegs: string[] = []
+  rawPath.split('/').forEach((seg, sIdx) => {
+    if (sIdx > 0) pathParts.push({ lit: '/' })
+    if (!seg) { deltaSegs.push(''); return }
+    let dec = seg; try { dec = decodeURIComponent(seg) } catch { /* raw */ }
+    const src = lookup(dec) ?? (dec !== seg ? lookup(seg) : undefined)
+    const expr = src ? bindLeafValue(st, plan, src, toStep, 'path', true, src.kind !== 'jsonPath' || (isOpaque(src.value, src, st.blocked) && Boolean(src.isSecretKey))) : undefined
+    if (expr) { pathParts.push({ expr }); deltaSegs.push(':param') } else { pathParts.push({ lit: seg }); deltaSegs.push(seg) }
+  })
+  plan.deltaPath = deltaSegs.join('/') || '/'
+
+  if (rawQuery) {
+    const qEntries = [...new URLSearchParams(rawQuery).entries()], counts = new Map<string, number>()
+    for (const [k] of qEntries) counts.set(k, (counts.get(k) ?? 0) + 1)
+    const kept: Array<{ k: string; expr?: string; raw?: string }> = []
+    for (const [k, v] of qEntries) {
+      const src = lookup(v)
+      if (!src) { kept.push({ k, raw: v }); continue }
+      if (isOpaque(src.value, src, st.blocked, k)) {
+        plan.usesDynamicUrlOrBody = true; plan.dynamicDepSteps.add(src.stepIdx); plan.hasSealedUrlOrBodyDep = true
+        const s = getOrCreateSeal(st, src, 'generic_secret')
+        if (!plan.primaryCapability && counts.get(k) === 1) plan.primaryCapability = { capVar: s.varName, target: 'url', queryParam: k }
+        else kept.push({ k, expr: `${s.varName}.handle` })
+        st.inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target: `query:${k}` })
+      } else { const expr = bindLeafValue(st, plan, src, toStep, `query:${k}`, true, false); kept.push(expr ? { k, expr } : { k, raw: v }) }
+    }
+    if (kept.length) { pathParts.push({ lit: '?' }); appendEncodedKv(pathParts, kept) }
+  }
+  plan.pathExpr = buildTemplate(pathParts)
+
+  const bodyJson = ex.requestJson !== undefined ? ex.requestJson : tryParseJson(ex.requestBody), boundBody = new Set<string>()
+  if (bodyJson !== undefined) {
+    plan.bodyExpr = renderJsonBindings(bodyJson, '', (leaf, fp) => {
+      const src = lookup(leaf); if (!src) return undefined
+      boundBody.add(fp)
+      return bindLeafValue(st, plan, src, toStep, `body:${fp}`, false, src.kind !== 'jsonPath' || isOpaque(src.value, src, st.blocked, fp.split('.').pop()))
+    })
+    if (/^(?:POST|PUT|PATCH)$/i.test(ex.method)) {
+      const uniq = detectUniqueFields(bodyJson, boundBody)
+      if (uniq.length) st.warnings.push(`Step ${plan.hopId} ${ex.method.toUpperCase()} body has literal unique-creation field(s) [${uniq.join(', ')}]; replay may need fresh values.`)
+    }
+  } else if (typeof ex.requestBody === 'string' && ex.requestBody.length > 0) {
+    if ((getHeaderCI(ex.requestHeaders, 'content-type') ?? '').toLowerCase().includes('application/x-www-form-urlencoded')) {
+      const fp: Array<{ lit?: string; expr?: string }> = []
+      const pairs = [...new URLSearchParams(ex.requestBody).entries()].map(([k, v]) => {
+        const src = lookup(v), expr = src ? bindLeafValue(st, plan, src, toStep, `body:${k}`, true, src.kind !== 'jsonPath' || isOpaque(src.value, src, st.blocked, k)) : undefined
+        return expr ? { k, expr } : { k, raw: v }
+      })
+      appendEncodedKv(fp, pairs); plan.bodyExpr = buildTemplate(fp)
+    } else plan.bodyExpr = JSON.stringify(ex.requestBody)
+  }
+}
+
 export function compileTraceToKovoVerifyScript(input: {
   submission: ExploitTraceSubmission; exchanges: RecordedRequestExchange[]
   allowedPersonas?: string[]; runOrigin?: string
@@ -292,7 +434,6 @@ export function compileTraceToKovoVerifyScript(input: {
   if (attackerPersona && allowedSet && !allowedSet.has(attackerPersona)) warnings.push(`Base attackerPersona "${attackerPersona}" is not in allowedPersonas.`)
 
   const blocked = buildBlockedValues(exchanges, allowedPersonas, attackerPersona, runOrigin)
-  const inferredBindings: BindingRecord[] = []
   const mkPlan = (ex: RecordedRequestExchange, stepNumber: number, hopId: string): StepPlan => ({
     exchange: ex, stepNumber, hopId, seals: [], vars: [], omitPersona: false,
     forceNoFollowRedirects: ex.followRedirects === false || (ex.status >= 300 && ex.status < 400 && Boolean(getHeaderCI(ex.responseHeaders, 'location'))),
@@ -300,142 +441,16 @@ export function compileTraceToKovoVerifyScript(input: {
     usesDynamicUrlOrBody: false, dynamicDepSteps: new Set<number>(), hasSealedUrlOrBodyDep: false,
   })
   const plans = causal.map((ex, i) => mkPlan(ex, i + 1, `step_${i + 1}`))
-
-  let sealN = 0, varN = 0
-  const sealMap = new Map<string, SealSpec>(), varMap = new Map<string, VarSpec>(), valueIndex = new Map<string, ExtractedSource>()
-  const getSeal = (source: ExtractedSource, kind: SealKind, extra?: { defaultHeaderName?: string; defaultCookieName?: string }): SealSpec => {
-    const key = `${source.stepIdx}|${source.kind}|${source.selector}|${kind}`, hit = sealMap.get(key)
-    if (hit) return hit
-    const s: SealSpec = { varName: `cap_${++sealN}`, slot: `cap_${sealN}`, source, kind, ...extra }
-    sealMap.set(key, s); plans[source.stepIdx]!.seals.push(s)
-    if (source.kind === 'locationQuery') plans[source.stepIdx]!.forceNoFollowRedirects = true
-    return s
+  const st: BindingState = {
+    plans, allowedSet, blocked, warnings, inferredBindings: [],
+    sealMap: new Map(), varMap: new Map(), valueIndex: new Map(), sealN: 0, varN: 0,
   }
-  const getVar = (source: ExtractedSource): VarSpec => {
-    const key = `${source.stepIdx}|${source.kind}|${source.selector}`, hit = varMap.get(key)
-    if (hit) return hit
-    const v: VarSpec = { varName: `v_${++varN}`, source }
-    varMap.set(key, v); plans[source.stepIdx]!.vars.push(v); return v
-  }
-  const bindLeaf = (plan: StepPlan, src: ExtractedSource, toStep: number, target: string, encode: boolean, sealIt: boolean): string | undefined => {
-    plan.usesDynamicUrlOrBody = true; plan.dynamicDepSteps.add(src.stepIdx)
-    if (sealIt && canSeal(src.value, blocked)) {
-      const s = getSeal(src, 'generic_secret'); plan.hasSealedUrlOrBodyDep = true
-      inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target }); return `${s.varName}.handle`
-    }
-    if (src.kind === 'jsonPath') {
-      const v = getVar(src)
-      inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'var', selector: src.selector, target })
-      return encode ? `encodeURIComponent(String(${v.varName}))` : v.varName
-    }
-    return undefined
-  }
-
-  const bindPlan = (plan: StepPlan, toStep: number, maxProdIdx: number): void => {
-    const ex = plan.exchange
-    if (ex.persona && allowedSet && !allowedSet.has(ex.persona)) warnings.push(`Step ${plan.hopId} references persona "${ex.persona}" outside allowedPersonas.`)
-    const lookup = (val: string) => { const h = valueIndex.get(val.trim()); return h && h.stepIdx < maxProdIdx ? h : undefined }
-    const hdrEntries: Array<[string, string]> = [], handled = new Set<string>(), reqHdrs = Object.entries(ex.requestHeaders ?? {})
-
-    for (const [k, v] of reqHdrs) {
-      const l = k.toLowerCase()
-      if (l === 'authorization') {
-        const m = /^bearer\s+(.+)$/i.exec(v.trim()), src = lookup(m ? m[1]! : v) ?? (m ? lookup(v) : undefined)
-        if (src && canSeal(src.value, blocked)) {
-          const s = getSeal(src, 'bearer_token'); plan.primaryCapability = { capVar: s.varName, target: 'bearer' }; plan.omitPersona = true; handled.add('authorization')
-          inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target: 'header:authorization:bearer' })
-        }
-      } else if (l === 'cookie') {
-        for (const seg of v.split(';')) {
-          const eq = seg.indexOf('='); if (eq <= 0) continue
-          const cName = seg.slice(0, eq).trim(), src = lookup(seg.slice(eq + 1))
-          if (src && canSeal(src.value, blocked)) {
-            const s = getSeal(src, 'cookie', { defaultCookieName: cName })
-            if (!plan.primaryCapability) { plan.primaryCapability = { capVar: s.varName, target: 'cookie', cookieName: cName }; plan.omitPersona = true }
-            else hdrEntries.push([k, `\`${cName}=\${${s.varName}.handle}\``])
-            handled.add('cookie'); inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target: `cookie:${cName}` }); break
-          }
-        }
-      }
-    }
-    for (const [k, v] of reqHdrs) {
-      const l = k.toLowerCase()
-      if (handled.has(l) || HOP_BY_HOP.has(l) || l.startsWith('sec-fetch-') || l.startsWith('sec-ch-')) continue
-      if (l === 'authorization' || l === 'cookie' || l === 'proxy-authorization') {
-        if (!ex.persona && !plan.primaryCapability) warnings.push(`Step ${plan.hopId} had unlinked literal "${k}" header; stripped for hygiene.`)
-        continue
-      }
-      const src = SKIP_TAINT_HDRS.has(l) ? undefined : lookup(v)
-      if (src && canSeal(src.value, blocked)) {
-        const s = getSeal(src, 'header_secret', { defaultHeaderName: k })
-        if (!plan.primaryCapability) { plan.primaryCapability = { capVar: s.varName, target: 'header', headerName: k }; if (AUTH_HDR_RE.test(l) || !ex.persona) plan.omitPersona = true }
-        else hdrEntries.push([k, `${s.varName}.handle`])
-        inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target: `header:${l}` })
-      } else hdrEntries.push([k, JSON.stringify(v)])
-    }
-    if (hdrEntries.length) plan.headersExpr = `{ ${hdrEntries.map(([k, v]) => `${JSON.stringify(k)}: ${v}`).join(', ')} }`
-
-    const rawPq = ex.pathAndQuery?.startsWith('/') ? ex.pathAndQuery : `/${ex.pathAndQuery ?? ''}`
-    const qIdx = rawPq.indexOf('?'), rawPath = qIdx >= 0 ? rawPq.slice(0, qIdx) : rawPq, rawQuery = qIdx >= 0 ? rawPq.slice(qIdx + 1) : ''
-    const pathParts: Array<{ lit?: string; expr?: string }> = [], deltaSegs: string[] = []
-    rawPath.split('/').forEach((seg, sIdx) => {
-      if (sIdx > 0) pathParts.push({ lit: '/' })
-      if (!seg) { deltaSegs.push(''); return }
-      let dec = seg; try { dec = decodeURIComponent(seg) } catch { /* raw */ }
-      const src = lookup(dec) ?? (dec !== seg ? lookup(seg) : undefined)
-      const expr = src ? bindLeaf(plan, src, toStep, 'path', true, src.kind !== 'jsonPath' || (isOpaque(src.value, src, blocked) && Boolean(src.isSecretKey))) : undefined
-      if (expr) { pathParts.push({ expr }); deltaSegs.push(':param') } else { pathParts.push({ lit: seg }); deltaSegs.push(seg) }
-    })
-    plan.deltaPath = deltaSegs.join('/') || '/'
-
-    if (rawQuery) {
-      const qEntries = [...new URLSearchParams(rawQuery).entries()], counts = new Map<string, number>()
-      for (const [k] of qEntries) counts.set(k, (counts.get(k) ?? 0) + 1)
-      const kept: Array<{ k: string; expr?: string; raw?: string }> = []
-      for (const [k, v] of qEntries) {
-        const src = lookup(v)
-        if (!src) { kept.push({ k, raw: v }); continue }
-        if (isOpaque(src.value, src, blocked, k)) {
-          plan.usesDynamicUrlOrBody = true; plan.dynamicDepSteps.add(src.stepIdx); plan.hasSealedUrlOrBodyDep = true
-          const s = getSeal(src, 'generic_secret')
-          if (!plan.primaryCapability && counts.get(k) === 1) plan.primaryCapability = { capVar: s.varName, target: 'url', queryParam: k }
-          else kept.push({ k, expr: `${s.varName}.handle` })
-          inferredBindings.push({ fromStep: src.stepIdx + 1, toStep, kind: 'seal', selector: src.selector, target: `query:${k}` })
-        } else { const expr = bindLeaf(plan, src, toStep, `query:${k}`, true, false); kept.push(expr ? { k, expr } : { k, raw: v }) }
-      }
-      if (kept.length) { pathParts.push({ lit: '?' }); appendEncodedKv(pathParts, kept) }
-    }
-    plan.pathExpr = buildTemplate(pathParts)
-
-    const bodyJson = ex.requestJson !== undefined ? ex.requestJson : tryParseJson(ex.requestBody), boundBody = new Set<string>()
-    if (bodyJson !== undefined) {
-      plan.bodyExpr = renderJsonBindings(bodyJson, '', (leaf, fp) => {
-        const src = lookup(leaf); if (!src) return undefined
-        boundBody.add(fp)
-        return bindLeaf(plan, src, toStep, `body:${fp}`, false, src.kind !== 'jsonPath' || isOpaque(src.value, src, blocked, fp.split('.').pop()))
-      })
-      if (/^(?:POST|PUT|PATCH)$/i.test(ex.method)) {
-        const uniq = detectUniqueFields(bodyJson, boundBody)
-        if (uniq.length) warnings.push(`Step ${plan.hopId} ${ex.method.toUpperCase()} body has literal unique-creation field(s) [${uniq.join(', ')}]; replay may need fresh values.`)
-      }
-    } else if (typeof ex.requestBody === 'string' && ex.requestBody.length > 0) {
-      if ((getHeaderCI(ex.requestHeaders, 'content-type') ?? '').toLowerCase().includes('application/x-www-form-urlencoded')) {
-        const fp: Array<{ lit?: string; expr?: string }> = []
-        const pairs = [...new URLSearchParams(ex.requestBody).entries()].map(([k, v]) => {
-          const src = lookup(v), expr = src ? bindLeaf(plan, src, toStep, `body:${k}`, true, src.kind !== 'jsonPath' || isOpaque(src.value, src, blocked, k)) : undefined
-          return expr ? { k, expr } : { k, raw: v }
-        })
-        appendEncodedKv(fp, pairs); plan.bodyExpr = buildTemplate(fp)
-      } else plan.bodyExpr = JSON.stringify(ex.requestBody)
-    }
-  }
-
   for (let i = 0; i < plans.length; i += 1) {
-    bindPlan(plans[i]!, i + 1, i)
-    for (const src of extractSources(causal[i]!, i)) if (isEligible(src.value, blocked) && !valueIndex.has(src.value)) valueIndex.set(src.value, src)
+    bindStepPlan(st, plans[i]!, i + 1, i)
+    for (const src of extractSources(causal[i]!, i)) if (isEligible(src.value, blocked) && !st.valueIndex.has(src.value)) st.valueIndex.set(src.value, src)
   }
   const readbackPlan = explicitReadback ? mkPlan(explicitReadback, plans.length + 1, 'readback') : undefined
-  if (readbackPlan) bindPlan(readbackPlan, plans.length + 1, plans.length)
+  if (readbackPlan) bindStepPlan(st, readbackPlan, plans.length + 1, plans.length)
 
   const termPlan = plans[terminalIdx]!, controlSynthesized = !explicitControl
   let ctrlAfterIdx = -1, ctrlUsesDyn = false
@@ -484,7 +499,7 @@ export function compileTraceToKovoVerifyScript(input: {
   const script = `${lines.join('\n')}\n`, bytes = Buffer.byteLength(script, 'utf8')
   if (bytes > MAX_SCRIPT_BYTES) {
     uncompilableReasons.push(`Compiled script exceeds 64 KiB limit (${bytes} bytes).`)
-    return { ok: false, chainId, terminalVulnClass, inferredBindings, controlSynthesized, warnings, uncompilableReasons }
+    return { ok: false, chainId, terminalVulnClass, inferredBindings: st.inferredBindings, controlSynthesized, warnings, uncompilableReasons }
   }
-  return { ok: true, script, chainId, terminalVulnClass, inferredBindings, controlSynthesized, warnings, uncompilableReasons }
+  return { ok: true, script, chainId, terminalVulnClass, inferredBindings: st.inferredBindings, controlSynthesized, warnings, uncompilableReasons }
 }

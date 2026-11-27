@@ -57,6 +57,8 @@ import { resolveRunSafetyBudgets } from './run-safety-budgets.ts'
 import { brokerExchanges, type ChainStepTerminalStatus } from './schema.ts'
 import type { Assignment, BoardMessageRow, ChainStep, Run } from './store.ts'
 import { probeDifferential, probeSurface } from './surface-engine.ts'
+import { isDecoupledProofPipelineEnabled, prepareDecoupledExploiterSession } from './exploiter-tools.ts'
+import type { RecordedRequestExchange } from './trace-proof-compiler.ts'
 import { recordProviderUsageTelemetry } from './token-telemetry.ts'
 import { buildWarmPoolPolicy, type WorkerBackend } from './worker-backend.ts'
 
@@ -409,11 +411,9 @@ export interface ExecBrokeredTransportContext {
     curRun: Run,
     kind: 'dns' | 'tls' | 'browser' | 'surface' | 'ws',
     title: string,
-    filename: string,
-    payload: unknown,
-    signal: AbortSignal,
-    secretsList?: readonly NamedSecret[],
+    filename: string, payload: unknown, signal: AbortSignal, secretsList?: readonly NamedSecret[],
   ) => Promise<{ evidenceId: string; stagedPath: string | null }>
+  onExchangeRecorded?: (ex: RecordedRequestExchange) => void
 }
 
 const UNSAFE_PROTO_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype'])
@@ -1603,17 +1603,11 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         },
         guardPrematureRuledOut,
       })
+      const recordedExchanges = new Map<string, RecordedRequestExchange>()
       const transportHandlers = this.host.buildBrokeredTransportHandlers({
-        job,
-        step,
-        session,
-        grant,
-        currentSecrets,
-        boardTools,
-        sharedHandlers,
-        trackPersonaResources,
-        prepareBudgetedProbe,
-        stageJsonArtifact,
+        job, step, session, grant, currentSecrets, boardTools, sharedHandlers,
+        trackPersonaResources, prepareBudgetedProbe, stageJsonArtifact,
+        onExchangeRecorded: ex => { recordedExchanges.set(ex.exchangeId, ex) },
       })
 
       const handlers: WorkerToolHandlers = {
@@ -2579,7 +2573,8 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         skills: step.skills,
       })
       const specialistConfig = resolveSpecialistProfile(specialistProfileId)
-      const rawScopedHandlers = filterHandlersForSpecialist(handlers, specialistConfig)
+      const decoupledPipeline = isDecoupledProofPipelineEnabled()
+      const rawScopedHandlers = decoupledPipeline ? handlers : filterHandlersForSpecialist(handlers, specialistConfig)
       const scopedHandlers: WorkerToolHandlers = {}
       for (const [toolName, handlerFn] of Object.entries(rawScopedHandlers)) {
         if (typeof handlerFn !== 'function') continue
@@ -2604,33 +2599,20 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       const assignmentBrief = this.host.assignmentBriefForStep({
         run,
         step,
-        targetOrigins,
-        personas: personasPub,
-        parentFacts,
-        confirmed: confirmedRefs,
-        detLeads,
-        maxTurns: job.assignment.maxTurns,
+        targetOrigins, personas: personasPub,
+        parentFacts, confirmed: confirmedRefs, detLeads, maxTurns: job.assignment.maxTurns,
       })
       const hasHopCheckpoint = Boolean(assignmentBrief && /\b(?:hopCheckpoint|cap:hop_|doNotRediscover)\b/.test(assignmentBrief))
       const isMultiHopStep = hasHopCheckpoint || isMultiHopChainStep(step)
       const preInjectedSkills = selectPreInjectionSkills({
-        profileSkills: specialistConfig.skills,
-        techTags: [...new Set(techTags)],
-        ...(sinkKind ? { sinkKind } : {}),
-        category: step.category,
-        title: step.title,
-        hypothesis: step.hypothesis,
+        profileSkills: specialistConfig.skills, techTags: [...new Set(techTags)], ...(sinkKind ? { sinkKind } : {}),
+        category: step.category, title: step.title, hypothesis: step.hypothesis,
         ...(hasHopCheckpoint ? { hasHopCheckpoint: true } : {}),
         ...(isMultiHopStep ? { multiHop: true, hopDepth: Math.max(2, step.dependsOnStepIds.length + 1) } : {}),
         limit: 2,
       })
       const runTrace = this.host.ensureRunTrace(run, profiles)
-      const assignedTargetRoutes = extractAssignedTargetRoutes({
-        title: step.title,
-        hypothesis: step.hypothesis,
-        parentFacts,
-        defaultOrigin: targetOrigins[0],
-      })
+      const assignedTargetRoutes = extractAssignedTargetRoutes({ title: step.title, hypothesis: step.hypothesis, parentFacts, defaultOrigin: targetOrigins[0] })
 
       clearPreSessionTimer()
       const preSessionElapsedMs = assignmentClock.activeElapsedMs()
@@ -2808,42 +2790,60 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       const sessionWallClockMs = wallPlan.hardWallClockCeilingMs
 
       const baseLlmHooks = llmRunHooks(this.storage, run.id)
+      const allPublicOrigins = [...new Set([...targetOrigins, ...permittedAtAdmission])]
+      const runAllowWebSearch = (run as { allowWebSearch?: boolean }).allowWebSearch
+      const decoupledSession = decoupledPipeline ? prepareDecoupledExploiterSession({
+        handlers, storage: this.storage, runId: run.id, assignmentId: job.assignment.id,
+        ...(runAllowWebSearch !== undefined ? { runAllowWebSearch } : {}),
+        publicOrigins: allPublicOrigins, personasPub, recordedExchanges, mountedRepos,
+        userPromptInput: {
+          goal: run.goal, step: { id: step.id, title: step.title, hypothesis: step.hypothesis, category: step.category },
+          origins: targetOrigins, ...(allPublicOrigins.length > 1 ? { publicOrigins: allPublicOrigins } : {}),
+          capabilityTier: run.capabilityTier, maxTurns: budget.maxTurns, budget, personas: personasPub, mountedRepos,
+          parentFacts: parentFacts.map(f => ({ id: f.id, kind: f.kind, origin: f.origin, summary: f.summary, data: f.data })),
+          alreadyConfirmed: confirmedRefs, detLeads, ...(assignmentBrief ? { assignmentBrief } : {}),
+        },
+        runKovoVerify: async ({ script, title, signal }) => {
+          if (!handlers.kovo_verify) return { confirmed: false, rejectedBy: 'backend', reason: 'verifier_unavailable', detail: 'kovo_verify backend unavailable.' }
+          const out = await handlers.kovo_verify({ script, runtime: 'ts', ...(title ? { title } : {}) }, signal ?? job.controller.signal) as Record<string, unknown>
+          const detail = typeof out?.detail === 'string' ? out.detail : undefined
+          const fid = typeof out?.findingId === 'string' ? out.findingId : detail?.match(/Finding\s+([^\s]+)\s+cites/)?.[1]
+          return {
+            confirmed: out?.confirmed === true, ...(fid ? { findingId: fid } : {}),
+            ...(typeof out?.rejectedBy === 'string' ? { rejectedBy: out.rejectedBy } : {}),
+            ...(typeof out?.reason === 'string' ? { reason: out.reason } : {}),
+            ...(detail ? { detail } : {}),
+            ...(Array.isArray(out?.missingEvidence) ? { missingEvidence: out.missingEvidence.map(String) } : {}),
+          }
+        },
+        proofWriterDeps: {
+          profiles: resolveProfilePoolForRole(specialistConfig.roleAffinity, profiles),
+          beforeCall: () => { this.host.check(job); if (this.storage.checkBudgetExceeded(run.id)) throw new BudgetExceededError('Run spend or request budget exceeded.') },
+          onUsage: u => { const tok = (u.inputTokens ?? 0) + (u.outputTokens ?? 0); this.storage.recordLlmSpend(run.id, { usd: u.costUsd ?? 0, tokens: tok }); this.host.board.noteTokens(job.assignment.id, boardHandle, tok) },
+          onProfileSuccess: baseLlmHooks.onProfileSuccess,
+          onProfileFailure: (pid, err, hard) => this.recordWorkerProfileFailure(turnState, pid, err, hard, baseLlmHooks.onProfileFailure),
+        },
+        onProofConfirmed: () => { confirmedDuringAssignment = true; this.host.schedulePlanner(run.id) },
+        onToolExecuted: () => { turnState.toolCallsInTurn += 1; turnState.totalToolCalls += 1 },
+      }) : undefined
       let sessionResult: Awaited<ReturnType<typeof runAgentSession>>
       try {
         sessionResult = await runAgentSession({
-          directory: this.storage.directory,
-          sessionId: job.assignment.sessionId,
+          directory: this.storage.directory, sessionId: job.assignment.sessionId,
           requestId: `investigate:${step.id}:attempt-${job.assignment.attempt}`,
           profiles: resolveProfilePoolForRole(specialistConfig.roleAffinity, profiles),
-          scenario: 'worker-investigation',
-          roleAffinity: specialistConfig.roleAffinity,
+          scenario: 'worker-investigation', roleAffinity: specialistConfig.roleAffinity,
           prompt: workerInvestigationPrompt({
             goal: run.goal,
-            step: {
-              id: step.id, title: step.title, hypothesis: step.hypothesis,
-              category: step.category, skills: [...new Set([...step.skills, ...specialistConfig.skills])],
-              specialistProfile: specialistProfileId,
-            },
-            origins: targetOrigins,
-            ...([...new Set([...targetOrigins, ...permittedAtAdmission])].length > 1
-              ? { publicOrigins: [...new Set([...targetOrigins, ...permittedAtAdmission])] }
-              : {}),
-            capabilityTier: run.capabilityTier,
-            maxTurns: budget.maxTurns,
-            budget,
-            personas: personasPub,
+            step: { id: step.id, title: step.title, hypothesis: step.hypothesis, category: step.category, skills: [...new Set([...step.skills, ...specialistConfig.skills])], specialistProfile: specialistProfileId },
+            origins: targetOrigins, ...(allPublicOrigins.length > 1 ? { publicOrigins: allPublicOrigins } : {}),
+            capabilityTier: run.capabilityTier, maxTurns: budget.maxTurns, budget, personas: personasPub,
             ...(bolaTestQueue.length ? { bolaTestQueue } : {}),
-            parentFacts: parentFacts.map(f => ({
-              id: f.id, kind: f.kind, origin: f.origin, summary: f.summary, data: f.data,
-            })),
-            specsSummary: stagedSpecs,
-            mountedRepos,
-            preInjectedSkills,
-            alreadyConfirmed: confirmedRefs,
-            unconfirmedHardSurface,
-            detLeads,
+            parentFacts: parentFacts.map(f => ({ id: f.id, kind: f.kind, origin: f.origin, summary: f.summary, data: f.data })),
+            specsSummary: stagedSpecs, mountedRepos, preInjectedSkills, alreadyConfirmed: confirmedRefs, unconfirmedHardSurface, detLeads,
             ...(assignmentBrief ? { assignmentBrief } : {}),
           }),
+          ...(decoupledSession ?? {}),
           signal: sessionRotateController.signal,
           budget,
           maxTurns: budget.maxTurns,

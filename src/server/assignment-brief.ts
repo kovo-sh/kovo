@@ -238,6 +238,8 @@ export interface AssignmentBriefInput {
   publicOrigins?: readonly string[]
   /** Count of sealed capabilities already present in the run's CapabilityLedger. */
   sealedCapabilityCount?: number
+  /** When true (or `KOVO_DECOUPLED_PROOF_PIPELINE=1`), omit `kovo_verify` boilerplate from the brief. */
+  decoupledProofPipeline?: boolean
 }
 
 export interface AssignmentBriefResult {
@@ -1051,13 +1053,14 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
   const code = input.codeSlice
     ? renderCodeDataflowSlice(input.codeSlice, codeBudget).slice
     : undefined
+  const decoupled = input.decoupledProofPipeline ?? (process.env.KOVO_DECOUPLED_PROOF_PIPELINE === '1')
   const hopCheckpointBudget = ASSIGNMENT_BRIEF_HOP_CHECKPOINT_MAX_BYTES
-  const fittedCheckpoint = input.hopCheckpoint
+  const fittedCheckpoint = !decoupled && input.hopCheckpoint
     ? fitHopCheckpointForBrief(input.hopCheckpoint, hopCheckpointBudget)
     : undefined
-  const proofObligation = input.proofObligation ? normalizeProofObligation(input.proofObligation) : undefined
-  const explicitMultiHop = isExplicitMultiHopMission(input)
-  const multiHopProofContract = isMultiHopBriefInput(input)
+  const proofObligation = !decoupled && input.proofObligation ? normalizeProofObligation(input.proofObligation) : undefined
+  const explicitMultiHop = !decoupled && isExplicitMultiHopMission(input)
+  const multiHopProofContract = !decoupled && isMultiHopBriefInput(input)
     ? buildMultiHopProofContract(!explicitMultiHop, input)
     : undefined
 
@@ -1074,7 +1077,7 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
     ...(multiHopProofContract ? { multiHopProofContract } : {}),
     multiHopContractCompacted: Boolean(multiHopProofContract && !explicitMultiHop),
     ...(proofObligation ? { proofObligation } : {}),
-    coverageContract: RECORD_COVERAGE_BRIEF_GUIDANCE,
+    ...(!decoupled ? { coverageContract: RECORD_COVERAGE_BRIEF_GUIDANCE } : {}),
     codeBudget,
     hopCheckpointBudget,
   }
