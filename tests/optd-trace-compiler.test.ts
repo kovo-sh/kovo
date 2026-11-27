@@ -30,13 +30,14 @@ interface MockCallLog {
   edges: Array<Record<string, unknown>>
   stateTransitions: Array<Record<string, unknown>>
   httpCalls: Array<{ target: unknown; opts: Record<string, unknown> }>
+  raceCalls: Array<Record<string, unknown>>
   sealCalls: Array<Record<string, unknown>>
   proveArgs: Array<Record<string, unknown>>
 }
 
 function createMockCtx(responses: Array<{ status?: number; json?: unknown; headers?: Record<string, string> }>) {
   const log: MockCallLog = {
-    chainArgs: [], controls: [], controlInsideHop: false, readbacks: [], hops: [], edges: [], stateTransitions: [], httpCalls: [], sealCalls: [], proveArgs: [],
+    chainArgs: [], controls: [], controlInsideHop: false, readbacks: [], hops: [], edges: [], stateTransitions: [], httpCalls: [], raceCalls: [], sealCalls: [], proveArgs: [],
   }
   let exCounter = 0
   let capCounter = 0
@@ -89,6 +90,20 @@ function createMockCtx(responses: Array<{ status?: number; json?: unknown; heade
           log.hops.push(resolvedHopId)
           hopDepth += 1
           try { return await sendMockHttp(target, httpOpts) } finally { hopDepth -= 1 }
+        },
+        async race(opts: Record<string, unknown>) {
+          const resolvedHopId = typeof opts.hopId === 'string' && opts.hopId.trim() ? opts.hopId.trim() : `hop_${log.hops.length + 1}`
+          log.hops.push(resolvedHopId)
+          log.raceCalls.push(opts)
+          const count = Number(opts.concurrency ?? opts.count ?? 2)
+          const req = (opts.request ?? {}) as Record<string, unknown>
+          const target = req.origin ? { origin: req.origin, path: req.path } : req.path
+          hopDepth += 1
+          const results = []
+          try {
+            for (let i = 0; i < count; i += 1) results.push(await sendMockHttp(target, req))
+          } finally { hopDepth -= 1 }
+          return { mode: 'http1-fallback', fallbackReason: null, raceBatchId: 'race_mock', summary: {}, results, exchanges: results }
         },
         async seal(exchange: { exchangeId: string } | string, selector: Record<string, unknown>) {
           capCounter += 1
@@ -1130,5 +1145,200 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
     assert.equal(log.httpCalls[1]!.target, '/api/v1/wallets/w_1/refund')
     assert.equal(log.httpCalls[2]!.target, '/api/v1/wallets/w_1/balance')
     assert.equal(log.proveArgs[0]!.oracleFamily, 'economic_conservation')
+  })
+
+  it('compiles trailing repeated mutating exchanges on economic_conservation/race traces into ch.race with concurrency, headers, and sealed capabilities between pre/post ch.readback', async () => {
+    // 1) Pure concurrent refund race (3x identical POSTs with Idempotency-Key + readback)
+    const refundExchanges: RecordedRequestExchange[] = [
+      {
+        exchangeId: 'rf_1',
+        origin: 'https://app.example.test',
+        method: 'POST',
+        pathAndQuery: '/api/v1/orders/ord_55/refund',
+        persona: 'member_a',
+        requestHeaders: { 'Idempotency-Key': 'idem-key-55', 'X-Trace': 't1' },
+        requestJson: { amount: 60 },
+        status: 200,
+        responseJson: { refunded: 60 },
+        timestampMs: 100,
+      },
+      {
+        exchangeId: 'rf_2',
+        origin: 'https://app.example.test',
+        method: 'POST',
+        pathAndQuery: '/api/v1/orders/ord_55/refund',
+        persona: 'member_a',
+        requestHeaders: { 'Idempotency-Key': 'idem-key-55', 'X-Trace': 't1' },
+        requestJson: { amount: 60 },
+        status: 200,
+        responseJson: { refunded: 60 },
+        timestampMs: 101,
+      },
+      {
+        exchangeId: 'rf_3',
+        origin: 'https://app.example.test',
+        method: 'POST',
+        pathAndQuery: '/api/v1/orders/ord_55/refund',
+        persona: 'member_a',
+        requestHeaders: { 'Idempotency-Key': 'idem-key-55', 'X-Trace': 't1' },
+        requestJson: { amount: 60 },
+        status: 200,
+        responseJson: { refunded: 60 },
+        timestampMs: 102,
+      },
+      {
+        exchangeId: 'rf_rb',
+        origin: 'https://app.example.test',
+        method: 'GET',
+        pathAndQuery: '/api/v1/orders/ord_55',
+        persona: 'member_a',
+        status: 200,
+        responseJson: { paidAmount: 100, refundedTotal: 180 },
+        timestampMs: 200,
+      },
+    ]
+
+    for (const cls of ['economic_conservation', 'conserved_balance', 'ledger_overcredit', 'over_refund', 'double_spend', 'race_condition', 'double-spend']) {
+      const compiled = compileTraceToKovoVerifyScript({
+        submission: {
+          title: `Concurrent refund ${cls}`,
+          vulnClass: cls,
+          exchangeIds: ['rf_1', 'rf_2', 'rf_3', 'rf_rb'],
+          terminalExchangeId: 'rf_3',
+          readbackExchangeId: 'rf_rb',
+          attackerPersona: 'member_a',
+        },
+        exchanges: refundExchanges,
+        runOrigin: 'https://app.example.test',
+      })
+      assert.equal(compiled.ok, true, `expected ${cls} to compile`)
+      assert.ok(compiled.script)
+      assert.match(compiled.script, /ch\.race\(/)
+      assert.match(compiled.script, /concurrency:\s*3\b/)
+      assert.match(compiled.script, /"Idempotency-Key":\s*"idem-key-55"/)
+      assert.doesNotMatch(compiled.script, /ch\.step\(/, `${cls} race mutations must not compile into sequential ch.step`)
+      assert.doesNotMatch(compiled.script, /ch\.control\(/, `${cls} race must not synthesize a mutating POST ch.control`)
+      const preRbIdx = compiled.script.indexOf('await ch.readback("/api/v1/orders/ord_55"')
+      const raceIdx = compiled.script.indexOf('await ch.race(')
+      const postRbIdx = compiled.script.indexOf('const rb = await ch.readback("/api/v1/orders/ord_55"')
+      assert.ok(preRbIdx >= 0 && raceIdx > preRbIdx && postRbIdx > raceIdx, `${cls} must sandwich ch.race between pre and post ch.readback`)
+    }
+
+    // Execute generated race script against mock ctx
+    const compiledRace = compileTraceToKovoVerifyScript({
+      submission: {
+        title: 'Concurrent refund execution check',
+        vulnClass: 'economic_conservation',
+        oracleFamily: 'economic_conservation',
+        exchangeIds: ['rf_1', 'rf_2', 'rf_3', 'rf_rb'],
+        terminalExchangeId: 'rf_1', // first exchange of race burst also works!
+        readbackExchangeId: 'rf_rb',
+        attackerPersona: 'member_a',
+      },
+      exchanges: refundExchanges,
+      runOrigin: 'https://app.example.test',
+    })
+    const { ctx: rCtx, log: rLog } = createMockCtx([
+      { status: 200, json: { paidAmount: 100, refundedTotal: 0 } }, // pre-hop baseline readback
+      { status: 200, json: { refunded: 60 } },
+      { status: 200, json: { refunded: 60 } },
+      { status: 200, json: { refunded: 60 } },
+      { status: 200, json: { paidAmount: 100, refundedTotal: 180 } }, // post-hop final readback
+    ])
+    await loadCompiledEntrypoint(compiledRace.script!)(rCtx)
+    assert.deepEqual(rLog.hops, ['step_1'])
+    assert.equal(rLog.raceCalls.length, 1)
+    assert.equal(rLog.raceCalls[0]!.concurrency, 3)
+    assert.equal(rLog.readbacks.length, 2)
+    assert.equal(rLog.controls.length, 0)
+    assert.equal((rLog.proveArgs[0]!.terminalExchange as { exchangeId: string }).exchangeId, 'ex_2')
+
+    // 2) Setup hop sealing a capability + 4x concurrent terminal mutations + pre/post readback (with value_binding edge & 0 orphans)
+    const couponTok = 'cpn_secret_a1b2c3d4e5f6g7h8'
+    const setupRaceTrace: RecordedRequestExchange[] = [
+      {
+        exchangeId: 'c_mint',
+        origin: 'https://app.example.test',
+        method: 'POST',
+        pathAndQuery: '/api/v1/coupons/mint',
+        persona: 'member_a',
+        status: 200,
+        responseJson: { voucherToken: couponTok },
+        timestampMs: 50,
+      },
+      ...([1, 2, 3, 4] as const).map(n => ({
+        exchangeId: `c_redeem_${n}`,
+        origin: 'https://app.example.test',
+        method: 'POST',
+        pathAndQuery: '/api/v1/coupons/redeem',
+        persona: 'member_a',
+        requestHeaders: { Authorization: `Bearer ${couponTok}`, 'Idempotency-Key': 'idem-coupon-9' },
+        requestJson: { apply: true },
+        status: 200,
+        responseJson: { credited: 50 },
+        timestampMs: 100 + n,
+      })),
+      {
+        exchangeId: 'c_bal',
+        origin: 'https://app.example.test',
+        method: 'GET',
+        pathAndQuery: '/api/v1/wallet/balance',
+        persona: 'member_a',
+        status: 200,
+        responseJson: { balance: 200 },
+        timestampMs: 200,
+      },
+    ]
+
+    const compiledSetupRace = compileTraceToKovoVerifyScript({
+      submission: {
+        title: 'Coupon double spend with setup seal',
+        vulnClass: 'double_spend',
+        exchangeIds: ['c_mint', 'c_redeem_1', 'c_redeem_2', 'c_redeem_3', 'c_redeem_4', 'c_bal'],
+        // Omit readbackExchangeId and terminalExchangeId -> trailing GET auto-promoted to readback!
+        attackerPersona: 'member_a',
+      },
+      exchanges: setupRaceTrace,
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(compiledSetupRace.ok, true)
+    assert.ok(compiledSetupRace.script)
+    assert.doesNotMatch(compiledSetupRace.script, new RegExp(couponTok))
+    assert.match(compiledSetupRace.script, /ch\.seal\(/)
+    assert.match(compiledSetupRace.script, /ch\.race\(/)
+    assert.match(compiledSetupRace.script, /concurrency:\s*4\b/)
+    assert.match(compiledSetupRace.script, /"Idempotency-Key":\s*"idem-coupon-9"/)
+
+    const { ctx: srCtx, log: srLog } = createMockCtx([
+      { status: 200, json: { balance: 0 } }, // pre-hop readback
+      { status: 200, json: { voucherToken: 'fresh_cpn_tok_999' } }, // step_1
+      { status: 200, json: { credited: 50 } },
+      { status: 200, json: { credited: 50 } },
+      { status: 200, json: { credited: 50 } },
+      { status: 200, json: { credited: 50 } },
+      { status: 200, json: { balance: 200 } }, // post-hop readback
+    ])
+    await loadCompiledEntrypoint(compiledSetupRace.script)(srCtx)
+    assert.deepEqual(srLog.hops, ['step_1', 'step_2'])
+    assert.equal(srLog.raceCalls.length, 1)
+    assert.equal(srLog.raceCalls[0]!.concurrency, 4)
+    assert.deepEqual((srLog.raceCalls[0]!.request as Record<string, unknown>).capability, { handle: 'cap:hop_1:cap_1', target: 'bearer' })
+    assert.equal(srLog.readbacks.length, 2)
+    assert.deepEqual(srLog.edges, [{ kind: 'value_binding', fromHopId: 'step_1', toHopId: 'step_2', capabilityHandle: 'cap:hop_1:cap_1' }])
+    assertAllHopsReachTerminal(srLog.hops, srLog.edges, 'step_2')
+
+    // 3) Non-economic class with repeated POSTs MUST NOT compile into ch.race
+    const nonEcon = compileTraceToKovoVerifyScript({
+      submission: {
+        title: 'Non-economic repeated POST',
+        vulnClass: 'broken_access_control',
+        exchangeIds: ['rf_1', 'rf_2'],
+        terminalExchangeId: 'rf_2',
+      },
+      exchanges: refundExchanges.slice(0, 2),
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(nonEcon.ok, true)
+    assert.doesNotMatch(nonEcon.script!, /ch\.race\(/)
   })
 })
