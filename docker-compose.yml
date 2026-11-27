@@ -17,6 +17,8 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
+      # Quiet HAProxy connection chatter so Kovo's bootstrap banner stays visible in `docker compose up`.
+      LOG_LEVEL: warning
       # Minimal API surface needed to pull images and create/start/stop/remove worker containers.
       CONTAINERS: "1"
       IMAGES: "1"
@@ -58,6 +60,7 @@ services:
       PORT: "8000"
       KOVO_PORT: "${KOVO_PORT:-8000}"
       KOVO_LISTEN_HOST: "0.0.0.0"
+      KOVO_PUBLIC_ORIGIN: "${KOVO_PUBLIC_ORIGIN:-}"
       DOCKER_HOST: tcp://docker-proxy:2375
       KOVO_DATA_DIR: /data
       KOVO_WORKER_AUTO_PULL: "1"

@@ -67,6 +67,7 @@ RUN apt-get update \
   && python3 -m venv /opt/kovo-venv \
   && /opt/kovo-venv/bin/pip install --no-cache-dir --upgrade pip \
   && /opt/kovo-venv/bin/pip install --no-cache-dir bandit==1.8.3 PyJWT==2.10.1 cryptography==44.0.2 \
+  && rm -rf /opt/kovo-venv/lib/python*/site-packages/pip* /opt/kovo-venv/bin/pip* \
   && chmod -R a+rX /opt/kovo-venv \
   && ln -s /tmp/kovo-evidence /evidence
 
@@ -75,8 +76,9 @@ COPY --from=tools-downloader /out/bin/trufflehog /usr/local/bin/trufflehog
 COPY --from=tools-downloader /out/bin/trivy /usr/local/bin/trivy
 COPY --from=tools-downloader /out/bin/opengrep /usr/local/bin/opengrep
 
-# Pre-bake offline Trivy vulnerability DB, Java DB, and Rego misconfig checks in a single pruned layer
-ARG INCLUDE_TRIVY_JAVA_DB=1
+# Pre-bake offline Trivy vulnerability DB and Rego misconfig checks in a single pruned layer.
+# Java binary JAR hash DB (~1 GB compressed) is opt-in (source pom.xml/build.gradle SCA works via trivy.db).
+ARG INCLUDE_TRIVY_JAVA_DB=0
 RUN mkdir -p /opt/trivy-cache /tmp/trivy-tmp \
   && TRIVY_CACHE_DIR=/opt/trivy-cache TMPDIR=/tmp/trivy-tmp trivy fs --download-db-only --no-progress /tmp \
   && (TRIVY_CACHE_DIR=/opt/trivy-cache TMPDIR=/tmp/trivy-tmp trivy fs --scanners misconfig --skip-db-update --no-progress /etc/hostname || true) \

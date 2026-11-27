@@ -72,6 +72,8 @@ export interface LocalSessionOptions {
   captureManager?: BrowserCaptureManager
   /** Optional request body byte limit override for proxied app requests (defaults to 8 MiB). */
   maxBodyBytes?: number
+  /** Optional callback invoked (throttled) when an unauthenticated visit arrives before bootstrap is consumed. */
+  onBootstrapRemind?: (origin: string) => void
 }
 
 export interface KovoLocalServer {
@@ -146,6 +148,91 @@ export function consumeBootstrapSecret(directory: string): void {
   rmSync(join(directory, 'bootstrap-url'), { force: true })
 }
 
+const pinnedOriginFilename = 'pinned-origin'
+const bootstrapReminderThrottleMs = 30_000
+const bootstrapRateWindowMs = 60_000
+const maxFailedBootstrapAttempts = 20
+const validHostHeaderRegex = /^[a-z0-9.-]+(?::[0-9]{1,5})?$/i
+
+export function readPinnedOrigin(directory: string): string | undefined {
+  const file = join(directory, pinnedOriginFilename)
+  let raw: string
+  try {
+    if ((statSync(file).mode & 0o077) !== 0) return undefined
+    raw = readFileSync(file, 'utf8').trim()
+  } catch {
+    return undefined
+  }
+  if (!raw) return undefined
+  try {
+    const parsed = new URL(raw)
+    if (parsed.protocol !== 'https:' || parsed.origin !== raw) return undefined
+    return parsed.origin
+  } catch {
+    return undefined
+  }
+}
+
+export function writePinnedOrigin(directory: string, origin: string): void {
+  const parsed = new URL(origin)
+  if (parsed.protocol !== 'https:' || parsed.origin !== origin) {
+    throw new Error('Pinned origin must be a single HTTPS origin.')
+  }
+  mkdirSync(directory, { recursive: true, mode: 0o700 })
+  const file = join(directory, pinnedOriginFilename)
+  const tmp = join(directory, `.${pinnedOriginFilename}.${randomBytes(8).toString('hex')}.tmp`)
+  writeFileSync(tmp, `${parsed.origin}\n`, { flag: 'wx', mode: 0o600 })
+  try {
+    chmodSync(tmp, 0o600)
+    if ((statSync(tmp).mode & 0o077) !== 0) throw new Error('The pinned origin file must have owner-only permissions.')
+    renameSync(tmp, file)
+  } catch (error) {
+    rmSync(tmp, { force: true })
+    throw error
+  }
+}
+
+function parseHttpsForwardedHost(req: IncomingMessage): { host: string; origin: string } | null {
+  const rawProto = req.headers['x-forwarded-proto']
+  const firstProto = (Array.isArray(rawProto) ? rawProto[0] : rawProto ?? '').split(',')[0]?.trim().toLowerCase()
+  if (firstProto !== 'https') return null
+  const rawHost = (req.headers.host ?? '').trim().toLowerCase()
+  if (!rawHost || !validHostHeaderRegex.test(rawHost)) return null
+  try {
+    const parsed = new URL(`https://${rawHost}`)
+    if (parsed.protocol !== 'https:' || parsed.host !== rawHost || isLoopbackOrigin(parsed.origin)) return null
+    return { host: parsed.host, origin: parsed.origin }
+  } catch {
+    return null
+  }
+}
+
+export function formatBootstrapBanner(options: {
+  localUrl: string
+  secret: string
+  publicOrigin?: string
+}): string {
+  const lines = [
+    '',
+    '========================================================================',
+    '  Kovo is ready — sign in with your one-time setup link or token',
+    '',
+    `  Local URL : ${options.localUrl}`,
+    `  Token     : ${options.secret}`,
+  ]
+  if (options.publicOrigin) {
+    lines.push(`  Public URL: ${options.publicOrigin}/?${bootstrapParam}=${options.secret}`)
+  } else {
+    lines.push('')
+    lines.push('  Behind an HTTPS proxy (exe.dev, Fly, Tailscale, Caddy)?')
+    lines.push('  Open your https://... URL and paste the token above (auto-pins host).')
+  }
+  lines.push('  Retrieve anytime: docker compose exec kovo cat /data/bootstrap')
+  lines.push('========================================================================')
+  lines.push('')
+  return lines.join('\n')
+}
+
 function isLoopbackOrigin(originUrl: string): boolean {
   try {
     const host = new URL(originUrl).hostname.toLowerCase()
@@ -170,12 +257,35 @@ export function sessionCookie(token: string, origin: string): string {
   return `kovo_local=${token}; Path=/; HttpOnly; SameSite=Strict${origin.startsWith('https:') ? '; Secure' : ''}`
 }
 
-function bootstrapNotice(): string {
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Kovo local session</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"></head>
-<body><h1>Kovo needs a local session</h1>
-<p>Open the one-time bootstrap URL printed by the Kovo server in your terminal, or read
-<code>&lt;data-dir&gt;/bootstrap</code> (mode 0600) and open <code>/?bootstrap=&lt;secret&gt;</code>.</p>
-<p>A plain request to this server no longer receives an owner session cookie.</p></body></html>`
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] ?? ch))
+}
+
+function bootstrapNotice(options: { bootstrapActive?: boolean; hostHint?: string } = {}): string {
+  const active = options.bootstrapActive !== false
+  const hostNote = options.hostHint
+    ? `<p class="hint">Signing in will pin <code>${escapeHtml(options.hostHint)}</code> as this Kovo instance's authorized HTTPS origin.</p>`
+    : ''
+  const subtitle = active
+    ? 'Paste the one-time setup token printed in your Kovo terminal to start a local owner session.'
+    : 'The startup bootstrap token has already been consumed. Paste an active pairing token, or restart Kovo to generate a fresh one-time token.'
+  const cmdHint = active
+    ? 'docker compose exec kovo cat /data/bootstrap'
+    : 'docker compose restart kovo'
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in to Kovo</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>
+:root{color-scheme:light dark;font-family:Inter,system-ui,-apple-system,sans-serif}
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#fbfbfa;color:#18181b}
+@media(prefers-color-scheme:dark){body{background:#141416;color:#f4f4f5}.card{background:#1c1c20;border-color:#2e2e34}input{background:#121215;border-color:#32323a;color:#f4f4f5}pre{background:#121215;border-color:#2e2e34}}
+.card{width:100%;max-width:460px;background:#fff;border:1px solid #e4e4e7;border-radius:12px;padding:28px;box-shadow:0 8px 30px rgba(0,0,0,.06)}
+h1{margin:0 0 8px;font-size:20px;font-weight:600}
+p{margin:0 0 16px;font-size:14px;line-height:1.5;color:#71717a}
+form{display:flex;flex-direction:column;gap:12px;margin:16px 0}
+input{width:100%;box-sizing:border-box;padding:10px 12px;font:14px ui-monospace,SFMono-Regular,Menlo,monospace;border:1px solid #d4d4d8;border-radius:8px}
+button{padding:10px 14px;font-size:14px;font-weight:600;border:0;border-radius:8px;background:#18181b;color:#fff;cursor:pointer}
+@media(prefers-color-scheme:dark){button{background:#f4f4f5;color:#141416}}
+.hint{font-size:13px}
+pre{margin:8px 0 0;padding:10px 12px;border-radius:8px;border:1px solid #e4e4e7;background:#f4f4f5;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;overflow-x:auto}
+</style></head><body><main class="card"><h1>Sign in to Kovo</h1><p>${subtitle}</p>${hostNote}<form method="GET" action="/"><input type="password" name="${bootstrapParam}" placeholder="Paste 64-character one-time token" autocomplete="off" spellcheck="false" autofocus required><button type="submit">Sign in</button></form><p class="hint">Missed the terminal banner? Run:</p><pre>${cmdHint}</pre></main></body></html>`
 }
 
 function reject(res: ServerResponse, status: number, message: string) {
@@ -275,8 +385,8 @@ async function readBoundedJsonBody(req: IncomingMessage, limitBytes = maxOpsBody
   return parsed as Record<string, unknown>
 }
 
-function rejectSession(res: ServerResponse) {
-  res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' }).end(bootstrapNotice())
+function rejectSession(res: ServerResponse, options?: { bootstrapActive?: boolean; hostHint?: string }) {
+  res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' }).end(bootstrapNotice(options))
 }
 
 const mime: Record<string, string> = {
@@ -302,7 +412,7 @@ function allowedOrigins(port: number, publicOrigin?: string, hostPort?: number):
     if (proxy.protocol !== 'https:' || proxy.origin !== publicOrigin) {
       throw new Error('KOVO_PUBLIC_ORIGIN must be a single HTTPS origin.')
     }
-    origins.set(proxy.host, proxy.origin)
+    origins.set(proxy.host.toLowerCase(), proxy.origin)
   }
   return origins
 }
@@ -338,6 +448,14 @@ function parseOptionalPort(rawPort: string | undefined): number | undefined {
 export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalServer {
   const { app, directory, port } = options
   const origins = allowedOrigins(port, options.publicOrigin, options.hostPort)
+  const explicitPublicOrigin = Boolean(options.publicOrigin)
+  if (!explicitPublicOrigin) {
+    const persistedPinned = readPinnedOrigin(directory)
+    if (persistedPinned) {
+      const parsedPinned = new URL(persistedPinned)
+      origins.set(parsedPinned.host.toLowerCase(), parsedPinned.origin)
+    }
+  }
   const pairingTtlMs = options.pairingTtlMs ?? defaultPairingTtlMs
   const now = options.now ?? Date.now
   const runtime = options.runtime
@@ -348,9 +466,36 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
   let token = readOrCreateSessionToken(directory)
   const secret = readOrCreateBootstrapSecret(directory)
   let bootstrapConsumed = false
+  let lastBootstrapReminderMs = -Infinity
+  const failedBootstrapAttempts: number[] = []
   const pairingTokens = new Map<string, number>()
   const clientRoot = resolve('build/client')
   const publicRoot = resolve('public')
+
+  function pruneFailedBootstrapAttempts(currentMs: number): void {
+    const cutoff = currentMs - bootstrapRateWindowMs
+    while (failedBootstrapAttempts.length > 0 && failedBootstrapAttempts[0]! <= cutoff) {
+      failedBootstrapAttempts.shift()
+    }
+  }
+
+  function isBootstrapRateLimited(currentMs: number): boolean {
+    pruneFailedBootstrapAttempts(currentMs)
+    return failedBootstrapAttempts.length >= maxFailedBootstrapAttempts
+  }
+
+  function recordFailedBootstrapAttempt(currentMs: number): void {
+    pruneFailedBootstrapAttempts(currentMs)
+    failedBootstrapAttempts.push(currentMs)
+  }
+
+  function maybeRemindBootstrap(targetOrigin: string): void {
+    if (bootstrapConsumed || !options.onBootstrapRemind) return
+    const currentMs = now()
+    if (currentMs - lastBootstrapReminderMs < bootstrapReminderThrottleMs) return
+    lastBootstrapReminderMs = currentMs
+    options.onBootstrapRemind(targetOrigin)
+  }
 
   function prunePairingTokens(currentMs: number): void {
     for (const [candidate, expiresAtMs] of pairingTokens) {
@@ -387,14 +532,50 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
   }
 
   async function serve(req: IncomingMessage, res: ServerResponse) {
-    const origin = origins.get(req.headers.host ?? '')
+    const hostKey = (req.headers.host ?? '').trim().toLowerCase()
+    let origin = origins.get(hostKey)
     const method = req.method ?? 'GET'
     const readOnly = method === 'GET' || method === 'HEAD'
     res.setHeader('X-Content-Type-Options', 'nosniff')
     res.setHeader('Referrer-Policy', 'no-referrer')
     res.setHeader('X-Frame-Options', 'DENY')
     res.setHeader('Cache-Control', 'no-store')
-    if (!origin) return reject(res, 421, 'Unexpected host.')
+    if (!origin) {
+      // Zero-config TOFU HTTPS host pinning: only active while bootstrap is unconsumed, no explicit
+      // KOVO_PUBLIC_ORIGIN is configured, and the request arrived over an HTTPS reverse proxy
+      // (X-Forwarded-Proto: https). Plain HTTP unknown hosts always fail closed with 421.
+      const httpsCandidate = !explicitPublicOrigin && !bootstrapConsumed && method === 'GET'
+        ? parseHttpsForwardedHost(req)
+        : null
+      if (!httpsCandidate) return reject(res, 421, 'Unexpected host.')
+      const candidateUrl = new URL(req.url ?? '/', httpsCandidate.origin)
+      if (candidateUrl.origin !== httpsCandidate.origin) return reject(res, 421, 'Unexpected request URL.')
+      const candidateBootstrap = candidateUrl.searchParams.get(bootstrapParam)
+      if (candidateBootstrap !== null) {
+        const currentMs = now()
+        if (isBootstrapRateLimited(currentMs)) {
+          return reject(res, 429, 'Too many bootstrap attempts. Try again in a minute.')
+        }
+        if (!isBootstrapAuthorized(candidateBootstrap, secret)) {
+          recordFailedBootstrapAttempt(currentMs)
+          return reject(res, 421, 'Unexpected host.')
+        }
+        writePinnedOrigin(directory, httpsCandidate.origin)
+        origins.set(httpsCandidate.host, httpsCandidate.origin)
+        origin = httpsCandidate.origin
+        bootstrapConsumed = true
+        consumeBootstrapSecret(directory)
+        candidateUrl.searchParams.delete(bootstrapParam)
+        res.setHeader('set-cookie', sessionCookie(token, origin))
+        res.writeHead(303, { location: candidateUrl.pathname + (candidateUrl.search || '') })
+        return res.end()
+      }
+      if (candidateUrl.pathname === '/' && isAllowedSecFetchSite(req.headers['sec-fetch-site'], true)) {
+        maybeRemindBootstrap(httpsCandidate.origin)
+        return rejectSession(res, { bootstrapActive: true, hostHint: httpsCandidate.origin })
+      }
+      return reject(res, 421, 'Unexpected host.')
+    }
     const path = new URL(req.url ?? '/', origin)
     if (path.origin !== origin) return reject(res, 421, 'Unexpected request URL.')
     if (!readOnly) {
@@ -451,6 +632,9 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
     const bootstrapCandidate = path.searchParams.get(bootstrapParam)
     if (method === 'GET' && bootstrapCandidate !== null) {
       const currentMs = now()
+      if (isBootstrapRateLimited(currentMs)) {
+        return reject(res, 429, 'Too many bootstrap attempts. Try again in a minute.')
+      }
       let authorized = false
       if (!bootstrapConsumed && isBootstrapAuthorized(bootstrapCandidate, secret)) {
         bootstrapConsumed = true
@@ -460,6 +644,7 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
         authorized = true
       }
       if (!authorized) {
+        recordFailedBootstrapAttempt(currentMs)
         return reject(res, 401, 'Invalid or already consumed bootstrap secret.')
       }
       path.searchParams.delete(bootstrapParam)
@@ -490,7 +675,8 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
         res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', 'x-kovo-auth': 'expired' }).end()
         return
       }
-      return rejectSession(res)
+      if (method === 'GET' && path.pathname === '/') maybeRemindBootstrap(origin)
+      return rejectSession(res, { bootstrapActive: !bootstrapConsumed })
     }
     if (Number(req.headers['content-length'] ?? 0) > bodyLimit) return reject(res, 413, 'Request body is too large.')
 
@@ -1431,15 +1617,29 @@ async function main() {
     filePath: killSwitchFilePath,
   })
 
+  const externalPort = hostPort ?? port
+  const configuredPublicOrigin = process.env.KOVO_PUBLIC_ORIGIN || undefined
+  const localOrigin = `http://127.0.0.1:${externalPort}`
+  let bannerRef: (() => string) | undefined
+
   const local = createKovoLocalServer({
     app,
     directory,
     port,
     ...(hostPort !== undefined ? { hostPort } : {}),
-    publicOrigin: process.env.KOVO_PUBLIC_ORIGIN || undefined,
+    publicOrigin: configuredPublicOrigin,
     runtime,
     killSwitch: sharedKillSwitch,
     store: sharedStore,
+    onBootstrapRemind: () => {
+      if (bannerRef) console.log(bannerRef())
+    },
+  })
+
+  bannerRef = () => formatBootstrapBanner({
+    localUrl: local.bootstrapUrl(localOrigin),
+    secret: local.bootstrapSecret,
+    publicOrigin: configuredPublicOrigin || readPinnedOrigin(directory),
   })
 
   let shuttingDown = false
@@ -1460,14 +1660,12 @@ async function main() {
   process.once('SIGTERM', () => shutdown(0))
   process.once('SIGINT', () => shutdown(0))
 
-  const externalPort = hostPort ?? port
-  const origin = process.env.KOVO_PUBLIC_ORIGIN || `http://127.0.0.1:${externalPort}`
   local.server.listen(port, listenHost, () => {
     const bootstrapFile = join(directory, 'bootstrap-url')
-    writeFileSync(bootstrapFile, `${local.bootstrapUrl(`http://127.0.0.1:${externalPort}`)}\n`, { mode: 0o600 })
+    writeFileSync(bootstrapFile, `${local.bootstrapUrl(localOrigin)}\n`, { mode: 0o600 })
     chmodSync(bootstrapFile, 0o600)
     console.log(`Kovo listening on http://${listenHost}:${port}`)
-    console.log(`Open Kovo with the one-time bootstrap URL: ${local.bootstrapUrl(origin)}`)
+    console.log(bannerRef!())
   })
 }
 

@@ -447,6 +447,8 @@ test('packaging artifacts (Dockerfile, .dockerignore, docker-compose.yml, docker
   const workflow = readFileSync(join(repoRoot, '.github/workflows/docker-publish.yml'), 'utf8')
 
   assert.match(dockerfile, /FROM docker:27-cli AS docker-cli/)
+  assert.match(dockerfile, /npm ci --omit=dev/)
+  assert.match(dockerfile, /playwright-core install --only-shell --with-deps chromium/)
   assert.match(dockerfile, /ARG KOVO_WORKER_IMAGE=ghcr\.io\/kovo-sh\/kovo-worker:latest/)
   assert.match(dockerfile, /USER 10001:10001/)
   assert.match(dockerfile, /http:\/\/127\.0\.0\.1:.*\/health/)
@@ -457,6 +459,8 @@ test('packaging artifacts (Dockerfile, .dockerignore, docker-compose.yml, docker
   }
 
   assert.match(compose, /tecnativa\/docker-socket-proxy:0\.3/)
+  assert.match(compose, /LOG_LEVEL:\s*warning/)
+  assert.match(compose, /KOVO_PUBLIC_ORIGIN:\s*"\$\{KOVO_PUBLIC_ORIGIN:-\}"/)
   assert.match(compose, /internal:\s*true/)
   assert.match(compose, /DOCKER_HOST:\s*tcp:\/\/docker-proxy:2375/)
   assert.match(compose, /KOVO_WORKER_AUTO_PULL:\s*"1"/)

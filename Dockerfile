@@ -12,6 +12,13 @@ RUN npm ci --no-audit --no-fund
 COPY . .
 RUN npm run build
 
+FROM node:24-bookworm-slim AS prod-deps
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
+
 FROM node:24-bookworm-slim AS runtime
 
 ARG KOVO_WORKER_IMAGE=ghcr.io/kovo-sh/kovo-worker:latest
@@ -32,12 +39,12 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
-COPY --from=builder /app/package.json /app/package-lock.json ./
-COPY --from=builder /app/node_modules ./node_modules
+COPY --from=prod-deps /app/package.json /app/package-lock.json ./
+COPY --from=prod-deps /app/node_modules ./node_modules
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates git \
-  && ./node_modules/.bin/playwright install --with-deps chromium \
+  && ./node_modules/.bin/playwright-core install --only-shell --with-deps chromium \
   && rm -rf /var/lib/apt/lists/* \
   && docker --version
 
