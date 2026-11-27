@@ -14,10 +14,10 @@ import { ROLE_RANK, normalizeRole, parseRoleMemberships, resolvePersonaIdentity,
 import type { ProofReceipt } from './proof-receipt.ts'
 import { deriveRecordAuthzDimension, extractIssuedSignedUrl, extractTenantMarkers, findNonErrorBatchRecord, isJobOrHandleStub, type HostAuthzDimension, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
 import { buildTerminalClassContractMap, resolveTerminalContractKind, type OracleTerminalContractKind } from './oracle-spec.ts'
-import { extractLedgerBalanceMap, filterEconomicActionRecords, isControlDeniedAction, normalizeTerminalVulnClass, resolveEntityLessReadStateTransition, resolveOpaqueDualCacheBleedTarget } from './own-org-terminal-guard.ts'
+import { extractLedgerBalanceMap, isControlDeniedAction, normalizeTerminalVulnClass, resolveEconomicActionRecords, resolveEntityLessReadStateTransition, resolveOpaqueDualCacheBleedTarget, selectAutoEconomicActions } from './own-org-terminal-guard.ts'
 
 export interface HydratableEntry {
-  exchangeId: string; seq?: number; timestampMs?: number
+  exchangeId: string; op?: string; seq?: number; timestampMs?: number
   actorPersona?: string | null; actorRoleLabel?: string | null; actorTenant?: string | null; actorPrivilege?: RoleName | null
   emittedCapabilities?: readonly string[]; observedResponseDigests?: readonly string[]; consumedCapabilities?: readonly string[]; injectedRequestDigests?: readonly string[]
   cryptoAttestations?: readonly { derivedFromCapabilityId: string; derivedCapabilityId?: string; artifactDigest?: string }[]
@@ -969,15 +969,15 @@ export function hydrateV8OracleInput(
     )
     if (econCtx) {
       if (!hasExplicitActions) {
-        const isMutProbe = (e: HydratableEntry | undefined): e is HydratableEntry =>
-          Boolean(e && e.step.arm === 'probe' && !stepReadsState(e.step) && is2xx(e.step.status) && isPosTs(e.timestampMs))
-        let actEntries = econCtx.termHopExchangeIds.map(id => idx.entriesById.get(id)).filter(isMutProbe)
-        if (actEntries.length === 0 && econCtx.citedExchangeIds?.length) {
-          const allMut = econCtx.citedExchangeIds.map(id => idx.entriesById.get(id)).filter(isMutProbe)
-          const raceBatched = allMut.filter(e => Boolean(e.raceBatchId?.trim()))
-          actEntries = raceBatched.length > 0 ? raceBatched : allMut
+        const autoActs = selectAutoEconomicActions({
+          econCtx,
+          entriesById: idx.entriesById,
+          toRecord: e => toOracleRecord(e, fallbackSig),
+        })
+        if (autoActs.length > 0) {
+          out.actions = autoActs
         }
-        if (actEntries.length > 0) out.actions = actEntries.map(e => toOracleRecord(e, fallbackSig))
+        // Preserves race sub-exchanges and rejects zero-mutating-action pseudo-ops.
       }
       const validActs = Array.isArray(out.actions)
         ? (out.actions as unknown[]).filter((a): a is HostSignedRecord => Boolean(a && typeof a === 'object' && isPosTs((a as HostSignedRecord).timestampMs)))
@@ -1003,20 +1003,20 @@ export function hydrateV8OracleInput(
 
     const baseRec = isRecObj(out.baselineReadback) ? out.baselineReadback : undefined
     const finRec = isRecObj(out.finalReadback) ? out.finalReadback : undefined
-    const citedSet = econCtx?.citedExchangeIds?.length ? new Set(econCtx.citedExchangeIds) : null
-    // Deduplicate action exchange IDs and bind strictly to probe-arm mutating actions (R2-C-8).
+    // Deduplicate action exchange IDs, bind strictly to probe-arm mutating actions (R2-C-8),
+    // and retain DAG/window-bound `race` op sub-exchanges cited in `oracleInput.actionExchangeIds`.
     const rawActRecs = Array.isArray(out.actions) ? (out.actions as unknown[]).filter(isRecObj) : []
-    const seenActIds = new Set<string>()
-    const actRecs: HostSignedRecord[] = []
-    for (const a of rawActRecs) {
-      if (seenActIds.has(a.id)) continue
-      seenActIds.add(a.id)
-      const entry = idx.entriesById.get(a.id)
-      if (entry && entry.step.arm !== 'probe') continue
-      if (citedSet && !citedSet.has(a.id)) continue
-      actRecs.push(a)
+    const actRecs = resolveEconomicActionRecords({
+      rawActRecs,
+      entriesById: idx.entriesById,
+      citedExchangeIds: econCtx?.citedExchangeIds,
+      baseRec,
+      finRec,
+    })
+    // Reject zero-mutating-action economic_conservation receipts cleanly via filtered actions.
+    if (Array.isArray(out.actions)) {
+      out.actions = actRecs
     }
-    if (Array.isArray(out.actions)) out.actions = filterEconomicActionRecords(actRecs, idx.entriesById)
     const baseJson = parseRecJson(baseRec), finJson = parseRecJson(finRec)
     const eq = resolveEconomicEquation(rawInput, baseRec, finRec)
     if (eq) out.equation = eq
