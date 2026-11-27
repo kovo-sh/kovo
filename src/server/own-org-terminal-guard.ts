@@ -251,8 +251,27 @@ export function filterEconomicActionRecords(
 }
 
 const SIG_CARRIER_KEY_RE = /(?:^|[-_])(?:sig|signature|hmac|digest|mac|derivation)(?:$|[-_])|signature|hmac/i
+const SIGNED_URL_QUERY_KEY_RE = /^(?:x-)?sign$|^sig(?:\[\]|\d+)$/i
 const FORGED_WEBHOOK_DENIED_STATUSES = new Set([401, 403, 404])
 const FORGED_WEBHOOK_ALWAYS_CLASS_RE = /^(?:webhook_forgery|webhook|forged_signature.*)$/i
+
+export function hasSignedUrlOrHeaderSignature(entry: HydratableEntry | undefined): boolean {
+  const hdrs = entry?.step.requestHeaders
+  if (hdrs && typeof hdrs === 'object') {
+    for (const [k, v] of Object.entries(hdrs)) {
+      if (SIG_CARRIER_KEY_RE.test(k.trim()) && typeof v === 'string' && v.trim().length > 0) return true
+    }
+  }
+  const rawPq = entry?.step.pathAndQuery ?? entry?.step.route ?? ''
+  const qIdx = rawPq.indexOf('?')
+  if (qIdx >= 0) {
+    const query = rawPq.slice(qIdx + 1).split('#', 1)[0] ?? ''
+    for (const [k, v] of new URLSearchParams(query).entries()) {
+      if ((SIG_CARRIER_KEY_RE.test(k.trim()) || SIGNED_URL_QUERY_KEY_RE.test(k.trim())) && v.trim().length > 0) return true
+    }
+  }
+  return false
+}
 
 export function hasWebhookSignatureHeader(entry: HydratableEntry | undefined): boolean {
   const hdrs = entry?.step.requestHeaders
@@ -426,11 +445,11 @@ export function selectVerifiedPostMutationReadback<T extends HydratableEntry>(
 }
 
 /**
- * R5(b): Reject 1-hop (`hops < 2`, `verifiedEdges === 0`) forged-signature / webhook POST/PUT
- * receipts whose denied control failed (`401`/`403`/`404`) and whose probe carries a signature
- * carrier (header, query param, or top-level JSON field matching sig/signature/hmac/digest/mac)
- * OR declares a forged-webhook/signature class without proving in-DAG secret provenance
- * (`hops >= 2` with causal edge, `derived_crypto_binding`, or host-attested `cryptoAttestations`).
+ * R5(b) + R6-nx: Reject 1-hop (`hops < 2`, `verifiedEdges === 0`) forged-signature / webhook
+ * POST/PUT receipts AND 1-hop signed-URL/header GET/HEAD receipts whose denied control failed
+ * (`401`/`403`/`404`) and whose probe carries a cryptographic signature carrier without proving
+ * in-DAG secret/capability provenance (`hops >= 2` with causal edge, `derived_crypto_binding`,
+ * or host-attested `cryptoAttestations`).
  */
 export function evaluateForgedWebhookProvenanceGuard(params: {
   normCls: string
@@ -442,16 +461,20 @@ export function evaluateForgedWebhookProvenanceGuard(params: {
   preChainControlIds: readonly string[]
   entriesById: ReadonlyMap<string, HydratableEntry>
   hasTermDerivedCrypto: boolean
+  /** v8 crypto oracle (e.g. cryptographic_scope_replay) already verified the in-transcript minting exchange. */
+  hostVerifiedCryptoOracle?: boolean
 }): string | null {
   if (params.singleHopProofOk || params.hopCount >= 2 || params.verifiedEdgeCount > 0) return null
   const term = params.termEx
-  if (!term || stepReadsState(term.step)) return null
+  if (!term) return null
   const meth = term.step.method.toUpperCase()
-  if (meth !== 'POST' && meth !== 'PUT') return null
+  const isRead = meth === 'GET' || meth === 'HEAD'
+  if (isRead && params.hostVerifiedCryptoOracle) return null
+  if (!isRead && (stepReadsState(term.step) || (meth !== 'POST' && meth !== 'PUT'))) return null
   if (params.hasTermDerivedCrypto || (term.cryptoAttestations?.length ?? 0) > 0) return null
-  const hasSigCarrier = hasWebhookSignatureHeader(term)
-  const isForgedClass = FORGED_WEBHOOK_ALWAYS_CLASS_RE.test(params.normCls)
-    || (params.normCls === 'forged_settlement' && (hasSigCarrier || term.step.requestHeaders !== undefined || term.step.requestJson !== undefined))
+  const hasSigCarrier = isRead ? hasSignedUrlOrHeaderSignature(term) : hasWebhookSignatureHeader(term)
+  const isForgedClass = !isRead && (FORGED_WEBHOOK_ALWAYS_CLASS_RE.test(params.normCls)
+    || (params.normCls === 'forged_settlement' && (hasSigCarrier || term.step.requestHeaders !== undefined || term.step.requestJson !== undefined)))
   if (!hasSigCarrier && !isForgedClass) return null
   const termFam = routeFamily(term.step.route ?? term.step.pathAndQuery)
   const hasDeniedCtrl = (typeof params.terminalCtrl?.step.status === 'number' && FORGED_WEBHOOK_DENIED_STATUSES.has(params.terminalCtrl.step.status))
@@ -460,7 +483,196 @@ export function evaluateForgedWebhookProvenanceGuard(params: {
       return Boolean(c && c.step.arm === 'control' && typeof c.step.status === 'number' && FORGED_WEBHOOK_DENIED_STATUSES.has(c.step.status) && c.step.method.toUpperCase() === meth && (!termFam || routeFamily(c.step.route ?? c.step.pathAndQuery) === termFam))
     })
   if (!hasDeniedCtrl) return null
-  return 'forged_signature_unproven_secret_provenance: 1-hop forged signature/webhook mutation with denied control (401/403/404) requires >= 2 hops with a verified causal edge or host-attested derived_crypto_binding proving in-DAG secret provenance.'
+  return isRead
+    ? 'signed_url_unproven_capability_provenance: 1-hop signed-URL/header GET/HEAD request with denied control (401/403/404) requires >= 2 hops with a verified causal edge or host-attested derived_crypto_binding proving in-DAG signature/URL provenance.'
+    : 'forged_signature_unproven_secret_provenance: 1-hop forged signature/webhook mutation with denied control (401/403/404) requires >= 2 hops with a verified causal edge or host-attested derived_crypto_binding proving in-DAG secret provenance.'
+}
+
+// --- R6-nx: Entity-Less Read State-Transition Edge + Pre-Mutation Control Selection ---
+
+const PRIV_MUTATION_ROUTE_RE = /(?:^|\/)(?:users?|members?(?:hips?)?|roles?|permissions?|acls?|grants?|groups?|scim|iam|principals?|identit(?:y|ies)|accounts?|sessions?|policies|policy|entitlements?|privileges?|admins?)(?:\/|$)/i
+const PRIV_MUTATION_PAYLOAD_KEY_RE = /^(?:role|roles|permission|permissions|privileges?|admin|is_admin|isAdmin|acl|entitlements?|membership|memberships|tier)$/i
+const PRIV_MUTATION_BENIGN_TAIL_RE = /(?:^|\/)(?:comments?|notes?|preferences?|settings?|notifications?|messages?|likes?|favou?rites?|bookmarks?|feedback|reviews?|avatars?|profile)\/?$/i
+const ENTITY_LESS_DENIED_CTRL_STATUSES = new Set([401, 403, 404])
+const GUARD_ANON_ACTOR_RE = /^(?:anon(?:ymous)?|unauth(?:enticated)?|guest)$/i
+
+type GuardChronoEntry = HydratableEntry & { origin?: string; cleanSession?: boolean; replayAttempt?: string }
+
+function hasPrivilegeMutationPayloadKey(node: unknown, depth = 0): boolean {
+  if (depth > 2 || !node || typeof node !== 'object') return false
+  if (Array.isArray(node)) return node.slice(0, 16).some(item => hasPrivilegeMutationPayloadKey(item, depth + 1))
+  for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+    if (PRIV_MUTATION_PAYLOAD_KEY_RE.test(k.trim())) return true
+    if (v && typeof v === 'object' && depth < 2 && hasPrivilegeMutationPayloadKey(v, depth + 1)) return true
+  }
+  return false
+}
+
+function isPrivilegeOrActorMutationEntry(entry: HydratableEntry): boolean {
+  const meth = entry.step.method.toUpperCase()
+  if (stepReadsState(entry.step) || (meth !== 'PATCH' && meth !== 'POST' && meth !== 'PUT')) return false
+  const cleanPath = normalizeGuardPath(entry.step.route ?? entry.step.pathAndQuery)
+  if (cleanPath && PRIV_MUTATION_ROUTE_RE.test(cleanPath) && !PRIV_MUTATION_BENIGN_TAIL_RE.test(cleanPath)) return true
+  return hasPrivilegeMutationPayloadKey(entry.step.requestJson) || hasPrivilegeMutationPayloadKey(entry.step.json)
+}
+
+function extractMutationLogicalEntityId(fromEx: HydratableEntry, fromHopEntityId: string | undefined, actorKey: string): string {
+  if (fromEx.entityId?.trim()) return fromEx.entityId.trim()
+  if (fromHopEntityId?.trim()) return fromHopEntityId.trim()
+  const rawBase = (fromEx.step.pathAndQuery ?? fromEx.step.route ?? '').split(/[?#]/, 1)[0] ?? ''
+  const rawSegs = rawBase.split('/').filter(Boolean)
+  for (let i = rawSegs.length - 1; i >= 0; i--) {
+    const seg = rawSegs[i]!.trim()
+    const low = seg.toLowerCase()
+    if (!seg || low === ':id' || low === '<scrubbed>') continue
+    if (OWN_ORG_DYNAMIC_SEG_RE.test(seg)) return seg
+  }
+  return `actor:${actorKey}`
+}
+
+function isChronoBefore(a: GuardChronoEntry, b: GuardChronoEntry): boolean {
+  const aTs = a.timestampMs, bTs = b.timestampMs
+  if (typeof aTs !== 'number' || !Number.isFinite(aTs) || typeof bTs !== 'number' || !Number.isFinite(bTs)) return false
+  if (aTs < bTs) return true
+  return aTs === bTs && typeof a.seq === 'number' && typeof b.seq === 'number' && Number.isFinite(a.seq) && Number.isFinite(b.seq) && a.seq < b.seq
+}
+
+function compareChronoAsc(a: GuardChronoEntry, b: GuardChronoEntry): number {
+  const aTs = typeof a.timestampMs === 'number' && Number.isFinite(a.timestampMs) ? a.timestampMs : Number.MAX_SAFE_INTEGER
+  const bTs = typeof b.timestampMs === 'number' && Number.isFinite(b.timestampMs) ? b.timestampMs : Number.MAX_SAFE_INTEGER
+  if (aTs !== bTs) return aTs - bTs
+  const aSeq = typeof a.seq === 'number' && Number.isFinite(a.seq) ? a.seq : Number.MAX_SAFE_INTEGER
+  const bSeq = typeof b.seq === 'number' && Number.isFinite(b.seq) ? b.seq : Number.MAX_SAFE_INTEGER
+  return aSeq - bSeq
+}
+
+function originsCompatible(a: string | undefined, b: string | undefined): boolean {
+  const na = (a ?? '').trim().replace(/\/+$/, '').toLowerCase()
+  const nb = (b ?? '').trim().replace(/\/+$/, '').toLowerCase()
+  return !na || !nb || na === nb
+}
+
+/**
+ * R6-nx: Host-completed `state_transition_binding` inference for entity-less privileged read
+ * terminals (e.g. privileged-mutation hop followed by a privileged read hop). Fires ONLY when:
+ *  - `toEx` is an entity-less terminal `GET`/`HEAD` read under an authenticated actor;
+ *  - `fromEx` is a succeeding `PATCH`/`POST`/`PUT` privilege/role/ACL/session mutation under the
+ *    same actor identity lineage;
+ *  - a verified clean pre-mutation denied `arm: 'control'` (401/403/404, strictly before `fromEx`,
+ *    same actor — never anonymous 401 on an auth'd route) exists on the terminal read route family.
+ */
+export function resolveEntityLessReadStateTransition<T extends GuardChronoEntry>(params: {
+  fromEx: T
+  fromHopEntityId?: string
+  toEx: T
+  isTerminalTo: boolean
+  allEntries: readonly T[]
+  pairExIds: ReadonlySet<string>
+  allHopExIds: ReadonlySet<string>
+  preCtrlIds: ReadonlySet<string>
+  normRouteFam: (p: string | null | undefined, eid?: string) => string
+  sameCredIdentity: (a: T, b: T) => boolean
+  probeActorOf: (e: T) => string | null
+  isLoginCap: (cap: string) => boolean
+  canonicalNonAuthQuery: (p: string | null | undefined) => string
+}): { entityId: string; ablationExchangeId: string } | null {
+  const { fromEx, fromHopEntityId, toEx, isTerminalTo, allEntries, pairExIds, allHopExIds, preCtrlIds, normRouteFam, sameCredIdentity, probeActorOf, isLoginCap, canonicalNonAuthQuery } = params
+  if (!isTerminalTo || !stepReadsState(toEx.step) || toEx.entityId?.trim()) return null
+  if (!isPrivilegeOrActorMutationEntry(fromEx)) return null
+  const toRaw = actorOfGuardEntry(toEx)
+  if (!toRaw || GUARD_ANON_ACTOR_RE.test(toRaw)) return null
+  const toActor = probeActorOf(toEx)
+  const fromActor = probeActorOf(fromEx)
+  if (!toActor || !fromActor || toActor !== fromActor) return null
+  const toFam = normRouteFam(toEx.step.route ?? toEx.step.pathAndQuery)
+  if (!toFam) return null
+  const toMeth = toEx.step.method.toUpperCase()
+  const toQuery = canonicalNonAuthQuery(toEx.step.pathAndQuery ?? toEx.step.route)
+  const cands = allEntries.filter(ab => {
+    if (pairExIds.has(ab.exchangeId) || (!preCtrlIds.has(ab.exchangeId) && allHopExIds.has(ab.exchangeId))) return false
+    if (ab.cleanSession !== true || (ab.step.arm !== 'control' && ab.replayAttempt !== 'ablation_control')) return false
+    if (typeof ab.step.status !== 'number' || !ENTITY_LESS_DENIED_CTRL_STATUSES.has(ab.step.status)) return false
+    if (ab.step.method.toUpperCase() !== toMeth || !originsCompatible(ab.origin, toEx.origin)) return false
+    if (!isChronoBefore(ab, fromEx) || canonicalNonAuthQuery(ab.step.pathAndQuery ?? ab.step.route) !== toQuery) return false
+    const abRaw = actorOfGuardEntry(ab)
+    if (!abRaw || GUARD_ANON_ACTOR_RE.test(abRaw)) return false
+    if (abRaw.startsWith('cap:') && abRaw !== toRaw && !isLoginCap(abRaw)) return false
+    if (!sameCredIdentity(ab, toEx)) return false
+    return normRouteFam(ab.step.route ?? ab.step.pathAndQuery, ab.entityId) === toFam
+  })
+  if (cands.length === 0) return null
+  cands.sort(compareChronoAsc)
+  const chosen = cands.find(c => preCtrlIds.has(c.exchangeId)) ?? cands[0]!
+  return {
+    entityId: extractMutationLogicalEntityId(fromEx, fromHopEntityId, toActor),
+    ablationExchangeId: chosen.exchangeId,
+  }
+}
+
+/**
+ * R6-nx: Auto-select the earliest clean pre-mutation denied control (`401`/`403`/`404`) when a
+ * `state_transition_binding` receipt cited a post-mutation `2xx` control (e.g. persistent
+ * user-level role escalation). Never accepts a `2xx` control, never accepts an anonymous `401` on
+ * an authenticated route, and requires a real mutating exchange between the clean pre-mutation
+ * denial and the cited `2xx` exchange.
+ */
+export function findPreMutationDeniedControl<T extends GuardChronoEntry>(params: {
+  citedTwoXx: T
+  mutationEx: T
+  toEx: T
+  entityId?: string
+  entriesById: ReadonlyMap<string, T>
+  excludedIds: ReadonlySet<string>
+  toUsesNewCap: boolean
+  normRouteFam: (p: string | null | undefined, eid?: string) => string
+  sameCredIdentity: (a: T, b: T) => boolean
+  isLoginCap: (cap: string) => boolean
+  canonicalNonAuthQuery: (p: string | null | undefined) => string
+}): T | null {
+  const { citedTwoXx, mutationEx, toEx, entityId, entriesById, excludedIds, toUsesNewCap, normRouteFam, sameCredIdentity, isLoginCap, canonicalNonAuthQuery } = params
+  if (stepReadsState(mutationEx.step) || (typeof mutationEx.step.status === 'number' && (mutationEx.step.status < 200 || mutationEx.step.status >= 300))) return null
+  const toFam = normRouteFam(toEx.step.route ?? toEx.step.pathAndQuery, entityId)
+  if (!toFam) return null
+  const toMeth = toEx.step.method.toUpperCase()
+  const toQuery = canonicalNonAuthQuery(toEx.step.pathAndQuery ?? toEx.step.route)
+  const toRaw = actorOfGuardEntry(toEx)
+  const toAuth = Boolean(toRaw && !GUARD_ANON_ACTOR_RE.test(toRaw))
+  const citedAfterMutation = isChronoBefore(mutationEx, citedTwoXx)
+  const mutFam = normRouteFam(mutationEx.step.route ?? mutationEx.step.pathAndQuery, entityId)
+  const allEntries = [...entriesById.values()]
+  const hasInterveningMutation = (cand: T): boolean => {
+    if (citedAfterMutation) return true
+    if (!mutFam) return false
+    return allEntries.some(m =>
+      m.exchangeId !== cand.exchangeId && m.exchangeId !== citedTwoXx.exchangeId
+      && !stepReadsState(m.step) && typeof m.step.status === 'number' && m.step.status >= 200 && m.step.status < 300
+      && isChronoBefore(cand, m) && isChronoBefore(m, citedTwoXx)
+      && normRouteFam(m.step.route ?? m.step.pathAndQuery, m.entityId ?? entityId) === mutFam,
+    )
+  }
+  const cands = allEntries.filter(c => {
+    if (excludedIds.has(c.exchangeId) || c.exchangeId === citedTwoXx.exchangeId || c.exchangeId === toEx.exchangeId || c.exchangeId === mutationEx.exchangeId) return false
+    if (c.cleanSession !== true || (c.step.arm !== 'control' && c.replayAttempt !== 'ablation_control')) return false
+    if (typeof c.step.status !== 'number' || !ENTITY_LESS_DENIED_CTRL_STATUSES.has(c.step.status)) return false
+    if (c.step.method.toUpperCase() !== toMeth || !originsCompatible(c.origin, toEx.origin)) return false
+    if (normRouteFam(c.step.route ?? c.step.pathAndQuery, c.entityId ?? entityId) !== toFam) return false
+    if (canonicalNonAuthQuery(c.step.pathAndQuery ?? c.step.route) !== toQuery) return false
+    if (!isChronoBefore(c, mutationEx) || !isChronoBefore(c, citedTwoXx)) return false
+    const cRaw = actorOfGuardEntry(c)
+    if (cRaw?.startsWith('cap:') && cRaw !== toRaw && !isLoginCap(cRaw)) return false
+    if (toAuth) {
+      if (!cRaw || GUARD_ANON_ACTOR_RE.test(cRaw)) return false
+      if (!toUsesNewCap && !sameCredIdentity(c, toEx)) return false
+    }
+    return hasInterveningMutation(c)
+  })
+  if (cands.length === 0) return null
+  cands.sort((a, b) => {
+    const aLab = (a.step.arm === 'control' || a.replayAttempt === 'ablation_control') ? 0 : 1
+    const bLab = (b.step.arm === 'control' || b.replayAttempt === 'ablation_control') ? 0 : 1
+    return (aLab - bLab) || compareChronoAsc(a, b)
+  })
+  return cands[0]!
 }
 
 function bodyMentionsTenantToken(body: string, tenant: string): boolean {

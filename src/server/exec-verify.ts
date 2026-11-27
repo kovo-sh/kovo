@@ -98,7 +98,7 @@ import { canaries, findings, type ReplayProofReceiptRow } from './schema.ts'
 
 export { isSensitiveRepoEntry, isSensitiveRepoRelativePath }
 import { classifyCompositeChainOverlap, compositeChainOriginsEquivalent, compositeChainRichnessScore, extractCompositeChainDedupSignature, extractRowCompositeSignature, isGenericSharedAuthOrUtilityEndpoint, sortChainDuplicateRows, type CompositeChainDedupSignature } from './store-findings.ts'
-import { isAuthzPrivescClassSupersessionCompatible, resolveCompositeSupersessionMatch } from './composite-chain-dedup.ts'
+import { isAuthzPrivescClassSupersessionCompatible, isSameTerminalCompositeClassCompatible, resolveCompositeSupersessionMatch } from './composite-chain-dedup.ts'
 export { isGenericSharedAuthOrUtilityEndpoint }
 import {
   assessmentAssignments,
@@ -2949,9 +2949,11 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       const earlierCompReceipt = (ev?.compositeReceipt ?? proofReceiptObj?.compositeReceipt) as CompositeProofReceipt | undefined
 
       // 1) Require verified signed upstream transcript match with exact origin & explicit HTTP method
-      // (or direct signed exchangeId overlap when endpoint metadata is absent).
+      // (or direct signed exchangeId overlap / exact same-terminal multi-hop composite dedup).
+      const earlierMeta = extractExistingFindingTargetMeta(row, linkedSpec)
       const matchedUpstreamSpecs: SupersessionEndpointSpec[] = []
       let supersessionDir: 'incoming_supersedes_earlier' | 'earlier_supersedes_incoming' = 'incoming_supersedes_earlier'
+      let isSameTerminalMatch = false
       if (earlierEndpoints.length > 0 && isEndpointSubsetOfUpstream(earlierEndpoints, upstreamEndpoints)) {
         for (const ep of earlierEndpoints) {
           if (isGenericSharedAuthOrUtilityEndpoint(ep.normalizedEndpoint)) continue
@@ -2963,34 +2965,32 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         matchedUpstreamSpecs.push(...directMatchedUpstream)
       } else {
         const resSup = resolveCompositeSupersessionMatch({
-          incomingReceipt: receipt, incomingOrigin: upstreamEndpoints[0]?.origin ?? row.finding.origin,
-          incomingTerminalEndpoint: verification?.terminalEndpoint ?? null, incomingUpstreamNonGeneric: upstreamNonGeneric,
-          earlierCompReceipt, earlierOrigin: row.finding.origin, earlierEndpoints, endpointsMatchExact: supersessionEndpointsMatchExact,
+          incomingReceipt: receipt, incomingOrigin: verification?.terminalOrigin ?? upstreamEndpoints[0]?.origin ?? '',
+          incomingTerminalEndpoint: verification?.terminalEndpoint ?? null, incomingOracleFamily: compositeOracleFamily,
+          incomingUpstreamNonGeneric: upstreamNonGeneric, earlierCompReceipt, earlierOrigin: row.finding.origin,
+          earlierTerminalEndpoint: earlierMeta.normalizedEndpoint ? `${earlierMeta.method ?? ''} ${earlierMeta.normalizedEndpoint}`.trim() : null,
+          earlierOracleFamily: earlierMeta.terminalOracleFamily, earlierEndpoints, endpointsMatchExact: supersessionEndpointsMatchExact,
         })
-        if (resSup.direction !== 'none') { supersessionDir = resSup.direction; matchedUpstreamSpecs.push(...resSup.matched) }
+        if (resSup.direction !== 'none') {
+          supersessionDir = resSup.direction; isSameTerminalMatch = Boolean(resSup.sameTerminal); matchedUpstreamSpecs.push(...resSup.matched)
+        }
       }
       if (!matchedUpstreamSpecs.length) continue
-
       const earlierVulnClass = earlierCompReceipt?.terminalVulnClass
         ?? linkedSpec?.proofReceipt?.receipt?.vulnClass
         ?? persistedAgentScriptOf(linkedSpec?.spec)?.envelope.vulnClass
         ?? null
-      const earlierMeta = extractExistingFindingTargetMeta(row, linkedSpec)
       const preconditionVulnClasses = matchedUpstreamSpecs
         .map(up => up.preconditionVulnClass)
         .filter((cls): cls is string => Boolean(cls))
-      if (!isFindingClassSupersessionCompatible(
-        {
-          cwe: row.finding.cwe,
-          vulnClass: earlierVulnClass,
-          terminalOracleFamily: earlierMeta.terminalOracleFamily,
-        },
-        {
-          terminalVulnClass: receipt.terminalVulnClass,
-          terminalOracleFamily: compositeOracleFamily,
-          preconditionVulnClasses,
-        },
-      )) continue
+      const classOk = isFindingClassSupersessionCompatible(
+        { cwe: row.finding.cwe, vulnClass: earlierVulnClass, terminalOracleFamily: earlierMeta.terminalOracleFamily },
+        { terminalVulnClass: receipt.terminalVulnClass, terminalOracleFamily: compositeOracleFamily, preconditionVulnClasses },
+      ) || (isSameTerminalMatch && isSameTerminalCompositeClassCompatible(
+        { cwe: row.finding.cwe, vulnClass: earlierVulnClass, terminalOracleFamily: earlierMeta.terminalOracleFamily },
+        { vulnClass: receipt.terminalVulnClass, terminalOracleFamily: compositeOracleFamily },
+      ))
+      if (!classOk) continue
 
       if (supersessionDir === 'earlier_supersedes_incoming') {
         this.storage.updateProposedFinding(run, newFindingId, { supersededByFindingId: row.id })

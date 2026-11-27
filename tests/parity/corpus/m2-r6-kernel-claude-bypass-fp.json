@@ -1,0 +1,109 @@
+{
+  "id": "m2-r6-kernel-claude-bypass-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "m2-r6-kernel-signed-url-get-provenance-bypass-variants",
+  "description": "R3-05 independent-review FP (m2-r6 kernel): a 1-hop GET export download whose only denied control is a 403 (unsigned fetch) and whose probe carries a mixed-case signature header (`X-Signature`) has no in-DAG capability/signature provenance (no second hop, no verified causal edge, no derived_crypto_binding). evaluateForgedWebhookProvenanceGuard must fail it closed for GET/HEAD (query or header signature carrier, any casing); main let this single-hop read confirm because the guard only covered POST/PUT.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/exec-verify.ts",
+      "src/server/own-org-terminal-guard.ts",
+      "src/server/v8-oracle-hydrate.ts"
+    ],
+    "classes": [
+      "cross_tenant_export",
+      "cryptographic_scope_replay"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "signed-url-forgery",
+    "title": "1-hop signed-URL GET export without proven signature provenance",
+    "impact": "A single GET carrying a guessed cloud signature, accepted after a 403 unsigned control, proves nothing about how the signature was obtained; terminal impact must stay unproven without a second hop or derived crypto binding.",
+    "claimedImpact": "other",
+    "claimedBoundary": "other",
+    "vulnClass": "cross_tenant_export"
+  },
+  "freeTextLabel": {
+    "title": "Forged signed URL downloads another tenant's export without signature provenance"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-m2r6-member-a"
+    },
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-m2r6-member-b"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ex_ctrl_403",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/exports/export-b-77/download",
+      "persona": "member_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"signature_required\"}"
+    },
+    {
+      "id": "ex_probe_200",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/exports/export-b-77/download",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"exportId\":\"export-b-77\",\"tenant\":\"tenant-b\",\"rows\":[{\"id\":\"r1\",\"amountCents\":50000}]}",
+      "requestHeaders": {
+        "X-Signature": "guessed-0001"
+      }
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-M2-R6-KERNEL-CLAUDE-BYPASS-FP",
+    "terminalVulnClass": "cross_tenant_export",
+    "oracleFamily": "",
+    "singleHop": true,
+    "terminalExchangeId": "ex_probe_200",
+    "preChainControlIds": [
+      "ex_ctrl_403"
+    ],
+    "attackerPersonas": [
+      "member_a"
+    ],
+    "expectedFailedStage": "terminal_impact",
+    "claimedDelta": "1-hop guessed-signature GET downloads tenant-b export; no in-DAG signature provenance."
+  }
+}

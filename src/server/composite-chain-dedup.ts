@@ -399,6 +399,16 @@ const AUTHZ_PRIVESC_CLASS_SET = new Set([
   'cross_tenant_write', 'cross_tenant_export', 'cross_tenant_exfiltration',
   'dual_tenant_abac', 'self_approved_payout', 'stale_privilege_use', 'temporal_revocation',
 ])
+const ECONOMIC_LOGIC_CWE_SET = new Set(['CWE-362', 'CWE-840', 'CWE-841'])
+const ECONOMIC_LOGIC_CLASS_SET = new Set([
+  'economic_conservation', 'business_logic', 'race_condition', 'double_spend',
+  'workflow_bypass', 'workflow_skip', 'invariant_violation', 'toctou',
+  'webhook_forgery', 'forged_settlement', 'cryptographic_scope_replay', 'parser_cache_differential',
+])
+const SAME_TERMINAL_ORACLE_FAMILIES = new Set([
+  'dual_tenant_abac', 'temporal_revocation', 'economic_conservation',
+  'cryptographic_scope_replay', 'parser_cache_differential', 'cross_surface_pivot',
+])
 const VERSION_SEG_RE = /^(?:api|rest|v\d+)$/i
 const TENANT_SCOPE_SEG_RE = /^(?:orgs?|organizations?|tenants?|workspaces?)$/i
 const PARAM_SEG_RE = /^(?::[a-z0-9_]+|<[^>]+>|\{[^}]+\})$/i
@@ -419,6 +429,29 @@ export function isAuthzPrivescClassSupersessionCompatible(
     || (Boolean(earlier.vulnClass) && AUTHZ_PRIVESC_CLASS_SET.has(norm(earlier.vulnClass)))
   if (!earlierInFamily) return false
   return composite.vulnClasses.some(cls => AUTHZ_PRIVESC_CLASS_SET.has(norm(cls)))
+}
+
+/**
+ * R6-nx: Exact-same-terminal multi-hop composite class compatibility (`authz`/`privesc`/`economic`).
+ * Strictly rejects concrete injection/XSS/SSRF/XXE/RCE/traversal/redirect CWEs so unrelated classes
+ * on the same endpoint are never merged.
+ */
+export function isSameTerminalCompositeClassCompatible(
+  earlier: { cwe?: string | null; vulnClass?: string | null; terminalOracleFamily?: string | null },
+  composite: { cwe?: string | null; vulnClass?: string | null; terminalOracleFamily?: string | null },
+): boolean {
+  const norm = (s: string | null | undefined) => (s ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_')
+  const inScope = (side: { cwe?: string | null; vulnClass?: string | null; terminalOracleFamily?: string | null }): boolean => {
+    const cwe = (side.cwe ?? '').trim().toUpperCase()
+    const hasCwe = /^CWE-\d{1,5}$/.test(cwe)
+    if (hasCwe && !AUTHZ_PRIVESC_CWE_SET.has(cwe) && !ECONOMIC_LOGIC_CWE_SET.has(cwe)) return false
+    const cls = norm(side.vulnClass)
+    const fam = norm(side.terminalOracleFamily)
+    return (hasCwe && (AUTHZ_PRIVESC_CWE_SET.has(cwe) || ECONOMIC_LOGIC_CWE_SET.has(cwe)))
+      || Boolean(cls && (AUTHZ_PRIVESC_CLASS_SET.has(cls) || ECONOMIC_LOGIC_CLASS_SET.has(cls)))
+      || Boolean(fam && SAME_TERMINAL_ORACLE_FAMILIES.has(fam))
+  }
+  return inScope(earlier) && inScope(composite)
 }
 
 function normalizedResourceFamilyRoot(normalizedEndpoint: string): string | null {
@@ -526,14 +559,20 @@ export function matchCausalPrefixPartialChainSupersession<T extends UpstreamSupe
   if (endpointsMatchExact(winnerTerm, partialTerm)) return []
 
   const winnerMut = Boolean(winnerTerm.method && MUTATING_HTTP_METHODS.has(winnerTerm.method))
-  if (!winnerMut) return []
   const partialReadOnly = partialTerm.method === 'GET' || partialTerm.method === 'HEAD'
   const winnerStrictlyDeeper = winnerReceipt.hops.length > partialReceipt.hops.length
-  if (!partialReadOnly && !winnerStrictlyDeeper) return []
+  const partialTermInWinnerUpstream = winnerUpstreamNonGeneric.some(wup => endpointsMatchExact(partialTerm, wup))
+  if (winnerMut) {
+    if (!partialReadOnly && !winnerStrictlyDeeper) return []
+  } else if (!winnerStrictlyDeeper || (!partialReadOnly && !partialTermInWinnerUpstream)) {
+    return []
+  }
 
-  const winnerRoot = normalizedResourceFamilyRoot(winnerTerm.normalizedEndpoint)
-  const partialRoot = normalizedResourceFamilyRoot(partialTerm.normalizedEndpoint)
-  if (!winnerRoot || !partialRoot || winnerRoot !== partialRoot) return []
+  if (!partialTermInWinnerUpstream) {
+    const winnerRoot = normalizedResourceFamilyRoot(winnerTerm.normalizedEndpoint)
+    const partialRoot = normalizedResourceFamilyRoot(partialTerm.normalizedEndpoint)
+    if (!winnerRoot || !partialRoot || winnerRoot !== partialRoot) return []
+  }
 
   const partialUpstream = (partialUpstreamNonGeneric && partialUpstreamNonGeneric.length > 0)
     ? partialUpstreamNonGeneric
@@ -550,19 +589,103 @@ export function matchCausalPrefixPartialChainSupersession<T extends UpstreamSupe
 }
 
 /**
- * R6: Resolve bidirectional causal-prefix / upstream composite supersession between a newly
- * persisted composite receipt and an existing confirmed finding row.
+ * R6-nx: Exact same-terminal multi-hop composite deduplication.
+ * When two confirmed >=2-hop composites hit the exact same non-generic normalized terminal
+ * endpoint + method on equivalent origins, supersedes the shallower finding (fewer hops, then
+ * verified v8 oracle family presence, then more causal edges, then later-created tie-break).
+ */
+export function matchSameTerminalCompositeDedup<T extends UpstreamSupersessionEndpointLike>(input: {
+  incomingReceipt: RawCompositeReceiptLike
+  incomingOrigin: string
+  incomingTerminalEndpoint?: string | null
+  incomingOracleFamily?: string | null
+  earlierCompReceipt: RawCompositeReceiptLike | undefined
+  earlierOrigin: string
+  earlierTerminalEndpoint?: string | null
+  earlierOracleFamily?: string | null
+  endpointsMatchExact: (a: T, b: T) => boolean
+}): { direction: 'none' | 'incoming_supersedes_earlier' | 'earlier_supersedes_incoming'; matched: T[] } {
+  const {
+    incomingReceipt, incomingOrigin, incomingTerminalEndpoint, incomingOracleFamily,
+    earlierCompReceipt, earlierOrigin, earlierTerminalEndpoint, earlierOracleFamily,
+    endpointsMatchExact,
+  } = input
+  if (
+    !earlierCompReceipt
+    || !Array.isArray(incomingReceipt.hops) || incomingReceipt.hops.length < 2
+    || !Array.isArray(earlierCompReceipt.hops) || earlierCompReceipt.hops.length < 2
+  ) {
+    return { direction: 'none', matched: [] }
+  }
+  if (!compositeChainOriginsEquivalent(incomingOrigin, earlierOrigin)) {
+    return { direction: 'none', matched: [] }
+  }
+  const inTerm = extractCompositeTerminalSpec<T>(incomingReceipt, incomingOrigin, incomingTerminalEndpoint)
+  const exTerm = extractCompositeTerminalSpec<T>(earlierCompReceipt, earlierOrigin, earlierTerminalEndpoint)
+  if (!inTerm || !exTerm) return { direction: 'none', matched: [] }
+  if (
+    isGenericSharedAuthOrUtilityEndpoint(inTerm.normalizedEndpoint)
+    || isGenericSharedAuthOrUtilityEndpoint(exTerm.normalizedEndpoint)
+  ) {
+    return { direction: 'none', matched: [] }
+  }
+  if (!endpointsMatchExact(inTerm, exTerm)) return { direction: 'none', matched: [] }
+  // Different canonical classes may only merge when BOTH sides carry real (non-generic) multi-hop upstream causal routes.
+  const clsKey = (r: RawCompositeReceiptLike): string => String((r as { terminalVulnClass?: string | null }).terminalVulnClass ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (clsKey(incomingReceipt) !== clsKey(earlierCompReceipt)
+    && (extractCompositeNonGenericUpstreamFromReceipt<T>(incomingReceipt, incomingOrigin).length === 0
+      || extractCompositeNonGenericUpstreamFromReceipt<T>(earlierCompReceipt, earlierOrigin).length === 0)) {
+    return { direction: 'none', matched: [] }
+  }
+
+  const inHops = incomingReceipt.hops.length
+  const exHops = earlierCompReceipt.hops.length
+  if (inHops !== exHops) {
+    return { direction: inHops > exHops ? 'incoming_supersedes_earlier' : 'earlier_supersedes_incoming', matched: [inTerm] }
+  }
+  const inHasOracle = Boolean(incomingOracleFamily?.trim())
+  const exHasOracle = Boolean(earlierOracleFamily?.trim())
+  if (inHasOracle !== exHasOracle) {
+    return { direction: inHasOracle ? 'incoming_supersedes_earlier' : 'earlier_supersedes_incoming', matched: [inTerm] }
+  }
+  const inEdges = Array.isArray(incomingReceipt.causalEdges) ? incomingReceipt.causalEdges.length : 0
+  const exEdges = Array.isArray(earlierCompReceipt.causalEdges) ? earlierCompReceipt.causalEdges.length : 0
+  if (inEdges !== exEdges) {
+    return { direction: inEdges > exEdges ? 'incoming_supersedes_earlier' : 'earlier_supersedes_incoming', matched: [inTerm] }
+  }
+  return { direction: 'earlier_supersedes_incoming', matched: [inTerm] }
+}
+
+/**
+ * R6: Resolve bidirectional same-terminal / causal-prefix / upstream composite supersession
+ * between a newly persisted composite receipt and an existing confirmed finding row.
  */
 export function resolveCompositeSupersessionMatch<T extends UpstreamSupersessionEndpointLike>(input: {
   incomingReceipt: RawCompositeReceiptLike
   incomingOrigin: string
   incomingTerminalEndpoint?: string | null
+  incomingOracleFamily?: string | null
   incomingUpstreamNonGeneric: readonly T[]
   earlierCompReceipt: RawCompositeReceiptLike | undefined
   earlierOrigin: string
+  earlierTerminalEndpoint?: string | null
+  earlierOracleFamily?: string | null
   earlierEndpoints: readonly T[]
   endpointsMatchExact: (a: T, b: T) => boolean
-}): { direction: 'none' | 'incoming_supersedes_earlier' | 'earlier_supersedes_incoming'; matched: T[] } {
+}): { direction: 'none' | 'incoming_supersedes_earlier' | 'earlier_supersedes_incoming'; matched: T[]; sameTerminal?: boolean } {
+  const sameTerm = matchSameTerminalCompositeDedup({
+    incomingReceipt: input.incomingReceipt,
+    incomingOrigin: input.incomingOrigin,
+    incomingTerminalEndpoint: input.incomingTerminalEndpoint,
+    incomingOracleFamily: input.incomingOracleFamily,
+    earlierCompReceipt: input.earlierCompReceipt,
+    earlierOrigin: input.earlierOrigin,
+    earlierTerminalEndpoint: input.earlierTerminalEndpoint,
+    earlierOracleFamily: input.earlierOracleFamily,
+    endpointsMatchExact: input.endpointsMatchExact,
+  })
+  if (sameTerm.direction !== 'none') return { ...sameTerm, sameTerminal: true }
+
   const sub = matchSubstantialUpstreamCompositeOverlap({
     earlierCompReceipt: input.earlierCompReceipt,
     incomingHopCount: input.incomingReceipt.hops?.length ?? 0,
@@ -572,6 +695,19 @@ export function resolveCompositeSupersessionMatch<T extends UpstreamSupersession
     endpointsMatchExact: input.endpointsMatchExact,
   })
   if (sub.length > 0) return { direction: 'incoming_supersedes_earlier', matched: sub }
+
+  const earlierUpstream = extractCompositeNonGenericUpstreamFromReceipt<T>(input.earlierCompReceipt, input.earlierOrigin)
+  const inTerm = extractCompositeTerminalSpec<T>(input.incomingReceipt, input.incomingOrigin, input.incomingTerminalEndpoint)
+  const incomingEndpoints = inTerm ? [...input.incomingUpstreamNonGeneric, inTerm] : [...input.incomingUpstreamNonGeneric]
+  const revSub = matchSubstantialUpstreamCompositeOverlap({
+    earlierCompReceipt: input.incomingReceipt,
+    incomingHopCount: input.earlierCompReceipt?.hops?.length ?? 0,
+    earlierOrigin: input.incomingOrigin,
+    earlierEndpoints: incomingEndpoints,
+    upstreamNonGeneric: earlierUpstream,
+    endpointsMatchExact: input.endpointsMatchExact,
+  })
+  if (revSub.length > 0) return { direction: 'earlier_supersedes_incoming', matched: revSub }
 
   const fwd = matchCausalPrefixPartialChainSupersession({
     winnerReceipt: input.incomingReceipt,
@@ -584,7 +720,6 @@ export function resolveCompositeSupersessionMatch<T extends UpstreamSupersession
   })
   if (fwd.length > 0) return { direction: 'incoming_supersedes_earlier', matched: fwd }
 
-  const earlierUpstream = extractCompositeNonGenericUpstreamFromReceipt<T>(input.earlierCompReceipt, input.earlierOrigin)
   const rev = matchCausalPrefixPartialChainSupersession({
     winnerReceipt: input.earlierCompReceipt,
     winnerOrigin: input.earlierOrigin,

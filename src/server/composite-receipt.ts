@@ -12,7 +12,7 @@ import { resolveCompositeTerminalExchange } from './composite-terminal.ts'
 import { HostFactLog } from './host-fact-log.ts'
 import { proofReceiptSchema, receiptIdSchema } from './proof-receipt.ts'
 import { extractTenantMarkers, isJobOrHandleStub, type V8OracleFamily } from './v8-oracle-families.ts'
-import { evaluateForgedWebhookProvenanceGuard, evaluateOwnOrgTerminalGuard, normalizeTerminalVulnClass, resolveCompositeTerminalContract, selectVerifiedPostMutationReadback } from './own-org-terminal-guard.ts'
+import { evaluateForgedWebhookProvenanceGuard, evaluateOwnOrgTerminalGuard, findPreMutationDeniedControl, normalizeTerminalVulnClass, resolveCompositeTerminalContract, selectVerifiedPostMutationReadback } from './own-org-terminal-guard.ts'
 import { TERMINAL_CLASS_CONTRACT, buildCapOriginIndex, canonicalNonAuthQuery, cleanExactPath, collectUrlParamTokens, diagnoseRejectedTerminalControls, entryCarriesRequestToken, entryMatchesCorrelation, entryMatchesEntity, inferSupplementalHostCausalEdges, isHydratedStub, isPrivilegedActorOrRole, matchesNormalizedDotSegmentPath, normalizeV8OracleInputKeys, partitionNonCausalControlHops, resolveEntryIdentity, resolveTerminalContract, resolveV8OracleFamilyOrDiagnostic, sanitizeEmbeddedProofReceipt, selectStateTransitionPair, type CapOriginIndex, type EconomicAutoHydrateContext, type TerminalContractKind } from './v8-oracle-hydrate.ts'
 export { TERMINAL_CLASS_CONTRACT, type TerminalContractKind }
 import type { ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
@@ -380,7 +380,8 @@ function verifyStateTransitionBinding(base: EdgeBase, edge: Extract<CausalEdgeBi
     const ab = idx.entriesById.get(abId)!, st = ab.step.status, denied = typeof st === 'number' && ABLATION_DENIED_STATUSES.has(st)
     if (ab.cleanSession === false) return edgeFail(base, `Ablation exchange "${abId}" had cleanSession=false (session/entity already mutated); run the ablation control BEFORE Hop "${fromHop.hopId}" or on a fresh untouched sibling entity (pass entityId).`)
     if (typeof st === 'number' && st >= 500) return edgeFail(base, `Ablation exchange "${abId}" returned server error ${st} [status=5xx].`)
-    if (is2xx(st) && (logicalFallback || ab.step.evidenceRole !== 'invariant_preserved')) return edgeFail(base, `Ablation control "${abId}" succeeded (${st}) [status=2xx]; Hop j is not dependent on Hop i.`)
+    if (is2xx(st) && (logicalFallback || ab.step.evidenceRole !== 'invariant_preserved')) {
+      const pre = findPreMutationDeniedControl({ citedTwoXx: ab, mutationEx: pair.from, toEx: pair.to, entityId: edge.entityId, entriesById: idx.entriesById, excludedIds: hopExSet, toUsesNewCap, normRouteFam, sameCredIdentity: (a, b) => sameCredIdentity(a, b, capIdx), isLoginCap: c => isLoginCap(c, capIdx), canonicalNonAuthQuery }); if (pre) { validAblation = pre; continue }; return edgeFail(base, `Ablation control "${abId}" succeeded (${st}) [status=2xx]; Hop j is not dependent on Hop i.`) }
     const labeled = ab.cleanSession === true && (ab.step.arm === 'control' || ab.replayAttempt === 'ablation_control')
     const sameRouteFam = Boolean(toFam) && normRouteFam(ab.step.route ?? ab.step.pathAndQuery, ab.entityId ?? edge.entityId) === toFam
     if (logicalFallback ? !sameRouteFam : (!entryMatchesEntity(ab, edge.entityId) && !sameRouteFam)) { diags.push(`${abId}: route_family_mismatch (entity and toHop route family "${toFam || 'none'}" unmatched)`); continue }
@@ -655,11 +656,11 @@ function verifyTerminalImpactGate(
   const upstreamEntries = receipt.hops.filter(h => h.hopId !== termHop.hopId).flatMap(h => h.exchangeIds).map(id => idx.entriesById.get(id)!).filter(e => Boolean(e && isExecArm(e) && is2xx(e.step.status)))
   let { ownTenantOnly, hasForeignTenantData, crossTenantSatisfied } = analyzeCrossTenantTerminalEvidence(termEx, attackerTenants, isStub, hasBody, upstreamEntries, hasPostMutation, receipt.hops.length >= 2 && hasExplicitVerifiedTermEdge)
   const termAblationIds = new Set(verifiedEdges.filter(ve => ve.verified && ve.kind === 'state_transition_binding' && ve.toHopId === termHop.hopId).map(ve => (ve.evidence as { ablationExchangeId?: string } | undefined)?.ablationExchangeId).filter((id): id is string => Boolean(id)))
-  const ctrlCandidates = [...ti.preChainControlExchangeIds, ...termHop.exchangeIds, ...receipt.causalEdges.flatMap(ed => ed.kind === 'state_transition_binding' && ed.toHopId === termHop.hopId ? ed.ablationExchangeIds : [])]
+  const ctrlCandidates = [...ti.preChainControlExchangeIds, ...termAblationIds, ...termHop.exchangeIds, ...receipt.causalEdges.flatMap(ed => ed.kind === 'state_transition_binding' && ed.toHopId === termHop.hopId ? ed.ablationExchangeIds : [])]
   const ctrlCtx = { hasExplicitVerifiedTermEdge, entriesById: idx.entriesById, attackerTenants }
   const terminalCtrl = ctrlCandidates.map(id => idx.entriesById.get(id)).find((c): c is HostTranscriptEntry => {
     const allowedStatus = c && typeof c.step.status === 'number' && (DENIED_CONTROL_STATUSES.has(c.step.status) || (termAblationIds.has(c.exchangeId) && ABLATION_DENIED_STATUSES.has(c.step.status)))
-    if (!c || !allowedStatus || (termEx && c.exchangeId === termEx.exchangeId) || nonTermExSet.has(c.exchangeId) || (c.step.arm !== 'control' && c.replayAttempt !== 'ablation_control')) return false
+    if (!c || !allowedStatus || (termEx && c.exchangeId === termEx.exchangeId) || nonTermExSet.has(c.exchangeId) || (c.step.arm !== 'control' && c.replayAttempt !== 'ablation_control' && !(termAblationIds.has(c.exchangeId) && c.cleanSession === true))) return false
     const cRaw = actorOf(c), isCapCtrl = Boolean(cRaw?.startsWith('cap:'))
     if (isCapCtrl && cRaw !== termRawActor && !isLoginCap(cRaw!, capIdx)) return false
     const anonFor401 = !cRaw || ANON_ACTOR_RE.test(cRaw) || (isCapCtrl && cRaw !== termRawActor)
@@ -680,7 +681,7 @@ function verifyTerminalImpactGate(
   if (rejectedZeroDelta) return failUnproven('terminal_impact_unproven: zero_delta_post_mutation_readback — post-chain readback state is identical to pre-chain baseline readback on the same route and actor.')
   if (isStub && !hasPostMutation) return failUnproven()
   const crossOrReplay = isCrossTenantCls || contract === 'v8_pivot' || contract === 'v8_crypto', singleHopProofOk = Boolean(ti.proofReceipt && terminalVerification?.confirmed && receipt.hops.length === 1 && !v8Default)
-  const forgedWhErr = evaluateForgedWebhookProvenanceGuard({ normCls, hopCount: receipt.hops.length, verifiedEdgeCount: verifiedEdges.length, singleHopProofOk, termEx, terminalCtrl, preChainControlIds: ti.preChainControlExchangeIds, entriesById: idx.entriesById, hasTermDerivedCrypto })
+  const forgedWhErr = evaluateForgedWebhookProvenanceGuard({ normCls, hopCount: receipt.hops.length, verifiedEdgeCount: verifiedEdges.length, singleHopProofOk, termEx, terminalCtrl, preChainControlIds: ti.preChainControlExchangeIds, entriesById: idx.entriesById, hasTermDerivedCrypto, hostVerifiedCryptoOracle: contract === 'v8_crypto' && Boolean(v8Default?.explicit) })
   if (forgedWhErr) return failUnproven(forgedWhErr)
   if (termEx && ownTenantOnly && !hasPostMutation && (crossOrReplay || !hasCleanDeniedCtrl)) return failUnproven()
   if (contract === 'v8_economic') return (v8Default?.explicit && v8Default.family === 'economic_conservation') ? okTerm('economic_conservation') : failUnproven('economic_conservation requires verified host-derived conservation oracle input.')

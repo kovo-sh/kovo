@@ -14,7 +14,7 @@ import { ROLE_RANK, normalizeRole, parseRoleMemberships, resolvePersonaIdentity,
 import type { ProofReceipt } from './proof-receipt.ts'
 import { deriveRecordAuthzDimension, extractIssuedSignedUrl, extractTenantMarkers, findNonErrorBatchRecord, isJobOrHandleStub, type HostAuthzDimension, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
 import { buildTerminalClassContractMap, resolveTerminalContractKind, type OracleTerminalContractKind } from './oracle-spec.ts'
-import { extractLedgerBalanceMap, filterEconomicActionRecords, isControlDeniedAction, normalizeTerminalVulnClass, resolveOpaqueDualCacheBleedTarget } from './own-org-terminal-guard.ts'
+import { extractLedgerBalanceMap, filterEconomicActionRecords, isControlDeniedAction, normalizeTerminalVulnClass, resolveEntityLessReadStateTransition, resolveOpaqueDualCacheBleedTarget } from './own-org-terminal-guard.ts'
 
 export interface HydratableEntry {
   exchangeId: string; seq?: number; timestampMs?: number
@@ -1506,7 +1506,9 @@ function inferFixedPointStateTransitions<H extends DagHopLike, E extends DagEdge
         const pairExIds = new Set([...hopA.exchangeIds, ...hopB.exchangeIds])
         const hostCands = [...new Set([pair.f.entityId, pair.t.entityId].filter((x): x is string => Boolean(x?.trim())).map(x => x.trim()))]
         const sharedEid = hostCands.find(eid => entryMatchesEntity(pair.f, eid) && entryMatchesEntity(pair.t, eid))
-        if (!sharedEid) continue
+        if (!sharedEid) {
+          const elRes = resolveEntityLessReadStateTransition({ fromEx: pair.f, fromHopEntityId: hopA.entityId, toEx: pair.t, isTerminalTo: hopB.hopId === termHopId, allEntries, pairExIds, allHopExIds, preCtrlIds, normRouteFam: helpers.normRouteFam, sameCredIdentity: (a, b) => helpers.sameCredIdentity(a, b, capIdx), probeActorOf: e => helpers.probeActorOf(e, capIdx), isLoginCap: c => helpers.isLoginCap(c, capIdx), canonicalNonAuthQuery })
+          if (elRes && tryAppend({ kind: 'state_transition_binding', fromHopId: hopA.hopId, toHopId: hopB.hopId, entityId: elRes.entityId, ablationExchangeIds: [elRes.ablationExchangeId] })) { changed = true; break }; continue }
         const toUsesCap = Boolean(actorOfEntry(pair.t)?.startsWith('cap:') || (pair.t.consumedCapabilities?.length ?? 0) > 0 || (pair.t.cryptoAttestations?.length ?? 0) > 0)
         const toFam = helpers.normRouteFam(pair.t.step.route ?? pair.t.step.pathAndQuery, sharedEid)
         const isCleanAb = (ab: T): boolean => {
