@@ -118,6 +118,8 @@ test('buildProofWriterSystemPrompt is short (<2700 chars), teaches ctx.chain() +
   assert.match(prompt, /webhook_forgery.*forged_settlement.*ch\.readback/i)
   assert.match(prompt, /economic_conservation.*await ch\.readback\(balanceTarget, \{ as: attacker \}\).*BEFORE.*AND AFTER `ch\.race/i)
   assert.match(prompt, /strictly for denied controls/i)
+  assert.match(prompt, /exact terminal route path \+ identical non-auth query params/i)
+  assert.match(prompt, /query_mismatch/i)
 
   for (const forbiddenReconTool of [
     'request_http',

@@ -494,17 +494,18 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
 
     const fn = loadCompiledEntrypoint(compiled.script)
     const { ctx, log } = createMockCtx([
-      { status: 403 },
-      { status: 200, headers: { 'x-internal-key': 'fresh_key' } },
-      { status: 200 },
-      { status: 200, json: { balance: 1500 } },
+      { status: 403 }, // explicit control
+      { status: 200, json: { balance: 1000 } }, // pre-hop baseline readback
+      { status: 200, headers: { 'x-internal-key': 'fresh_key' } }, // step_1
+      { status: 200 }, // step_2
+      { status: 200, json: { balance: 1500 } }, // post-hop final readback
     ])
     await fn(ctx)
 
     assert.equal(log.controls.length, 1)
-    assert.equal(log.readbacks.length, 1)
+    assert.equal(log.readbacks.length, 2)
     assert.equal(log.sealCalls[0]!.header, 'X-Internal-Key')
-    assert.deepEqual(log.httpCalls[2]!.opts.capability, { handle: 'cap:hop_1:cap_1', target: 'header', headerName: 'X-Api-Key' })
+    assert.deepEqual(log.httpCalls[3]!.opts.capability, { handle: 'cap:hop_1:cap_1', target: 'header', headerName: 'X-Api-Key' })
     assert.equal(log.proveArgs[0]!.oracleFamily, 'economic_conservation')
 
     // Multi-hop cross_tenant_read -> dual_tenant_abac
@@ -605,8 +606,10 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
 
     assert.equal(compiledExact.ok, true)
     assert.ok(compiledExact.script)
-    assert.doesNotMatch(compiledExact.script, new RegExp(jobId))
     assert.doesNotMatch(compiledExact.script, new RegExp(sig))
+    for (const line of compiledExact.script.split('\n').filter(l => l.includes('ch.step('))) {
+      assert.doesNotMatch(line, new RegExp(jobId), 'ch.step must dynamically bind jobId instead of hardcoding it')
+    }
 
     const fnExact = loadCompiledEntrypoint(compiledExact.script)
     const { ctx: ctxExact, log: logExact } = createMockCtx([
@@ -620,6 +623,7 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
 
     assert.deepEqual(logExact.hops, ['step_1', 'step_2', 'step_3', 'step_4'])
     assert.equal(logExact.controlInsideHop, false)
+    assert.deepEqual(logExact.httpCalls[0]!.target, { origin: 'https://storage.example.test', path: `/files/export/org_a/report.csv?tenant=org_a&job=${jobId}` })
     assert.equal(logExact.httpCalls[0]!.opts.arm, 'control')
     assert.equal(logExact.httpCalls[0]!.opts.role, 'control')
     assert.equal(logExact.httpCalls[0]!.opts.session, 'ctrl_clean')
@@ -924,5 +928,207 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
     assert.equal(log.httpCalls[2]!.opts.role, 'setup')
     assert.equal(log.httpCalls[3]!.target, '/api/v1/jobs/job_live_991122/trace')
     assertAllHopsReachTerminal(log.hops, log.edges, 'step_2')
+  })
+
+  it('preserves non-auth query params and strips ONLY AUTH_QUERY_KEYS on signed_url ch.control', async () => {
+    const signedUrl = 'https://storage.example.test/api/exports/download?job=abc&tenant=org_a&sig=deadbeef&ts=123'
+    const exchanges: RecordedRequestExchange[] = [
+      {
+        exchangeId: 'su1',
+        origin: 'https://app.example.test',
+        method: 'POST',
+        pathAndQuery: '/api/exports/mint',
+        persona: 'member_b',
+        status: 200,
+        responseJson: { signedUrl },
+        timestampMs: 100,
+      },
+      {
+        exchangeId: 'su2',
+        origin: 'https://storage.example.test',
+        method: 'GET',
+        pathAndQuery: '/api/exports/download?job=abc&tenant=org_a&sig=deadbeef&ts=123',
+        persona: 'member_b',
+        status: 200,
+        responseBody: 'secret,1\n',
+        timestampMs: 200,
+      },
+    ]
+
+    const compiled = compileTraceToKovoVerifyScript({
+      submission: {
+        title: 'Signed URL control preserves non-auth query params',
+        vulnClass: 'dual_tenant_abac',
+        exchangeIds: ['su1', 'su2'],
+        terminalExchangeId: 'su2',
+        attackerPersona: 'member_b',
+      },
+      exchanges,
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(compiled.ok, true)
+    assert.equal(compiled.controlSynthesized, true)
+    assert.ok(compiled.script)
+    assert.doesNotMatch(compiled.script, /deadbeef/)
+    assert.doesNotMatch(compiled.script, /[?&]ts=123\b/)
+
+    const fn = loadCompiledEntrypoint(compiled.script)
+    const { ctx, log } = createMockCtx([
+      { status: 403, json: { error: 'denied' } },
+      { status: 200, json: { signedUrl: 'https://storage.example.test/api/exports/download?job=abc&tenant=org_a&sig=freshsig&ts=456' } },
+      { status: 200, json: { rows: 1 } },
+    ])
+    await fn(ctx)
+
+    assert.deepEqual(log.httpCalls[0]!.target, {
+      origin: 'https://storage.example.test',
+      path: '/api/exports/download?job=abc&tenant=org_a',
+    })
+    assert.equal(log.httpCalls[0]!.opts.arm, 'control')
+    assert.equal(log.httpCalls[0]!.opts.as, 'member_b')
+    assert.deepEqual(log.httpCalls[2]!.target, { origin: 'https://storage.example.test', path: 'cap:hop_1:cap_1' })
+  })
+
+  it('ignores mismatched explicitControl on an earlier hop route or mismatched query and derives ch.control from terminalEx', async () => {
+    const tok = 'eyJhbGciOiJIUzI1NiJ9.mismatchedCtrlPayload123.sig778899'
+    const exchanges: RecordedRequestExchange[] = [
+      {
+        exchangeId: 'bad_ctrl_route',
+        origin: 'https://app.example.test',
+        method: 'POST',
+        pathAndQuery: '/api/v1/tokens/mint',
+        persona: 'member_b',
+        status: 403,
+        timestampMs: 50,
+      },
+      {
+        exchangeId: 'bad_ctrl_query',
+        origin: 'https://app.example.test',
+        method: 'GET',
+        pathAndQuery: '/api/v1/reports/download?tenant=org_b&format=csv',
+        persona: 'member_b',
+        status: 403,
+        timestampMs: 60,
+      },
+      {
+        exchangeId: 'h1',
+        origin: 'https://app.example.test',
+        method: 'POST',
+        pathAndQuery: '/api/v1/tokens/mint',
+        persona: 'member_b',
+        status: 200,
+        responseJson: { accessToken: tok },
+        timestampMs: 100,
+      },
+      {
+        exchangeId: 'h2',
+        origin: 'https://app.example.test',
+        method: 'GET',
+        pathAndQuery: '/api/v1/reports/download?tenant=org_a&format=csv&sig=aaa111bbb&expires=999999',
+        requestHeaders: { Authorization: `Bearer ${tok}` },
+        status: 200,
+        responseJson: { rows: 10 },
+        timestampMs: 200,
+      },
+    ]
+
+    for (const badCtrlId of ['bad_ctrl_route', 'bad_ctrl_query']) {
+      const compiled = compileTraceToKovoVerifyScript({
+        submission: {
+          title: `Ignore mismatched control ${badCtrlId}`,
+          vulnClass: 'dual_tenant_abac',
+          exchangeIds: [badCtrlId, 'h1', 'h2'],
+          controlExchangeId: badCtrlId,
+          terminalExchangeId: 'h2',
+          attackerPersona: 'member_b',
+        },
+        exchanges,
+        runOrigin: 'https://app.example.test',
+      })
+      assert.equal(compiled.ok, true)
+      assert.equal(compiled.controlSynthesized, true, `expected controlSynthesized=true when ${badCtrlId} is ignored`)
+      assert.ok(compiled.warnings.some(w => /Ignoring mismatched controlExchangeId/i.test(w)))
+      assert.ok(compiled.script)
+
+      const fn = loadCompiledEntrypoint(compiled.script)
+      const { ctx, log } = createMockCtx([
+        { status: 403 },
+        { status: 200, json: { accessToken: 'fresh_tok_999' } },
+        { status: 200, json: { rows: 10 } },
+      ])
+      await fn(ctx)
+
+      assert.equal(log.httpCalls[0]!.target, '/api/v1/reports/download?tenant=org_a&format=csv')
+      assert.equal(log.httpCalls[0]!.opts.method, 'GET')
+      assert.equal(log.httpCalls[0]!.opts.arm, 'control')
+      assert.equal(log.httpCalls[0]!.opts.as, 'member_b')
+    }
+  })
+
+  it('emits BOTH pre-hop baseline ch.readback before step_1 and post-hop ch.readback after final hop for economic_conservation', async () => {
+    const exchanges: RecordedRequestExchange[] = [
+      {
+        exchangeId: 'ec_mut',
+        origin: 'https://app.example.test',
+        method: 'POST',
+        pathAndQuery: '/api/v1/wallets/w_1/refund',
+        persona: 'member_a',
+        requestJson: { amount: 100 },
+        status: 200,
+        responseJson: { ok: true, credited: 100 },
+        timestampMs: 100,
+      },
+      {
+        exchangeId: 'ec_rb',
+        origin: 'https://app.example.test',
+        method: 'GET',
+        pathAndQuery: '/api/v1/wallets/w_1/balance',
+        persona: 'member_a',
+        status: 200,
+        responseJson: { balance: 200 },
+        timestampMs: 200,
+      },
+    ]
+
+    const compiled = compileTraceToKovoVerifyScript({
+      submission: {
+        title: 'Wallet refund conservation violation',
+        vulnClass: 'economic_conservation',
+        oracleFamily: 'economic_conservation',
+        exchangeIds: ['ec_mut', 'ec_rb'],
+        terminalExchangeId: 'ec_mut',
+        readbackExchangeId: 'ec_rb',
+        attackerPersona: 'member_a',
+      },
+      exchanges,
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(compiled.ok, true)
+    assert.equal(compiled.controlSynthesized, false)
+    assert.ok(compiled.script)
+
+    const preRbIdx = compiled.script.indexOf('await ch.readback("/api/v1/wallets/w_1/balance"')
+    const step1Idx = compiled.script.indexOf('const step_1 = await ch.step(')
+    const postRbIdx = compiled.script.indexOf('const rb = await ch.readback("/api/v1/wallets/w_1/balance"')
+    assert.ok(preRbIdx >= 0 && step1Idx > preRbIdx, 'pre-hop baseline ch.readback must appear BEFORE step_1')
+    assert.ok(postRbIdx > step1Idx, 'post-hop final ch.readback must appear AFTER step_1')
+    assert.doesNotMatch(compiled.script, /ch\.control\(/, 'must not synthesize a mutating POST ch.control before baseline readback')
+
+    const fn = loadCompiledEntrypoint(compiled.script)
+    const { ctx, log } = createMockCtx([
+      { status: 200, json: { balance: 100 } }, // pre-hop baseline readback
+      { status: 200, json: { ok: true, credited: 100 } }, // step_1 mutation
+      { status: 200, json: { balance: 200 } }, // post-hop final readback
+    ])
+    await fn(ctx)
+
+    assert.equal(log.controls.length, 0)
+    assert.equal(log.readbacks.length, 2)
+    assert.deepEqual(log.hops, ['step_1'])
+    assert.equal(log.httpCalls[0]!.target, '/api/v1/wallets/w_1/balance')
+    assert.equal(log.httpCalls[0]!.opts.as, 'member_a')
+    assert.equal(log.httpCalls[1]!.target, '/api/v1/wallets/w_1/refund')
+    assert.equal(log.httpCalls[2]!.target, '/api/v1/wallets/w_1/balance')
+    assert.equal(log.proveArgs[0]!.oracleFamily, 'economic_conservation')
   })
 })

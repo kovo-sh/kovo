@@ -77,6 +77,8 @@ const AUTH_HDR_RE = /^(?:authorization|proxy-authorization|cookie|x-api-key|x-au
 const UNIQUE_KEY_RE = /^(?:email|e_?mail|username|user_?name|handle|slug|org_?slug|tenant_?slug|subdomain|account_?name)$/i
 const EMAIL_VAL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/, SIMPLE_ENTITY_ID_RE = /^[a-zA-Z]{2,20}[_-]\d{2,16}$/
 const REPEATED_CHAR_RE = /^(.)\1+$/, JS_IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/, READ_ONLY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+const AUTH_QUERY_KEYS = new Set(['sig', 'signature', 'hmac', 'mac', 'token', 'access_token', 'code', 'state', 'nonce', 'ts', 'timestamp', 'expires', 'exp'])
+const ECONOMIC_CONSERVATION_CLASSES = new Set(['economic_conservation', 'conserved_balance', 'ledger_overcredit', 'over_refund', 'double_spend', 'race_condition'])
 
 const slugifyChainId = (title: string): string => { const s = title.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 42); return s ? `trace_${s}` : 'trace_chain' }
 function normalizeVulnClass(raw: string, oracleFamily: string | undefined, hopCount: number, warnings: string[]) {
@@ -237,10 +239,38 @@ const sanitizeControlHeaders = (headers?: Record<string, string>): string | unde
   const safe = Object.entries(headers ?? {}).filter(([k]) => { const l = k.toLowerCase(); return !HOP_BY_HOP.has(l) && !l.startsWith('sec-fetch-') && !l.startsWith('sec-ch-') && !AUTH_HDR_RE.test(l) })
   return safe.length ? JSON.stringify(Object.fromEntries(safe)) : undefined
 }
-function sanitizeControlPath(rawPq: string, sealedValues: ReadonlyMap<string, number>, stripAllQuery: boolean): string {
+const normOrigin = (o?: string): string => {
+  const t = (o ?? '').trim().replace(/\/+$/, '').toLowerCase()
+  if (!t) return ''
+  try { return new URL(t).origin.toLowerCase() } catch { return t }
+}
+const cleanControlPath = (p?: string): string => {
+  const raw = (p ?? '').split(/[?#]/, 1)[0] ?? ''
+  const withSlash = raw.startsWith('/') ? raw : `/${raw}`
+  return withSlash.replace(/\/+$/, '').toLowerCase() || '/'
+}
+function canonicalNonAuthQuery(p?: string): string {
+  const qIdx = (p ?? '').indexOf('?'); if (qIdx < 0) return ''
+  const pairs: [string, string][] = []
+  for (const [k, v] of new URLSearchParams((p ?? '').slice(qIdx + 1).split('#', 1)[0]!).entries()) {
+    const lk = k.trim().toLowerCase()
+    if (!AUTH_QUERY_KEYS.has(lk)) pairs.push([lk, v.trim()])
+  }
+  return pairs.sort(([a, av], [b, bv]) => (a < b ? -1 : a > b ? 1 : av < bv ? -1 : av > bv ? 1 : 0)).map(([k, v]) => `${k}=${v}`).join('&')
+}
+function matchesControlTarget(ctrlEx: RecordedRequestExchange, refEx: RecordedRequestExchange): boolean {
+  const co = normOrigin(ctrlEx.origin), ro = normOrigin(refEx.origin)
+  if (co && ro && co !== ro) return false
+  if ((ctrlEx.method || 'GET').toUpperCase() !== (refEx.method || 'GET').toUpperCase()) return false
+  if (cleanControlPath(ctrlEx.pathAndQuery) !== cleanControlPath(refEx.pathAndQuery)) return false
+  return canonicalNonAuthQuery(ctrlEx.pathAndQuery) === canonicalNonAuthQuery(refEx.pathAndQuery)
+}
+function sanitizeControlPath(rawPq: string): string {
   const pq = rawPq?.startsWith('/') ? rawPq : `/${rawPq ?? ''}`, qIdx = pq.indexOf('?'); if (qIdx < 0) return pq
-  const base = pq.slice(0, qIdx) || '/'; if (stripAllQuery) return base
-  const kept = [...new URLSearchParams(pq.slice(qIdx + 1)).entries()].filter(([k, v]) => !sealedValues.has(v.trim()) && !SECRET_KEY_RE.test(k))
+  const base = pq.slice(0, qIdx) || '/'
+  const hashIdx = pq.indexOf('#', qIdx + 1)
+  const rawQuery = hashIdx >= 0 ? pq.slice(qIdx + 1, hashIdx) : pq.slice(qIdx + 1)
+  const kept = [...new URLSearchParams(rawQuery).entries()].filter(([k]) => !AUTH_QUERY_KEYS.has(k.trim().toLowerCase()))
   return kept.length ? `${base}?${new URLSearchParams(kept).toString()}` : base
 }
 const appendEncodedKv = (parts: Array<{ lit?: string; expr?: string }>, pairs: Array<{ k: string; expr?: string; raw?: string }>): void => {
@@ -556,7 +586,23 @@ export function compileTraceToKovoVerifyScript(input: {
   }
 
   const { terminalVulnClass, validOracleFamily } = normalizeVulnClass(submission.vulnClass, submission.oracleFamily, causal.length, warnings)
-  const { plans } = st, termPlan = plans[terminalIdx]!, controlSynthesized = !explicitControl
+  const { plans } = st, termPlan = plans[terminalIdx]!
+  const isTerminalMutation = !READ_ONLY_METHODS.has((terminalEx.method || 'GET').toUpperCase())
+  const explicitControlMatches = Boolean(
+    explicitControl && (
+      matchesControlTarget(explicitControl, terminalEx)
+      || (isTerminalMutation && readbackPlan && matchesControlTarget(explicitControl, readbackPlan.exchange))
+    ),
+  )
+  if (explicitControl && !explicitControlMatches) {
+    warnings.push(`Ignoring mismatched controlExchangeId "${explicitControl.exchangeId}" (${explicitControl.method} ${explicitControl.pathAndQuery || '/'}); deriving clean control from terminal exchange.`)
+  }
+  const effectiveControl = explicitControlMatches ? explicitControl : undefined
+  const isEconomicConservation = validOracleFamily === 'economic_conservation' || ECONOMIC_CONSERVATION_CLASSES.has(terminalVulnClass)
+  const hasStateTransitionEdge = st.edges.some(e => e.kind === 'state_transition_binding')
+  const emitBaselineReadback = Boolean(readbackPlan && isEconomicConservation)
+  const skipSynthEconCtrl = Boolean(emitBaselineReadback && !effectiveControl && !hasStateTransitionEdge && isTerminalMutation)
+  const controlSynthesized = !effectiveControl && !skipSynthEconCtrl
   let ctrlAfterIdx = -1, ctrlUsesDyn = false
   if (controlSynthesized && termPlan.usesDynamicUrlOrBody) {
     const deps = [...termPlan.dynamicDepSteps].sort((a, b) => a - b), maxDep = deps[deps.length - 1] ?? -1
@@ -569,15 +615,20 @@ export function compileTraceToKovoVerifyScript(input: {
   const lines: string[] = ['export default async function (ctx) {', `  const ch = ctx.chain(${JSON.stringify(chainId)}, ${JSON.stringify(terminalVulnClass)})`]
   if (st.needsSha256) lines.push('  const _sha256 = async (s) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(s)))), b => b.toString(16).padStart(2, "0")).join("")')
   const emitCtrl = (): void => {
-    const srcEx = explicitControl ?? terminalEx, cBodyJson = srcEx.requestJson !== undefined ? srcEx.requestJson : tryParseJson(srcEx.requestBody)
-    const cBody = (!explicitControl && ctrlUsesDyn) ? termPlan.bodyExpr : (cBodyJson !== undefined ? JSON.stringify(cBodyJson) : (srcEx.requestBody ? JSON.stringify(srcEx.requestBody) : undefined))
-    const stripAllQ = Boolean(!explicitControl && (termPlan.signedUrlCapVar || (termPlan.primaryCapability?.target === 'url' && !termPlan.primaryCapability.queryParam)))
-    const cPath = (!explicitControl && ctrlUsesDyn) ? termPlan.pathExpr : JSON.stringify(explicitControl ? (srcEx.pathAndQuery || '/') : sanitizeControlPath(srcEx.pathAndQuery || '/', st.sealedValues, stripAllQ))
-    lines.push(`  const ctrl = await ch.control(${formatTarget(srcEx.origin, cPath, runOrigin)}, ${formatHttpOpts({ method: srcEx.method || 'GET', persona: explicitControl ? (explicitControl.persona?.trim() || attackerPersona) : attackerPersona, headersExpr: sanitizeControlHeaders(srcEx.requestHeaders), bodyExpr: cBody, session: 'ctrl_clean' })})`)
+    const srcEx = effectiveControl ?? terminalEx, cBodyJson = srcEx.requestJson !== undefined ? srcEx.requestJson : tryParseJson(srcEx.requestBody)
+    const cBody = (!effectiveControl && ctrlUsesDyn) ? termPlan.bodyExpr : (cBodyJson !== undefined ? JSON.stringify(cBodyJson) : (srcEx.requestBody ? JSON.stringify(srcEx.requestBody) : undefined))
+    const cPath = (!effectiveControl && ctrlUsesDyn) ? termPlan.pathExpr : JSON.stringify(effectiveControl ? (srcEx.pathAndQuery || '/') : sanitizeControlPath(srcEx.pathAndQuery || '/'))
+    lines.push(`  const ctrl = await ch.control(${formatTarget(srcEx.origin, cPath, runOrigin)}, ${formatHttpOpts({ method: srcEx.method || 'GET', persona: effectiveControl ? (effectiveControl.persona?.trim() || attackerPersona) : attackerPersona, headersExpr: sanitizeControlHeaders(srcEx.requestHeaders), bodyExpr: cBody, session: 'ctrl_clean' })})`)
   }
   const planOpts = (p: StepPlan, fallbackPersona?: string, stepMeta?: { hopId: string; claimedDelta: string }, role?: 'control' | 'setup') => formatHttpOpts({ ...(stepMeta ?? {}), method: p.exchange.method || 'GET', persona: p.omitPersona ? undefined : (p.exchange.persona?.trim() || fallbackPersona), headersExpr: p.headersExpr, bodyExpr: p.bodyExpr, followRedirectsFalse: p.forceNoFollowRedirects, capability: p.primaryCapability, ...(role ? { role } : {}), entityIdExpr: p.entityIdExpr })
 
-  if (ctrlAfterIdx < 0) emitCtrl()
+  if (!skipSynthEconCtrl && ctrlAfterIdx < 0) emitCtrl()
+  if (emitBaselineReadback && readbackPlan) {
+    const rbEx = readbackPlan.exchange
+    const rbTarget = formatTarget(rbEx.origin, JSON.stringify(sanitizeControlPath(rbEx.pathAndQuery || '/')), runOrigin)
+    const rbOpts = formatHttpOpts({ method: rbEx.method || 'GET', persona: rbEx.persona?.trim() || attackerPersona, headersExpr: sanitizeControlHeaders(rbEx.requestHeaders) })
+    lines.push(`  await ch.readback(${rbTarget}, ${rbOpts})`)
+  }
   for (let i = 0; i < plans.length; i += 1) {
     const p = plans[i]!, stepVar = `step_${p.stepNumber}`
     lines.push(
@@ -591,12 +642,13 @@ export function compileTraceToKovoVerifyScript(input: {
       const pollPlan = asyncPollsByStep.get(i)
       if (pollPlan) lines.push(`  if (${stepVar}.status === 202) await ctx.http_send(${formatTarget(pollPlan.exchange.origin, pollPlan.pathExpr, runOrigin, Boolean(pollPlan.signedUrlCapVar))}, ${planOpts(pollPlan, attackerPersona, undefined, 'setup')})`)
     }
-    if (ctrlAfterIdx === i) emitCtrl()
+    if (!skipSynthEconCtrl && ctrlAfterIdx === i) emitCtrl()
   }
   if (readbackPlan) lines.push(`  const rb = await ch.readback(${formatTarget(readbackPlan.exchange.origin, readbackPlan.pathExpr, runOrigin, Boolean(readbackPlan.signedUrlCapVar))}, ${planOpts(readbackPlan, attackerPersona)})`)
 
   const prove = [
-    `terminalHopId: ${JSON.stringify(termPlan.hopId)}`, `terminalExchange: step_${termPlan.stepNumber}`, 'control: ctrl',
+    `terminalHopId: ${JSON.stringify(termPlan.hopId)}`, `terminalExchange: step_${termPlan.stepNumber}`,
+    ...(!skipSynthEconCtrl ? ['control: ctrl'] : []),
     ...(readbackPlan ? ['readback: rb'] : []), ...(validOracleFamily ? [`oracleFamily: ${JSON.stringify(validOracleFamily)}`] : []),
     `claimedImpact: ${JSON.stringify((submission.reproNotes?.trim() || submission.title || terminalVulnClass).slice(0, 240))}`,
   ]
