@@ -1,10 +1,11 @@
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, extname, join, relative } from 'node:path'
 import { createInterface } from 'node:readline'
+import { fileURLToPath } from 'node:url'
 import { Bash, InMemoryFs, MountableFs, OverlayFs } from 'just-bash'
 import { buildCallGraphFromFiles, runAnalyzer } from './analyzers.ts'
 import type { AnalyzerName, CallGraphBuildResult, CallGraphSinkKind } from './analyzers.ts'
@@ -79,6 +80,24 @@ export interface VerifyScriptResult {
   timedOut: boolean
 }
 
+export interface PtcExecRequest {
+  code: string
+  clientCode: string
+  timeoutMs?: number
+  maxOutputBytes?: number
+}
+
+export interface PtcExecResult {
+  ok: boolean
+  result: unknown
+  stdout: string
+  stderr: string
+  exitCode: number
+  durationMs: number
+  timedOut?: boolean
+  error?: string
+}
+
 export interface AstVerifyRequest {
   repo: string
   file: string
@@ -135,6 +154,7 @@ type SessionMessage =
   | ({ id: string; op: 'sast' } & SastScanRequest)
   | ({ id: string; op: 'script' } & OfflineScriptRequest)
   | ({ id: string; op: 'verify' } & VerifyScriptRequest)
+  | ({ id: string; op: 'ptc' } & PtcExecRequest)
   | ({ id: string; op: 'ast_verify' } & AstVerifyRequest)
   | ({ id: string; op: 'call_graph' } & CallGraphRequest)
   | { id: string; op: 'shutdown' }
@@ -1289,6 +1309,91 @@ async function runVerifyScript(req: VerifyScriptRequest): Promise<VerifyScriptRe
 }
 
 // ============================================================================
+// Programmatic Tool Calling (PTC) runner (op: 'ptc', /kovo-ptc Unix socket)
+// ============================================================================
+
+const maxPtcResultBytes = 32 * 1024
+
+export async function runPtcScript(
+  req: PtcExecRequest,
+  inputDirectory: string,
+  envOverrides?: Record<string, string>,
+): Promise<PtcExecResult> {
+  if (typeof req.code !== 'string' || !req.code.trim()) throw new Error('PTC code must be non-empty.')
+  if (Buffer.byteLength(req.code) > maxScriptCodeBytes) throw new Error('PTC code exceeds 256 KiB limit.')
+  if (typeof req.clientCode !== 'string' || !req.clientCode.trim()) throw new Error('PTC client SDK code must be non-empty.')
+  if (Buffer.byteLength(req.clientCode) > maxScriptCodeBytes) throw new Error('PTC client SDK exceeds 256 KiB limit.')
+  const timeoutMs = Math.max(1_000, Math.min(req.timeoutMs ?? 60_000, 120_000))
+  const outCap = Math.max(1_024, Math.min(req.maxOutputBytes ?? maxOutputBytes, maxOutputBytes))
+  const dir = await mkdtemp(join(tmpdir(), 'kovo-ptc-'))
+  const clientPath = join(dir, 'ptc_client.ts')
+  const entryPath = join(dir, 'entry.ts')
+  const resultPath = join(dir, 'result.json')
+  try {
+    await writeFile(clientPath, req.clientCode, { mode: 0o600 })
+    const entrySource = [
+      "import { writeFileSync } from 'node:fs'",
+      "import { createKovoClient } from './ptc_client.ts'",
+      'async function __ptcMain(kovo: ReturnType<typeof createKovoClient>) {',
+      req.code,
+      '}',
+      'const __kovo = createKovoClient()',
+      'const __ret = await __ptcMain(__kovo)',
+      'const __outFile = process.env.KOVO_PTC_RESULT_FILE',
+      'if (__outFile) writeFileSync(__outFile, JSON.stringify(__ret ?? null), { mode: 0o600 })',
+      '',
+    ].join('\n')
+    await writeFile(entryPath, entrySource, { mode: 0o600 })
+    const res = await execTool(process.execPath, ['--max-old-space-size=256', entryPath], {
+      cwd: existsSync(REPOS_ROOT) ? REPOS_ROOT : dir,
+      timeoutMs,
+      maxBytes: outCap,
+      env: {
+        KOVO_PTC_SOCKET: envOverrides?.KOVO_PTC_SOCKET ?? process.env.KOVO_PTC_SOCKET ?? '/kovo-ptc/ptc.sock',
+        KOVO_PTC_TOKEN_FILE: envOverrides?.KOVO_PTC_TOKEN_FILE ?? process.env.KOVO_PTC_TOKEN_FILE ?? '/kovo-ptc/token',
+        KOVO_PTC_RESULT_FILE: resultPath,
+        KOVO_REPOS: REPOS_ROOT,
+        KOVO_EVIDENCE: inputDirectory,
+      },
+    })
+    const stdout = secretMask(res.stdout).slice(0, outCap)
+    const stderr = secretMask(res.stderr).slice(0, outCap)
+    let result: unknown = null
+    let error: string | undefined
+    if (res.timedOut) {
+      error = `PTC execution timed out after ${timeoutMs}ms.`
+    } else if (res.exitCode !== 0) {
+      const firstLine = stderr.split(/\r?\n/).map(l => l.trim()).find(Boolean)
+      error = firstLine ? firstLine.slice(0, 400) : `PTC execution exited with code ${res.exitCode}.`
+    } else if (existsSync(resultPath)) {
+      try {
+        const raw = await readFile(resultPath, 'utf8')
+        if (Buffer.byteLength(raw) > maxPtcResultBytes) {
+          error = `PTC result JSON exceeded ${maxPtcResultBytes}-byte limit.`
+        } else {
+          result = JSON.parse(raw)
+        }
+      } catch {
+        error = 'PTC result JSON could not be parsed.'
+      }
+    }
+    const ok = res.exitCode === 0 && !res.timedOut && !error
+    return {
+      ok,
+      result,
+      stdout,
+      stderr,
+      exitCode: res.exitCode,
+      durationMs: res.durationMs,
+      ...(res.timedOut ? { timedOut: true } : {}),
+      ...(error ? { error } : {}),
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined)
+  }
+}
+
+// ============================================================================
 // Deterministic Static AST Re-Verification (op: 'ast_verify')
 // ============================================================================
 
@@ -1764,6 +1869,9 @@ async function runSession() {
       } else if (msg.op === 'verify') {
         const result = await runVerifyScript(msg)
         respond({ id: msg.id, ok: true, result })
+      } else if (msg.op === 'ptc') {
+        const result = await runPtcScript(msg, inputDirectory)
+        respond({ id: msg.id, ok: true, result })
       } else if (msg.op === 'ast_verify') {
         const result = await runAstVerify(msg)
         respond({ id: msg.id, ok: true, result })
@@ -1776,8 +1884,20 @@ async function runSession() {
   }
 }
 
-const sessionMode = process.argv.includes('--session')
-;(sessionMode ? runSession() : runOneShot()).catch(() => {
-  process.stderr.write('The evidence worker could not execute the operation.\n')
-  process.exitCode = 1
-})
+function isBridgeMainModule(): boolean {
+  const entry = process.argv[1]
+  if (!entry) return false
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return false
+  }
+}
+
+if (isBridgeMainModule()) {
+  const sessionMode = process.argv.includes('--session')
+  ;(sessionMode ? runSession() : runOneShot()).catch(() => {
+    process.stderr.write('The evidence worker could not execute the operation.\n')
+    process.exitCode = 1
+  })
+}
