@@ -37,7 +37,7 @@ import {
 import {
   ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE,
   assertAssignmentBriefSize,
-  buildAssignmentBrief,
+  buildAssignmentBrief, selectBriefRoutes,
   type MissionKind,
 } from './assignment-brief.ts'
 import {
@@ -5496,23 +5496,24 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const origin = input.targetOrigins[0]
     if (!origin) return undefined
     try {
+      const publicOrigins = [...new Set([...input.targetOrigins, ...input.run.candidates.filter(c => input.run.approved.includes(c.id)).map(c => c.origin)])]
       const confirmedPathSet = new Set(
         input.confirmed
           .filter(ref => !ref.origin || ref.origin === origin)
           .map(ref => normalizeConfirmedRouteTemplate(ref.path)),
       )
-      const originEndpoints = this.storage.listEndpoints(input.run.id, { orderBy: 'risk', limit: 40 })
-        .filter(ep => input.targetOrigins.includes(ep.origin))
-      const unconfirmedOriginEndpoints = originEndpoints.filter(ep => !confirmedPathSet.has(normalizeConfirmedRouteTemplate(ep.pathTemplate)))
-      const routes = (unconfirmedOriginEndpoints.length > 0 ? unconfirmedOriginEndpoints : originEndpoints)
-        .slice(0, 6)
-        .map(ep => ({
-          method: ep.method,
-          path: ep.pathTemplate,
-          riskScore: ep.riskScore,
-        }))
-      const samples = this.storage.listResourceSamples(input.run.id)
-        .filter(sample => input.targetOrigins.includes(sample.origin))
+      const confirmedOriginPathSet = new Set(input.confirmed.map(ref => `${ref.origin ?? origin} ${normalizeConfirmedRouteTemplate(ref.path)}`))
+      const samples = this.storage.listResourceSamples(input.run.id).filter(sample => publicOrigins.includes(sample.origin))
+      const routes = selectBriefRoutes(
+        this.storage.listEndpoints(input.run.id, { orderBy: 'risk', limit: publicOrigins.length > 1 ? 120 : 40 }),
+        {
+          publicOrigins,
+          targetOrigins: input.targetOrigins,
+          confirmedPaths: confirmedPathSet,
+          confirmedOriginPaths: confirmedOriginPathSet,
+          normalizePath: normalizeConfirmedRouteTemplate,
+        },
+      )
       // v7 M2: extract typed ChainHop artifacts persisted from prior/current rounds so follow-on
       // round briefs receive structured handles (tokens, leaked IDs, SSRF/redirect targets, role
       // transitions, workflow state handles) without prompt soup.
@@ -5554,7 +5555,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         : this.missionKindForStep(input.step, Boolean(parentDetLead))
       // v7/v8: wire multi-origin & CapabilityLedger counts so grey-box briefs receive Mode-A proof contracts.
       // Compact by default; chains, multi-origin/ledger runs, and multi-persona 4-hop slices expand to full.
-      const publicOrigins = [...new Set([...input.targetOrigins, ...input.run.candidates.filter(c => input.run.approved.includes(c.id)).map(c => c.origin)])]
       const ledger = this.storage.capabilityLedger(input.run.id)
       const sealedCapabilityCount = ledger.listCapabilities().length
       const codeSlice = this.host.codeSliceForAssignment(input.run, input.step, input.parentFacts)

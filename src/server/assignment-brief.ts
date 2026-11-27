@@ -46,6 +46,8 @@ export type MissionKind =
   | 'class_scan'
 
 export interface AssignmentBriefRoute {
+  /** Optional origin URL when routes span multiple approved public origins. */
+  origin?: string
   method: string
   /** Path template only; any query string or fragment is stripped before rendering. */
   path: string
@@ -363,9 +365,11 @@ function routeSignal(route: AssignmentBriefRoute): number {
 }
 
 function normalizeRoute(route: AssignmentBriefRoute): AssignmentBriefRoute {
+  const origin = typeof route.origin === 'string' ? cleanText(route.origin.split(/[?#]/, 1)[0], 120) : ''
   const params = [...new Set((route.params ?? []).map(cleanParamName).filter(Boolean))].slice(0, 8)
   const encoding = cleanEncoding(route.encoding)
   return {
+    ...(origin ? { origin } : {}),
     method: (route.method || 'GET').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 10) || 'GET',
     path: cleanPath(route.path),
     ...(params.length ? { params } : {}),
@@ -382,7 +386,7 @@ function sortRoutes(routes: readonly AssignmentBriefRoute[]): AssignmentBriefRou
   const normalized: AssignmentBriefRoute[] = []
   for (const route of routes) {
     const next = normalizeRoute(route)
-    const key = `${next.method} ${next.path} ${(next.params ?? []).join(',')}`
+    const key = `${next.origin ?? ''} ${next.method} ${next.path} ${(next.params ?? []).join(',')}`
     if (seen.has(key)) continue
     seen.add(key)
     normalized.push(next)
@@ -390,9 +394,83 @@ function sortRoutes(routes: readonly AssignmentBriefRoute[]): AssignmentBriefRou
   return normalized.sort((a, b) => {
     const signal = routeSignal(b) - routeSignal(a)
     if (signal !== 0) return signal
+    if ((a.origin ?? '') !== (b.origin ?? '')) return (a.origin ?? '') < (b.origin ?? '') ? -1 : 1
     if (a.path !== b.path) return a.path < b.path ? -1 : 1
     return a.method < b.method ? -1 : a.method > b.method ? 1 : 0
   })
+}
+
+function interleaveMultiOriginRoutes(
+  routes: readonly AssignmentBriefRoute[],
+  publicOrigins: readonly string[],
+  primaryOrigin: string,
+  maxTotal: number,
+): AssignmentBriefRoute[] {
+  const sorted = sortRoutes(routes)
+  const buckets = new Map<string, AssignmentBriefRoute[]>()
+  for (const route of sorted) {
+    const bucketOrigin = route.origin || primaryOrigin
+    const list = buckets.get(bucketOrigin)
+    if (list) list.push(route)
+    else buckets.set(bucketOrigin, [route])
+  }
+  const orderedOrigins = [
+    ...publicOrigins.filter(orig => buckets.has(orig)),
+    ...[...buckets.keys()].filter(orig => !publicOrigins.includes(orig)).sort(),
+  ]
+  const interleaved: AssignmentBriefRoute[] = []
+  let depth = 0
+  while (interleaved.length < maxTotal) {
+    let added = false
+    for (const orig of orderedOrigins) {
+      const bucket = buckets.get(orig)
+      if (bucket && depth < bucket.length) {
+        interleaved.push(bucket[depth]!)
+        added = true
+        if (interleaved.length >= maxTotal) break
+      }
+    }
+    if (!added) break
+    depth += 1
+  }
+  return interleaved
+}
+
+export function selectBriefRoutes(
+  endpoints: readonly { origin: string; method: string; pathTemplate: string; riskScore: number }[],
+  options: {
+    publicOrigins: readonly string[]
+    targetOrigins: readonly string[]
+    confirmedPaths: ReadonlySet<string>
+    confirmedOriginPaths: ReadonlySet<string>
+    normalizePath: (path: string) => string
+  },
+): AssignmentBriefRoute[] {
+  const { publicOrigins, targetOrigins, confirmedPaths, confirmedOriginPaths, normalizePath } = options
+  if (publicOrigins.length <= 1) {
+    const originEndpoints = endpoints.filter(ep => targetOrigins.includes(ep.origin))
+    const unconfirmed = originEndpoints.filter(ep => !confirmedPaths.has(normalizePath(ep.pathTemplate)))
+    return (unconfirmed.length > 0 ? unconfirmed : originEndpoints)
+      .slice(0, 6)
+      .map(ep => ({ method: ep.method, path: ep.pathTemplate, riskScore: ep.riskScore }))
+  }
+  const perOrigin = new Map<string, typeof endpoints[number][]>()
+  for (const orig of publicOrigins) {
+    const epsForOrigin = endpoints.filter(ep => ep.origin === orig)
+    if (epsForOrigin.length === 0) continue
+    const unconfirmed = epsForOrigin.filter(ep => !confirmedOriginPaths.has(`${orig} ${normalizePath(ep.pathTemplate)}`))
+    perOrigin.set(orig, (unconfirmed.length > 0 ? unconfirmed : epsForOrigin).slice(0, 4))
+  }
+  const routes: AssignmentBriefRoute[] = []
+  for (let slot = 0; slot < 4 && routes.length < 20; slot += 1) {
+    for (const orig of publicOrigins) {
+      const ep = perOrigin.get(orig)?.[slot]
+      if (!ep) continue
+      routes.push({ origin: ep.origin, method: ep.method, path: ep.pathTemplate, riskScore: ep.riskScore })
+      if (routes.length >= 20) break
+    }
+  }
+  return routes
 }
 
 function normalizeConfirmed(ref: AssignmentBriefConfirmedRef): Record<string, unknown> {
@@ -689,10 +767,10 @@ export interface AssignmentBriefMultiHopContract {
 }
 
 export const MULTIHOP_ATTACKER_ORIGIN_RULE =
-  'Start Hop 1 strictly from a low-privilege or cross-tenant persona (never pre-seeded owner/admin victim personas; use mixed dual-tenant personas ONLY for cross-tenant chains targeting their non-admin tenant). Ablation controls MUST run as the SAME actor/persona as toHop (without the upstream prerequisite/capability).'
+  'Run discovery & attack hops as low-privilege/attacker persona(s) ONLY — NEVER privileged victim/owner/admin shortcuts (negative control only). Shared/dual-tenant persona crossing into non-admin tenant -> dual_tenant_abac/cross_tenant_data_access (not broken_access_control). Ablation = SAME actor as toHop.'
 
 export const MULTIHOP_CONTINUE_CHAIN_RULE =
-  'Explore with kovo_http first; NEVER call kovo_verify just to seal a single hop. Seal Hop 1-2 handles/URLs/keys (ctx.seal_capability) and continue Hops 3-5 + ctx.chain(...).prove() inside ONE SAME script (ctx.await_async / ctx.hmac_sign / ctx.jwt_sign) rather than calling ctx.prove_composite prematurely on a Hop-2 stub.'
+  'Explore with http_request/kovo_http first; NEVER seal-only kovo_verify. Never stop at intermediate invite/token/metadata/role-write hops as broken_access_control — seal (ctx.seal_capability) and chain Hops 3-5 in ONE SAME script to terminal mutation/approval/secret readback as terminalHopId via ctx.chain(...).prove().'
 
 export const RECORD_COVERAGE_BRIEF_GUIDANCE = buildRecordCoverageBriefGuidance()
 
@@ -809,8 +887,8 @@ export function buildMultiHopProofContract(compact = false, input?: AssignmentBr
   const helperPatterns = detectMultiHopHelperPatterns(input, compact)
   if (compact) {
     return {
-      attackerOriginRule: 'Low-priv root persona (no owner/admin; dual-tenant only vs non-admin tenant); ablation=SAME actor as toHop.',
-      continueChainRule: 'Explore w/kovo_http; no seal-only kovo_verify. ctx.seal_capability Hops 1-2 + Hops 3-5+ctx.chain().prove() in SAME script.',
+      attackerOriginRule: 'Low-privilege only (no victim/owner/admin); non-admin tenant->dual_tenant_abac/cross_tenant_data_access; SAME actor.',
+      continueChainRule: 'kovo_http; ctx.seal_capability Hops 1-2+Hops 3-5->terminalHopId+ctx.chain().prove() in SAME script.',
       ...(helperPatterns.length ? { helperPatterns } : {}),
       modeATsRecipe: COMPACT_MULTIHOP_MODE_A_RECIPE,
       hardenedTwinRule: 'Guard holds: no Hop1-2 finding; record_coverage(status="ruled_out", proofGapReason="invariant_enforced_hardened")+complete_intent.',
@@ -827,6 +905,7 @@ export function buildMultiHopProofContract(compact = false, input?: AssignmentBr
 }
 
 interface WorkingState {
+  publicOrigins: string[]
   routes: AssignmentBriefRoute[]
   linked: AssignmentBriefRoute[]
   personas: Array<{ handle: string; role?: string; harvestedIds: string[] }>
@@ -847,6 +926,7 @@ function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<
   return {
     mission: input.missionKind,
     origin: cleanText(input.origin.split(/[?#]/, 1)[0], 180),
+    ...(state.publicOrigins.length > 1 ? { publicOrigins: state.publicOrigins } : {}),
     ...(state.detLead ? { detLead: state.detLead } : {}),
     ...(state.hopCheckpoint ? { hopCheckpoint: state.hopCheckpoint } : {}),
     ...(state.multiHopProofContract ? { multiHopProofContract: state.multiHopProofContract } : {}),
@@ -887,7 +967,16 @@ function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<
 }
 
 function buildWorkingState(input: AssignmentBriefInput): WorkingState {
-  const routes = sortRoutes(input.routes ?? []).slice(0, 12)
+  const primaryOrigin = cleanText(input.origin.split(/[?#]/, 1)[0], 180)
+  const rawPublicOrigins = [...new Set(
+    (input.publicOrigins ?? [])
+      .map(o => cleanText(typeof o === 'string' ? o.split(/[?#]/, 1)[0] : '', 180))
+      .filter(Boolean),
+  )].slice(0, 8)
+  const publicOrigins = rawPublicOrigins.length > 1 ? rawPublicOrigins : []
+  const routes = publicOrigins.length > 1
+    ? interleaveMultiOriginRoutes(input.routes ?? [], publicOrigins, primaryOrigin, 20)
+    : sortRoutes(input.routes ?? []).slice(0, 12)
   const linked = sortRoutes(input.linkedRoutes ?? []).slice(0, 8)
 
   const personaSeen = new Set<string>()
@@ -973,6 +1062,7 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
     : undefined
 
   return {
+    publicOrigins,
     routes,
     linked,
     personas,
@@ -1021,7 +1111,6 @@ export function buildAssignmentBriefPacket(
       state.coverageContract = undefined
       continue
     }
-
     // Compact the Mode-A multi-hop proof contract before dropping linkedRoutes or shrinking
     // secondary material so follow-on hop endpoints and chain lineage coexist inside the 4 KB budget.
     if (state.multiHopProofContract && !state.multiHopContractCompacted) {
@@ -1139,6 +1228,7 @@ export function buildAssignmentBriefPacket(
       state.hopCheckpoint = undefined
       continue
     }
+    if (state.publicOrigins.length) { state.publicOrigins = []; continue }
 
     // Guaranteed-under-cap fallback (mission + bounded origin only).
     const minimal = JSON.stringify({
