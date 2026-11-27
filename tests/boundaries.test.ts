@@ -1556,12 +1556,14 @@ test('WS-20 AST lint: EgressGateway direct egress* and loopback-proxy usage stay
   const files = walkServerTsFiles(serverDir)
 
   // Direct EgressGateway.egress* / egressHttp2 transport calls are strictly confined to broker/gateway/provider/auth
+  // plus the bounded read-only public HTTPS advisory/web-search tool (`allowLocalLab: false, allowHttp: false`)
   // (verify-rpc.ts has strictly 0 allowed bypasses after C-1 broker HTTP/2 migration).
   const egressCallAllowlist: Record<string, number> = {
     'src/server/egress-gateway.ts': Number.POSITIVE_INFINITY,
     'src/server/broker.ts': Number.POSITIVE_INFINITY,
     'src/server/provider.ts': Number.POSITIVE_INFINITY,
     'src/server/persona-auth.ts': Number.POSITIVE_INFINITY,
+    'src/server/web-search-tool.ts': 1,
     'src/server/verify-rpc.ts': 0,
   }
 
