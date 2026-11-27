@@ -2539,11 +2539,14 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
   const cellConfigs = [...new Set(explicitConfigs.filter(Boolean))]
   const nullConfigCount = explicitConfigs.filter((v) => !v).length
   if (nullConfigCount > 0) ingestRefusals.push(`${nullConfigCount} cell(s) have null/empty effectiveConfigHash`)
-  if (cellConfigs.length > 1) {
-    ingestRefusals.push(`mixed effectiveConfigHash across cells (${cellConfigs.map((v) => v.slice(0, 12)).join(', ')})`)
+  const mixedConfigBuckets = findMixedEffectiveConfigBuckets(cells)
+  if (mixedConfigBuckets.length > 0) {
+    ingestRefusals.push(
+      `mixed effectiveConfigHash within cell bucket(s): ${mixedConfigBuckets.map((b) => `${b.bucketKey} (${b.hashes.map((v) => v.slice(0, 12)).join(', ')})`).join('; ')}`,
+    )
   }
   const effectiveConfigHash: string | null =
-    nullConfigCount > 0 || cellConfigs.length > 1
+    nullConfigCount > 0 || mixedConfigBuckets.length > 0
       ? null
       : cellConfigs.length === 1
         ? cellConfigs[0]!
@@ -2579,7 +2582,7 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
     addCheck({
       id: 'provenance_integrity',
       category: 'precision',
-      description: 'Cells share one non-null benchmarkVersion & effectiveConfigHash, reportable=true, wordlistOn=false, and matching worker image/sdkVersion',
+      description: 'Cells share one non-null benchmarkVersion, consistent per-(app,seed,mode,llm,tier) non-null effectiveConfigHash, reportable=true, wordlistOn=false, and matching worker image/sdkVersion',
       threshold: '0 provenance/ingest refusals',
       observed: `REFUSED: ${ingestRefusals.join('; ')}`,
       status: 'FAIL',
@@ -3245,6 +3248,44 @@ export function parseCertifyV8Args(argv: readonly string[]): CertifyV8CliArgs {
   }
 }
 
+/**
+ * Canonical provenance bucket key for `effectiveConfigHash` consistency checks.
+ * Distinct `(app, seed, mode, llm, tierLabel)` cells legitimately run with different
+ * effective configs (e.g., `--no-llm` vs `white-box` vs `grey-box`, isolated per-cell
+ * `modelProfileId` UUIDs, or scaling tiers), whereas conflicting hashes inside the same
+ * bucket must still fail closed.
+ */
+function effectiveConfigBucketKey(
+  c: Pick<NormalizedMultihopCell, 'app' | 'seed' | 'mode' | 'llm' | 'tierLabel'>,
+): string {
+  return `${c.app}@${c.seed}|${c.mode}|${c.llm}|${c.tierLabel}`
+}
+
+function findMixedEffectiveConfigBuckets(
+  cells: readonly NormalizedMultihopCell[],
+): Array<{ bucketKey: string; hashes: string[] }> {
+  const byBucket = new Map<string, Set<string>>()
+  for (const c of cells) {
+    if (c.effectiveConfigHash === undefined) continue
+    const h = typeof c.effectiveConfigHash === 'string' ? c.effectiveConfigHash.trim() : ''
+    if (!h) continue
+    const key = effectiveConfigBucketKey(c)
+    let set = byBucket.get(key)
+    if (!set) {
+      set = new Set<string>()
+      byBucket.set(key, set)
+    }
+    set.add(h)
+  }
+  const mixed: Array<{ bucketKey: string; hashes: string[] }> = []
+  for (const [bucketKey, hashes] of byBucket.entries()) {
+    if (hashes.size > 1) {
+      mixed.push({ bucketKey, hashes: [...hashes] })
+    }
+  }
+  return mixed
+}
+
 export function writeV8CertifyLedgerRows(input: {
   cells: readonly MultihopCellInput[]
   report: V8CertificationReport
@@ -3256,6 +3297,17 @@ export function writeV8CertifyLedgerRows(input: {
 }): { perRunPath: string; rows: LedgerRow[] } {
   const gitState = resolveGitState(input.repoRoot)
   const normalized = input.cells.map(normalizeCell)
+  const mixedBucketKeys = new Set(findMixedEffectiveConfigBuckets(normalized).map((b) => b.bucketKey))
+  const explicitBenchmarkVersions = new Set(
+    normalized
+      .filter((c) => c.benchmarkVersion !== undefined)
+      .map((c) => (typeof c.benchmarkVersion === 'string' ? c.benchmarkVersion.trim() : ''))
+      .filter(Boolean),
+  )
+  const hasMixedBenchmarkVersion = explicitBenchmarkVersions.size > 1
+  const hasProvenanceFailure = input.report.checks.some(
+    (chk) => chk.id === 'provenance_integrity' && chk.status === 'FAIL',
+  )
   const rows: LedgerRow[] = []
   let perRunPath = ''
   const runId = input.runId ?? `certify-v8-${input.report.gate}-${input.report.generatedAt.replace(/[:.]/g, '-')}-${process.pid}`
@@ -3281,16 +3333,21 @@ export function writeV8CertifyLedgerRows(input: {
       },
       { failed: c.failed || c.status === 'INVALID', inert: c.inert },
     )
-    const rowBenchmarkVersion = c.benchmarkVersion === undefined ? input.report.benchmarkVersion : c.benchmarkVersion
-    const explicitNullConfig = c.effectiveConfigHash === null || c.effectiveConfigHash === ''
-    const hasMixedConfig = input.report.checks.some((chk) => chk.id === 'provenance_integrity' && chk.status === 'FAIL')
-    if (!rowBenchmarkVersion || !/^[0-9a-f]{16,64}$/i.test(rowBenchmarkVersion) || explicitNullConfig || hasMixedConfig) {
-      throw new Error(
-        `Refusing to write v8 ledger row for ${c.app}@${c.seed}: missing, null, or mixed benchmarkVersion/effectiveConfigHash.`,
-      )
-    }
+    const rowBenchmarkVersion =
+      c.benchmarkVersion === undefined
+        ? input.report.benchmarkVersion
+        : typeof c.benchmarkVersion === 'string'
+          ? c.benchmarkVersion.trim()
+          : ''
+    const explicitNullConfig =
+      c.effectiveConfigHash === null ||
+      (typeof c.effectiveConfigHash === 'string' && c.effectiveConfigHash.trim() === '')
+    const bucketKey = effectiveConfigBucketKey(c)
+    const hasBucketMixedConfig = mixedBucketKeys.has(bucketKey)
     const rowConfigHash =
-      c.effectiveConfigHash
+      (typeof c.effectiveConfigHash === 'string' && c.effectiveConfigHash.trim().length > 0
+        ? c.effectiveConfigHash.trim()
+        : null)
       ?? input.report.effectiveConfigHash
       ?? computeEffectiveConfig({
         deterministicOnly: c.llm === 'deterministic-no-llm',
@@ -3299,6 +3356,20 @@ export function writeV8CertifyLedgerRows(input: {
         wordlistOn: c.wordlistOn ?? false,
         mode: c.mode,
       }).effectiveConfigHash
+    if (
+      !rowBenchmarkVersion ||
+      !/^[0-9a-f]{16,64}$/i.test(rowBenchmarkVersion) ||
+      hasMixedBenchmarkVersion ||
+      explicitNullConfig ||
+      hasBucketMixedConfig ||
+      hasProvenanceFailure ||
+      !rowConfigHash ||
+      !/^[0-9a-f]{16,64}$/i.test(rowConfigHash)
+    ) {
+      throw new Error(
+        `Refusing to write v8 ledger row for ${c.app}@${c.seed} (${c.mode}/${c.llm}): missing, null, or mixed benchmarkVersion/effectiveConfigHash.`,
+      )
+    }
     const row = buildLedgerRow({
       cell: readerCell,
       recordedAt: input.report.generatedAt,

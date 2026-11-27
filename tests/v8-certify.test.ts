@@ -30,6 +30,7 @@ import {
   parseCertifyV8Args,
   renderCalibrationJson,
   renderCalibrationMarkdown,
+  writeV8CertifyLedgerRows,
   type MultihopCellInput,
   type MultihopChainVerdictInput,
   type MultihopMode,
@@ -37,7 +38,7 @@ import {
   type V7RegressionFloorInput,
 } from '../scripts/certify-v8.ts'
 
-import { resolveGitState } from '../scripts/bench-ledger.ts'
+import { readLedgerRows, resolveGitState } from '../scripts/bench-ledger.ts'
 
 const REPO_ROOT = join(import.meta.dirname, '..')
 const tempRoot = mkdtempSync(join(tmpdir(), 'kovo-v8-certify-test-'))
@@ -1034,4 +1035,139 @@ test('CLI end-to-end: PASS writes CALIBRATION-v8.md and JSON with exit 0; FAIL e
     failedExitCode = (err as { status?: number }).status ?? 0
   }
   assert.equal(failedExitCode, 1)
+})
+
+test('M2 multi-mode/multi-LLM provenance: distinct per-(app,seed,mode,llm) effectiveConfigHash writes ledger rows cleanly while refusing null or same-bucket mixed hashes', () => {
+  const benchVersion = 'a'.repeat(64)
+  const noLlmHash = '1'.repeat(64)
+  const wbHashes: Record<string, string> = {
+    paygrid: '2'.repeat(64),
+    shipforge: '3'.repeat(64),
+    nexusiam: '4'.repeat(64),
+  }
+  const gbHashes: Record<string, string> = {
+    paygrid: '5'.repeat(64),
+    shipforge: '6'.repeat(64),
+    nexusiam: '7'.repeat(64),
+  }
+
+  const cells: MultihopCellInput[] = [
+    ...makeNoLlmFloorCells(0).map((c) => ({
+      ...c,
+      gitSha: TEST_GIT_SHA,
+      benchmarkVersion: benchVersion,
+      effectiveConfigHash: noLlmHash,
+      reportable: true,
+      wordlistOn: false,
+      workerImageId: 'sha256:133f4fc1a2e22634afedb2e3596c02e2e150f63f7209d479caa98d9290795fc1',
+      sdkVersion: 'kovo_verify/v8',
+    })),
+    ...makeDevSuiteCells({
+      mode: 'grey-box',
+      budgetUsd: 5,
+      maxDurationMs: 1_800_000,
+      seed: 1,
+      confirmedByApp: [2, 1, 1],
+    }).map((c) => ({
+      ...c,
+      benchmarkVersion: benchVersion,
+      effectiveConfigHash: gbHashes[c.app]!,
+      reportable: true,
+      wordlistOn: false,
+      workerImageId: 'sha256:133f4fc1a2e22634afedb2e3596c02e2e150f63f7209d479caa98d9290795fc1',
+      sdkVersion: 'kovo_verify/v8',
+    })),
+    ...makeDevSuiteCells({
+      mode: 'white-box',
+      budgetUsd: 5,
+      maxDurationMs: 1_800_000,
+      seed: 1,
+      confirmedByApp: [2, 2, 2],
+    }).map((c) => ({
+      ...c,
+      benchmarkVersion: benchVersion,
+      effectiveConfigHash: wbHashes[c.app]!,
+      reportable: true,
+      wordlistOn: false,
+      workerImageId: 'sha256:133f4fc1a2e22634afedb2e3596c02e2e150f63f7209d479caa98d9290795fc1',
+      sdkVersion: 'kovo_verify/v8',
+    })),
+  ]
+
+  // 1. Multi-mode + multi-LLM + per-cell isolated hashes PASS M2 and write 9 validated ledger rows.
+  const report = evaluateV8Certification({
+    gate: 'm2',
+    cells,
+    options: { gitSha: TEST_GIT_SHA, generatedAt: '2026-11-26T00:00:00.000Z' },
+  })
+  assert.equal(report.status, 'VALID')
+  assert.equal(report.verdict, 'PASS', JSON.stringify(report.failedChecks, null, 2))
+  assert.equal(report.checks.some((chk) => chk.id === 'provenance_integrity'), false)
+  assert.equal(report.benchmarkVersion, benchVersion)
+
+  const runsDir = join(tempRoot, 'm2-multimode-ledger-runs')
+  const written = writeV8CertifyLedgerRows({
+    cells,
+    report,
+    runsDir,
+    runId: 'm2-multimode-test',
+  })
+  assert.equal(written.rows.length, 9)
+  const onDisk = readLedgerRows(written.perRunPath)
+  assert.equal(onDisk.length, 9)
+
+  const hashByKey = new Map(onDisk.map((r) => [`${r.app}@${r.seed}|${r.mode}|${r.llm}`, r.effectiveConfigHash]))
+  assert.equal(hashByKey.get('paygrid@1|white-box|deterministic-no-llm'), noLlmHash)
+  assert.equal(hashByKey.get('paygrid@1|white-box|agentic'), wbHashes.paygrid)
+  assert.equal(hashByKey.get('shipforge@1|white-box|agentic'), wbHashes.shipforge)
+  assert.equal(hashByKey.get('nexusiam@1|white-box|agentic'), wbHashes.nexusiam)
+  assert.equal(hashByKey.get('paygrid@1|grey-box|agentic'), gbHashes.paygrid)
+  assert.equal(hashByKey.get('shipforge@1|grey-box|agentic'), gbHashes.shipforge)
+  assert.equal(hashByKey.get('nexusiam@1|grey-box|agentic'), gbHashes.nexusiam)
+
+  // 2. Mixed effectiveConfigHash WITHIN the same (app, seed, mode, llm, tier) bucket MUST still fail & refuse ledger write.
+  const duplicateMixedCell: MultihopCellInput = {
+    ...cells.find((c) => c.app === 'paygrid' && c.mode === 'white-box' && c.llm === 'agentic')!,
+    effectiveConfigHash: 'f'.repeat(64),
+  }
+  const mixedSameBucket = [...cells, duplicateMixedCell]
+  const mixedReport = evaluateV8Certification({
+    gate: 'm2',
+    cells: mixedSameBucket,
+    options: { gitSha: TEST_GIT_SHA, generatedAt: '2026-11-26T00:00:00.000Z' },
+  })
+  assert.equal(mixedReport.status, 'INVALID')
+  assert.equal(mixedReport.verdict, 'FAIL')
+  assert.ok(mixedReport.checks.some((chk) => chk.id === 'provenance_integrity' && chk.status === 'FAIL'))
+  assert.throws(
+    () =>
+      writeV8CertifyLedgerRows({
+        cells: mixedSameBucket,
+        report: mixedReport,
+        runsDir,
+        runId: 'm2-mixed-same-bucket',
+      }),
+    /Refusing to write v8 ledger row/,
+  )
+
+  // 3. Explicit null effectiveConfigHash MUST still fail & refuse ledger write.
+  const nullConfigCells = cells.map((c, idx) => (idx === 0 ? { ...c, effectiveConfigHash: null } : c))
+  const nullReport = evaluateV8Certification({
+    gate: 'm2',
+    cells: nullConfigCells,
+    options: { gitSha: TEST_GIT_SHA, generatedAt: '2026-11-26T00:00:00.000Z' },
+  })
+  assert.equal(nullReport.status, 'INVALID')
+  assert.equal(nullReport.verdict, 'FAIL')
+  assert.ok(nullReport.checks.some((chk) => chk.id === 'provenance_integrity' && chk.status === 'FAIL'))
+  assert.throws(
+    () =>
+      writeV8CertifyLedgerRows({
+        cells: nullConfigCells,
+        report: nullReport,
+        runsDir,
+        runId: 'm2-null-config',
+      }),
+    /Refusing to write v8 ledger row/,
+  )
 })
