@@ -74,6 +74,24 @@ if [[ "$CHECK_ONLY" -eq 0 && ! -d node_modules ]]; then
   exit 2
 fi
 
+# Protect /tmp tmpfs by defaulting TMPDIR to a per-run subdir under
+# ${KOVO_TMPDIR:-$HOME/guardian-bench-tmp} when TMPDIR is unset/empty.
+RUN_TMPDIR=""
+cleanup_run_tmpdir() {
+  if [[ -n "${RUN_TMPDIR:-}" && -e "$RUN_TMPDIR" ]]; then
+    rm -rf "$RUN_TMPDIR" >/dev/null 2>&1 || true
+  fi
+}
+if [[ -z "${TMPDIR:-}" ]]; then
+  _kovo_tmp_base="${KOVO_TMPDIR:-${HOME:+${HOME}/guardian-bench-tmp}}"
+  if [[ -n "$_kovo_tmp_base" && -d "$_kovo_tmp_base" && -w "$_kovo_tmp_base" ]]; then
+    trap cleanup_run_tmpdir EXIT
+    RUN_TMPDIR="$(mktemp -d "${_kovo_tmp_base}/kovo-gate-XXXXXX")"
+    export TMPDIR="$RUN_TMPDIR"
+  fi
+  unset _kovo_tmp_base
+fi
+
 export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=2048}"
 
 # Categorized, documented exclude list for non-fast tests/*.test.ts suites (tier|file|reason).
@@ -154,7 +172,7 @@ export FAST_TEST_FORBID_KERNEL_VERDICTS="$FORBID_KERNEL_VERDICTS"
 
 node --input-type=module <<'EOF'
 import { execFile, execFileSync } from 'node:child_process'
-import { existsSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { join, posix, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -963,9 +981,24 @@ function evaluateFileExecution(file, execRes) {
   }
 }
 
+function createRunSandboxDir(rootTmpDir, prefix) {
+  if (!rootTmpDir) {
+    return prepareHermeticTestDir(undefined, prefix)
+  }
+  const resolvedRoot = resolve(rootTmpDir)
+  mkdirSync(resolvedRoot, { recursive: true })
+  const dir = mkdtempSync(join(resolvedRoot, prefix))
+  mkdirSync(join(dir, 'd'), { recursive: true, mode: 0o700 })
+  mkdirSync(join(dir, 'ledger'), { recursive: true, mode: 0o700 })
+  mkdirSync(join(dir, 't'), { recursive: true, mode: 0o700 })
+  mkdirSync(join(dir, 'xdg-d'), { recursive: true, mode: 0o700 })
+  mkdirSync(join(dir, 'xdg-c'), { recursive: true, mode: 0o700 })
+  return dir
+}
+
 function runOneRaw(file) {
   const absFile = isDefaultTestsDir ? file : join(testsDirAbs, file.replace(/^tests\//, ''))
-  const sandboxDir = prepareHermeticTestDir(preferredTmpRoot, 'kf-')
+  const sandboxDir = createRunSandboxDir(preferredTmpRoot, 'kf-')
   const tapPath = join(sandboxDir, 'r.tap')
   const env = buildHermeticTestEnv(sandboxDir)
   const args = buildHermeticNodeTestArgs(absFile, [
