@@ -63,6 +63,17 @@ function makeGrant(origin: string, port: number): Grant {
     canaryMarkers: [],
     session: { headerType: 'bearer', value: 'member-a-optd-sdk-secret', adapterUsed: 'static' },
   }
+  const dualMember: ResolvedPersona = {
+    id: 'dual_member',
+    handle: 'dual_member',
+    roleLabel: 'admin (tenant-a), viewer (tenant-b)',
+    originAllowlist: [origin],
+    authKind: 'bearer',
+    headerName: 'Authorization',
+    secret: 'dual-member-optd-sdk-secret',
+    canaryMarkers: [],
+    session: { headerType: 'bearer', value: 'dual-member-optd-sdk-secret', adapterUsed: 'static' },
+  }
   return {
     origin,
     canRead: o => { try { return new URL(o).origin === origin } catch { return o === origin } },
@@ -72,7 +83,7 @@ function makeGrant(origin: string, port: number): Grant {
     maxRpsPerOrigin: 300,
     tier: 3,
     isStateChangeApproved: () => true,
-    personas: new Map([['member_a', memberA]]),
+    personas: new Map([['member_a', memberA], ['dual_member', dualMember]]),
     secrets: [],
   }
 }
@@ -84,6 +95,8 @@ async function startFixture(t: TestContext, runId: string): Promise<{ origin: st
   let origin = ''
   let paidAmount = 100
   let refundedTotal = 0
+  let cachePrimed = false
+  let itemOwnerTenant = 'tenant-b'
   const httpServer = createServer(async (req, res) => {
     const u = new URL(req.url ?? '/', 'http://127.0.0.1')
 
@@ -107,6 +120,26 @@ async function startFixture(t: TestContext, runId: string): Promise<{ origin: st
         return sendJson(res, 200, { tenantId: 'tenant-b', records: [{ id: 'inv-b-902', amountCents: 42000, ownerEmail: 'billing@tenant-b.test' }] })
       }
       return sendJson(res, 403, { error: 'missing_or_invalid_token' })
+    }
+    if (u.pathname === '/api/v1/permissions/prime' && req.method === 'POST') {
+      cachePrimed = true
+      return sendJson(res, 200, { ok: true, tenantId: 'tenant-a', primed: true })
+    }
+    if (u.pathname === '/api/v1/reports/export' && req.method === 'GET') {
+      if (cachePrimed) {
+        return sendJson(res, 200, { tenantId: 'tenant-b', records: [{ id: 'rep-b-401', balanceCents: 750000, ownerEmail: 'cfo@tenant-b.test' }] })
+      }
+      return sendJson(res, 403, { error: 'admin_role_required_in_tenant_b' })
+    }
+    if (u.pathname === '/api/v1/items/item-77/export' && req.method === 'GET') {
+      if (itemOwnerTenant === 'tenant-a') {
+        return sendJson(res, 200, { id: 'item-77', ownerTenantId: 'tenant-a', secretNote: 'transferred-record-payload' })
+      }
+      return sendJson(res, 403, { error: 'source_tenant_admin_required', entityId: 'item-77' })
+    }
+    if (u.pathname === '/api/v1/items/item-77/transfer' && req.method === 'POST') {
+      itemOwnerTenant = 'tenant-a'
+      return sendJson(res, 200, { id: 'item-77', transferred: true, destTenantId: 'tenant-a' })
     }
     if (u.pathname === '/api/v1/orders/ord-1' && req.method === 'GET') {
       return sendJson(res, 200, { orderId: 'ord-1', paidAmount, refundedTotal })
@@ -389,4 +422,75 @@ test('ChainBuilder.build() produces strictly forward-only edges with zero cycles
   assert.ok(edges.some(e => e.kind === 'value_binding' && e.fromHopId === 'hop_1' && e.toHopId === 'hop_2' && e.capabilityHandle === 'cap:hop_1:s1'))
   assert.ok(edges.some(e => e.kind === 'value_binding' && e.fromHopId === 'hop_1' && e.toHopId === 'hop_3' && e.capabilityHandle === 'cap:hop_1:s1'))
   assert.ok(edges.some(e => e.kind === 'value_binding' && e.fromHopId === 'hop_2' && e.toHopId === 'hop_3' && e.capabilityHandle === 'cap:hop_2:s2'))
+})
+
+test('live VerifyRpcServer: dual_tenant_abac synthOracleInput auto-populates oracleInput from 401/403/404 control + terminal exchange and confirms', async t => {
+  const { ctx } = await startFixture(t, 'run-optd-sdk-dual-tenant-synth')
+
+  // 1) dual_org_cache_bleed: 0 explicit oracleInput + 0 capability edges + preceding 200 readback before 403 control
+  const ch = ctx.chain('chain-optd-dual-bleed', 'dual_tenant_abac')
+  const okPre = await ch.readback('GET /api/v1/orders/ord-1', { as: 'dual_member' })
+  assert.equal(okPre.status, 200)
+  const ctrl = await ch.control('GET /api/v1/reports/export', { as: 'dual_member' })
+  assert.equal(ctrl.status, 403)
+  const s1 = await ch.step('POST /api/v1/permissions/prime', { hopId: 'step_1', as: 'dual_member', claimedDelta: 'Prime tenant-a admin cache.' })
+  assert.equal(s1.status, 200)
+  const s2 = await ch.step('GET /api/v1/reports/export', { hopId: 'step_2', as: 'dual_member', claimedDelta: 'Read tenant-b report after cache bleed.' })
+  assert.equal(s2.status, 200)
+
+  const built = ch.build({ terminalHopId: 'step_2', terminalExchange: s2, claimedImpact: 'Dual-tenant permission cache bleed into tenant-b.' })
+  assert.deepEqual(built.terminalImpact.oracleInput, {
+    mode: 'dual_org_cache_bleed',
+    baselineDeniedControlExchangeId: ctrl.exchangeId,
+    primeActionExchangeId: s1.exchangeId,
+    bledAccessExchangeId: s2.exchangeId,
+  })
+  const proved = await ch.prove({ terminalHopId: 'step_2', terminalExchange: s2, claimedImpact: 'Dual-tenant permission cache bleed into tenant-b.' })
+  assert.equal(proved.confirmed, true, `Expected live dual_tenant_abac cache bleed to confirm without explicit oracleInput: ${JSON.stringify(proved)}`)
+
+  // 2) cross_tenant_export alias triggers the same dual_tenant_abac synthesis
+  const chAlias = ctx.chain('chain-optd-dual-alias', 'cross_tenant_export')
+  chAlias.control(ctrl)
+  chAlias.recordHop({ hopId: 'h1', target: 'POST /api/v1/permissions/prime', exchangeIds: [s1.exchangeId], claimedDelta: 'Prime.' })
+  chAlias.recordHop({ hopId: 'h2', target: 'GET /api/v1/reports/export', exchangeIds: [s2.exchangeId], claimedDelta: 'Read.' })
+  assert.deepEqual(chAlias.build().terminalImpact.oracleInput, {
+    mode: 'dual_org_cache_bleed',
+    baselineDeniedControlExchangeId: ctrl.exchangeId,
+    primeActionExchangeId: s1.exchangeId,
+    bledAccessExchangeId: s2.exchangeId,
+  })
+
+  // 3) cross_org_transfer: auto-synthesizes mode + sourceControlDenied + transferRecord + postTransferReadback + entityId
+  const chXfer = ctx.chain('chain-optd-dual-xfer', 'dual_tenant_abac')
+  const xCtrl = await chXfer.control('GET /api/v1/items/item-77/export', { as: 'dual_member', entityId: 'item-77' })
+  assert.equal(xCtrl.status, 403)
+  const xHop1 = await chXfer.step('POST /api/v1/permissions/prime', { hopId: 'x_1', as: 'dual_member', claimedDelta: 'Setup session.' })
+  assert.equal(xHop1.status, 200)
+  const xHop2 = await chXfer.step('POST /api/v1/items/item-77/transfer', { hopId: 'x_2', as: 'dual_member', entityId: 'item-77', claimedDelta: 'Transfer item-77 to tenant-a.' })
+  assert.equal(xHop2.status, 200)
+  const xRb = await chXfer.readback('GET /api/v1/items/item-77/export', { as: 'dual_member', entityId: 'item-77' })
+  assert.equal(xRb.status, 200)
+
+  const builtXfer = chXfer.build({ claimedImpact: 'Unauthorized cross-org transfer of item-77.' })
+  assert.deepEqual(builtXfer.terminalImpact.oracleInput, {
+    mode: 'cross_org_transfer',
+    sourceControlDeniedExchangeId: xCtrl.exchangeId,
+    transferRecordExchangeId: xHop2.exchangeId,
+    postTransferReadbackExchangeId: xRb.exchangeId,
+    entityId: 'item-77',
+  })
+
+  // 4) partial caller oracleInput infers batch_partial_authz without overriding caller fields
+  const chBatch = ctx.chain('chain-optd-dual-batch', 'dual_tenant_abac')
+  chBatch.control(ctrl)
+  chBatch.recordHop({ hopId: 'b1', target: 'POST /api/v1/batch', exchangeIds: [s2.exchangeId], claimedDelta: 'Batch read.' })
+  const builtBatch = chBatch.build({ oracleInput: { ownRecordId: 'own-1', foreignRecordId: 'for-2', requestedIds: ['own-1', 'for-2'] } })
+  assert.deepEqual(builtBatch.terminalImpact.oracleInput, {
+    mode: 'batch_partial_authz',
+    ownRecordId: 'own-1',
+    foreignRecordId: 'for-2',
+    requestedIds: ['own-1', 'for-2'],
+    singleForeignControlDeniedExchangeId: ctrl.exchangeId,
+    batchRequestExchangeId: s2.exchangeId,
+  })
 })

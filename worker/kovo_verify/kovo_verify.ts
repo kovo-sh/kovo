@@ -420,13 +420,14 @@ export class ChainBuilder {
     return { ...burst, ...(baseline ? { baseline } : {}), ...(post ? { post } : {}) }
   }
 
-  private synthOracleInput(family: OracleFamily, raw: Record<string, unknown> | undefined, activeHops: RecordedHop[], edges: CausalEdgeInput[], preControl: string[], postReadback: string[], termEx: string | undefined): Record<string, unknown> | undefined {
+  private synthOracleInput(family: OracleFamily, raw: Record<string, unknown> | undefined, activeHops: RecordedHop[], edges: CausalEdgeInput[], preControl: string[], postReadback: string[], termEx: string | undefined, explicitFamily = false): Record<string, unknown> | undefined {
     const oi: Record<string, unknown> = raw ? { ...raw } : {}
     const fill = (k: string, aliases: readonly string[], v: unknown): void => { if (v !== undefined && aliases.every(a => oi[a] === undefined)) oi[k] = v }
-    const firstEx = activeHops[0]?.receipt.exchangeIds?.[0], ctrl = preControl[0], rb = postReadback[0]
+    const stOf = (id: string) => this.exStatus.get(id) ?? this.ctx._exStatusOf(id)
+    const pickOk = (ids: string[]) => { const r = [...ids].reverse(); return r.find(id => { const s = stOf(id); return s !== undefined && s >= 200 && s < 300 }) ?? r.find(id => stOf(id) === undefined) }
+    const deniedCtrl = preControl.find(id => { const s = stOf(id); return s === 401 || s === 403 || s === 404 })
+    const firstEx = activeHops[0]?.receipt.exchangeIds?.[0], prevEx = activeHops[activeHops.length - 2]?.receipt.exchangeIds?.[0] ?? firstEx, ctrl = deniedCtrl ?? preControl[0], rb = postReadback[0]
     if (family === 'economic_conservation') {
-      const stOf = (id: string) => this.exStatus.get(id) ?? this.ctx._exStatusOf(id)
-      const pickOk = (ids: string[]) => { const r = [...ids].reverse(); return r.find(id => { const s = stOf(id); return s !== undefined && s >= 200 && s < 300 }) ?? r.find(id => stOf(id) === undefined) }
       fill('baselineReadbackExchangeId', ['baselineReadback', 'baselineReadbackExchangeId', 'baselineExchangeId'], pickOk(this.baselineReadbackIds) ?? pickOk(preControl))
       fill('finalReadbackExchangeId', ['finalReadback', 'finalReadbackExchangeId', 'finalExchangeId'], pickOk(postReadback))
       const acts = this.raceActionIds.length > 0 ? [...this.raceActionIds] : activeHops.flatMap(h => h.receipt.exchangeIds ?? []).filter(id => !preControl.includes(id) && !postReadback.includes(id))
@@ -446,9 +447,18 @@ export class ChainBuilder {
       if (isCache) { if (activeHops.length >= 2 && firstEx && firstEx !== termEx) fill('victimOrPrimeRequestExchangeId', ['victimOrPrimeRequest', 'victimOrPrimeRequestExchangeId', 'victimPrimeExchangeId'], firstEx); fill('attackerProbeExchangeId', ['attackerProbe', 'attackerProbeExchangeId'], termEx) }
       else { fill('differentialProbeExchangeId', ['differentialProbe', 'differentialProbeExchangeId'], termEx); fill('postMutationReadbackExchangeId', ['postMutationReadback', 'postMutationReadbackExchangeId'], rb) }
     } else if (family === 'dual_tenant_abac') {
-      if (oi.mode === 'dual_org_cache_bleed') { fill('baselineDeniedControlExchangeId', ['baselineDeniedControl', 'baselineDeniedControlExchangeId', 'baselineControlExchangeId'], ctrl); if (activeHops.length >= 2 && firstEx && firstEx !== termEx) fill('primeActionExchangeId', ['primeAction', 'primeActionExchangeId'], firstEx); fill('bledAccessExchangeId', ['bledAccess', 'bledAccessExchangeId'], termEx) }
-      else if (oi.mode === 'cross_org_transfer') { fill('sourceControlDeniedExchangeId', ['sourceControlDenied', 'sourceControlDeniedExchangeId', 'sourceControlExchangeId'], ctrl); fill('transferRecordExchangeId', ['transferRecord', 'transferRecordExchangeId', 'transferExchangeId'], termEx); fill('postTransferReadbackExchangeId', ['postTransferReadback', 'postTransferReadbackExchangeId'], rb) }
-      else if (oi.mode === 'batch_partial_authz') { fill('singleForeignControlDeniedExchangeId', ['singleForeignControlDenied', 'singleForeignControlDeniedExchangeId', 'singleForeignControlExchangeId'], ctrl); fill('batchRequestExchangeId', ['batchRequest', 'batchRequestExchangeId'], termEx); fill('postMutationReadbackExchangeId', ['postMutationReadback', 'postMutationReadbackExchangeId'], rb) }
+      const hasAny = (...ks: string[]) => ks.some(k => oi[k] !== undefined), rbOk = postReadback.find(id => { const s = stOf(id); return s !== undefined && s >= 200 && s < 300 })
+      const eid = (typeof oi.entityId === 'string' && oi.entityId.trim()) || activeHops.map(h => h.receipt.entityId?.trim()).find(Boolean)
+      const xferHop = [...activeHops].reverse().find(h => { const m = typeof h.receipt.target === 'object' ? h.receipt.target.method : ''; return Boolean(m && !/^(?:GET|HEAD|OPTIONS)$/i.test(m)) })
+      if (oi.mode === undefined) {
+        if (hasAny('transferRecord', 'transferRecordExchangeId', 'transferExchangeId', 'postTransferReadback', 'postTransferReadbackExchangeId', 'sourceControlDenied', 'sourceControlDeniedExchangeId', 'sourceControlExchangeId', 'sourceTenantId', 'destTenantId', 'observedOwnerTenantId', 'entityId')) oi.mode = 'cross_org_transfer'
+        else if (hasAny('singleForeignControlDenied', 'singleForeignControlDeniedExchangeId', 'singleForeignControlExchangeId', 'batchRequest', 'batchRequestExchangeId', 'ownRecordId', 'foreignRecordId', 'requestedIds')) oi.mode = 'batch_partial_authz'
+        else if (hasAny('baselineDeniedControl', 'baselineDeniedControlExchangeId', 'baselineControlExchangeId', 'primeAction', 'primeActionExchangeId', 'bledAccess', 'bledAccessExchangeId', 'primeTenantId', 'targetTenantId', 'observedTenantId', 'isolatedControl')) oi.mode = 'dual_org_cache_bleed'
+        else if (!raw && deniedCtrl && termEx) { const m = rbOk && eid && xferHop ? 'cross_org_transfer' : ((explicitFamily || edges.length === 0) && activeHops.length >= 2 && prevEx && prevEx !== termEx ? 'dual_org_cache_bleed' : ''); if (m) oi.mode = m }
+      }
+      if (oi.mode === 'dual_org_cache_bleed') { fill('baselineDeniedControlExchangeId', ['baselineDeniedControl', 'baselineDeniedControlExchangeId', 'baselineControlExchangeId'], ctrl); if (activeHops.length >= 2 && prevEx && prevEx !== termEx) fill('primeActionExchangeId', ['primeAction', 'primeActionExchangeId'], prevEx); fill('bledAccessExchangeId', ['bledAccess', 'bledAccessExchangeId'], termEx) }
+      else if (oi.mode === 'cross_org_transfer') { fill('sourceControlDeniedExchangeId', ['sourceControlDenied', 'sourceControlDeniedExchangeId', 'sourceControlExchangeId'], ctrl); fill('transferRecordExchangeId', ['transferRecord', 'transferRecordExchangeId', 'transferExchangeId'], xferHop?.receipt.exchangeIds?.[0] ?? termEx); fill('postTransferReadbackExchangeId', ['postTransferReadback', 'postTransferReadbackExchangeId'], rbOk ?? rb); if (eid) fill('entityId', ['entityId'], eid) }
+      else if (oi.mode === 'batch_partial_authz') { fill('singleForeignControlDeniedExchangeId', ['singleForeignControlDenied', 'singleForeignControlDeniedExchangeId', 'singleForeignControlExchangeId'], ctrl); fill('batchRequestExchangeId', ['batchRequest', 'batchRequestExchangeId'], termEx); fill('postMutationReadbackExchangeId', ['postMutationReadback', 'postMutationReadbackExchangeId'], rbOk ?? rb) }
     } else if (family === 'cross_surface_pivot') {
       fill('preChainControlDenied', ['preChainControlDenied', 'preChainControlDeniedExchangeId', 'preChainControlExchangeId'], ctrl)
       if (oi.hops === undefined && activeHops.length >= 2) oi.hops = activeHops.map((h, i) => { const inE = edges.find(e => e.toHopId === h.receipt.hopId); return { surface: h.receipt.surface ?? 'http', role: i === activeHops.length - 1 ? 'terminal_impact' : h.receipt.surface === 'browser' ? 'browser_dom_trace' : h.receipt.surface === 'webhook' ? 'oob_callback' : 'trigger_write', record: i === activeHops.length - 1 ? (termEx ?? h.receipt.exchangeIds?.[0]) : h.receipt.exchangeIds?.[0], ...(inE ? { bindingKind: inE.kind } : {}) } })
@@ -495,8 +505,9 @@ export class ChainBuilder {
     for (const id of this.readbackIds) pushUnique(postReadback, id); this.recordRefs(postReadback, opts.readback); for (const id of opts.postChainReadbackExchangeIds ?? []) pushUnique(postReadback, id)
     const terminalExchangeId = opts.terminalExchangeId ?? extractExchangeIds(opts.terminalExchange)[0], modeAFailureExchangeId = opts.modeAFailureExchangeId ?? extractExchangeIds(opts.modeAFailureExchange)[0]
     const lastExIds = lastHop.exchangeIds ?? [], resolvedTermEx = terminalExchangeId ?? lastExIds[lastExIds.length - 1]
-    const effFamily: OracleFamily | undefined = opts.oracleFamily ?? (/^(?:economic_conservation|conserved_balance|ledger_overcredit|over_refund|double_spend|race_condition)$/.test(this.terminalVulnClass.trim().toLowerCase().replace(/[\s-]+/g, '_')) ? 'economic_conservation' : undefined)
-    const oracleInput = effFamily ? this.synthOracleInput(effFamily, opts.oracleInput, activeHops, edges, preControl, postReadback, resolvedTermEx) : (opts.oracleInput ? { ...opts.oracleInput } : undefined)
+    const normCls = this.terminalVulnClass.trim().toLowerCase().replace(/[\s-]+/g, '_')
+    const effFamily: OracleFamily | undefined = opts.oracleFamily ?? (/^(?:economic_conservation|conserved_balance|ledger_overcredit|over_refund|double_spend|race_condition)$/.test(normCls) ? 'economic_conservation' : /^(?:dual_tenant_abac|cross_tenant_(?:export|read|write|idor))$/.test(normCls) ? 'dual_tenant_abac' : undefined)
+    const oracleInput = effFamily ? this.synthOracleInput(effFamily, opts.oracleInput, activeHops, edges, preControl, postReadback, resolvedTermEx, Boolean(opts.oracleFamily)) : (opts.oracleInput ? { ...opts.oracleInput } : undefined)
     return {
       chainId: this.chainId, terminalVulnClass: this.terminalVulnClass, replayMode: opts.replayMode ?? this.replayMode,
       ...(opts.benchmarkMode ?? this.benchmarkMode !== undefined ? { benchmarkMode: opts.benchmarkMode ?? this.benchmarkMode } : {}),
@@ -636,7 +647,6 @@ export class VerifyContext {
     return { mode: raw.mode ?? 'http1-fallback', fallbackReason: raw.fallbackReason ?? null, raceBatchId, summary: raw.summary ?? {}, results, exchanges: results }
   }
   raceBurst(requests: Array<RaceRequestInput | HttpTarget>, opts?: { barrier?: 'auto' | 'h2' | 'http1'; session?: string; entityId?: string; correlationIds?: string[] }): Promise<RaceBurstHopResult> { return this.race_burst(requests, opts) }
-
   async seal_capability(input: SealCapabilityInput): Promise<SealedCapabilityResult> {
     const raw = (input && typeof input === 'object' ? input : {}) as unknown as Record<string, unknown>, exchangeId = extractExchangeIds((raw.exchangeId ?? raw.exchange ?? raw.exchange_id ?? raw.sourceExchangeId ?? raw.response) as ExchangeRef | undefined)[0]
     if (!exchangeId) throw new Error('seal_capability requires exchangeId (string) or exchange ({ exchangeId }).')
@@ -654,7 +664,6 @@ export class VerifyContext {
     const srcEx = res.exchangeId || exchangeId; if (res.handle && srcEx && !this._capOrigins.has(res.handle)) this._capOrigins.set(res.handle, srcEx); activeHop?.onProduce(res.handle, srcEx); return res
   }
   sealCapability(input: SealCapabilityInput): Promise<SealedCapabilityResult> { return this.seal_capability(input) }
-
   private recordCrypto(secretHandle: string, exchangeId: string | undefined, derivedHandle: string, alg?: string): void {
     const hop = this.activeHop(); if (!hop) return; if (exchangeId) hop.onExchange(exchangeId)
     if (secretHandle) { pushUnique(hop.consumedCapabilities, secretHandle); hop.cryptoConsumptions.push({ sourceCapabilityId: secretHandle, derivedCapabilityId: derivedHandle, alg }) }
@@ -670,7 +679,6 @@ export class VerifyContext {
     this.recordCrypto(secretHandle, out.exchangeId, out.derivedHandle, out.attestation?.alg ?? alg); return out
   }
   hmacSign(...args: Parameters<VerifyContext['hmac_sign']>): Promise<HmacSignResult> { return this.hmac_sign(...args) }
-
   async jwt_sign(inputOrSecret: JwtSignInput | Record<string, unknown> | string, claimsArg?: Record<string, unknown>, opts?: Omit<JwtSignInput, 'secretHandle' | 'claims'> | string): Promise<JwtSignResult> {
     const isPos = typeof inputOrSecret === 'string' || (claimsArg !== undefined && inputOrSecret && typeof inputOrSecret === 'object' && !('secretHandle' in inputOrSecret))
     const r: Partial<JwtSignInput> = isPos ? (typeof opts === 'string' ? { alg: opts as JwtSignInput['alg'] } : { ...(opts ?? {}) }) : ((inputOrSecret && typeof inputOrSecret === 'object' ? inputOrSecret : {}) as Partial<JwtSignInput>)
@@ -681,7 +689,6 @@ export class VerifyContext {
     this.recordCrypto(secretHandle, out.exchangeId, out.derivedHandle, out.attestation?.alg ?? r.alg); return out
   }
   jwtSign(...args: Parameters<VerifyContext['jwt_sign']>): Promise<JwtSignResult> { return this.jwt_sign(...args) }
-
   async await_async(input: AsyncAwaitInput | Record<string, unknown>): Promise<AsyncAwaitResult> {
     const r = (input && typeof input === 'object' ? input : {}) as AsyncAwaitInput
     const { args: pollRequest } = r.pollRequest !== undefined ? this.buildHttpRpcArgs(r.pollRequest, typeof r.pollRequest === 'string' ? extractInlineHttpOptions(r) : {}) : this.buildHttpRpcArgs(r as HttpTarget)
@@ -698,7 +705,6 @@ export class VerifyContext {
     return out
   }
   awaitAsync(input: AsyncAwaitInput | Record<string, unknown>): Promise<AsyncAwaitResult> { return this.await_async(input) }
-
   private recordProofClaims(ok: boolean, claims: readonly VerifyClaim[]): void { if (claims.length) { if (ok) { this._lastFailedClaims = []; this.claims.push(...claims) } else { this._lastFailedClaims = [...claims] } } }
   async prove_composite(receipt: CompositeProofReceiptInput): Promise<CompositeVerificationResult> {
     const res = await this.callRpc('composite.verify', normalizeCompositeReceipt(receipt, this.defaultOrigin, this._capOrigins), 30_000) as CompositeVerificationResult
@@ -758,19 +764,14 @@ export class VerifyContext {
   }
   prove_injection_differential(input: InjectionDifferentialInput | Record<string, unknown>): Promise<InjectionDifferentialProof> { return this.callProof<InjectionDifferentialProof>('prove.injection', input, 'prove_injection_differential requires { control, probe, expectedOutput?, vulnClass? }.', 70_000, ['control', 'probe']) }
   prove_signed_url_mint(input: SignedUrlMintInput | Record<string, unknown>): Promise<SignedUrlMintProof> { return this.callProof<SignedUrlMintProof>('prove.signedUrlMint', input, 'prove_signed_url_mint requires { control, probe } (or route + controlBody/probeBody, or controlExchangeId/probeExchangeId).', 70_000, ['control', 'probe']) }
-  proveAccessBoundary(input: AccessBoundaryInput | Record<string, unknown>): Promise<AccessBoundaryProof> { return this.prove_access_boundary(input) }
-  provePersistedMutation(input: PersistedMutationInput | Record<string, unknown>): Promise<PersistedMutationProof> { return this.prove_persisted_mutation(input) }
-  proveBooleanOrTimingDiff(input: BooleanOrTimingDiffInput | Record<string, unknown>): Promise<DifferentialProof> { return this.prove_boolean_or_timing_diff(input) }
-  proveInjectionDifferential(input: InjectionDifferentialInput | Record<string, unknown>): Promise<InjectionDifferentialProof> { return this.prove_injection_differential(input) }
-  proveSignedUrlMint(input: SignedUrlMintInput | Record<string, unknown>): Promise<SignedUrlMintProof> { return this.prove_signed_url_mint(input) }
-  proveOobCallback(input: OobCallbackInput | Record<string, unknown>): Promise<OobCallbackProof> { return this.prove_oob_callback(input) }
-  proveRaceBurst(input: RaceBurstInput | Record<string, unknown>): Promise<RaceBurstProof> { return this.prove_race_burst(input) }
+  proveAccessBoundary(i: AccessBoundaryInput | Record<string, unknown>) { return this.prove_access_boundary(i) }; provePersistedMutation(i: PersistedMutationInput | Record<string, unknown>) { return this.prove_persisted_mutation(i) }
+  proveBooleanOrTimingDiff(i: BooleanOrTimingDiffInput | Record<string, unknown>) { return this.prove_boolean_or_timing_diff(i) }; proveInjectionDifferential(i: InjectionDifferentialInput | Record<string, unknown>) { return this.prove_injection_differential(i) }
+  proveSignedUrlMint(i: SignedUrlMintInput | Record<string, unknown>) { return this.prove_signed_url_mint(i) }; proveOobCallback(i: OobCallbackInput | Record<string, unknown>) { return this.prove_oob_callback(i) }; proveRaceBurst(i: RaceBurstInput | Record<string, unknown>) { return this.prove_race_burst(i) }
   result(input: { title: string; severity?: string; description?: string }): ProofResult {
     if (!input.title || !input.title.trim()) throw new Error('Proof result requires a title.')
     return { sdk: 'kovo_verify.ts', nonce: this.nonce, title: input.title.slice(0, 300), severity: (input.severity ?? 'high').slice(0, 32), ...(input.description ? { description: input.description.slice(0, 4000) } : {}), claims: this.effectiveClaims() }
   }
 }
-
 export interface VerificationScript { setup?(ctx: VerifyContext): Promise<void> | void; verify(ctx: VerifyContext): Promise<ProofResult | unknown> | ProofResult | unknown; cleanup?(ctx: VerifyContext): Promise<void> | void }
 export type VerificationEntrypoint = VerificationScript | ((ctx: VerifyContext) => Promise<ProofResult | unknown> | ProofResult | unknown)
 export function defineVerification(script: VerificationScript): VerificationScript { return script }
@@ -783,9 +784,7 @@ function normalizeProofResult(ctx: VerifyContext, returned: unknown, defaultTitl
   }
   return { sdk: 'kovo_verify.ts', nonce: ctx.nonce, title: fallbackTitle, severity: 'high', claims: fallbackClaims }
 }
-function failScript(ctx: VerifyContext, message: string, claims: VerifyClaim[]): void {
-  writeResult({ sdk: 'kovo_verify.ts', nonce: ctx.nonce, error: message.slice(0, 2000), ...(ctx.lastRpcOp ? { lastRpcOp: ctx.lastRpcOp } : {}), claims }); process.stderr.write(`kovo_verify: ${message}\n`); process.exitCode = 1
-}
+function failScript(ctx: VerifyContext, message: string, claims: VerifyClaim[]): void { writeResult({ sdk: 'kovo_verify.ts', nonce: ctx.nonce, error: message.slice(0, 2000), ...(ctx.lastRpcOp ? { lastRpcOp: ctx.lastRpcOp } : {}), claims }); process.stderr.write(`kovo_verify: ${message}\n`); process.exitCode = 1 }
 export async function runVerification(script: VerificationScript, defaultTitle?: string): Promise<void> {
   const ctx = new VerifyContext(); let result: unknown = null
   try { await script.setup?.(ctx); result = await script.verify(ctx); await script.cleanup?.(ctx) } catch (error) { failScript(ctx, error instanceof Error ? error.message : 'Verification script failed.', ctx.effectiveClaims()); return }
