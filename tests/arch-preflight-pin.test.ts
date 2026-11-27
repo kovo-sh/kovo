@@ -518,6 +518,8 @@ describe('Move B: <1ms Pre-Flight Rejection, Negative-Edge Recording, and Litera
     assert.equal(res403.rejectedBy, 'terminal_exchange_not_succeeding')
     assert.equal((res403.evidence as { negativeEdge?: { status?: number; path?: string } })?.negativeEdge?.status, 403)
     assert.equal(rpcOps.includes('composite.verify'), false, 'must NOT call composite.verify RPC on non-2xx terminal')
+    assert.equal(ctx.claims.length, 0, 'failed preflight must not poison ctx.claims')
+    assert.equal(ctx.effectiveClaims().length, 1, 'failed preflight must surface fallback claim via effectiveClaims()')
 
     // 2. Multi-hop literal token carry-over without ch.seal short-circuits BEFORE composite.verify RPC
     const chCarry = ctx.chain('c-carry', 'privilege_escalation')
