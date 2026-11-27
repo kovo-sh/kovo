@@ -123,6 +123,7 @@ export const runs = sqliteTable('runs', {
   workerMaxTurns: integer('worker_max_turns').default(150).notNull(),
   dynamicStepBudget: integer('dynamic_step_budget'),
   multiTrialEnabled: integer('multi_trial_enabled', { mode: 'boolean' }).default(true).notNull(),
+  allowWebSearch: integer('allow_web_search', { mode: 'boolean' }).default(true).notNull(),
   phase0CompletedAt: integer('phase0_completed_at'),
   reviewPlan: text('review_plan', { mode: 'json' }).$type<ReviewPlan>(),
   candidates: text('candidates', { mode: 'json' }).$type<Candidate[]>().notNull(),

@@ -298,6 +298,7 @@ export class ProjectsRepository {
       phase: tables.runs.phase,
       capabilityTier: tables.runs.capabilityTier,
       approvalPolicy: tables.runs.approvalPolicy,
+      allowWebSearch: tables.runs.allowWebSearch,
       spentUsd: tables.runs.spentUsd,
       spentRequests: tables.runs.spentRequests,
       turnsUsed: tables.runs.turnsUsed,
@@ -347,6 +348,7 @@ export class ProjectsRepository {
         })
         return {
           ...r,
+          allowWebSearch: r.allowWebSearch ?? true,
           findingCount: counts?.findingCount ?? 0,
           confirmedCount: counts?.confirmedCount ?? 0,
           activity,

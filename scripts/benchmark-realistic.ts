@@ -3093,6 +3093,8 @@ export function resolveObservedEffectiveConfigForRunner(input: {
   workerSourceHash?: string | null
   sdkVersion?: string | null
   opaqueLabels?: boolean
+  env?: NodeJS.ProcessEnv
+  extra?: Record<string, string | number | boolean | null | undefined>
 }): { observed: boolean; effectiveConfigHash: string; effectiveConfig?: EffectiveConfigSnapshot } {
   if (!input.observed) {
     return {
@@ -3101,7 +3103,12 @@ export function resolveObservedEffectiveConfigForRunner(input: {
       effectiveConfig: undefined,
     }
   }
+  const mergedExtra = {
+    ...(input.opaqueLabels ? { opaqueLabels: true } : {}),
+    ...(input.extra ?? {}),
+  }
   const { effectiveConfigHash, effectiveConfig } = computeEffectiveConfig({
+    ...(input.env ? { env: input.env } : {}),
     observed: input.observed,
     deterministicOnly: input.deterministicOnly,
     environment: input.environment ?? 'local-lab',
@@ -3112,7 +3119,7 @@ export function resolveObservedEffectiveConfigForRunner(input: {
     ...(input.workerImageId ? { workerImageId: input.workerImageId } : {}),
     ...(input.workerSourceHash ? { workerSourceHash: input.workerSourceHash } : {}),
     sdkVersion: input.sdkVersion ?? VERIFY_RPC_SDK_VERSION,
-    ...(input.opaqueLabels ? { extra: { opaqueLabels: true } } : {}),
+    ...(Object.keys(mergedExtra).length > 0 ? { extra: mergedExtra } : {}),
   })
   return { observed: true, effectiveConfigHash, effectiveConfig }
 }
@@ -3613,6 +3620,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
         workerConcurrency: runWorkerConcurrency(args),
         workerMaxTurns: 30,
         multiTrialEnabled: true,
+        allowWebSearch: false,
       })
       runId = createdRun.id
 

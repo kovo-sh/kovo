@@ -1068,7 +1068,7 @@ export const createRun = createServerFn({ method: 'POST' }).validator(newRun)
 /** Testable core for `createRun` instant navigation + non-blocking async subdomain discovery. */
 export function createRunWithAsyncDiscovery(
   db: Store,
-  data: z.infer<typeof newRun>,
+  data: Omit<z.infer<typeof newRun>, 'allowWebSearch'> & { allowWebSearch?: boolean },
   options: {
     discover: typeof runDiscoverySubdomainsForRun
     timeoutMs?: number

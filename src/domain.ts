@@ -757,6 +757,7 @@ export const newRun = z.object({
   workerConcurrency: z.number().int().min(1).max(maxWorkerConcurrency).default(defaultWorkerConcurrency),
   workerMaxTurns: z.number().int().min(1).max(maxWorkerMaxTurns).default(defaultWorkerMaxTurns),
   multiTrialEnabled: z.boolean().default(true),
+  allowWebSearch: z.boolean().default(true),
 })
 
 export const referrerPolicies = [
