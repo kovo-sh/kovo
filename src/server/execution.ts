@@ -247,13 +247,17 @@ function createBroker(options: {
   storage: SecondOrderStore
   canaryBroker: CanaryBroker
   reauth?: BrokerOptions['reauth']
+  mintIsolatedSession?: BrokerOptions['mintIsolatedSession']
 }) {
   const target = process.env.KOVO_NETWORK_FIXTURE
-  const reauthOpt = options.reauth ? { reauth: options.reauth } : {}
+  const authOpts = {
+    ...(options.reauth ? { reauth: options.reauth } : {}),
+    ...(options.mintIsolatedSession ? { mintIsolatedSession: options.mintIsolatedSession } : {}),
+  }
   if (!target) {
     return process.env.KOVO_OFFLINE === '1'
-      ? new RequestBroker({ resolve: async () => [], storage: options.storage, canaryBroker: options.canaryBroker, ...reauthOpt })
-      : new RequestBroker({ storage: options.storage, canaryBroker: options.canaryBroker, ...reauthOpt })
+      ? new RequestBroker({ resolve: async () => [], storage: options.storage, canaryBroker: options.canaryBroker, ...authOpts })
+      : new RequestBroker({ storage: options.storage, canaryBroker: options.canaryBroker, ...authOpts })
   }
   const fixture = new URL(target)
   if (fixture.origin !== target || fixture.hostname !== '127.0.0.1' || fixture.protocol !== 'http:' || !fixture.port) {
@@ -262,7 +266,7 @@ function createBroker(options: {
   return new RequestBroker({
     storage: options.storage,
     canaryBroker: options.canaryBroker,
-    ...reauthOpt,
+    ...authOpts,
     source: 'fixture response',
     resolve: async host => host.endsWith('.private-fixture.example')
       ? [{ address: '127.0.0.1', family: 4 }]
@@ -550,26 +554,17 @@ export class Execution {
     this.broker = options.broker ?? createBroker({ storage, canaryBroker: this.canaryBroker })
     if (!options.broker) {
       this.broker.setReauth(async (personaHandle, runId) => {
-        if (runId) {
-          if (this.personaAuth.sessions.has(personaHandle, runId)) {
-            return this.personaAuth.requestReauth(personaHandle, undefined, runId)
-          }
-          const runScoped = await this.personaAuth.requestReauth(personaHandle, undefined, runId)
-          if (runScoped) return true
-          // Backwards-compatible fallback ONLY for legacy unscoped pool registrations (`entry.runId === undefined`);
-          // never fall back across runs when the handle belongs to a different run.
-          const probe = this.personaAuth.cloneSession(personaHandle)
-          if (probe) {
-            const isUnscoped = !probe.runId
-            probe.dispose()
-            if (isUnscoped) {
-              return this.personaAuth.requestReauth(personaHandle)
-            }
-          }
-          return false
-        }
-        return this.personaAuth.requestReauth(personaHandle)
+        if (!runId) return this.personaAuth.requestReauth(personaHandle)
+        if (this.personaAuth.sessions.has(personaHandle, runId)) return this.personaAuth.requestReauth(personaHandle, undefined, runId)
+        if (await this.personaAuth.requestReauth(personaHandle, undefined, runId)) return true
+        const probe = this.personaAuth.cloneSession(personaHandle)
+        if (!probe) return false
+        const isUnscoped = !probe.runId
+        probe.dispose()
+        return isUnscoped ? this.personaAuth.requestReauth(personaHandle) : false
       })
+      this.broker.setMintIsolatedSession(({ personaHandle, runId, origin }) =>
+        this.personaAuth.mintIsolatedPersonaSession(personaHandle, runId, { storage: this.storage, origin }))
     }
     // `storage` activates second-order canary scanning inside the browser context too.
     this.browser = options.browser ?? new ScopedBrowser(this.broker, { storage })

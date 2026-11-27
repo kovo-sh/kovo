@@ -19,6 +19,12 @@ import type { CanaryBroker, SecondOrderStore } from './canary-broker.ts'
 import { detectSessionExpiry, scanJwtCandidatesLinear } from './persona-auth.ts'
 import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
+import {
+  injectPersonaHeadersOntoOutbound, IsolatedSessionCache, mergeJarAndVaultCookieMaps,
+  refreshBrokerPersonaHeadersForRetry, resolveEffectiveBrokerPersonaHeaders, selectEligibleJarCookies,
+  type IsolatedPersonaSession, type MintIsolatedSessionHandler, type MintIsolatedSessionInput,
+} from './broker-session-isolation.ts'
+export type { IsolatedPersonaSession, MintIsolatedSessionHandler, MintIsolatedSessionInput }
 import { redact, redactHeaders, scanSecretHeaders, scanSecrets } from './redact.ts'
 import type { NamedSecret, SecretMatch } from './redact.ts'
 import {
@@ -537,6 +543,8 @@ export type BrokerOptions = {
    * Returning true retries the request once with freshly resolved persona headers.
    */
   reauth?: (personaHandle: string, runId?: string, origin?: string) => Promise<boolean | void>
+  /** Mint an isolated, non-persisted persona session for control / isolated session requests. */
+  mintIsolatedSession?: MintIsolatedSessionHandler
   /** v7 M4: optional kill-switch instance (defaults to process-wide `globalKillSwitch`). */
   killSwitch?: GlobalKillSwitch
   /** Canonical request admission engine (defaults to `defaultRequestAdmissionEngine`). */
@@ -2038,10 +2046,13 @@ export class RequestBroker {
   /** Per-run scope revision floor so bumping Run A's scope never invalidates Run B. */
   private readonly latestScopeRevisionByRun = new Map<string, number>()
   private reauthHandler?: BrokerOptions['reauth']
+  private mintIsolatedSessionHandler?: BrokerOptions['mintIsolatedSession']
+  private readonly isolatedSessions = new IsolatedSessionCache()
 
   constructor(options: BrokerOptions = {}) {
     this.options = options
     this.reauthHandler = options.reauth
+    this.mintIsolatedSessionHandler = options.mintIsolatedSession
     const safetyBudgets = resolveRunSafetyBudgets({
       ...(options.maxAssignments !== undefined ? { maxAssignments: options.maxAssignments } : {}),
       ...(options.maxRedactedSecretsPerRun !== undefined
@@ -2070,6 +2081,11 @@ export class RequestBroker {
   /** Attach or replace the broker's persona 401 re-authentication callback. */
   setReauth(reauth: BrokerOptions['reauth']): void {
     this.reauthHandler = reauth
+  }
+
+  /** Attach or replace the broker's isolated persona session minter (non-persisted control/session isolation). */
+  setMintIsolatedSession(handler: BrokerOptions['mintIsolatedSession']): void {
+    this.mintIsolatedSessionHandler = handler
   }
 
   private getKillSwitch(): GlobalKillSwitch {
@@ -2528,6 +2544,7 @@ export class RequestBroker {
     this.redactedSecretRefsByRun.delete(key)
     this.redactionCapacityWarnedByRun.delete(key)
     this.redactionCapacitySaturatedByRun.delete(key)
+    this.isolatedSessions.disposeRun(key)
     this.disposeAggregateBuckets(key, this.now())
   }
 
@@ -4350,6 +4367,30 @@ export class RequestBroker {
     deny(`Persona "${personaHandle}" could not be resolved from run grant.`)
   }
 
+  private resolveEffectivePersonaHeaders(
+    req: BrokerHttpRequest, grant: Grant, initialOrigin: string, personaHandle: string | undefined,
+    fallbackHeaders: Record<string, string> | undefined, refreshedHeaders: Record<string, string> | undefined,
+    extraSecrets: NamedSecret[], raceBurst?: boolean,
+  ) {
+    return resolveEffectiveBrokerPersonaHeaders({
+      req, runId: this.resolveScopeRunKey(req, grant), initialOrigin, personaHandle, fallbackHeaders, refreshedHeaders,
+      extraSecrets, isolatedSessions: this.isolatedSessions, mintIsolatedSession: this.mintIsolatedSessionHandler, raceBurst,
+    })
+  }
+
+  private refreshPersonaHeadersForRetry(params: {
+    req: BrokerHttpRequest; grant: Grant; initialOrigin: string; urlOrigin: string; personaHandle: string; isolatedKey: string | null; jar: SessionJar | undefined
+  }) {
+    const { req, grant, initialOrigin, urlOrigin, personaHandle, isolatedKey, jar } = params
+    return refreshBrokerPersonaHeadersForRetry({
+      runId: this.resolveScopeRunKey(req, grant), reauthRunId: req.runId ?? grant.scopePolicy?.runId ?? undefined,
+      initialOrigin, urlOrigin, personaHandle, isolatedKey, isolatedSessions: this.isolatedSessions,
+      mintIsolatedSession: this.mintIsolatedSessionHandler, reauthHandler: this.reauthHandler,
+      rebuildSharedHeaders: () => { const p = grant.personas?.get(personaHandle); return p ? buildPersonaHeader(p, initialOrigin) : null },
+      clearJarCookies: rebuilt => this.clearRefreshedJarCookies(jar, rebuilt),
+    })
+  }
+
   private async applyAuthMutationIfNeeded(
     prepared: ReturnType<RequestBroker['prepareHttpRequest']>,
     req: BrokerHttpRequest,
@@ -4663,7 +4704,11 @@ export class RequestBroker {
       maxRps,
       timeoutMs,
     } = prepared
-    let personaHeaders = options.refreshedPersonaHeaders ?? prepared.resolvedPersonaHeaders
+    const exchangeExtraSecrets: NamedSecret[] = []
+    const effectivePersona = await this.resolveEffectivePersonaHeaders(
+      req, grant, initialOrigin, personaHandle, prepared.resolvedPersonaHeaders, options.refreshedPersonaHeaders, exchangeExtraSecrets, options.raceBurst,
+    )
+    let personaHeaders = effectivePersona.personaHeaders
     let url = new URL(prepared.url.href)
     const jar = this.getOrCreateSessionJar(req, grant)
 
@@ -4673,7 +4718,6 @@ export class RequestBroker {
 
     const redirectOrigins = new Set<string>([url.origin])
     const redirectPaths: string[] = []
-    const exchangeExtraSecrets: NamedSecret[] = []
     let activeMethod: BrokerHttpRequest['method'] = req.method
     let activeBody = prepared.preparedBody
     let activeHeaders = { ...cleanHeaders }
@@ -4777,19 +4821,9 @@ export class RequestBroker {
       check()
 
       const outboundHeaders = stripRedirectHeaders(activeHeaders, stripSensitiveHeaders, stripEntityHeaders)
-      let personaCookieRaw: string | undefined
-      const vaultHeaderNames: string[] = []
-      if (includePersona && personaHeaders) {
-        for (const [k, v] of Object.entries(personaHeaders)) {
-          if (k.toLowerCase() === 'cookie') {
-            personaCookieRaw = v
-          } else if (!(stripSensitiveHeaders && crossOriginSensitiveHeaders.has(k.toLowerCase()))) {
-            // Preserve canonical persona header casing (e.g. `Authorization`) after case-insensitive deduplication.
-            setHeaderCaseInsensitive(outboundHeaders, k, v)
-            vaultHeaderNames.push(k.toLowerCase())
-          }
-        }
-      }
+      const { personaCookieRaw, vaultHeaderNames } = injectPersonaHeadersOntoOutbound({
+        includePersona, personaHeaders, outboundHeaders, stripSensitiveHeaders, crossOriginSensitiveHeaders, setHeader: setHeaderCaseInsensitive,
+      })
       if (prepared.syntheticAuthHeader && !stripSensitiveHeaders) {
         setHeaderCaseInsensitive(
           outboundHeaders,
@@ -4806,21 +4840,9 @@ export class RequestBroker {
       // Invariant: the Vault credential wins over a colliding jar cookie UNLESS the jar
       // observed a genuine rotation (2+ Set-Cookie writes for that name), in which case
       // the fresh rotated value supersedes the stale vault cookie.
-      const mergedCookies = new Map<string, string>()
-      const jarCookieByName = new Map<string, JarCookieEntry>()
-      if (jar) {
-        const now = Date.now()
-        for (const entry of jar.cookies.values()) {
-          if (!cookieDomainMatches(entry, url)) continue
-          if (entry.expiresAt !== undefined && entry.expiresAt <= now) continue
-          if (entry.secure && url.protocol !== 'https:') continue
-          if (!cookiePathMatches(url.pathname, entry.path)) continue
-          const sameSiteLower = entry.sameSite?.toLowerCase()
-          if (isCrossOriginHop && sameSiteLower === 'strict') continue
-          if (isCrossOriginHop && sameSiteLower === 'lax' && activeMethod !== 'GET' && activeMethod !== 'HEAD') continue
-          jarCookieByName.set(entry.name, entry)
-        }
-      }
+      const jarCookieByName = selectEligibleJarCookies({
+        cookies: jar?.cookies.values(), url, isCrossOriginHop, activeMethod, domainMatches: cookieDomainMatches, pathMatches: cookiePathMatches,
+      })
       const vaultCookies = personaCookieRaw ? parseCookieHeaderPairs(personaCookieRaw) : new Map<string, string>()
       // A session cookie is the server's handle on one identity. Two different personas presenting
       // the *same* login-minted session cookie are the same server session, so at most one of them
@@ -4838,23 +4860,16 @@ export class RequestBroker {
         // bytes on the wire and any claim drawn from them belong to the wrong actor. Send nothing.
         deny(`Persona scope mismatch: the credential for "${personaHandle}" is the session of another persona; no request was sent. Re-mint this persona's login before scanning.`)
       }
-      const jarCookieNames: string[] = []
-      const vaultCookieNames: string[] = []
-      const personaUpdatedAtMs = personaVaultUpdatedAtMs(personaHandle ? grant.personas?.get(personaHandle) : undefined)
+      const personaUpdatedAtMs = Math.max(
+        personaVaultUpdatedAtMs(personaHandle ? grant.personas?.get(personaHandle) : undefined),
+        effectivePersona.isolatedMintedAt,
+      )
       const jarVaultRefreshedAtMs = jar?.vaultRefreshedAt ?? 0
-      for (const [name, entry] of jarCookieByName) {
-        const vaultVal = vaultCookies.get(name)
-        if (vaultVal === undefined || jarCookieSupersedesVault(entry, vaultVal, personaUpdatedAtMs, jarVaultRefreshedAtMs)) {
-          mergedCookies.set(name, entry.value)
-          jarCookieNames.push(name)
-        }
-      }
-      for (const [k, v] of vaultCookies) {
-        const jarEntry = jarCookieByName.get(k)
-        if (jarEntry && jarCookieSupersedesVault(jarEntry, v, personaUpdatedAtMs, jarVaultRefreshedAtMs)) continue
-        mergedCookies.set(k, v)
-        vaultCookieNames.push(k)
-      }
+      const { mergedCookies, jarCookieNames, vaultCookieNames } = mergeJarAndVaultCookieMaps({
+        jarCookieByName,
+        vaultCookies,
+        supersedes: (entry, vaultVal) => jarCookieSupersedesVault(entry, vaultVal, personaUpdatedAtMs, jarVaultRefreshedAtMs),
+      })
       if (mergedCookies.size > 0) {
         setHeaderCaseInsensitive(
           outboundHeaders,
@@ -5061,21 +5076,19 @@ export class RequestBroker {
         personaHandle &&
         !req.authMutation &&
         !options.reauthAttempted &&
-        this.reauthHandler &&
+        (effectivePersona.isolatedKey ? this.mintIsolatedSessionHandler : this.reauthHandler) &&
         !deadline.aborted &&
         this.shouldAutoReauthOnResponse(response, url, personaHandle, grant)
       ) {
-        const reauthRunId = req.runId ?? grant.scopePolicy?.runId ?? undefined
-        const refreshed = await this.reauthHandler(personaHandle, reauthRunId, url.origin).catch(() => false)
-        if (refreshed !== false) {
-          const refreshedPersona = grant.personas?.get(personaHandle)
-          const rebuilt = refreshedPersona ? buildPersonaHeader(refreshedPersona, initialOrigin) : null
-          this.clearRefreshedJarCookies(jar, rebuilt)
+        const refreshed = await this.refreshPersonaHeadersForRetry({
+          req, grant, initialOrigin, urlOrigin: url.origin, personaHandle, isolatedKey: effectivePersona.isolatedKey, jar,
+        })
+        if (refreshed.ok) {
           const refreshedPrepared = { ...prepared, secrets: collectSecrets(req, grant) }
           return this.executePreparedHttp(refreshedPrepared, req, grant, signal, {
             ...options,
             reauthAttempted: true,
-            ...(rebuilt ? { refreshedPersonaHeaders: rebuilt } : {}),
+            ...(refreshed.rebuilt ? { refreshedPersonaHeaders: refreshed.rebuilt } : {}),
           })
         }
       }
@@ -5264,6 +5277,7 @@ export class RequestBroker {
       invalidatedJars += 1
     }
     const owners = this.personaSessionOwnersByRun.get(runKey)
+    this.isolatedSessions.evictPersona(runKey, input.personaHandle)
     if (owners) {
       for (const [fp, ownerPersona] of owners.entries()) {
         if (ownerPersona === input.personaHandle) owners.delete(fp)
@@ -5333,7 +5347,11 @@ export class RequestBroker {
         timeoutMs,
       } = prepared
       const url = new URL(prepared.url.href)
-      const personaHeaders = internalOptions.refreshedPersonaHeaders ?? prepared.resolvedPersonaHeaders
+      const h2ExtraSecrets: NamedSecret[] = []
+      const effectivePersona = await this.resolveEffectivePersonaHeaders(
+        req, grant, initialOrigin, personaHandle, prepared.resolvedPersonaHeaders, internalOptions.refreshedPersonaHeaders, h2ExtraSecrets,
+      )
+      const personaHeaders = effectivePersona.personaHeaders
       const includePersona = Boolean(personaHeaders && Object.keys(personaHeaders).length > 0)
       const jar = this.getOrCreateSessionJar(req, grant)
 
@@ -5415,34 +5433,16 @@ export class RequestBroker {
         outboundHeaders['x-kovo-trace-id'] = req.traceId.slice(0, 128)
       }
 
-      let personaCookieRaw: string | undefined
-      const vaultHeaderNames: string[] = []
-      if (includePersona && personaHeaders) {
-        for (const [k, v] of Object.entries(personaHeaders)) {
-          if (k.toLowerCase() === 'cookie') {
-            personaCookieRaw = v
-          } else {
-            setHeaderCaseInsensitive(outboundHeaders, k, v)
-            vaultHeaderNames.push(k.toLowerCase())
-          }
-        }
-      }
+      const { personaCookieRaw, vaultHeaderNames } = injectPersonaHeadersOntoOutbound({
+        includePersona, personaHeaders, outboundHeaders, stripSensitiveHeaders: false, setHeader: setHeaderCaseInsensitive,
+      })
       if (prepared.syntheticAuthHeader) {
         outboundHeaders[prepared.syntheticAuthHeader.name.toLowerCase()] = prepared.syntheticAuthHeader.value
       }
 
-      const mergedCookies = new Map<string, string>()
-      const jarCookieByName = new Map<string, JarCookieEntry>()
-      if (jar) {
-        const now = Date.now()
-        for (const entry of jar.cookies.values()) {
-          if (!cookieDomainMatches(entry, url)) continue
-          if (entry.expiresAt !== undefined && entry.expiresAt <= now) continue
-          if (entry.secure && url.protocol !== 'https:') continue
-          if (!cookiePathMatches(url.pathname, entry.path)) continue
-          jarCookieByName.set(entry.name, entry)
-        }
-      }
+      const jarCookieByName = selectEligibleJarCookies({
+        cookies: jar?.cookies.values(), url, isCrossOriginHop: false, activeMethod: req.method, domainMatches: cookieDomainMatches, pathMatches: cookiePathMatches,
+      })
       const vaultCookies = personaCookieRaw ? parseCookieHeaderPairs(personaCookieRaw) : new Map<string, string>()
       if (personaHandle && vaultCookies.size > 0 &&
         this.notePersonaSessionSharing({
@@ -5454,23 +5454,16 @@ export class RequestBroker {
         })) {
         deny(`Persona scope mismatch: the credential for "${personaHandle}" is the session of another persona; no request was sent. Re-mint this persona's login before scanning.`)
       }
-      const jarCookieNames: string[] = []
-      const vaultCookieNames: string[] = []
-      const personaUpdatedAtMs = personaVaultUpdatedAtMs(personaHandle ? grant.personas?.get(personaHandle) : undefined)
+      const personaUpdatedAtMs = Math.max(
+        personaVaultUpdatedAtMs(personaHandle ? grant.personas?.get(personaHandle) : undefined),
+        effectivePersona.isolatedMintedAt,
+      )
       const jarVaultRefreshedAtMs = jar?.vaultRefreshedAt ?? 0
-      for (const [name, entry] of jarCookieByName) {
-        const vaultVal = vaultCookies.get(name)
-        if (vaultVal === undefined || jarCookieSupersedesVault(entry, vaultVal, personaUpdatedAtMs, jarVaultRefreshedAtMs)) {
-          mergedCookies.set(name, entry.value)
-          jarCookieNames.push(name)
-        }
-      }
-      for (const [k, v] of vaultCookies) {
-        const jarEntry = jarCookieByName.get(k)
-        if (jarEntry && jarCookieSupersedesVault(jarEntry, v, personaUpdatedAtMs, jarVaultRefreshedAtMs)) continue
-        mergedCookies.set(k, v)
-        vaultCookieNames.push(k)
-      }
+      const { mergedCookies, jarCookieNames, vaultCookieNames } = mergeJarAndVaultCookieMaps({
+        jarCookieByName,
+        vaultCookies,
+        supersedes: (entry, vaultVal) => jarCookieSupersedesVault(entry, vaultVal, personaUpdatedAtMs, jarVaultRefreshedAtMs),
+      })
       if (mergedCookies.size > 0) {
         setHeaderCaseInsensitive(
           outboundHeaders,
@@ -5602,24 +5595,21 @@ export class RequestBroker {
         personaHandle &&
         !req.authMutation &&
         !internalOptions.reauthAttempted &&
-        this.reauthHandler &&
+        (effectivePersona.isolatedKey ? this.mintIsolatedSessionHandler : this.reauthHandler) &&
         !deadline.aborted &&
         this.shouldAutoReauthOnResponse(response, url, personaHandle, grant)
       ) {
-        const reauthRunId = req.runId ?? grant.scopePolicy?.runId ?? undefined
-        const refreshed = await this.reauthHandler(personaHandle, reauthRunId, url.origin).catch(() => false)
-        if (refreshed !== false) {
-          const refreshedPersona = grant.personas?.get(personaHandle)
-          const rebuilt = refreshedPersona ? buildPersonaHeader(refreshedPersona, initialOrigin) : null
-          this.clearRefreshedJarCookies(jar, rebuilt)
+        const refreshed = await this.refreshPersonaHeadersForRetry({
+          req, grant, initialOrigin, urlOrigin: url.origin, personaHandle, isolatedKey: effectivePersona.isolatedKey, jar,
+        })
+        if (refreshed.ok) {
           return this.executeHttp2Exchange(req, grant, signal, {
             reauthAttempted: true,
-            ...(rebuilt ? { refreshedPersonaHeaders: rebuilt } : {}),
+            ...(refreshed.rebuilt ? { refreshedPersonaHeaders: refreshed.rebuilt } : {}),
           })
         }
       }
 
-      const h2ExtraSecrets: NamedSecret[] = []
       if (jar) {
         const jarDelta = this.storeJarCookiesAndCsrf(
           jar,

@@ -41,6 +41,9 @@ import {
 } from './egress-gateway.ts'
 import type { AddressClass, EgressLoopbackProxy } from './egress-gateway.ts'
 import {
+  bundleSecrets,
+  extractScrubbableCookieMapNeedles,
+  frameForSessionOrigin,
   isBrowserSessionConfig,
   isSessionExpired,
   normalizeClerkClientCookie,
@@ -59,7 +62,12 @@ import type {
   PersonaStorageSnapshot,
   ResolvedPersona,
 } from './persona-vault.ts'
-import { bundleSecrets, extractScrubbableCookieMapNeedles, frameForSessionOrigin } from './persona-vault.ts'
+import {
+  mintedSessionToIsolatedResult,
+  resolveIsolatedPersonaTarget,
+  type IsolatedPersonaSession,
+  type IsolatedPersonaTarget,
+} from './broker-session-isolation.ts'
 import { globalKillSwitch, KillSwitchTrippedError } from './kill-switch.ts'
 import type { GlobalKillSwitch } from './kill-switch.ts'
 import { isCredentialScopeHost, normalizeHostname, registrableDomain } from './public-suffix.ts'
@@ -1862,6 +1870,7 @@ interface RunRefresherControllerEntry {
   controller: AbortController
   releaseKillSwitch: () => void
   releaseOuterSignal?: () => void
+  personas?: Map<string, IsolatedPersonaTarget>
 }
 
 export class PersonaAuthManager {
@@ -2318,13 +2327,41 @@ export class PersonaAuthManager {
     }
   }
 
+  private finishSession(sessionPath: string | undefined, session: MintedPersonaSession, persist: boolean): MintedPersonaSession {
+    if (persist && sessionPath) writePersonaSessionFile(sessionPath, session)
+    return session
+  }
+
+  /** Mint a fresh, isolated persona session without persisting or rotating `sessionPool`; returns `null` for non-login static personas. */
+  async mintIsolatedPersonaSession(
+    personaHandle: string,
+    runId?: string,
+    options: { storage?: Store; projectId?: string; personaId?: string; origin?: string; signal?: AbortSignal } = {},
+  ): Promise<IsolatedPersonaSession | null> {
+    const runKey = normalizePoolRunId(runId)
+    const entry = runKey ? this.runControllers.get(runKey) : undefined
+    const target = resolveIsolatedPersonaTarget(personaHandle, runKey, entry?.personas?.get(personaHandle), options)
+    if (!target) return null
+    const persona = [...resolveRunPersonas(target.storage, target.projectId, [target.personaId]).values()][0]
+    if (!persona || persona.authKind !== 'login' || !persona.secretPath || !persona.loginConfig) return null
+    const runSignal = entry?.controller.signal
+    const effectiveSignal = options.signal && runSignal ? AbortSignal.any([options.signal, runSignal]) : (options.signal ?? runSignal)
+    if (effectiveSignal?.aborted) return null
+    const authRes = await this.authenticatePersona(target.storage, target.projectId, target.personaId, effectiveSignal, runKey, { persist: false })
+    if (!authRes.session) return null
+    const origin = options.origin && persona.originAllowlist.includes(options.origin) ? options.origin : persona.originAllowlist[0]
+    return origin ? mintedSessionToIsolatedResult(authRes.session, persona.originAllowlist, origin, persona.headerName) : null
+  }
+
   async authenticatePersona(
     storage: Store,
     projectId: string,
     personaId: string,
     signal?: AbortSignal,
     runId?: string,
+    options?: { persist?: boolean },
   ): Promise<AuthenticateResult> {
+    const persist = options?.persist !== false
     const project = storage.project(projectId)
     const tenantId = project.tenantId ?? null
     this.killSwitch.assertAllowed(tenantId)
@@ -2337,7 +2374,7 @@ export class PersonaAuthManager {
     if (persona.authKind !== 'login') {
       throw new PersonaAuthError('UNSUPPORTED_ADAPTER', `Persona "${persona.handle}" uses static ${persona.authKind} auth, not email+password login.`)
     }
-    if (!persona.secretPath || !persona.sessionPath || !persona.loginConfig) {
+    if (!persona.secretPath || (persist && !persona.sessionPath) || !persona.loginConfig) {
       throw new PersonaAuthError('AUTH_FAILED', `Persona "${persona.handle}" is missing login configuration or credential file.`)
     }
 
@@ -2347,8 +2384,6 @@ export class PersonaAuthManager {
       throw new PersonaAuthError('AUTH_FAILED', `Persona "${persona.handle}" has no allowlisted origin configured.`)
     }
 
-    // Universal IdP-agnostic browser session path (primary): refresh via headless Playwright
-    // storageState with zero IdP-specific code.
     if (isBrowserSessionConfig(config as { adapter?: string })) {
       const browserCfg = config as unknown as BrowserSessionLoginConfig
       const preferredVerifyOrigin = (() => {
@@ -2356,37 +2391,27 @@ export class PersonaAuthManager {
         try {
           const normalizedVerify = new URL(browserCfg.verifyOrigin.trim()).origin
           for (const allowed of persona.originAllowlist) {
-            try {
-              if (new URL(allowed).origin === normalizedVerify) return normalizedVerify
-            } catch { /* ignore malformed entry */ }
+            try { if (new URL(allowed).origin === normalizedVerify) return normalizedVerify } catch { /* ignore malformed entry */ }
           }
-        } catch {
-          // Ignore malformed verifyOrigin and fall back to originAllowlist[0].
-        }
+        } catch { /* fallback to originAllowlist[0] */ }
         return null
       })()
       const browserTargetOrigin = preferredVerifyOrigin ?? defaultTargetOrigin
-      return await this.authenticateBrowserSession(storage, projectId, persona, browserCfg, browserTargetOrigin, signal, tenantId, runId)
+      return await this.authenticateBrowserSession(storage, projectId, persona, browserCfg, browserTargetOrigin, signal, tenantId, runId, persist)
     }
 
     const targetOrigin = defaultTargetOrigin
-
-    const { email, password } = readLoginCredentialFile(persona.secretPath, {
-      allowEmptyEmail: config.adapter === 'clerk_client',
-    })
+    const { email, password } = readLoginCredentialFile(persona.secretPath, { allowEmptyEmail: config.adapter === 'clerk_client' })
 
     let adapter: Exclude<PersonaLoginAdapter, 'auto'> | 'oidc'
     let detectedClerkFapiOrigin: string | null = null
     let detectedSupabase: { origin: string | null; apiKey: string | null } | undefined
-
     const crossOriginAuthUrl = (() => {
       if (!config.loginUrl) return false
       try {
         const loginOrigin = new URL(config.loginUrl).origin
         return loginOrigin !== targetOrigin && isOriginInScope(loginOrigin, persona.originAllowlist)
-      } catch {
-        return false
-      }
+      } catch { return false }
     })()
 
     if ((config.adapter as string) === 'oidc') {
@@ -2397,7 +2422,6 @@ export class PersonaAuthManager {
         adapter = 'supabase'
         detectedSupabase = { origin: inspected.supabaseOrigin, apiKey: inspected.supabaseAnonKey }
       } else if (crossOriginAuthUrl) {
-        // An allowlisted external login URL is an SSO/IdP hop, not the app's own form.
         adapter = 'oidc'
       } else if (inspected.hasClerk) {
         adapter = 'clerk'
@@ -2417,22 +2441,18 @@ export class PersonaAuthManager {
     }
 
     switch (adapter) {
-      /** @deprecated Prefer universal `browser_session` for SSO / OIDC / MFA apps. Kept for backward compatibility. */
       case 'oidc':
-        return await this.authenticateOidc(persona, config, email, password, targetOrigin, signal, tenantId)
-      /** @deprecated Prefer universal `browser_session` for Clerk apps. Kept for backward compatibility. */
+        return await this.authenticateOidc(persona, config, email, password, targetOrigin, signal, tenantId, persist)
       case 'clerk':
-        return await this.authenticateClerk(persona, config, email, password, targetOrigin, detectedClerkFapiOrigin, signal, tenantId)
-      /** @deprecated Prefer universal `browser_session` for Clerk apps. Kept for backward compatibility. */
+        return await this.authenticateClerk(persona, config, email, password, targetOrigin, detectedClerkFapiOrigin, signal, tenantId, persist)
       case 'clerk_client':
-        return await this.authenticateClerkClientCookie(persona, config, password, targetOrigin, signal, tenantId)
-      /** @deprecated Prefer universal `browser_session` for Supabase apps. Kept for backward compatibility. */
+        return await this.authenticateClerkClientCookie(persona, config, password, targetOrigin, signal, tenantId, persist)
       case 'supabase':
-        return await this.authenticateSupabase(persona, config, email, password, targetOrigin, detectedSupabase, signal, tenantId)
+        return await this.authenticateSupabase(persona, config, email, password, targetOrigin, detectedSupabase, signal, tenantId, persist)
       case 'json':
-        return await this.authenticateJson(persona, config, email, password, targetOrigin, signal, tenantId)
+        return await this.authenticateJson(persona, config, email, password, targetOrigin, signal, tenantId, persist)
       case 'form':
-        return await this.authenticateForm(persona, config, email, password, targetOrigin, signal, tenantId)
+        return await this.authenticateForm(persona, config, email, password, targetOrigin, signal, tenantId, persist)
     }
   }
 
@@ -2574,6 +2594,7 @@ export class PersonaAuthManager {
     signal?: AbortSignal,
     tenantId?: string | null,
     runId?: string,
+    persist = true,
   ): Promise<AuthenticateResult> {
     const project = storage.project(projectId)
     const effectiveTenantId = tenantId !== undefined ? tenantId : (project.tenantId ?? null)
@@ -2630,12 +2651,12 @@ export class PersonaAuthManager {
             verifyPath,
             allowLocalLab,
             priorObservedHeaders: bundle.observedHeaders,
-            persistBundlePath: persona.secretPath!,
+            ...(persist ? { persistBundlePath: persona.secretPath! } : {}),
             signal: ksBound.signal,
             ...(this.launchBrowserSession ? { launchBrowser: this.launchBrowserSession } : {}),
             resolveHost: this.resolveHost,
           })
-          writePersonaSessionFile(persona.sessionPath!, refreshed.session)
+          this.finishSession(persona.sessionPath, refreshed.session, persist)
           return refreshed
         } catch (err) {
           if (err instanceof KillSwitchTrippedError) throw err
@@ -2766,16 +2787,17 @@ export class PersonaAuthManager {
     email: string
     extraSecrets?: readonly string[]
     tenantId?: string | null
+    persist?: boolean
   }): {
-    mintFreshToken: (signal?: AbortSignal) => Promise<{ jwt: string; expiresAt: number }>
+    mintFreshToken: (signal?: AbortSignal) => Promise<{ jwt: string; expiresAt: number; session: MintedPersonaSession }>
     getClientCookie: () => string
   } {
     let clientCookie = params.initialClientCookie
     let jwt = ''
-    let inFlight: Promise<{ jwt: string; expiresAt: number }> | null = null
+    let inFlight: Promise<{ jwt: string; expiresAt: number; session: MintedPersonaSession }> | null = null
     const extraSecrets = (params.extraSecrets ?? []).filter(Boolean)
 
-    const mintFreshToken = (refreshSignal?: AbortSignal): Promise<{ jwt: string; expiresAt: number }> => {
+    const mintFreshToken = (refreshSignal?: AbortSignal): Promise<{ jwt: string; expiresAt: number; session: MintedPersonaSession }> => {
       this.killSwitch.assertAllowed(params.tenantId ?? null)
       if (refreshSignal?.aborted) {
         return Promise.reject(
@@ -2785,7 +2807,7 @@ export class PersonaAuthManager {
         )
       }
       if (inFlight) return inFlight
-      const task = (async (): Promise<{ jwt: string; expiresAt: number }> => {
+      const task = (async (): Promise<{ jwt: string; expiresAt: number; session: MintedPersonaSession }> => {
         try {
           if (!params.sessionId) {
             throw new PersonaAuthError('AUTH_FAILED', 'Clerk sign-in did not return a session ID for token refresh.')
@@ -2855,15 +2877,11 @@ export class PersonaAuthManager {
             params.authHeaderToken ?? '',
             ...extraSecrets,
           ].filter(Boolean)
-          writePersonaSessionFile(params.persona.sessionPath!, {
-            headerType: 'cookie',
-            value: cookieHeader,
-            expiresAt,
-            adapterUsed: 'clerk',
-            scrubTokens,
-          })
+          const session = this.finishSession(params.persona.sessionPath, {
+            headerType: 'cookie', value: cookieHeader, expiresAt, adapterUsed: 'clerk', scrubTokens,
+          }, params.persist !== false)
           jwt = freshJwt
-          return { jwt: freshJwt, expiresAt }
+          return { jwt: freshJwt, expiresAt, session }
         } finally {
           inFlight = null
         }
@@ -2885,6 +2903,7 @@ export class PersonaAuthManager {
     targetOrigin: string,
     signal?: AbortSignal,
     tenantId?: string | null,
+    persist = true,
   ): Promise<AuthenticateResult> {
     const initialClientCookie = normalizeClerkClientCookie(rawClientCookie)
     if (!initialClientCookie) {
@@ -2990,18 +3009,14 @@ export class PersonaAuthManager {
       email: actorLabel,
       extraSecrets: [rawClientCookie, initialClientCookie, effectiveClientCookie],
       tenantId,
+      persist,
     })
 
-    const { expiresAt } = await mintFreshToken(signal)
+    const { expiresAt, session } = await mintFreshToken(signal)
     const refreshIntervalSec = config.refreshIntervalSec ?? DEFAULT_CLERK_REFRESH_SEC
     return {
-      personaId: persona.id,
-      handle: persona.handle,
-      adapterUsed: 'clerk',
-      headerType: 'cookie',
-      expiresAt,
-      refreshIntervalSec,
-      refresh: async (refreshSignal?: AbortSignal) => { await mintFreshToken(refreshSignal) },
+      personaId: persona.id, handle: persona.handle, adapterUsed: 'clerk', headerType: 'cookie', expiresAt, session,
+      ...(persist ? { refreshIntervalSec, refresh: async (refreshSignal?: AbortSignal) => { await mintFreshToken(refreshSignal) } } : {}),
     }
   }
 
@@ -3014,6 +3029,7 @@ export class PersonaAuthManager {
     detectedClerkFapiOrigin: string | null,
     signal?: AbortSignal,
     tenantId?: string | null,
+    persist = true,
   ): Promise<AuthenticateResult> {
     const fapiOrigin = await this.resolveClerkFapiOrigin(persona, config, targetOrigin, detectedClerkFapiOrigin, signal, tenantId)
     const clerkAllowlist = this.clerkFapiAllowlist(persona, config, fapiOrigin)
@@ -3123,9 +3139,11 @@ export class PersonaAuthManager {
       email,
       extraSecrets: [password],
       tenantId,
+      persist,
     })
 
     let expiresAt: number
+    let session: MintedPersonaSession
     if (!jwt) {
       if (!sessionId || (!clientCookie && !authHeaderToken)) {
         throw new PersonaAuthError(
@@ -3136,29 +3154,22 @@ export class PersonaAuthManager {
       const minted = await mintFreshToken(signal)
       jwt = minted.jwt
       expiresAt = minted.expiresAt
+      session = minted.session
     } else {
       const claims = decodeJwtPayload(jwt)
       const iat = claims?.iat ?? Math.floor(Date.now() / 1000)
       expiresAt = claims?.exp ? claims.exp * 1000 : Date.now() + 55_000
       const cookieHeader = `__session=${jwt}; __client_uat=${iat}`
       const scrubTokens = [jwt, clientCookie, authHeaderToken].filter(Boolean)
-      writePersonaSessionFile(persona.sessionPath!, {
-        headerType: 'cookie',
-        value: cookieHeader,
-        expiresAt,
-        adapterUsed: 'clerk',
-        scrubTokens,
-      })
+      session = this.finishSession(persona.sessionPath, {
+        headerType: 'cookie', value: cookieHeader, expiresAt, adapterUsed: 'clerk', scrubTokens,
+      }, persist)
     }
 
     const refreshIntervalSec = config.refreshIntervalSec ?? DEFAULT_CLERK_REFRESH_SEC
-    const canRefresh = Boolean(sessionId && (getClientCookie() || authHeaderToken))
+    const canRefresh = persist && Boolean(sessionId && (getClientCookie() || authHeaderToken))
     return {
-      personaId: persona.id,
-      handle: persona.handle,
-      adapterUsed: 'clerk',
-      headerType: 'cookie',
-      expiresAt,
+      personaId: persona.id, handle: persona.handle, adapterUsed: 'clerk', headerType: 'cookie', expiresAt, session,
       refreshIntervalSec: canRefresh ? refreshIntervalSec : undefined,
       refresh: canRefresh ? async (refreshSignal?: AbortSignal) => { await mintFreshToken(refreshSignal) } : undefined,
     }
@@ -3192,6 +3203,7 @@ export class PersonaAuthManager {
     detectedSupabase?: { origin: string | null; apiKey: string | null },
     signal?: AbortSignal,
     tenantId?: string | null,
+    persist = true,
   ): Promise<AuthenticateResult> {
     const ext = config as PersonaLoginConfig & {
       apikey?: string
@@ -3301,13 +3313,9 @@ export class PersonaAuthManager {
       ? body.expires_at * 1000
       : Date.now() + expiresInSec * 1000
 
-    writePersonaSessionFile(persona.sessionPath!, {
-      headerType: 'bearer',
-      value: accessToken,
-      expiresAt,
-      adapterUsed: 'supabase',
-      scrubTokens: [accessToken, refreshToken].filter(Boolean),
-    })
+    const session = this.finishSession(persona.sessionPath, {
+      headerType: 'bearer', value: accessToken, expiresAt, adapterUsed: 'supabase', scrubTokens: [accessToken, refreshToken].filter(Boolean),
+    }, persist)
 
     const refreshUrlObj = new URL(loginUrl)
     refreshUrlObj.searchParams.set('grant_type', 'refresh_token')
@@ -3372,13 +3380,9 @@ export class PersonaAuthManager {
     }
 
     return {
-      personaId: persona.id,
-      handle: persona.handle,
-      adapterUsed: 'supabase',
-      headerType: 'bearer',
-      expiresAt,
-      refreshIntervalSec: refreshToken ? refreshIntervalSec : undefined,
-      refresh: refreshToken ? doRefresh : undefined,
+      personaId: persona.id, handle: persona.handle, adapterUsed: 'supabase', headerType: 'bearer', expiresAt, session,
+      refreshIntervalSec: persist && refreshToken ? refreshIntervalSec : undefined,
+      refresh: persist && refreshToken ? doRefresh : undefined,
     }
   }
 
@@ -3390,6 +3394,7 @@ export class PersonaAuthManager {
     targetOrigin: string,
     signal?: AbortSignal,
     tenantId?: string | null,
+    persist = true,
   ): Promise<AuthenticateResult> {
     // Optional v5 session-hardening knobs (accepted structurally so older persisted configs stay valid).
     const ext = config as PersonaLoginConfig & {
@@ -3540,20 +3545,13 @@ export class PersonaAuthManager {
             return task
           }
         : undefined
-      writePersonaSessionFile(persona.sessionPath!, {
-        headerType: 'bearer',
-        value: token,
-        expiresAt,
-        adapterUsed: 'json',
+      const session = this.finishSession(persona.sessionPath, {
+        headerType: 'bearer', value: token, expiresAt, adapterUsed: 'json',
         scrubTokens: [token, ...(currentRefreshToken ? [currentRefreshToken] : []), ...scrub],
-      })
+      }, persist)
       return {
-        personaId: persona.id,
-        handle: persona.handle,
-        adapterUsed: 'json',
-        headerType: 'bearer',
-        expiresAt,
-        ...(doRefresh ? { refresh: doRefresh, refreshIntervalSec } : {}),
+        personaId: persona.id, handle: persona.handle, adapterUsed: 'json', headerType: 'bearer', expiresAt, session,
+        ...(persist && doRefresh ? { refresh: doRefresh, refreshIntervalSec } : {}),
       }
     }
 
@@ -3575,18 +3573,10 @@ export class PersonaAuthManager {
     if (cookies.size > 0) {
       const cookieHeader = cookiesToHeader(cookies)
       const scrubTokens = extractScrubbableCookieMapNeedles(cookies)
-      writePersonaSessionFile(persona.sessionPath!, {
-        headerType: 'cookie',
-        value: cookieHeader,
-        adapterUsed: 'json',
-        scrubTokens,
-      })
-      return {
-        personaId: persona.id,
-        handle: persona.handle,
-        adapterUsed: 'json',
-        headerType: 'cookie',
-      }
+      const session = this.finishSession(persona.sessionPath, {
+        headerType: 'cookie', value: cookieHeader, adapterUsed: 'json', scrubTokens,
+      }, persist)
+      return { personaId: persona.id, handle: persona.handle, adapterUsed: 'json', headerType: 'cookie', session }
     }
 
     // 4. Standard JSON token fields.
@@ -3626,7 +3616,7 @@ export class PersonaAuthManager {
     password: string,
     targetOrigin: string,
     signal?: AbortSignal,
-    tenantId?: string | null,
+    tenantId?: string | null, persist = true,
   ): Promise<AuthenticateResult> {
     this.killSwitch.assertAllowed(tenantId ?? null)
     if (signal?.aborted) {
@@ -3912,7 +3902,7 @@ export class PersonaAuthManager {
         session = { ...imported.session, adapterUsed: 'form' }
         if (bearerToken) session.scrubTokens = [...new Set([...(session.scrubTokens ?? []), bearerToken, ...storageTokens, ...interceptedBearer])]
       }
-      writePersonaSessionFile(persona.sessionPath!, session)
+      this.finishSession(persona.sessionPath, session, persist)
       const claims = session.headerType === 'bearer' ? decodeJwtPayload(session.value) : null
       return {
         personaId: persona.id,
@@ -4038,7 +4028,7 @@ export class PersonaAuthManager {
     password: string,
     targetOrigin: string,
     signal?: AbortSignal,
-    tenantId?: string | null,
+    tenantId?: string | null, persist = true,
   ): Promise<AuthenticateResult> {
     this.killSwitch.assertAllowed(tenantId ?? null)
     if (signal?.aborted) {
@@ -4319,7 +4309,7 @@ export class PersonaAuthManager {
           ...(claims?.exp ? { expiresAt: claims.exp * 1000 } : {}),
           scrubTokens: [bearerToken, ...harvested],
         }
-        writePersonaSessionFile(persona.sessionPath!, session)
+        this.finishSession(persona.sessionPath, session, persist)
         return {
           personaId: persona.id,
           handle: persona.handle,
@@ -4354,7 +4344,7 @@ export class PersonaAuthManager {
         adapterUsed: 'form',
         scrubTokens: [...extractScrubbableCookieMapNeedles(cookieMap), ...harvested],
       }
-      writePersonaSessionFile(persona.sessionPath!, session)
+      this.finishSession(persona.sessionPath, session, persist)
 
       return {
         personaId: persona.id,
@@ -4415,10 +4405,8 @@ export class PersonaAuthManager {
     this.runControllers.set(runId, {
       controller: runController,
       releaseKillSwitch,
-      releaseOuterSignal: () => {
-        releaseOuterSignal?.()
-        runController.signal.removeEventListener('abort', onRunAbort)
-      },
+      releaseOuterSignal: () => { releaseOuterSignal?.(); runController.signal.removeEventListener('abort', onRunAbort) },
+      personas: new Map(loginPersonas.map(p => [p.handle, { storage, projectId, personaId: p.id }])),
     })
 
     const results: AuthenticateResult[] = []
@@ -4593,7 +4581,8 @@ export class PersonaAuthManager {
       this.runControllers.delete(scopeId)
       this.sessionPool.unregisterRun(scopeId)
     }
-    this.runControllers.set(scopeId, { controller, releaseKillSwitch, releaseOuterSignal })
+    const ephemeralPersonas = new Map(loginPersonas.map(p => [p.handle, { storage, projectId: opts.projectId, personaId: p.id }]))
+    this.runControllers.set(scopeId, { controller, releaseKillSwitch, releaseOuterSignal, personas: ephemeralPersonas })
 
     const authenticatedHandles: string[] = []
     const unavailable: EphemeralPersonaSessionHandle['unavailable'] = []
