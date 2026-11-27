@@ -198,7 +198,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
   }
   if (!isStatic && hasDestructiveContent(JSON.stringify(spec))) {
     grant.audit('denied', spec.origin)
-    return inconclusiveResult('Replay spec rejected by Kovo Hunter destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
+    return inconclusiveResult('Replay spec rejected by Kovo destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
   }
   if ((grant.tier ?? 1) === 0 && !isStatic) {
     return inconclusiveResult('Live replay verification is disabled in Tier 0.', exchanges, exchangeIds, { kind: spec.kind })

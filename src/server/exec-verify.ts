@@ -1235,7 +1235,7 @@ function receiptFindingTemplate(vulnClass: 'ssrf' | 'xxe', origin: string, param
       coverageCategory: 'ssrf-redirects' as const,
       impact: 'A server-side fetch of an attacker-controlled URL completes after the HTTP response, so synchronous SSRF filtering and response-time evidence miss it.',
       remediation: 'Resolve and allowlist outbound destinations against a strict scheme/host policy, block metadata and loopback ranges, and perform the fetch inside the request scope so failures are observable.',
-      recheck: 'Re-inject the same canary URL and confirm no callback is delivered to the Kovo Hunter relay after the response.',
+      recheck: 'Re-inject the same canary URL and confirm no callback is delivered to the Kovo relay after the response.',
     }
   }
   return {

@@ -684,7 +684,7 @@ export async function awaitReplayCanary(
       // when the caller only has an opaque handle.
       canaryId: input.canaryId ?? input.token,
       token: input.token,
-      // Empty artifact: real callbacks rarely carry Kovo Hunter's artifact header, and a truthy
+      // Empty artifact: real callbacks rarely carry Kovo's artifact header, and a truthy
       // artifact would reject them at ingest. Token↔canary binding is the causal link.
       artifact: '',
       immediateMs,
