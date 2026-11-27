@@ -3710,7 +3710,7 @@ export interface RunAgentSessionOptions {
   /** Require complete_intent before finishing (with up to 2 empty-turn nudges; default: true when complete_intent handler is present). */
   requireCompleteIntent?: boolean
   handlers?: WorkerToolHandlers
-  extraTools?: readonly ToolRegistration[]
+  extraTools?: readonly ToolRegistration[]; overrideTools?: readonly ToolRegistration[] | ((ctx: { scrubbers: SessionScrubbers; signal: AbortSignal; inlineLimit: number; onCompleteIntent: (completion: IntentCompletion) => void; specSubmission: SpecSubmissionToolOptions }) => readonly ToolRegistration[]); decoupledMode?: boolean
   /** Static array (live-read if mutated) or dynamic getter returning the current secret set (H-8). */
   secrets?: SecretSource
   record?: CallRecorder
@@ -4116,7 +4116,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     ? { earlyExit, earlyExitTurnsSaved: earlyExit.turnsSaved }
     : {}
 
-  const registeredProofTools = handlers.kovo_verify ? ['kovo_verify'] : []
+  const registeredProofTools = options.decoupledMode ? ['submit_exploit_trace'] : (handlers.kovo_verify ? ['kovo_verify'] : [])
   const trace = options.trace
   const traceRunId = options.traceContext?.runId ?? options.requestId
   const traceAssignmentId = options.traceContext?.assignmentId ?? options.sessionId
@@ -4155,25 +4155,24 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       ? resolveAutoReposDir(options.directory, options.prompt)
       : undefined)
 
-  const builtTools = buildWorkerTools(
-    handlers,
-    scrubbers,
-    sessionController.signal,
-    inlineLimit,
-    result => { completion = result },
-    {
-      tracker: specTracker,
-      onRequired: (info: { status: string; count: number; route?: SpecRouteEvidence }) => {
-        repairTurn = turnsUsed
-        options.onSpecSubmissionRequired?.(info)
-      },
-      isSettling,
-      ...(options.onVerifyAliasUsed ? { onVerifyAliasUsed: options.onVerifyAliasUsed } : {}),
-      ...(options.allowLegacyReplaySpec ? { allowLegacyReplaySpec: true } : {}),
-      ...(resolvedReposDir ? { reposDir: resolvedReposDir } : {}),
-      ...(options.evidenceDir ? { evidenceDir: options.evidenceDir } : {}),
+  const specSubmissionOpts: SpecSubmissionToolOptions = {
+    tracker: specTracker,
+    onRequired: (info: { status: string; count: number; route?: SpecRouteEvidence }) => {
+      repairTurn = turnsUsed; options.onSpecSubmissionRequired?.(info)
     },
-  )
+    isSettling,
+    ...(options.onVerifyAliasUsed ? { onVerifyAliasUsed: options.onVerifyAliasUsed } : {}),
+    ...(options.allowLegacyReplaySpec ? { allowLegacyReplaySpec: true } : {}),
+    ...(resolvedReposDir ? { reposDir: resolvedReposDir } : {}),
+    ...(options.evidenceDir ? { evidenceDir: options.evidenceDir } : {}),
+  }
+  const onCompleteIntentCb = (result: IntentCompletion) => { completion = result }
+  const builtTools: ToolRegistration[] = options.overrideTools
+    ? (typeof options.overrideTools === 'function'
+      ? [...options.overrideTools({ scrubbers, signal: sessionController.signal, inlineLimit, onCompleteIntent: onCompleteIntentCb, specSubmission: specSubmissionOpts })]
+      : [...options.overrideTools])
+    : buildWorkerTools(handlers, scrubbers, sessionController.signal, inlineLimit, onCompleteIntentCb, specSubmissionOpts)
+  const decoupledSettlementAllowed = new Set(['submit_exploit_trace', 'search_run', 'analyze', 'sandbox_exec', 'record_fact', 'complete_intent', 'repo', 'query_cves'])
   // Extra tools have unknown semantics: keep them sequential so a round that calls one never races.
   const allTools: ToolRegistration[] = [
     ...builtTools,
@@ -4316,15 +4315,15 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         }
         const snapshot = specSnapshot()
         const specPending = specSubmissionPending(snapshot)
-        const block = settlementToolBlock({
-          name: call.name,
-          settling: isSettling(),
-          turnsUsed,
-          maxTurns,
-          finalTurn: finalTurnForRun(),
-          ...(specPending ? { specPending, specDirective: settlementSpecDirective(snapshot.obligationTarget ?? snapshot.route) } : {}),
-        })
-        if (!block && SPEC_SUBMISSION_TOOLS.has(call.name)) activeProofCallIds.add(call.id)
+        const block = options.decoupledMode
+          ? (isSettling() && !decoupledSettlementAllowed.has(call.name)
+            ? `Settlement wrap-up active (${turnsUsed}/${maxTurns} turns). ${call.name} is disabled during settlement; call submit_exploit_trace or complete_intent.`
+            : undefined)
+          : settlementToolBlock({
+              name: call.name, settling: isSettling(), turnsUsed, maxTurns, finalTurn: finalTurnForRun(),
+              ...(specPending ? { specPending, specDirective: settlementSpecDirective(snapshot.obligationTarget ?? snapshot.route) } : {}),
+            })
+        if (!block && (SPEC_SUBMISSION_TOOLS.has(call.name) || call.name === 'submit_exploit_trace')) activeProofCallIds.add(call.id)
         return block ? { block } : undefined
       },
       afterTool(call, result) {
@@ -4376,9 +4375,10 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
             // Tracing must never break an investigation run.
           }
         }
-        if (wasProofCall && wallClockExpired && activeProofCallIds.size === 0 && !wallClockRotated) {
-          queueMicrotask(() => triggerWallClockRotation())
+        if (call.name === 'submit_exploit_trace' && !effectiveResult.isError && specTracker.snapshot().specAttempts === 0) {
+          specTracker.noteVerifyScript(undefined, undefined, { confirmed: /"confirmed"\s*:\s*true/.test(rawToolResultText) })
         }
+        if (wasProofCall && wallClockExpired && activeProofCallIds.size === 0 && !wallClockRotated) queueMicrotask(() => triggerWallClockRotation())
         return malformed ? effectiveResult : undefined
       },
     }),
@@ -4476,7 +4476,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       maxTurns,
       extensions,
       instructions: options.instructions ?? workerSessionInstructions(options.scenario, {
-        hasKovoVerify: Boolean(options.handlers?.kovo_verify),
+        hasKovoVerify: Boolean(options.handlers?.kovo_verify), decoupledProofPipeline: Boolean(options.decoupledMode),
       }),
     }
     const conversation = await harness.root(context, { agent })

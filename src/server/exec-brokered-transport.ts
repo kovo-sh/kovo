@@ -22,6 +22,48 @@ import { tenantTagForRun } from './scope-policy.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
 import type { BoardMessageRow, Run, Store } from './store.ts'
 import { runSafeTemplates } from './surface-engine.ts'
+import type { RecordedRequestExchange } from './trace-proof-compiler.ts'
+
+function tryParseJsonBody(raw?: string): unknown {
+  if (!raw) return undefined
+  const t = raw.trim()
+  if (!t || (t[0] !== '{' && t[0] !== '[')) return undefined
+  try { return JSON.parse(t) } catch { return undefined }
+}
+
+function emitRecordedExchange(
+  cb: ((ex: RecordedRequestExchange) => void) | undefined,
+  exchangeId: string,
+  req: { headers?: Record<string, string>; body?: string; jsonBody?: unknown; persona?: string; followRedirects?: boolean },
+  res: BrokerExchangeResult,
+): void {
+  if (!cb) return
+  const rawSc = Object.entries(res.respHeaders ?? {}).find(([k]) => k.toLowerCase() === 'set-cookie')?.[1]
+  const setCookies = rawSc
+    ? rawSc.split(/\r?\n/).flatMap(ln => ln.split(/,\s*(?=[!#$%&'*+\-.^_`|~0-9A-Za-z]+=)/)).map(s => s.trim()).filter(Boolean)
+    : undefined
+  const reqJson = req.jsonBody !== undefined ? req.jsonBody : tryParseJsonBody(req.body)
+  const respJson = tryParseJsonBody(res.body)
+  const persona = res.personaHandle ?? req.persona ?? undefined
+  cb({
+    exchangeId,
+    origin: res.origin,
+    method: res.method,
+    pathAndQuery: res.pathAndQuery,
+    ...(persona ? { persona } : {}),
+    requestHeaders: { ...(res.reqHeaders ?? {}), ...(req.headers ?? {}) },
+    ...(req.body !== undefined ? { requestBody: req.body } : {}),
+    ...(reqJson !== undefined ? { requestJson: reqJson } : {}),
+    ...(req.followRedirects !== undefined ? { followRedirects: req.followRedirects } : {}),
+    status: res.status,
+    mediaType: res.mediaType,
+    responseHeaders: res.respHeaders,
+    ...(setCookies?.length ? { setCookies } : {}),
+    responseBody: res.body,
+    ...(respJson !== undefined ? { responseJson: respJson } : {}),
+    timestampMs: Date.now(),
+  })
+}
 
 export interface ExecBrokeredTransportHost {
   storage: Store
@@ -75,7 +117,7 @@ export function buildBrokeredTransportHandlers(
 ): Partial<WorkerToolHandlers> {
   const {
     job, step, session, grant, currentSecrets, boardTools, sharedHandlers,
-    trackPersonaResources, prepareBudgetedProbe, stageJsonArtifact,
+    trackPersonaResources, prepareBudgetedProbe, stageJsonArtifact, onExchangeRecorded,
   } = ctx
 
   const executeBrokerRequest = async (args: RequestHttpArgs, signal: AbortSignal): Promise<{
@@ -175,8 +217,8 @@ export function buildBrokeredTransportHandlers(
     }
 
     const saved = recordBrokerExchange(host.storage, curRun, job.assignment.id, res, currentSecrets())
-    trackPersonaResources(curRun, res, saved.id)
-    boardTools.noteEvidence()
+    emitRecordedExchange(onExchangeRecorded, saved.id, { headers, body, jsonBody, persona: args.persona, followRedirects: args.followRedirects ?? false }, res)
+    trackPersonaResources(curRun, res, saved.id); boardTools.noteEvidence()
     host.markEndpointCoverage(curRun, res.origin, res.method, res.pathAndQuery, 'http_exchange')
     host.scanSecondOrderExchange(curRun, job.assignment.id, res, saved.id)
     if (stagingEntityTag && /^(?:POST|PUT|PATCH)$/i.test(args.method) && res.status >= 200 && res.status < 300) {
@@ -245,12 +287,12 @@ export function buildBrokeredTransportHandlers(
       secrets: currentSecrets(),
       execute: () => host.broker.executeRaceBurst(stagedReqs, grant, signal),
     })
-    const summaries = burst.results.map(res => ({
-      exchangeId: recordTrackedBatchExchange(curRun, res).id,
-      origin: res.origin, method: res.method, pathAndQuery: res.pathAndQuery,
-      personaHandle: res.personaHandle, status: res.status, durationMs: res.durationMs,
-      bodySha256: res.bodySha256, bodyPreview: res.bodyPreview.slice(0, 800),
-    }))
+    const summaries = burst.results.map((res, idx) => {
+      const id = recordTrackedBatchExchange(curRun, res).id
+      const r = stagedReqs[idx]
+      emitRecordedExchange(onExchangeRecorded, id, { headers: r?.headers, body: r?.body, persona: r?.persona, followRedirects: r?.followRedirects }, res)
+      return { exchangeId: id, origin: res.origin, method: res.method, pathAndQuery: res.pathAndQuery, personaHandle: res.personaHandle, status: res.status, durationMs: res.durationMs, bodySha256: res.bodySha256, bodyPreview: res.bodyPreview.slice(0, 800) }
+    })
     const stagedPath = await session.stage(`exchanges/race-${randomUUID().slice(0, 8)}.json`,
       JSON.stringify({ summary: burst.summary, results: summaries }, null, 2), signal).catch(() => null)
     boardTools.noteEvidence()
@@ -289,11 +331,11 @@ export function buildBrokeredTransportHandlers(
         secrets: currentSecrets(),
         execute: () => host.broker.executeBatch(brokerReqs, grant, signal),
       })
-      const summaries = results.map(res => ({
-        exchangeId: recordTrackedBatchExchange(curRun, res).id,
-        status: res.status, durationMs: res.durationMs,
-        bodySha256: res.bodySha256, bodyPreview: res.bodyPreview.slice(0, 800),
-      }))
+      const summaries = results.map((res, idx) => {
+        const id = recordTrackedBatchExchange(curRun, res).id; const r = brokerReqs[idx]
+        emitRecordedExchange(onExchangeRecorded, id, { headers: r?.headers, body: r?.body, persona: r?.persona, followRedirects: r?.followRedirects }, res)
+        return { exchangeId: id, status: res.status, durationMs: res.durationMs, bodySha256: res.bodySha256, bodyPreview: res.bodyPreview.slice(0, 800) }
+      })
       const stagedPath = await session.stage(`exchanges/batch-${randomUUID().slice(0, 8)}.json`,
         JSON.stringify(summaries, null, 2), signal).catch(() => null)
       boardTools.noteEvidence()
