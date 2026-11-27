@@ -76,6 +76,7 @@ import {
 } from './finding-fingerprint.ts'
 import { CWE_TO_RECEIPT_CLASS, SEVERITY_BY_CLASS } from './floor-recipe-engine.ts'
 import { alignClaimClass, resolvePersonaIdentity, type RoleName } from './oracle-invariants.ts'
+import { resolveBasePersonaHandle, resolveSealedCapabilitySyncContext } from './own-org-terminal-guard.ts'
 import {
   buildOobReceipt,
   verifyReceipt,
@@ -114,7 +115,6 @@ import type {
   VerifyTranscriptRecord,
 } from './verify-rpc.ts'
 import { LinuxWorkerBackend, type WorkerBackend } from './worker-backend.ts'
-
 type Active = ExecActiveJob
 type Capture = ExecCapture
 type ReviewInput = ExecReviewInput
@@ -1482,9 +1482,9 @@ export function syncVerifyArtifactsToLedger(input: {
   let newEdgeCount = 0
 
   type PersonaMeta = { roleLabel: string | null; tenantRef: string | null; privilege: RoleName | null }
-  const recordByCapHandle = new Map<string, VerifyTranscriptRecord>()
-  const recordByExchangeId = new Map<string, VerifyTranscriptRecord>()
-  const hostEntryByExchangeId = new Map<string, HostTranscriptEntry>()
+  const recordByCapHandle = new Map<string, VerifyTranscriptRecord>(), recordByExchangeId = new Map<string, VerifyTranscriptRecord>()
+  const hostEntryByExchangeId = new Map<string, HostTranscriptEntry>(), hostEntryByEmittedCap = new Map<string, HostTranscriptEntry>()
+  const sealedMetaByHandle = new Map<string, typeof proof.sealedCapabilities[number]>(proof.sealedCapabilities.map(m => [m.handle, m]))
   const metaByPersona = new Map<string, PersonaMeta>()
   const rememberMeta = (handle: string | null | undefined, meta: PersonaMeta): void => {
     const key = handle?.trim().toLowerCase()
@@ -1510,11 +1510,8 @@ export function syncVerifyArtifactsToLedger(input: {
   }
   for (const entry of proof.hostTranscript?.entries ?? []) {
     hostEntryByExchangeId.set(entry.exchangeId, entry)
-    rememberMeta(entry.actorPersona ?? entry.step.actor.handle, {
-      roleLabel: entry.actorRoleLabel ?? null,
-      tenantRef: entry.actorTenant ?? entry.step.actor.tenant ?? null,
-      privilege: entry.actorPrivilege ?? entry.step.actor.role ?? null,
-    })
+    if (entry.op !== 'capability' && entry.step.method.toUpperCase() !== 'SEAL') for (const c of entry.emittedCapabilities ?? []) if (!hostEntryByEmittedCap.has(c)) hostEntryByEmittedCap.set(c, entry)
+    rememberMeta(entry.actorPersona ?? entry.step.actor.handle, { roleLabel: entry.actorRoleLabel ?? null, tenantRef: entry.actorTenant ?? entry.step.actor.tenant ?? null, privilege: entry.actorPrivilege ?? entry.step.actor.role ?? null })
   }
   const resolveActorTenant = (
     persona: string,
@@ -1560,7 +1557,10 @@ export function syncVerifyArtifactsToLedger(input: {
   for (const meta of proof.sealedCapabilities) {
     const capId = normalizeLedgerCapHandle(meta)
     const rec = recordByCapHandle.get(meta.handle)
-    const actorPersona = rec?.request?.personaHandle?.trim() || defaultPersona
+    const { actorPersona, endpoint, method, fieldName } = resolveSealedCapabilitySyncContext({
+      meta, rec, defaultPersona, ledger, recordByCapHandle, recordByExchangeId, hostEntryByEmittedCap, sealedMetaByHandle,
+      normalizeCapId: h => (sealedMetaByHandle.has(h) ? normalizeLedgerCapHandle(sealedMetaByHandle.get(h)!) : h),
+    })
     const { tenant: resolvedTenant, roleLabel } = resolveActorTenant(actorPersona, rec)
     const tenantScope = resolvedTenant ?? unscopedTenant
     const serviceOrigin = rec?.request?.origin?.trim() || meta.allowedOrigins?.[0] || defaultOrigin
@@ -1576,7 +1576,7 @@ export function syncVerifyArtifactsToLedger(input: {
         validityTtlMs: meta.expiresAtMs !== null ? Math.max(0, meta.expiresAtMs - meta.createdAtMs) : null,
         parentHopReceiptIds: [meta.hopReceiptId], artifactDigest: meta.sha256,
         artifactSummary: `Sealed ${meta.kind} slot ${meta.slot} (sha256:${meta.sha256Prefix})`,
-        metadata: { slot: meta.slot, secretKind: meta.kind, ...(meta.derivedFromCapabilityId ? { parentHandle: meta.derivedFromCapabilityId } : {}) },
+        metadata: { slot: meta.slot, secretKind: meta.kind, ...(meta.derivedFromCapabilityId ? { parentHandle: meta.derivedFromCapabilityId } : {}), ...(endpoint ? { endpoint } : {}), ...(method ? { method } : {}), ...(fieldName ? { fieldName } : {}) },
         createdAtMs: nowMs,
       })
       newCapabilityCount += 1
@@ -1646,7 +1646,7 @@ export function syncVerifyArtifactsToLedger(input: {
 
     for (let idx = 0; idx < receipt.hops.length; idx += 1) {
       const hop = receipt.hops[idx]!
-      const persona = hopActors[hop.hopId] || defaultPersona
+      const persona = resolveBasePersonaHandle({ rawPersona: hopActors[hop.hopId], defaultPersona, ledger, recordByCapHandle, hostEntryByEmittedCap, sealedMetaByHandle })
       const origin = hop.target.origin || defaultOrigin
       const { tenant: resolvedTenant } = resolveActorTenant(persona, undefined, hop.exchangeIds)
       const tenantScope = resolvedTenant ?? unscopedTenant

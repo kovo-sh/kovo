@@ -56,6 +56,7 @@ import type {
 import { HostFactLog, deriveAmbientAuthFromHeaders } from './host-fact-log.ts'
 import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
 import { isReadMethod, resolvePersonaIdentity } from './oracle-invariants.ts'
+import { extractSealMetadataHeaders } from './own-org-terminal-guard.ts'
 import type { ImpactStep, RoleName } from './oracle-invariants.ts'
 import {
   buildHostAuthPlacement, compileAsyncMatchPredicate, computeWorkerVisibleBodyDigest,
@@ -602,7 +603,7 @@ export class VerifyRpcServer {
     return { origin: decision.normalizedOrigin, url: decision.parsedUrl }
   }
 
-  private parseHttpArgs(args: Record<string, unknown>): { brokerRequest: BrokerHttpRequest; requestMeta: VerifyTranscriptRequest } {
+  private parseHttpArgs(args: Record<string, unknown>): { brokerRequest: BrokerHttpRequest; requestMeta: VerifyTranscriptRequest; liftedCap: ParsedCapabilityArg | null } {
     let originArg = args.origin
     let rawPathInput = args.path ?? args.pathAndQuery ?? args.endpoint
     if (rawPathInput === undefined && typeof args.url === 'string' && args.url.trim()) {
@@ -636,14 +637,18 @@ export class VerifyRpcServer {
     }
     const body = typeof args.body === 'string' ? args.body : undefined
     if (body !== undefined && Buffer.byteLength(body) > 2 * 1024 * 1024) throw new Error('Request body exceeds 2 MiB.')
-    const rawPersona = typeof args.persona === 'string' ? args.persona.trim()
-      : typeof args.as === 'string' ? args.as.trim() : undefined
-    const isAnonSentinel = Boolean(
-      rawPersona
-      && ['anonymous', 'anon', 'unauthenticated', 'none'].includes(rawPersona.toLowerCase())
-      && !this.options.grant.personas?.has(rawPersona),
-    )
-    const persona = rawPersona && !isAnonSentinel ? rawPersona : undefined
+    const rawPersona = (typeof args.persona === 'string' && args.persona.trim()) || (typeof args.as === 'string' && args.as.trim()) || undefined
+    let liftedCap: ParsedCapabilityArg | null = null
+    let effectiveRawPersona = rawPersona
+    if (rawPersona && /^cap:/i.test(rawPersona)) {
+      if (!this.capabilityVault.getMeta(rawPersona)) throw new Error(`Unknown capability handle "${rawPersona}"; seal it first and pass { capability: handle }.`)
+      const explicitCap = parseCapabilityArg(args)
+      if (explicitCap && explicitCap.handle !== rawPersona) throw new Error(`Persona "${rawPersona}" is a capability handle; pass { capability: handle } without a conflicting capability argument.`)
+      liftedCap = explicitCap ?? { handle: rawPersona }
+      effectiveRawPersona = undefined
+    }
+    const isAnonSentinel = Boolean(effectiveRawPersona && ['anonymous', 'anon', 'unauthenticated', 'none'].includes(effectiveRawPersona.toLowerCase()) && !this.options.grant.personas?.has(effectiveRawPersona))
+    const persona = effectiveRawPersona && !isAnonSentinel ? effectiveRawPersona : undefined
     const session = typeof args.session === 'string' ? args.session : undefined
     const role = typeof args.sessionGroupRole === 'string' ? args.sessionGroupRole : (typeof args.arm === 'string' ? args.arm : undefined)
     if (role !== undefined && !['setup', 'control', 'probe', 'cleanup'].includes(role)) {
@@ -667,17 +672,12 @@ export class VerifyRpcServer {
     }
     const initialReqDig = this.workerBodyDigest(body), personaObj = persona ? this.options.grant.personas?.get(persona) : undefined
     return {
-      brokerRequest,
+      brokerRequest, liftedCap,
       requestMeta: {
-        origin, method, pathAndQuery: rawPath, headers,
-        bodyBytes: initialReqDig.bodyBytes,
-        bodySha256: initialReqDig.bodySha256,
-        personaHandle: persona ?? null,
-        sessionRole: role ?? null,
-        actorRoleLabel: personaObj?.roleLabel ?? null,
+        origin, method, pathAndQuery: rawPath, headers, bodyBytes: initialReqDig.bodyBytes, bodySha256: initialReqDig.bodySha256,
+        personaHandle: persona ?? null, sessionRole: role ?? null, actorRoleLabel: personaObj?.roleLabel ?? null,
         ...(personaObj?.tenantRef !== undefined ? { actorTenant: personaObj.tenantRef } : {}),
-        ...(personaObj?.privilege !== undefined ? { actorPrivilege: personaObj.privilege } : {}),
-        nonce: this.nonce,
+        ...(personaObj?.privilege !== undefined ? { actorPrivilege: personaObj.privilege } : {}), nonce: this.nonce,
       },
     }
   }
@@ -1201,7 +1201,7 @@ export class VerifyRpcServer {
 
   private prepareCapRequest(args: Record<string, unknown>, nonce: string) {
     const parsed = this.parseHttpArgs(args)
-    const applied = this.applyCapabilityInjection(parsed.brokerRequest, parsed.requestMeta, parseCapabilityArg(args))
+    const applied = this.applyCapabilityInjection(parsed.brokerRequest, parsed.requestMeta, parseCapabilityArg(args) ?? parsed.liftedCap)
     const consumedIds = applied.attestations.map(a => a.consumedCapabilityId)
     const cryptoAttestations = this.detectCryptoAttestationsForRequest(applied.brokerRequest, consumedIds, applied.injectedHeaders)
     const derivedFromCapabilityIds = [...new Set(cryptoAttestations.map(a => a.derivedFromCapabilityId))]
@@ -1703,7 +1703,7 @@ export class VerifyRpcServer {
       op: 'capability', startedAt: started, durationMs: 0,
       request: {
         origin: sourceRecord.request?.origin ?? '', method: 'SEAL', pathAndQuery: `/capability/seal/${encodeURIComponent(slot)}`,
-        headers: {}, bodyBytes: 0, bodySha256: opaqueHandleDigest, personaHandle: sourceRecord.request?.personaHandle ?? null,
+        headers: extractSealMetadataHeaders(args, sourceRecord.request, extractedCookie), bodyBytes: 0, bodySha256: opaqueHandleDigest, personaHandle: sourceRecord.request?.personaHandle ?? null,
         sessionRole: sourceRecord.request?.sessionRole ?? 'probe', actorRoleLabel: sourceRecord.request?.actorRoleLabel ?? null, actorTenant: sourceRecord.request?.actorTenant ?? null, actorPrivilege: sourceRecord.request?.actorPrivilege ?? null, nonce,
       },
       artifact: { kind: 'capability', capabilityHandle: meta.handle, artifactDigest: opaqueHandleDigest },
@@ -1897,7 +1897,7 @@ export class VerifyRpcServer {
     }
 
     const parsedPoll = this.parseHttpArgs(pollReqArgs)
-    const capArg = parseCapabilityArg(pollReqArgs)
+    const capArg = parseCapabilityArg(pollReqArgs) ?? parsedPoll.liftedCap
     consumeRunAsyncPollCallBudget(this.options.runId, this.options.maxAsyncPollCallsPerRun)
     type LastPoll = { result: BrokerExchangeResult; rawResp: { body: string; headers: Record<string, string> } | null; startedAt: number; applied: ReturnType<VerifyRpcServer['applyCapabilityInjection']>; cryptoAtts: HostCryptoAttestation[]; cleanSession: boolean }
     let lastBrokerResult: LastPoll | null = null

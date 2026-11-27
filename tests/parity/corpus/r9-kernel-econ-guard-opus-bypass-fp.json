@@ -1,0 +1,145 @@
+{
+  "id": "r9-kernel-econ-guard-opus-bypass-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "r9-balance-minting-wallet-resource-id-entity-collapse",
+  "description": "R3-05 independent-review FP (r9-kernel-econ-guard, reviewer claude-opus-5-5-high): two legitimate, sequential, same-amount deposits to the attacker's own wallet resource (`POST /v1/wallets/<walletId>/deposit`), each response echoing the wallet object's top-level `id`, bracketed by own-tenant balance readbacks whose delta exactly equals the sum of both deposits. The wallet/account resource id is NOT an economic entity (order/payment/invoice) id, so the deposits must not be collapsed into one entity (max-per-entity dedup would under-count authorizedDeposits by half) and must not satisfy duplicate-entity credit multiplicity. Balance is fully conserved; balance_minting must fail closed. The authored branch keyed both deposits by the wallet id (top-level response `id` / dynamic path segment) and confirmed it. Coverage note: the verdict runs through own-org-terminal-guard/v8-oracle-hydrate (hydrateBalanceMintingOperands) and exec-verify's composite host-origin inspection; the verify-rpc cap:* persona auto-lift path is exercised live by tests/r9-kernel-econ-guard.test.ts test 2 (no RPC transport in the static corpus runner).",
+  "covers": {
+    "files": [
+      "src/server/own-org-terminal-guard.ts",
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/composite-receipt.ts",
+      "src/server/exec-verify.ts",
+      "src/server/verify-rpc.ts"
+    ],
+    "classes": [
+      "business_logic"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-840",
+    "category": "business-logic",
+    "title": "Sequential own-wallet deposits misread as balance minting",
+    "impact": "Two authorized deposits to the same wallet conserve balance exactly; collapsing them by wallet resource id under-counts authorized deposits and fabricates a conservation break.",
+    "claimedImpact": "other",
+    "claimedBoundary": "other",
+    "vulnClass": "business_logic"
+  },
+  "freeTextLabel": {
+    "title": "Repeated wallet deposit mints balance"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member [slug=tenant-a] (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r9econ-opus-member-a"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "w_base",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/balance",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"tenant\":\"tenant-a\",\"balance\":100}"
+    },
+    {
+      "id": "w_dep1",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/v1/wallets/wal_9f3a21c7/deposit",
+      "persona": "member_a",
+      "requestJson": {
+        "amount": 50
+      },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"wal_9f3a21c7\",\"currency\":\"USD\",\"status\":\"active\"}"
+    },
+    {
+      "id": "w_dep2",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/v1/wallets/wal_9f3a21c7/deposit",
+      "persona": "member_a",
+      "requestJson": {
+        "amount": 50
+      },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"wal_9f3a21c7\",\"currency\":\"USD\",\"status\":\"active\"}"
+    },
+    {
+      "id": "w_fin",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/balance",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"tenant\":\"tenant-a\",\"balance\":200}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-R9-KERNEL-ECON-GUARD-OPUS-BYPASS-FP",
+    "terminalVulnClass": "economic_conservation",
+    "oracleFamily": "economic_conservation",
+    "singleHop": true,
+    "attackerPersonas": [
+      "member_a"
+    ],
+    "preChainControlIds": [
+      "w_base"
+    ],
+    "postChainReadbackIds": [
+      "w_fin"
+    ],
+    "terminalExchangeId": "w_dep2",
+    "claimedDelta": "Two sequential deposits to the same wallet resource minted balance beyond the authorized deposit amount.",
+    "v8OracleInput": {
+      "family": "economic_conservation",
+      "rawInput": {
+        "equation": "balance_minting",
+        "baselineReadback": "w_base",
+        "actions": [
+          "w_dep1",
+          "w_dep2"
+        ],
+        "finalReadback": "w_fin"
+      }
+    }
+  }
+}
