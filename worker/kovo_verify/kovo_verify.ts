@@ -127,8 +127,7 @@ function pickDefined(src: Record<string, unknown>, keys: readonly string[]): Rec
 function normalizeBodyAndHeaders(rawBody: unknown, rawHeaders?: Record<string, string>): { body?: string; headers?: Record<string, string> } {
   const headers = rawHeaders ? { ...rawHeaders } : undefined
   if (rawBody === undefined || rawBody === null) return headers ? { headers } : {}
-  if (typeof rawBody === 'string') return { body: rawBody, ...(headers ? { headers } : {}) }
-  return { body: JSON.stringify(rawBody), headers: Object.keys(headers ?? {}).some(k => k.toLowerCase() === 'content-type') ? headers : { 'content-type': 'application/json', ...(headers ?? {}) } }
+  return typeof rawBody === 'string' ? { body: rawBody, ...(headers ? { headers } : {}) } : { body: JSON.stringify(rawBody), headers: Object.keys(headers ?? {}).some(k => k.toLowerCase() === 'content-type') ? headers : { 'content-type': 'application/json', ...(headers ?? {}) } }
 }
 function splitTarget(input: HttpTarget, defaultOrigin: string | undefined): { origin?: string; path: string } {
   if (typeof input === 'string') {
@@ -160,16 +159,24 @@ export function hydrateExchange(raw: HttpExchange): HttpExchange {
   return { ...raw, body, text: body, json: parsed, data: parsed, headers: raw.headers && typeof raw.headers === 'object' ? raw.headers : {} }
 }
 function hydrateFields<T extends Record<string, unknown>>(res: T, keys: readonly string[]): T {
-  const out: Record<string, unknown> = { ...res }
-  for (const k of keys) { const v = out[k]; if (v && typeof v === 'object' && !Array.isArray(v) && 'exchangeId' in (v as Record<string, unknown>)) out[k] = hydrateExchange(v as HttpExchange) }
-  return out as T
+  const out: Record<string, unknown> = { ...res }; for (const k of keys) { const v = out[k]; if (v && typeof v === 'object' && !Array.isArray(v) && 'exchangeId' in (v as Record<string, unknown>)) out[k] = hydrateExchange(v as HttpExchange) }; return out as T
 }
-const resolveCapHandle = (value: unknown): string => typeof value === 'string' ? value : value && typeof value === 'object' && !Array.isArray(value) ? String((value as Record<string, unknown>).handle ?? (value as Record<string, unknown>).derivedHandle ?? '') : ''
+const CAP_OBJ_KEYS = ['handle', 'derivedHandle', 'capability', 'capabilityHandle', 'capability_handle', 'sealedHandle', 'sealedCapability', 'cap', 'token', 'id'] as const
+export function unwrapCapabilityHandle(val: unknown, depth = 0): unknown {
+  if (typeof val === 'string') return val.trim() || val
+  if (depth > 4 || !val || typeof val !== 'object' || Array.isArray(val)) return val
+  for (const k of CAP_OBJ_KEYS) { const c = (val as Record<string, unknown>)[k]; const u = typeof c === 'string' ? c.trim() : c && typeof c === 'object' && !Array.isArray(c) ? unwrapCapabilityHandle(c, depth + 1) : ''; if (typeof u === 'string' && u) return u }
+  return val
+}
+function normalizeCapabilityInjection(val: unknown): unknown {
+  if (!val || typeof val !== 'object' || Array.isArray(val)) return typeof val === 'string' ? val.trim() : val
+  const handle = unwrapCapabilityHandle(val); if (typeof handle !== 'string' || !handle) return val
+  const spec = pickDefined(val as Record<string, unknown>, ['target', 'headerName', 'cookieName', 'queryParam']); return Object.keys(spec).length > 0 ? { handle, ...spec } : handle
+}
+const resolveCapHandle = (value: unknown): string => { const u = unwrapCapabilityHandle(value); return typeof u === 'string' ? u : '' }
 const normalizePayloadStr = (value: unknown): string => typeof value === 'string' ? value : value === undefined || value === null ? '' : JSON.stringify(value)
 function normalizeAsyncPredicate(raw: AsyncMatchPredicate | undefined, expectStatus?: number | number[]): AsyncMatchPredicate | undefined {
-  const pred: AsyncMatchPredicate = raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...raw } : {}
-  if (expectStatus !== undefined && pred.status === undefined) pred.status = expectStatus
-  return Object.keys(pred).length > 0 ? pred : undefined
+  const pred: AsyncMatchPredicate = raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...raw } : {}; if (expectStatus !== undefined && pred.status === undefined) pred.status = expectStatus; return Object.keys(pred).length > 0 ? pred : undefined
 }
 function normalizeHopTarget(rawTarget: unknown, hopMethod: unknown, defaultOrigin: string | undefined): unknown {
   const fallbackMethod = typeof hopMethod === 'string' && hopMethod.trim() ? hopMethod.trim().toUpperCase() : undefined
@@ -189,8 +196,7 @@ function normalizeHopTarget(rawTarget: unknown, hopMethod: unknown, defaultOrigi
 }
 const normExRef = (v: unknown): unknown => (v && typeof v === 'object' && !Array.isArray(v) && typeof (v as Record<string, unknown>).exchangeId === 'string') ? (v as Record<string, unknown>).exchangeId : v
 const normExList = (v: unknown): unknown => Array.isArray(v) ? v.map(normExRef) : v
-const normCapRef = (v: unknown): unknown => (v && typeof v === 'object' && !Array.isArray(v)) ? (resolveCapHandle(v) || v) : v
-const normCapList = (v: unknown): unknown => Array.isArray(v) ? v.map(normCapRef) : v
+const normCapList = (v: unknown): unknown => Array.isArray(v) ? v.map(x => unwrapCapabilityHandle(x)) : v
 const mapFields = (obj: Record<string, unknown>, map: Record<string, (v: unknown) => unknown>): Record<string, unknown> => { const out: Record<string, unknown> = { ...obj }; for (const [k, fn] of Object.entries(map)) if (out[k] !== undefined) out[k] = fn(out[k]); return out }
 
 const EDGE_KIND_ALIASES: Record<string, CausalEdgeInput['kind']> = {
@@ -201,38 +207,53 @@ const EDGE_KIND_ALIASES: Record<string, CausalEdgeInput['kind']> = {
 }
 function normalizeEdgeKind(e: Record<string, unknown>, idx: number): CausalEdgeInput['kind'] {
   const raw = e.kind ?? e.type ?? e.bindingKind ?? e.binding
-  if (typeof raw === 'string') {
-    const mapped = EDGE_KIND_ALIASES[raw.trim().toLowerCase().replace(/[\s-]+/g, '_')]
-    if (mapped) return mapped
-  }
+  if (typeof raw === 'string') { const mapped = EDGE_KIND_ALIASES[raw.trim().toLowerCase().replace(/[\s-]+/g, '_')]; if (mapped) return mapped }
   throw new Error(`Invalid causalEdges[${idx}].kind "${String(raw ?? '')}". Valid causalEdges[].kind values: value_binding | derived_crypto_binding | state_transition_binding | async_pivot_binding.`)
 }
 function normalizeEdgeRecord(ed: unknown, idx: number): unknown {
   if (!ed || typeof ed !== 'object' || Array.isArray(ed)) return ed
-  const { type: _t, bindingKind: _bk, binding: _b, ablationExchange, ...e } = ed as Record<string, unknown>
+  const { type: _t, bindingKind: _bk, binding: _b, ablationExchange, capability, cap, handle, capability_handle, sealedHandle, sealedCapability, derivedHandle, ...e } = ed as Record<string, unknown>
   const kind = normalizeEdgeKind(ed as Record<string, unknown>, idx)
   const ab = e.ablationExchangeIds !== undefined ? normExList(e.ablationExchangeIds) : ablationExchange !== undefined ? extractExchangeIds(ablationExchange as ExchangeRef | ExchangeRef[]) : undefined
-  return mapFields({ ...e, kind, ...(ab !== undefined ? { ablationExchangeIds: ab } : {}) }, { capabilityHandle: normCapRef, sourceCapabilityId: normCapRef, derivedCapabilityId: normCapRef, sourceExchangeId: normExRef, targetExchangeId: normExRef })
+  const rawCap = [e.capabilityHandle, capability, cap, handle, capability_handle, sealedHandle, sealedCapability, derivedHandle].find(v => v !== undefined && v !== null && (typeof v !== 'string' || v.trim().length > 0))
+  const normCap = rawCap !== undefined ? unwrapCapabilityHandle(rawCap) : undefined
+  const base: Record<string, unknown> = { ...e, kind, ...(ab !== undefined ? { ablationExchangeIds: ab } : {}) }
+  if (kind === 'value_binding') { if (normCap !== undefined && normCap !== '') base.capabilityHandle = normCap; else delete base.capabilityHandle }
+  else if (e.capabilityHandle !== undefined) base.capabilityHandle = unwrapCapabilityHandle(e.capabilityHandle)
+  return mapFields(base, { sourceCapabilityId: unwrapCapabilityHandle, derivedCapabilityId: unwrapCapabilityHandle, sourceExchangeId: normExRef, targetExchangeId: normExRef })
 }
-
-function normalizeCompositeReceipt(receipt: unknown, defaultOrigin: string | undefined): Record<string, unknown> {
+function inferValueBindingCap(edge: Record<string, unknown>, hops: unknown[], capOrigins?: ReadonlyMap<string, string>): string | undefined {
+  const list = hops.filter((h): h is Record<string, unknown> => Boolean(h) && typeof h === 'object' && !Array.isArray(h))
+  const fromHop = list.find(h => h.hopId === edge.fromHopId), toHop = list.find(h => h.hopId === edge.toHopId); if (!fromHop || !toHop) return undefined
+  const strs = (v: unknown): string[] => Array.isArray(v) ? [...new Set(v.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map(x => x.trim()))] : []
+  const prodOf = (h: Record<string, unknown>): string[] => { const ex = strs(h.producedCapabilities); if (ex.length || !capOrigins?.size) return ex; const ids = new Set(strs(h.exchangeIds)); return [...new Set([...capOrigins.entries()].filter(([, id]) => ids.has(id)).map(([c]) => c))] }
+  const fromProd = prodOf(fromHop), cred = typeof toHop.credentialHandle === 'string' && /^cap[:_][A-Za-z0-9._:-]{1,180}$/.test(toHop.credentialHandle.trim()) ? [toHop.credentialHandle.trim()] : [], toCons = [...new Set([...strs(toHop.consumedCapabilities), ...cred])]
+  const shared = fromProd.filter(c => toCons.includes(c)); if (shared.length === 1) return shared[0]; if (shared.length > 1) return undefined
+  const tp = toHop.target && typeof toHop.target === 'object' && !Array.isArray(toHop.target) && typeof (toHop.target as Record<string, unknown>).pathAndQuery === 'string' ? (toHop.target as Record<string, unknown>).pathAndQuery as string : ''
+  const inT = tp ? fromProd.filter(c => tp.includes(c)) : []; if (inT.length === 1) return inT[0]; if (inT.length > 1) return undefined
+  if (fromProd.length === 1 && toCons.length === 0) return fromProd[0]
+  return fromProd.length === 0 && toCons.length === 1 && !list.some(h => h.hopId !== fromHop.hopId && prodOf(h).includes(toCons[0]!)) ? toCons[0] : undefined
+}
+export function normalizeCompositeReceipt(receipt: unknown, defaultOrigin: string | undefined, capOrigins?: ReadonlyMap<string, string>): Record<string, unknown> {
   const raw = receipt && typeof receipt === 'object' && !Array.isArray(receipt) && 'receipt' in receipt ? (receipt as Record<string, unknown>).receipt : receipt
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { receipt: raw }
-  const { controlExchanges: topCtrl, ...rec } = raw as Record<string, unknown>
-  if (!Array.isArray(rec.hops)) return { receipt: rec }
+  const { controlExchanges: topCtrl, ...rec } = raw as Record<string, unknown>; if (!Array.isArray(rec.hops)) return { receipt: rec }
+  const toArr = (v: unknown): unknown => v === undefined ? undefined : Array.isArray(v) ? v : [v]
   const hops = rec.hops.map(h => {
     if (!h || typeof h !== 'object' || Array.isArray(h)) return h
-    const { method, target, role: _r, arm: _a, ...rest } = h as Record<string, unknown>
-    return mapFields({ ...rest, target: normalizeHopTarget(target, method, defaultOrigin) }, { exchangeIds: normExList, producedCapabilities: normCapList, consumedCapabilities: normCapList })
+    const { method, target, role: _r, arm: _a, produces, consumes, sealedCapabilities, sealedCapability, ...rest } = h as Record<string, unknown>
+    const rawProd = rest.producedCapabilities ?? toArr(produces ?? sealedCapabilities ?? sealedCapability), rawCons = rest.consumedCapabilities ?? toArr(consumes)
+    return mapFields({ ...rest, target: normalizeHopTarget(target, method, defaultOrigin), ...(rawProd !== undefined ? { producedCapabilities: rawProd } : {}), ...(rawCons !== undefined ? { consumedCapabilities: rawCons } : {}) }, { exchangeIds: normExList, producedCapabilities: normCapList, consumedCapabilities: normCapList, credentialHandle: unwrapCapabilityHandle })
   })
   const rawEdges = Array.isArray(rec.causalEdges) ? rec.causalEdges : Array.isArray(rec.edges) ? rec.edges : undefined
-  const causalEdges = rawEdges?.map((ed, idx) => normalizeEdgeRecord(ed, idx))
-  let ti = rec.terminalImpact && typeof rec.terminalImpact === 'object' && !Array.isArray(rec.terminalImpact)
-    ? mapFields(rec.terminalImpact as Record<string, unknown>, { terminalExchangeId: normExRef, modeAFailureExchangeId: normExRef, preChainControlExchangeIds: normExList, postChainReadbackExchangeIds: normExList })
-    : rec.terminalImpact
+  const causalEdges = rawEdges?.map((ed, idx) => {
+    const norm = normalizeEdgeRecord(ed, idx) as Record<string, unknown> | unknown
+    if (norm && typeof norm === 'object' && !Array.isArray(norm) && (norm as Record<string, unknown>).kind === 'value_binding' && (norm as Record<string, unknown>).capabilityHandle === undefined && (norm as Record<string, unknown>).valueDigest === undefined) { const inf = inferValueBindingCap(norm as Record<string, unknown>, hops, capOrigins); if (inf) return { ...(norm as Record<string, unknown>), capabilityHandle: inf } }
+    return norm
+  })
+  let ti = rec.terminalImpact && typeof rec.terminalImpact === 'object' && !Array.isArray(rec.terminalImpact) ? mapFields(rec.terminalImpact as Record<string, unknown>, { terminalExchangeId: normExRef, modeAFailureExchangeId: normExRef, preChainControlExchangeIds: normExList, postChainReadbackExchangeIds: normExList }) : rec.terminalImpact
   if (topCtrl !== undefined && ti && typeof ti === 'object' && !Array.isArray(ti)) {
-    const merged: string[] = []
-    for (const id of [...extractExchangeIds((ti as Record<string, unknown>).preChainControlExchangeIds as ExchangeRef[] | undefined), ...extractExchangeIds(topCtrl as ExchangeRef | ExchangeRef[])]) pushUnique(merged, id)
+    const merged: string[] = []; for (const id of [...extractExchangeIds((ti as Record<string, unknown>).preChainControlExchangeIds as ExchangeRef[] | undefined), ...extractExchangeIds(topCtrl as ExchangeRef | ExchangeRef[])]) pushUnique(merged, id)
     if (merged.length) ti = { ...(ti as Record<string, unknown>), preChainControlExchangeIds: merged }
   }
   return { receipt: { ...rec, hops, ...(causalEdges !== undefined ? { causalEdges } : {}), ...(ti !== undefined ? { terminalImpact: ti } : {}) } }
@@ -280,7 +301,7 @@ export class ChainBuilder {
   recordHop(hop: HopReceiptInput & { role?: 'setup' | 'control' | 'probe' | 'cleanup'; arm?: 'setup' | 'control' | 'probe' | 'cleanup' }): this {
     const { role, arm, ...cleanHop } = hop
     const target = normalizeHopTarget(cleanHop.target, cleanHop.method, this.ctx.targetOrigin || undefined) as HopTargetObject
-    const receipt: HopReceiptInput = { ...cleanHop, surface: cleanHop.surface ?? 'http', target }
+    const receipt: HopReceiptInput = { ...cleanHop, surface: cleanHop.surface ?? 'http', target, ...(cleanHop.producedCapabilities ? { producedCapabilities: normCapList(cleanHop.producedCapabilities) as string[] } : {}), ...(cleanHop.consumedCapabilities ? { consumedCapabilities: normCapList(cleanHop.consumedCapabilities) as string[] } : {}) }
     for (const exId of receipt.exchangeIds ?? []) this.exchangeToHop.set(exId, receipt.hopId)
     for (const cap of receipt.producedCapabilities ?? []) if (!this.capProducer.has(cap)) this.capProducer.set(cap, { hopId: receipt.hopId, exchangeId: receipt.exchangeIds?.[0] })
     this.hops.push({ receipt, isControlOnly: (role ?? arm) === 'control', capConsumeExchange: new Map(), cryptoConsumptions: [], asyncPolls: [] })
@@ -296,7 +317,7 @@ export class ChainBuilder {
     if (typeof fn !== 'function') throw new Error(`chain.hop("${trimmedId}") requires a callback function.`)
     const rec: HopRecorder = {
       hopId: trimmedId, exchangeIds: [...(meta.exchangeIds ?? [])], oobEventIds: [...(meta.oobEventIds ?? [])], browserTraceIds: [...(meta.browserTraceIds ?? [])],
-      producedCapabilities: [...(meta.producedCapabilities ?? [])], consumedCapabilities: [...(meta.consumedCapabilities ?? [])], entityId: meta.entityId, correlationIds: [],
+      producedCapabilities: [...(normCapList(meta.producedCapabilities ?? []) as string[])], consumedCapabilities: [...(normCapList(meta.consumedCapabilities ?? []) as string[])], entityId: meta.entityId, correlationIds: [],
       controlExCount: 0, nonControlExCount: 0, capConsumeExchange: new Map(), cryptoConsumptions: [], asyncPolls: [],
       onProduce: (cap, exId) => { pushUnique(rec.producedCapabilities, cap); if (!this.capProducer.has(cap)) this.capProducer.set(cap, { hopId: trimmedId, ...(exId ? { exchangeId: exId } : {}) }) },
       onExchange: (exId, isControl) => { pushUnique(rec.exchangeIds, exId); this.exchangeToHop.set(exId, trimmedId); if (isControl) rec.controlExCount++; else rec.nonControlExCount++ },
@@ -449,21 +470,9 @@ export class VerifyContext {
   }
 
   private buildHttpRpcArgs(input: HttpTarget, options: HttpOptions = {}): { args: Record<string, unknown>; timeoutMs: number } {
-    const target = splitTarget(input, this.defaultOrigin)
-    const merged: HttpOptions = { ...extractInlineHttpOptions(input), ...options }
-    const { body, headers } = normalizeBodyAndHeaders(merged.body, merged.headers)
-    const persona = merged.as ?? merged.persona
-    const sessionGroupRole = merged.role ?? merged.arm
-    return {
-      args: {
-        ...(target.origin ? { origin: target.origin } : {}), path: target.path, method: (merged.method ?? 'GET').toUpperCase(),
-        ...(headers ? { headers } : {}), ...(body !== undefined ? { body } : {}), ...(persona ? { persona } : {}),
-        ...(sessionGroupRole ? { sessionGroupRole } : {}),
-        ...pickDefined(merged as Record<string, unknown>, ['session', 'followRedirects', 'capability', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'authMutation', 'entityId', 'evidenceRole', 'replayAttempt']),
-        ...(merged.correlationIds?.length ? { correlationIds: merged.correlationIds } : {}),
-      },
-      timeoutMs: (merged.timeoutMs ?? 60_000) + 10_000,
-    }
+    const target = splitTarget(input, this.defaultOrigin), merged: HttpOptions = { ...extractInlineHttpOptions(input), ...options }
+    const { body, headers } = normalizeBodyAndHeaders(merged.body, merged.headers), persona = merged.as ?? merged.persona, sessionGroupRole = merged.role ?? merged.arm, capability = normalizeCapabilityInjection(merged.capability)
+    return { args: { ...(target.origin ? { origin: target.origin } : {}), path: target.path, method: (merged.method ?? 'GET').toUpperCase(), ...(headers ? { headers } : {}), ...(body !== undefined ? { body } : {}), ...(persona ? { persona } : {}), ...(sessionGroupRole ? { sessionGroupRole } : {}), ...(capability !== undefined && capability !== '' ? { capability } : {}), ...pickDefined(merged as Record<string, unknown>, ['session', 'followRedirects', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'authMutation', 'entityId', 'evidenceRole', 'replayAttempt']), ...(merged.correlationIds?.length ? { correlationIds: merged.correlationIds } : {}) }, timeoutMs: (merged.timeoutMs ?? 60_000) + 10_000 }
   }
 
   private extractExDiag(raw: { status?: unknown; mediaType?: unknown; headers?: unknown; json?: unknown; body?: unknown }): ExSealDiag {
@@ -660,7 +669,7 @@ export class VerifyContext {
     if (claims.length) { if (ok) { this._lastFailedClaims = []; this.claims.push(...claims) } else { this._lastFailedClaims = [...claims] } }
   }
   async prove_composite(receipt: CompositeProofReceiptInput): Promise<CompositeVerificationResult> {
-    const res = await this.callRpc('composite.verify', normalizeCompositeReceipt(receipt, this.defaultOrigin), 30_000) as CompositeVerificationResult
+    const res = await this.callRpc('composite.verify', normalizeCompositeReceipt(receipt, this.defaultOrigin, this._capOrigins), 30_000) as CompositeVerificationResult
     const confirmed = res.confirmed === true || res.ok === true || res.verified === true
     if (res.claim) this.recordProofClaims(confirmed, [res.claim])
     return { ...res, confirmed, ok: confirmed, verified: confirmed }
@@ -766,18 +775,15 @@ function normalizeProofResult(ctx: VerifyContext, returned: unknown, defaultTitl
   return { sdk: 'kovo_verify.ts', nonce: ctx.nonce, title: fallbackTitle, severity: 'high', claims: fallbackClaims }
 }
 function failScript(ctx: VerifyContext, message: string, claims: VerifyClaim[]): void {
-  writeResult({ sdk: 'kovo_verify.ts', nonce: ctx.nonce, error: message.slice(0, 2000), ...(ctx.lastRpcOp ? { lastRpcOp: ctx.lastRpcOp } : {}), claims })
-  process.stderr.write(`kovo_verify: ${message}\n`); process.exitCode = 1
+  writeResult({ sdk: 'kovo_verify.ts', nonce: ctx.nonce, error: message.slice(0, 2000), ...(ctx.lastRpcOp ? { lastRpcOp: ctx.lastRpcOp } : {}), claims }); process.stderr.write(`kovo_verify: ${message}\n`); process.exitCode = 1
 }
 export async function runVerification(script: VerificationScript, defaultTitle?: string): Promise<void> {
   const ctx = new VerifyContext(); let result: unknown = null
-  try { await script.setup?.(ctx); result = await script.verify(ctx); await script.cleanup?.(ctx) }
-  catch (error) { failScript(ctx, error instanceof Error ? error.message : 'Verification script failed.', ctx.effectiveClaims()); return }
-  const normalized = normalizeProofResult(ctx, result, defaultTitle); writeResult(normalized)
-  process.stdout.write(`kovo_verify: ${normalized.claims.length} transcript-backed claim(s) recorded\n`)
+  try { await script.setup?.(ctx); result = await script.verify(ctx); await script.cleanup?.(ctx) } catch (error) { failScript(ctx, error instanceof Error ? error.message : 'Verification script failed.', ctx.effectiveClaims()); return }
+  const normalized = normalizeProofResult(ctx, result, defaultTitle); writeResult(normalized); process.stdout.write(`kovo_verify: ${normalized.claims.length} transcript-backed claim(s) recorded\n`)
 }
 export async function runEntrypoint(entry: VerificationEntrypoint, defaultTitle?: string): Promise<void> {
-  if (typeof entry === 'function') { await runVerification({ verify: entry }, defaultTitle); return }
-  if (entry && typeof entry === 'object' && typeof entry.verify === 'function') { await runVerification(entry, defaultTitle); return }
+  if (typeof entry === 'function') return runVerification({ verify: entry }, defaultTitle)
+  if (entry && typeof entry === 'object' && typeof entry.verify === 'function') return runVerification(entry, defaultTitle)
   failScript(new VerifyContext(), 'kovo_verify script must export a default async (ctx) => ... function, an object with verify(ctx), or execute ctx.prove_* directly.', [])
 }
