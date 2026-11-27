@@ -375,6 +375,14 @@ export async function handleApi(
       sendJson(res, 400, { error: 'workspace required' })
       return
     }
+    // Explicit workspace selection requires membership in that workspace.
+    if (!fallback && !roleOf(state, session, workspaceId)) {
+      state.emit('docs.workspace_denied', {
+        reason: 'workspace_role_required', workspaceId: workspaceHeader, tenantId: workspaceId, runId,
+      }, session.originPersona)
+      sendJson(res, 403, { error: 'workspace membership required' })
+      return
+    }
     const delegation = delegationFor(state, req)
     if (!delegation || delegation.tenantId !== workspaceId) {
       state.emit('docs.access_denied', {
