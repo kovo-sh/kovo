@@ -169,11 +169,11 @@ function extractSources(ex: RecordedRequestExchange, stepIdx: number): Extracted
     if (typeof node === 'string' || typeof node === 'number') {
       const s = String(node).trim(); if (!s || !jp) return
       out.push({ stepIdx, kind: 'jsonPath', selector: jp, value: s, jsAccess: js, isSecretKey: SECRET_KEY_RE.test(lastKey) || SECRET_KEY_RE.test(jp), isIdKey: ID_KEY_RE.test(lastKey), isUrlKey: URL_KEY_RE.test(lastKey) })
-      if (typeof node === 'string' && (/^https?:\/\//i.test(s) || (s.startsWith('/') && (s.includes('?') || s.includes('#'))))) {
+      if (ex.status >= 200 && ex.status < 300 && typeof node === 'string' && !/^\[redacted/i.test(s) && (/^https?:\/\//i.test(s) || (s.startsWith('/') && (s.includes('?') || s.includes('#'))))) {
         try {
           const u = new URL(s, 'http://kovo-local.invalid')
-          for (const [k, v] of u.searchParams.entries()) if (v) out.push({ stepIdx, kind: 'jsonUrlQuery', selector: `${jp}?${k}`, value: v, jsAccess: js, paramName: k, fromHash: false, isSecretKey: true })
-          if (u.hash.length > 1) for (const [k, v] of new URLSearchParams(u.hash.slice(1)).entries()) if (v) out.push({ stepIdx, kind: 'jsonUrlQuery', selector: `${jp}#${k}`, value: v, jsAccess: js, paramName: k, fromHash: true, isSecretKey: true })
+          for (const [k, v] of u.searchParams.entries()) if (v && !v.toLowerCase().includes('[redacted')) out.push({ stepIdx, kind: 'jsonUrlQuery', selector: `${jp}?${k}`, value: v, jsAccess: js, paramName: k, fromHash: false, isSecretKey: true })
+          if (u.hash.length > 1) for (const [k, v] of new URLSearchParams(u.hash.slice(1)).entries()) if (v && !v.toLowerCase().includes('[redacted')) out.push({ stepIdx, kind: 'jsonUrlQuery', selector: `${jp}#${k}`, value: v, jsAccess: js, paramName: k, fromHash: true, isSecretKey: true })
         } catch { /* ignore malformed URL */ }
       }
     } else if (Array.isArray(node)) { for (let i = 0; i < Math.min(node.length, 25); i += 1) walk(node[i], `${jp}[${i}]`, `${js}?.[${i}]`, depth + 1, lastKey) }
@@ -241,13 +241,25 @@ const stepJsAccess = (jsAccess: string | undefined, stepVar: string): string =>
   jsAccess ? jsAccess.replace(/^ex\./, `${stepVar}.`) : 'undefined'
 function formatSealCall(s: SealSpec, stepVar: string): string {
   const jsExpr = stepJsAccess(s.source.jsAccess, stepVar)
+  if (s.source.kind === 'jsonUrlQuery') {
+    const paramLit = JSON.stringify(s.source.paramName!), rawVar = `_u_${s.varName}`, valVar = `_v_${s.varName}`
+    const extract = s.source.fromHash
+      ? `(() => { try { return new URLSearchParams(new URL(${rawVar}, "http://kovo-local.invalid").hash.slice(1)).get(${paramLit}) ?? "" } catch { return "" } })()`
+      : `(() => { try { return new URL(${rawVar}, "http://kovo-local.invalid").searchParams.get(${paramLit}) ?? "" } catch { return "" } })()`
+    const f = [`slot: ${JSON.stringify(s.slot)}`, `value: ${valVar}`, `kind: ${JSON.stringify(s.kind)}`]
+    if (s.defaultHeaderName) f.push(`defaultHeaderName: ${JSON.stringify(s.defaultHeaderName)}`)
+    if (s.defaultCookieName) f.push(`defaultCookieName: ${JSON.stringify(s.defaultCookieName)}`)
+    return [
+      `if (${stepVar}.status < 200 || ${stepVar}.status >= 300) throw new Error(${JSON.stringify(`Cannot seal ${s.source.selector}: ${stepVar} returned HTTP `)} + ${stepVar}.status)`,
+      `  const ${rawVar} = typeof ${jsExpr} === "string" ? ${jsExpr}.trim() : ""`,
+      `  const ${valVar} = ${rawVar} && !/^\\[redacted/i.test(${rawVar}) ? ${extract} : ""`,
+      `  if (!${valVar} || ${valVar}.toLowerCase().includes("[redacted")) throw new Error(${JSON.stringify(`Cannot seal query param "${s.source.paramName!}" from ${s.source.selector}: missing or redacted`)})`,
+      `  const ${s.varName} = await ch.seal(${stepVar}, { ${f.join(', ')} })`,
+    ].join('\n')
+  }
   const sel = s.source.kind === 'jsonPath' ? `jsonPath: ${JSON.stringify(s.source.selector)}`
     : s.source.kind === 'setCookie' ? `setCookie: ${JSON.stringify(s.source.cookieName!)}`
     : s.source.kind === 'locationQuery' ? `locationQuery: ${JSON.stringify(s.source.paramName!)}`
-    : s.source.kind === 'jsonUrlQuery'
-      ? (s.source.fromHash
-          ? `value: new URLSearchParams(new URL(String(${jsExpr} ?? ""), "http://kovo-local.invalid").hash.slice(1)).get(${JSON.stringify(s.source.paramName!)}) ?? ""`
-          : `value: new URL(String(${jsExpr} ?? ""), "http://kovo-local.invalid").searchParams.get(${JSON.stringify(s.source.paramName!)}) ?? ""`)
     : `header: ${JSON.stringify(s.source.headerName!)}`
   const f = [`slot: ${JSON.stringify(s.slot)}`, sel, `kind: ${JSON.stringify(s.kind)}`]
   if (s.defaultHeaderName) f.push(`defaultHeaderName: ${JSON.stringify(s.defaultHeaderName)}`)
@@ -505,16 +517,29 @@ function computeReachableToTerminal(edges: readonly CompiledEdge[], terminalIdx:
   }
   return reachable
 }
-function linkMutatingStateTransitions(st: BindingState, terminalIdx: number): void {
+function linkMutatingStateTransitions(st: BindingState, terminalIdx: number, allowGetCachePrime = false): void {
   const entByStep = st.plans.map(p => extractRequestEntities(p.exchange, st.blocked))
   let reachable = computeReachableToTerminal(st.edges, terminalIdx)
   for (let i = terminalIdx - 1; i >= 0; i -= 1) {
-    if (READ_ONLY_METHODS.has(st.plans[i]!.exchange.method.toUpperCase()) || reachable.has(i)) continue
+    if (reachable.has(i)) continue
+    const srcEx = st.plans[i]!.exchange, method = srcEx.method.toUpperCase(), isReadOnly = READ_ONLY_METHODS.has(method)
+    const isGetPrime = isReadOnly && allowGetCachePrime && method === 'GET' && srcEx.status >= 200 && srcEx.status < 300
+      && ![...st.plans[i]!.dynamicDepSteps].some(d => st.plans[d]!.exchange.status === 202)
+    if (isReadOnly && !isGetPrime) continue
     for (let j = i + 1; j <= terminalIdx; j += 1) {
       if (!reachable.has(j)) continue
+      const dstEx = st.plans[j]!.exchange
+      if (isGetPrime) {
+        const canLink = j === terminalIdx || st.edges.some(e => e.fromStepIdx === j && e.kind === 'value_binding')
+        if (!canLink || st.edges.some(e => e.toStepIdx === j)) continue
+        const pSrc = srcEx.persona?.trim().toLowerCase(), pDst = dstEx.persona?.trim().toLowerCase()
+        if (pSrc && pDst && pSrc !== pDst) continue
+        if (cleanControlPath(srcEx.pathAndQuery) === cleanControlPath(dstEx.pathAndQuery) && canonicalNonAuthQuery(srcEx.pathAndQuery) === canonicalNonAuthQuery(dstEx.pathAndQuery)) continue
+      }
       const sharedVar = [...st.plans[i]!.boundVars].find(v => st.plans[j]!.boundVars.has(v))
       const sharedLit = sharedVar ? undefined : entByStep[i]!.find(ent => entByStep[j]!.includes(ent))
-      const entityExpr = sharedVar ? `String(${sharedVar})` : sharedLit ? JSON.stringify(sharedLit) : undefined
+      const primeEnt = isGetPrime ? (entByStep[j]![0] ?? entByStep[i]![0] ?? `cache:${srcEx.persona?.trim() || cleanControlPath(dstEx.pathAndQuery)}`) : undefined
+      const entityExpr = sharedVar ? `String(${sharedVar})` : sharedLit ? JSON.stringify(sharedLit) : primeEnt ? JSON.stringify(primeEnt) : undefined
       if (!entityExpr) continue
       addCompiledEdge(st, { kind: 'state_transition_binding', fromStepIdx: i, toStepIdx: j, entityExpr })
       st.plans[i]!.entityIdExpr ??= entityExpr; st.plans[j]!.entityIdExpr ??= entityExpr
@@ -529,7 +554,7 @@ const mkStepPlan = (ex: RecordedRequestExchange, stepNumber: number, hopId: stri
   pathExpr: JSON.stringify(ex.pathAndQuery || '/'), deltaPath: (ex.pathAndQuery || '/').split('?')[0] || '/',
   usesDynamicUrlOrBody: false, dynamicDepSteps: new Set<number>(), boundVars: new Set<string>(), hasSealedUrlOrBodyDep: false,
 })
-function runBindingPass(causal: RecordedRequestExchange[], terminalIdx: number, explicitReadback: RecordedRequestExchange | undefined, allowedSet: ReadonlySet<string> | undefined, blocked: ReadonlySet<string>, warnings: string[]) {
+function runBindingPass(causal: RecordedRequestExchange[], terminalIdx: number, explicitReadback: RecordedRequestExchange | undefined, allowedSet: ReadonlySet<string> | undefined, blocked: ReadonlySet<string>, warnings: string[], allowGetCachePrime = false) {
   const plans = causal.map((ex, i) => mkStepPlan(ex, i + 1, `step_${i + 1}`))
   const st: BindingState = {
     plans, allowedSet, blocked, warnings, inferredBindings: [], sealMap: new Map(), varMap: new Map(),
@@ -543,7 +568,7 @@ function runBindingPass(causal: RecordedRequestExchange[], terminalIdx: number, 
       else if (isShortDynamicId(src, blocked) && !st.shortValueIndex.has(src.value)) st.shortValueIndex.set(src.value, src)
     }
   }
-  linkMutatingStateTransitions(st, terminalIdx)
+  linkMutatingStateTransitions(st, terminalIdx, allowGetCachePrime)
   const readbackPlan = explicitReadback ? mkStepPlan(explicitReadback, plans.length + 1, 'readback') : undefined
   if (readbackPlan) bindStepPlan(st, readbackPlan, plans.length, plans.length)
   return { st, readbackPlan }
@@ -632,11 +657,11 @@ function resolveStepPersona(
 function pruneAndBindCausalExchanges(
   initialCausal: RecordedRequestExchange[], initialTermIdx: number, terminalEx: RecordedRequestExchange,
   explicitReadback: RecordedRequestExchange | undefined, allowedSet: ReadonlySet<string> | undefined,
-  blocked: ReadonlySet<string>, warnings: string[],
+  blocked: ReadonlySet<string>, warnings: string[], allowGetCachePrime = false,
 ) {
   let causal = initialCausal, terminalIdx = initialTermIdx
   const passWarnings: string[] = []
-  let { st, readbackPlan } = runBindingPass(causal, terminalIdx, explicitReadback, allowedSet, blocked, passWarnings)
+  let { st, readbackPlan } = runBindingPass(causal, terminalIdx, explicitReadback, allowedSet, blocked, passWarnings, allowGetCachePrime)
   const reachable = computeReachableToTerminal(st.edges, terminalIdx)
   const prunedPollsBy202Id = new Map<string, RecordedRequestExchange>()
   for (let i = 0; i < causal.length; i += 1) {
@@ -652,7 +677,7 @@ function pruneAndBindCausalExchanges(
   }
   if (reachable.size < causal.length) {
     causal = causal.filter((_, i) => reachable.has(i)); terminalIdx = causal.findIndex(e => e.exchangeId === terminalEx.exchangeId)
-    ;({ st, readbackPlan } = runBindingPass(causal, terminalIdx, explicitReadback, allowedSet, blocked, warnings))
+    ;({ st, readbackPlan } = runBindingPass(causal, terminalIdx, explicitReadback, allowedSet, blocked, warnings, allowGetCachePrime))
   } else warnings.push(...passWarnings)
 
   const asyncPollsByStep = new Map<number, StepPlan>()
@@ -702,7 +727,9 @@ export function compileTraceToKovoVerifyScript(input: {
   const terminalEx = causal[terminalIdx]!, raceConcurrency = collapsed.raceConcurrency
   const allowedSet = allowedPersonas?.length ? new Set(allowedPersonas) : undefined
   const blocked = buildBlockedValues(exchanges, allowedPersonas, submission.attackerPersona?.trim() || undefined, runOrigin)
-  const bound = pruneAndBindCausalExchanges(causal, terminalIdx, terminalEx, explicitReadback, allowedSet, blocked, warnings)
+  const prelimNorm = normalizeVulnClass(submission.vulnClass, submission.oracleFamily, causal.length, [])
+  const allowGetCachePrime = prelimNorm.validOracleFamily === 'dual_tenant_abac' || prelimNorm.validOracleFamily === 'parser_cache_differential' || prelimNorm.terminalVulnClass === 'dual_tenant_abac' || prelimNorm.terminalVulnClass === 'parser_cache_differential' || /^cross_tenant_/.test(prelimNorm.terminalVulnClass)
+  const bound = pruneAndBindCausalExchanges(causal, terminalIdx, terminalEx, explicitReadback, allowedSet, blocked, warnings, allowGetCachePrime)
   causal = bound.causal; terminalIdx = bound.terminalIdx
   const { st, readbackPlan, asyncPollsByStep } = bound
 
