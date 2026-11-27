@@ -239,14 +239,20 @@ fi
 
 # 2. Protect /tmp tmpfs by defaulting TMPDIR to a per-run subdir under
 #    ${KOVO_TMPDIR:-$HOME/guardian-bench-tmp} when TMPDIR is unset/empty,
-#    then create the temporary detached worktree under ${TMPDIR:-/tmp} with guaranteed cleanup.
+#    bridged via a short /tmp/kt-XXXX symlink whenever the real path exceeds 24 bytes
+#    so Linux AF_UNIX sun_path (108-byte cap) stays short while bytes live on disk.
+#    Then create the temporary detached worktree under ${TMPDIR:-/tmp} with guaranteed cleanup.
 RUN_TMPDIR=""
+RUN_TMPDIR_LINK=""
 WORKTREE_DIR=""
 cleanup() {
   if [[ -n "${WORKTREE_DIR:-}" && -e "$WORKTREE_DIR" ]]; then
     git -C "$REPO_ROOT" worktree remove --force "$WORKTREE_DIR" >/dev/null 2>&1 || true
     rm -rf "$WORKTREE_DIR" >/dev/null 2>&1 || true
     git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${RUN_TMPDIR_LINK:-}" && ( -L "$RUN_TMPDIR_LINK" || -e "$RUN_TMPDIR_LINK" ) ]]; then
+    rm -f "$RUN_TMPDIR_LINK" >/dev/null 2>&1 || true
   fi
   if [[ -n "${RUN_TMPDIR:-}" && -e "$RUN_TMPDIR" ]]; then
     rm -rf "$RUN_TMPDIR" >/dev/null 2>&1 || true
@@ -257,8 +263,27 @@ trap cleanup EXIT
 if [[ -z "${TMPDIR:-}" ]]; then
   _kovo_tmp_base="${KOVO_TMPDIR:-${HOME:+${HOME}/guardian-bench-tmp}}"
   if [[ -n "$_kovo_tmp_base" && -d "$_kovo_tmp_base" && -w "$_kovo_tmp_base" ]]; then
-    RUN_TMPDIR="$(mktemp -d "${_kovo_tmp_base}/kovo-gate-XXXXXX")"
-    export TMPDIR="$RUN_TMPDIR"
+    if _kovo_tmp_abs="$(cd "$_kovo_tmp_base" 2>/dev/null && pwd)"; then
+      RUN_TMPDIR="$(mktemp -d "${_kovo_tmp_abs%/}/kg-XXXXXX")"
+      if (( ${#RUN_TMPDIR} > 24 )) && [[ -d /tmp && -w /tmp ]]; then
+        _kovo_link_attempt=0
+        while (( _kovo_link_attempt < 16 )); do
+          _kovo_cand="$(mktemp -u /tmp/kt-XXXX)"
+          if ln -s "$RUN_TMPDIR" "$_kovo_cand" 2>/dev/null; then
+            RUN_TMPDIR_LINK="$_kovo_cand"
+            break
+          fi
+          _kovo_link_attempt=$(( _kovo_link_attempt + 1 ))
+        done
+        unset _kovo_link_attempt _kovo_cand
+      fi
+      if [[ -n "$RUN_TMPDIR_LINK" ]]; then
+        export TMPDIR="$RUN_TMPDIR_LINK"
+      else
+        export TMPDIR="$RUN_TMPDIR"
+      fi
+    fi
+    unset _kovo_tmp_abs
   fi
   unset _kovo_tmp_base
 fi
