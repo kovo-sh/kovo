@@ -42,7 +42,7 @@ export interface DifferentialArmInput { target: HttpTarget; options?: HttpOption
 export interface BooleanOrTimingDiffInput { control: DifferentialArmInput | HttpTarget; variant: DifferentialArmInput | HttpTarget; mode: 'boolean' | 'timing'; rounds?: number; minSimilarityDelta?: number; minDeltaTokens?: number; maxSimilarity?: number; maxPValue?: number; session?: string; message?: string }
 export interface OobInjectionInput { target: HttpTarget; method?: string; headers?: Record<string, string>; body?: string; as?: string }
 export interface OobCallbackInput { inject: ((canary: { url: string; token: string; dnsHost: string }) => Promise<HttpExchange | void> | HttpExchange | void) | OobInjectionInput; token?: string; timeoutMs?: number; immediateMs?: number; windowMs?: number; message?: string }
-export interface RaceRequestInput { target?: HttpTarget; url?: HttpTarget; path?: string; origin?: string; method?: string; headers?: Record<string, string>; body?: string | Record<string, unknown> | unknown[]; as?: string }
+export interface RaceRequestInput { target?: HttpTarget; url?: HttpTarget; path?: string; origin?: string; method?: string; headers?: Record<string, string>; body?: string | Record<string, unknown> | unknown[]; jsonBody?: unknown; textBody?: string; as?: string }
 export interface RaceBurstInput { requests: Array<RaceRequestInput | HttpTarget>; barrier?: 'auto' | 'h2' | 'http1'; session?: string; minDistinctOutcomes?: number; expectAllSuccess?: boolean; readRoute?: HttpTarget; readMethod?: string; readPersona?: string; serialRequest?: RaceRequestInput | HttpTarget; balanceField?: string; capField?: string; unitDebit?: number; vulnClass?: string; baselineExchangeId?: string; postExchangeId?: string; serialExchangeIds?: string[]; serialPreExchangeId?: string; serialPostExchangeId?: string; message?: string }
 export interface InjectionDifferentialInput { control?: DifferentialArmInput | HttpTarget; probe?: DifferentialArmInput | HttpTarget; variant?: DifferentialArmInput | HttpTarget; url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; method?: string; headers?: Record<string, string>; as?: string; controlBody?: string | Record<string, unknown>; probeBody?: string | Record<string, unknown>; expectedOutput?: string; vulnClass?: string; session?: string; message?: string }
 export interface SignedUrlMintInput { control?: DifferentialArmInput | HttpTarget; probe?: DifferentialArmInput | HttpTarget; controlExchangeId?: string; probeExchangeId?: string; variant?: 'auto' | 'key_traversal' | 'unauth_write_mint'; url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; method?: string; headers?: Record<string, string>; as?: string; controlBody?: string | Record<string, unknown>; probeBody?: string | Record<string, unknown>; session?: string; message?: string }
@@ -53,7 +53,7 @@ interface RpcEnvelope { ok: boolean; result?: unknown; error?: string }
 export interface HttpExchange { exchangeId: string; status: number; method: string; pathAndQuery: string; finalPathAndQuery?: string; redirectOrigins?: string[]; mediaType: string; headers: Record<string, string>; body: string; text: string; json: unknown; data: unknown; bodyPreview: string; bodyBytes: number; bodySha256: string; durationMs: number; personaHandle: string | null; raceBatchId?: string; consumedCapabilityId?: string | null; consumedCapabilities?: string[]; derivedFromCapabilityIds?: string[]; protocol?: 'h2' }
 export interface RaceBurstHopResult { mode: 'h2-single-packet' | 'http1-fallback'; fallbackReason: string | null; raceBatchId: string; summary: Record<string, unknown>; results: HttpExchange[]; exchanges: HttpExchange[]; baseline?: HttpExchange; post?: HttpExchange }
 export interface CapabilityInjectionSpec { handle: string; target?: 'bearer' | 'header' | 'cookie' | 'url'; headerName?: string; cookieName?: string; queryParam?: string }
-export interface SealCapabilityInput { exchangeId?: string | { exchangeId: string }; exchange?: string | { exchangeId: string } | null; hopReceiptId?: string; hopId?: string; slot: string; jsonPath?: string; header?: string; cookie?: string; setCookie?: string; locationQuery?: string; queryParam?: string; regex?: string; value?: string; kind?: 'bearer_token' | 'api_token' | 'cookie' | 'signed_url' | 'oidc_assertion' | 'signing_salt' | 'hmac_key' | 'jwt' | 'header_secret' | 'generic_secret'; ttlMs?: number | null; defaultHeaderName?: string; defaultCookieName?: string; allowedOrigins?: string[] }
+export interface SealCapabilityInput { exchangeId?: string | { exchangeId: string }; exchange?: string | { exchangeId: string } | null; hopReceiptId?: string; hopId?: string; slot: string; jsonPath?: string; path?: string; header?: string; cookie?: string; setCookie?: string; locationQuery?: string; queryParam?: string; regex?: string; value?: string; kind?: 'bearer_token' | 'api_token' | 'cookie' | 'signed_url' | 'oidc_assertion' | 'signing_salt' | 'hmac_key' | 'jwt' | 'header_secret' | 'generic_secret'; ttlMs?: number | null; defaultHeaderName?: string; defaultCookieName?: string; allowedOrigins?: string[] }
 export interface SealedCapabilityResult { handle: string; meta: Record<string, unknown>; exchangeId: string; sealExchangeId: string; scrubbedPreview: string }
 export interface HmacSignInput { secretHandle: string; payload: string | Record<string, unknown> | unknown[]; alg?: 'sha256' | 'sha384' | 'sha512'; encoding?: 'hex' | 'base64' | 'base64url' }
 export interface HmacSignResult { exchangeId: string; signature: string; handle: string; derivedHandle: string; attestation: { derivedFromCapabilityId: string; alg: string; encoding: string; payloadDigest: string; signatureDigest: string; sourceSecretDigest: string; runId: string; timestampMs: number } }
@@ -81,8 +81,8 @@ export interface BrowserExchange { exchangeId: string; status: number; url: stri
 export interface OobHandle { exchangeId: string; token: string; url: string; dnsHost: string }
 export interface OobCheck extends OobHandle { hit: boolean; checkExchangeId?: string; hits: Array<{ protocol: string; token: string; remoteIp?: string; timestamp?: number }> }
 
-export interface HttpOptions { as?: string; persona?: string; session?: string; role?: 'setup' | 'control' | 'probe' | 'cleanup'; arm?: 'setup' | 'control' | 'probe' | 'cleanup'; isControl?: boolean; control?: boolean; method?: string; headers?: Record<string, string>; body?: string | Record<string, unknown> | unknown[]; followRedirects?: boolean; timeoutMs?: number; capability?: string | CapabilityInjectionSpec; capabilityTarget?: 'bearer' | 'header' | 'cookie' | 'url'; capabilityHeaderName?: string; capabilityCookieName?: string; capabilityQueryParam?: string; authMutation?: Record<string, unknown>; entityId?: string; correlationIds?: string[]; evidenceRole?: string; replayAttempt?: 'mode_a' | 'ablation_control' | 'primary' }
-export type HttpTargetString = `/${string}` | `http://${string}` | `https://${string}` | `${'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS'} ${string}`
+export interface HttpOptions { as?: string; persona?: string; session?: string; role?: 'setup' | 'control' | 'probe' | 'cleanup'; arm?: 'setup' | 'control' | 'probe' | 'cleanup'; isControl?: boolean; control?: boolean; method?: string; headers?: Record<string, string>; body?: string | Record<string, unknown> | unknown[]; jsonBody?: unknown; textBody?: string; followRedirects?: boolean; timeoutMs?: number; capability?: string | CapabilityInjectionSpec; capabilityTarget?: 'bearer' | 'header' | 'cookie' | 'url'; capabilityHeaderName?: string; capabilityCookieName?: string; capabilityQueryParam?: string; authMutation?: Record<string, unknown>; entityId?: string; correlationIds?: string[]; evidenceRole?: string; replayAttempt?: 'mode_a' | 'ablation_control' | 'primary' }
+export type HttpTargetString = `/${string}` | `http://${string}` | `https://${string}` | `cap:${string}` | `${'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS'} ${string}`
 export type HttpTargetObj = HttpOptions & { exchangeId?: never; url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; target?: HttpTarget; origin?: string }
 export type HttpTarget = string | (HttpOptions & { url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; target?: HttpTarget; origin?: string })
 export interface Expectations {
@@ -135,6 +135,7 @@ function splitTarget(input: HttpTarget, defaultOrigin: string | undefined): { or
     const trimmed = input.trim(); if (!trimmed) throw new Error('HTTP target path/URL must be non-empty.')
     const mp = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(.+)$/i.exec(trimmed), method = mp ? mp[1]!.toUpperCase() : undefined, raw = mp ? mp[2]!.trim() : trimmed
     if (/^https?:\/\//i.test(raw)) { const u = new URL(raw); return { origin: u.origin, path: u.pathname + u.search, ...(method ? { method } : {}) } }
+    if (/^cap:[a-zA-Z0-9_.:-]+$/.test(raw)) return { ...(defaultOrigin ? { origin: defaultOrigin } : {}), path: raw, ...(method ? { method } : {}) }
     return { ...(defaultOrigin ? { origin: defaultOrigin } : {}), path: raw.startsWith('/') ? raw : `/${raw}`, ...(method ? { method } : {}) }
   }
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('HTTP target requires a path/URL string or an object with { url | path | pathAndQuery | endpoint }.')
@@ -150,13 +151,15 @@ function extractInlineHttpOptions(input: unknown): HttpOptions {
   if (typeof r.method === 'string' && r.method.trim()) out.method = r.method.trim().toUpperCase()
   if (r.headers && typeof r.headers === 'object' && !Array.isArray(r.headers)) out.headers = r.headers as Record<string, string>
   if (r.body !== undefined) out.body = r.body as HttpOptions['body']
+  if (r.jsonBody !== undefined) out.jsonBody = r.jsonBody
+  if (r.textBody !== undefined) out.textBody = r.textBody as string
   const persona = typeof r.as === 'string' ? r.as : typeof r.persona === 'string' ? r.persona : undefined; if (persona) out.as = persona; return out
 }
 function isHttpTargetArg(v: unknown, hasOpts: boolean): boolean {
   if (Array.isArray(v)) return false
   if (v && typeof v === 'object') return typeof (v as Record<string, unknown>).exchangeId !== 'string'
   if (typeof v !== 'string') return false
-  const t = v.trim(); return hasOpts || t.startsWith('/') || /^https?:\/\//i.test(t) || /^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+/i.test(t)
+  const t = v.trim(); return hasOpts || t.startsWith('/') || /^https?:\/\//i.test(t) || /^cap:[a-zA-Z0-9_.:-]+$/.test(t) || /^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+/i.test(t)
 }
 function parseSealSelector(s: string): Record<string, unknown> {
   const t = s.trim()
@@ -305,7 +308,7 @@ export class ChainBuilder {
   control(targetOrRef: ExchangeRef | ExchangeRef[] | HttpTarget, opts?: HttpOptions): this | Promise<HttpExchange> {
     if (!isHttpTargetArg(targetOrRef, opts !== undefined)) { for (const id of extractExchangeIds(targetOrRef as ExchangeRef | ExchangeRef[])) pushUnique(this.controlIds, id); return this }
     const inlineSess = targetOrRef && typeof targetOrRef === 'object' && !Array.isArray(targetOrRef) && typeof (targetOrRef as HttpOptions).session === 'string' ? (targetOrRef as HttpOptions).session : undefined
-    return this.ctx._httpSendDetached(targetOrRef as HttpTarget, { ...(opts ?? {}), role: 'control', arm: 'control', session: opts?.session ?? inlineSess ?? `ctrl_${this.chainId}` }).then(ex => { pushUnique(this.controlIds, ex.exchangeId); return ex })
+    return this.ctx._httpSendDetached(targetOrRef as HttpTarget, { ...(opts ?? {}), role: 'control', arm: 'control', session: opts?.session ?? inlineSess ?? `ctrl_${this.chainId.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 27)}` }).then(ex => { pushUnique(this.controlIds, ex.exchangeId); return ex })
   }
 
   readback(target: HttpTargetString | HttpTargetObj, opts?: HttpOptions): Promise<HttpExchange>
@@ -316,7 +319,11 @@ export class ChainBuilder {
     return this.ctx._httpSendDetached(targetOrRef as HttpTarget, { ...(opts ?? {}), role: 'control', arm: 'control' }).then(ex => { pushUnique(this.readbackIds, ex.exchangeId); return ex })
   }
 
-  step(target: HttpTarget, opts: ChainStepOptions = {}): Promise<HttpExchange> {
+  step<T = HttpExchange>(hopId: string, fn: () => Promise<T> | T): Promise<T>
+  step<T = HttpExchange>(hopId: string, meta: ChainHopOptions, fn: () => Promise<T> | T): Promise<T>
+  step(target: HttpTarget, opts?: ChainStepOptions): Promise<HttpExchange>
+  step(target: HttpTarget, opts: ChainStepOptions | (() => Promise<unknown> | unknown) = {}, fn?: () => Promise<unknown> | unknown): Promise<unknown> {
+    if (typeof opts === 'function' || typeof fn === 'function') return this.hop(String(target), typeof opts === 'function' ? {} : (opts as ChainHopOptions), (typeof opts === 'function' ? opts : fn)!)
     const { hopId, surface, claimedDelta, canaryToken, proofReceipt, producedCapabilities, consumedCapabilities, ...httpOpts } = opts
     const inline = extractInlineHttpOptions(target), hasRole = Boolean(httpOpts.role || httpOpts.arm || httpOpts.isControl || httpOpts.control || inline.role || inline.arm || inline.isControl || inline.control)
     return this.hop(hopId?.trim() || this.nextHopId(), { ...(surface ? { surface } : {}), ...(claimedDelta ? { claimedDelta } : {}), ...(canaryToken ? { canaryToken } : {}), ...(proofReceipt ? { proofReceipt } : {}), ...(producedCapabilities ? { producedCapabilities } : {}), ...(consumedCapabilities ? { consumedCapabilities } : {}) }, () => this.ctx.http_send(target, hasRole ? httpOpts : { role: 'probe', ...httpOpts }))
@@ -326,6 +333,7 @@ export class ChainBuilder {
   async seal(exchange: ExchangeRef, selector: ChainSealSelector): Promise<string> {
     const exId = extractExchangeIds(exchange)[0]; if (!exId) throw new Error('chain.seal requires an exchange or exchangeId.')
     const sel: Record<string, unknown> = typeof selector === 'string' ? parseSealSelector(selector) : { ...(selector ?? {}) }
+    if (sel.jsonPath === undefined && typeof sel.path === 'string' && sel.path.trim()) { sel.jsonPath = sel.path.trim(); delete sel.path }
     const slot = typeof sel.slot === 'string' && sel.slot.trim() ? sel.slot.trim() : `s${++this.sealSeq}`
     const hopId = (typeof sel.hopReceiptId === 'string' && sel.hopReceiptId.trim()) ? sel.hopReceiptId.trim() : (typeof sel.hopId === 'string' && sel.hopId.trim()) ? sel.hopId.trim() : this.exchangeToHop.get(exId)
     const res = await this.ctx.seal_capability({ ...(sel as Omit<SealCapabilityInput, 'slot'>), exchangeId: exId, slot, ...(hopId ? { hopReceiptId: hopId } : {}) })
@@ -547,7 +555,8 @@ export class VerifyContext {
 
   private buildHttpRpcArgs(input: HttpTarget, options: HttpOptions = {}): { args: Record<string, unknown>; timeoutMs: number } {
     const target = splitTarget(input, this.defaultOrigin), merged: HttpOptions = { ...extractInlineHttpOptions(input), ...options }
-    const { body, headers } = normalizeBodyAndHeaders(merged.body, merged.headers), persona = merged.as ?? merged.persona, capability = normalizeCapabilityInjection(merged.capability)
+    const rawBody = merged.body !== undefined ? merged.body : (merged.jsonBody !== undefined ? merged.jsonBody : merged.textBody)
+    const { body, headers } = normalizeBodyAndHeaders(rawBody, merged.headers), persona = merged.as ?? merged.persona, capability = normalizeCapabilityInjection(merged.capability)
     const arm = merged.arm ?? (merged.role === 'control' || merged.isControl === true || merged.control === true ? 'control' : undefined), sessionGroupRole = merged.role ?? arm
     return { args: { ...(target.origin ? { origin: target.origin } : {}), path: target.path, method: (merged.method ?? target.method ?? 'GET').toUpperCase(), ...(headers ? { headers } : {}), ...(body !== undefined ? { body } : {}), ...(persona ? { persona } : {}), ...(sessionGroupRole ? { sessionGroupRole } : {}), ...(arm ? { arm } : {}), ...(capability !== undefined && capability !== '' ? { capability } : {}), ...pickDefined(merged as Record<string, unknown>, ['session', 'followRedirects', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'authMutation', 'entityId', 'evidenceRole', 'replayAttempt']), ...(merged.correlationIds?.length ? { correlationIds: merged.correlationIds } : {}) }, timeoutMs: (merged.timeoutMs ?? 60_000) + 10_000 }
   }
@@ -627,9 +636,10 @@ export class VerifyContext {
     if (!exchangeId) throw new Error('seal_capability requires exchangeId (string) or exchange ({ exchangeId }).')
     const activeHop = this.activeHop(), hopReceiptId = (typeof raw.hopReceiptId === 'string' && raw.hopReceiptId.trim()) ? raw.hopReceiptId.trim() : (typeof raw.hopId === 'string' && raw.hopId.trim()) ? raw.hopId.trim() : activeHop?.hopId
     const cookieSel = typeof raw.cookie === 'string' && raw.cookie.trim() ? raw.cookie : typeof raw.setCookie === 'string' && raw.setCookie.trim() ? raw.setCookie : undefined
+    const jsonPathSel = typeof raw.jsonPath === 'string' && raw.jsonPath.trim() ? raw.jsonPath : typeof raw.path === 'string' && raw.path.trim() ? raw.path : undefined
     let res: SealedCapabilityResult
     try {
-      res = await this.callRpc('capability.seal', { exchangeId, slot: input.slot, ...(hopReceiptId ? { hopReceiptId } : {}), ...(cookieSel ? { cookie: cookieSel } : {}), ...pickDefined(raw, ['jsonPath', 'header', 'setCookie', 'locationQuery', 'queryParam', 'regex', 'kind', 'defaultHeaderName', 'defaultCookieName']), ...(input.value !== undefined ? { value: input.value } : {}), ...(input.ttlMs !== undefined ? { ttlMs: input.ttlMs } : {}), ...(input.allowedOrigins?.length ? { allowedOrigins: input.allowedOrigins } : {}) }, 30_000) as SealedCapabilityResult
+      res = await this.callRpc('capability.seal', { exchangeId, slot: input.slot, ...(hopReceiptId ? { hopReceiptId } : {}), ...(cookieSel ? { cookie: cookieSel } : {}), ...(jsonPathSel ? { jsonPath: jsonPathSel } : {}), ...pickDefined(raw, ['header', 'setCookie', 'locationQuery', 'queryParam', 'regex', 'kind', 'defaultHeaderName', 'defaultCookieName']), ...(input.value !== undefined ? { value: input.value } : {}), ...(input.ttlMs !== undefined ? { ttlMs: input.ttlMs } : {}), ...(input.allowedOrigins?.length ? { allowedOrigins: input.allowedOrigins } : {}) }, 30_000) as SealedCapabilityResult
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       if (/structured field not found/i.test(msg)) throw new Error(this.diagnoseSealFailure(msg, raw, this._exMeta.get(exchangeId) ?? (raw.exchange && typeof raw.exchange === 'object' ? this.extractExDiag(raw.exchange as Record<string, unknown>) : undefined)))

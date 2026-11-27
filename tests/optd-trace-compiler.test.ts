@@ -41,18 +41,64 @@ function createMockCtx(responses: Array<{ status?: number; json?: unknown; heade
   let exCounter = 0
   let capCounter = 0
   let hopDepth = 0
+  const sendMockHttp = async (target: unknown, opts: Record<string, unknown> = {}, detached = false) => {
+    const idx = exCounter
+    exCounter += 1
+    if (!detached && (opts.arm === 'control' || opts.role === 'control') && hopDepth > 0) log.controlInsideHop = true
+    log.httpCalls.push({ target, opts })
+    const spec = responses[idx] ?? { status: 200, json: {} }
+    return {
+      exchangeId: `ex_${exCounter}`,
+      status: spec.status ?? 200,
+      json: spec.json ?? null,
+      headers: spec.headers ?? {},
+      body: spec.json ? JSON.stringify(spec.json) : '',
+    }
+  }
   const ctx = {
     chain(chainId: string, terminalVulnClass: string) {
       log.chainArgs.push([chainId, terminalVulnClass])
-      return {
-        control(ref: { exchangeId: string }) {
+      const self = {
+        control(targetOrRef: unknown, opts?: Record<string, unknown>) {
+          if (targetOrRef && typeof targetOrRef === 'object' && 'exchangeId' in (targetOrRef as Record<string, unknown>)) {
+            if (hopDepth > 0) log.controlInsideHop = true
+            log.controls.push(String((targetOrRef as { exchangeId: string }).exchangeId))
+            return self
+          }
           if (hopDepth > 0) log.controlInsideHop = true
-          log.controls.push(ref.exchangeId)
-          return this
+          return sendMockHttp(targetOrRef, { ...(opts ?? {}), arm: 'control', role: 'control' }, true).then(ex => {
+            log.controls.push(ex.exchangeId)
+            return ex
+          })
         },
-        readback(ref: { exchangeId: string }) { log.readbacks.push(ref.exchangeId); return this },
-        edge(e: Record<string, unknown>) { log.edges.push(e); return this },
-        stateTransition(e: Record<string, unknown>) { log.stateTransitions.push(e); return this },
+        readback(targetOrRef: unknown, opts?: Record<string, unknown>) {
+          if (targetOrRef && typeof targetOrRef === 'object' && 'exchangeId' in (targetOrRef as Record<string, unknown>)) {
+            log.readbacks.push(String((targetOrRef as { exchangeId: string }).exchangeId))
+            return self
+          }
+          return sendMockHttp(targetOrRef, { ...(opts ?? {}), arm: 'control', role: 'control' }, true).then(ex => {
+            log.readbacks.push(ex.exchangeId)
+            return ex
+          })
+        },
+        edge(e: Record<string, unknown>) { log.edges.push(e); return self },
+        stateTransition(e: Record<string, unknown>) { log.stateTransitions.push(e); return self },
+        async step(target: unknown, opts: Record<string, unknown> = {}) {
+          const { hopId, claimedDelta: _cd, ...httpOpts } = opts
+          const resolvedHopId = typeof hopId === 'string' && hopId.trim() ? hopId.trim() : `hop_${log.hops.length + 1}`
+          log.hops.push(resolvedHopId)
+          hopDepth += 1
+          try { return await sendMockHttp(target, httpOpts) } finally { hopDepth -= 1 }
+        },
+        async seal(exchange: { exchangeId: string } | string, selector: Record<string, unknown>) {
+          capCounter += 1
+          const exchangeId = typeof exchange === 'string' ? exchange : exchange?.exchangeId
+          assert.equal(typeof exchangeId, 'string', 'ch.seal must receive an exchange or exchangeId')
+          assert.equal(typeof selector.slot, 'string', 'ch.seal must receive non-empty slot')
+          const input = { ...selector, exchangeId }
+          log.sealCalls.push(input)
+          return `cap:hop_${capCounter}:${String(selector.slot)}`
+        },
         async hop(hopId: string, _meta: unknown, fn: () => Promise<unknown>) {
           log.hops.push(hopId)
           hopDepth += 1
@@ -63,20 +109,10 @@ function createMockCtx(responses: Array<{ status?: number; json?: unknown; heade
           return { confirmed: true, reason: 'mock_confirmed' }
         },
       }
+      return self
     },
     async http_send(target: unknown, opts: Record<string, unknown> = {}) {
-      const idx = exCounter
-      exCounter += 1
-      if ((opts.arm === 'control' || opts.role === 'control') && hopDepth > 0) log.controlInsideHop = true
-      log.httpCalls.push({ target, opts })
-      const spec = responses[idx] ?? { status: 200, json: {} }
-      return {
-        exchangeId: `ex_${exCounter}`,
-        status: spec.status ?? 200,
-        json: spec.json ?? null,
-        headers: spec.headers ?? {},
-        body: spec.json ? JSON.stringify(spec.json) : '',
-      }
+      return sendMockHttp(target, opts)
     },
     async seal_capability(input: Record<string, unknown>) {
       capCounter += 1
@@ -201,12 +237,17 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
       ],
     )
 
-    // Header hygiene: no hop-by-hop headers or raw tokens in compiled output
+    // Header hygiene & ChainBuilder v2 syntax: no hop-by-hop headers, raw tokens, legacy ch.hop, ctx.seal_capability, or .handle
     assert.doesNotMatch(compiled.script, /"Host"|"Content-Length"|"Connection"|"Transfer-Encoding"|"Accept-Encoding"/i)
     assert.doesNotMatch(compiled.script, /ambient_stale_token_should_strip|ambient_sid/)
     assert.doesNotMatch(compiled.script, new RegExp(tok1.replace(/\./g, '\\.')))
     assert.doesNotMatch(compiled.script, new RegExp(tok2.replace(/\./g, '\\.')))
     assert.match(compiled.script, /"X-Client-Mode":\s*"cli"/)
+    assert.match(compiled.script, /ch\.step\(/)
+    assert.match(compiled.script, /ch\.seal\(/)
+    assert.doesNotMatch(compiled.script, /ch\.hop\(/)
+    assert.doesNotMatch(compiled.script, /ctx\.seal_capability\(/)
+    assert.doesNotMatch(compiled.script, /\.handle\b/)
 
     // Execute generated script against mock VerifyContext
     const fn = loadCompiledEntrypoint(compiled.script)
@@ -582,9 +623,12 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
     assert.equal(logExact.httpCalls[0]!.opts.arm, 'control')
     assert.equal(logExact.httpCalls[0]!.opts.role, 'control')
     assert.equal(logExact.httpCalls[0]!.opts.session, 'ctrl_clean')
-    // step_3 must use cap_2.handle (NOT redacted ex.json.job.id!)
+    // step_3 must use cap_2 string handle directly (NOT redacted ex.json.job.id or cap_2.handle!)
     assert.match(String(logExact.httpCalls[3]!.target), /cap:hop_2:cap_2/)
+    // step_4 must consume signed_url via `{ origin, path: cap_3 }` with NO leading '/'
+    assert.deepEqual(logExact.httpCalls[4]!.target, { origin: 'https://storage.example.test', path: 'cap:hop_3:cap_3' })
     assert.equal(logExact.sealCalls.length, 3)
+    assert.equal(logExact.sealCalls[2]!.kind, 'signed_url')
     assert.deepEqual(
       logExact.edges.map(e => `${e.fromHopId}->${e.toHopId}:${e.kind}`),
       ['step_1->step_2:value_binding', 'step_2->step_3:value_binding', 'step_3->step_4:value_binding'],
@@ -694,7 +738,7 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
     assert.equal(logMut.stateTransitions[0]!.entityId, 'ord_101')
     assertAllHopsReachTerminal(logMut.hops, logMut.stateTransitions, 'step_2')
 
-    // 3) Unrelated mutating + terminal steps MUST NOT fabricate edges
+    // 3) Unrelated mutating + terminal steps MUST prune orphan mutating hop (keeping terminal alone, 0 fabricated edges, 0 orphans)
     const unrelated: RecordedRequestExchange[] = [
       { exchangeId: 'u1', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/alpha', persona: 'user_a', status: 200, responseJson: { ok: true }, timestampMs: 10 },
       { exchangeId: 'u2', origin: 'https://app.example.test', method: 'GET', pathAndQuery: '/api/beta', persona: 'user_a', status: 200, responseJson: { ok: true }, timestampMs: 20 },
@@ -705,9 +749,110 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
       runOrigin: 'https://app.example.test',
     })
     assert.equal(compiledUnrel.ok, true)
-    const { ctx: ctxUnrel, log: logUnrel } = createMockCtx([{ status: 403 }, { status: 200 }, { status: 200 }])
+    assert.ok(compiledUnrel.warnings.some(w => /pruned unreachable exchange "u1"/i.test(w)))
+    const { ctx: ctxUnrel, log: logUnrel } = createMockCtx([{ status: 403 }, { status: 200 }])
     await loadCompiledEntrypoint(compiledUnrel.script!)(ctxUnrel)
+    assert.deepEqual(logUnrel.hops, ['step_1'])
+    assert.equal(logUnrel.httpCalls[1]!.target, '/api/beta')
     assert.equal(logUnrel.edges.length, 0)
     assert.equal(logUnrel.stateTransitions.length, 0)
+    assertAllHopsReachTerminal(logUnrel.hops, [...logUnrel.edges, ...logUnrel.stateTransitions], 'step_1')
+  })
+
+  it('seals relative signed_url / download keys as kind="signed_url" and emits path: cap_k without leading /', async () => {
+    const relDownload = '/api/files/export/download?token=dl_tok_9876543210abcdef'
+    const exchanges: RecordedRequestExchange[] = [
+      {
+        exchangeId: 's1',
+        origin: 'https://app.example.test',
+        method: 'POST',
+        pathAndQuery: '/api/exports',
+        persona: 'member_a',
+        status: 200,
+        responseJson: { downloadHref: relDownload },
+        timestampMs: 100,
+      },
+      {
+        exchangeId: 's2',
+        origin: 'https://app.example.test',
+        method: 'GET',
+        pathAndQuery: relDownload,
+        persona: 'member_a',
+        status: 200,
+        responseJson: { rows: 50 },
+        timestampMs: 200,
+      },
+    ]
+
+    const compiled = compileTraceToKovoVerifyScript({
+      submission: { title: 'Relative signed URL export', vulnClass: 'cross_tenant_read', exchangeIds: ['s1', 's2'], terminalExchangeId: 's2' },
+      exchanges,
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(compiled.ok, true)
+    assert.ok(compiled.script)
+    assert.doesNotMatch(compiled.script, /\.handle\b/)
+    assert.match(compiled.script, /kind:\s*"signed_url"/)
+    assert.match(compiled.script, /path:\s*cap_1\b/)
+
+    const fn = loadCompiledEntrypoint(compiled.script)
+    const { ctx, log } = createMockCtx([
+      { status: 403 },
+      { status: 200, json: { downloadHref: '/api/files/export/download?token=live_fresh_tok' } },
+      { status: 200, json: { rows: 50 } },
+    ])
+    await fn(ctx)
+
+    assert.equal(log.sealCalls.length, 1)
+    assert.equal(log.sealCalls[0]!.kind, 'signed_url')
+    assert.equal(log.sealCalls[0]!.jsonPath, 'downloadHref')
+    // Target is `{ path: "cap:hop_1:cap_1" }` with NO leading '/'
+    assert.deepEqual(log.httpCalls[2]!.target, { path: 'cap:hop_1:cap_1' })
+    assert.deepEqual(log.edges, [{ kind: 'value_binding', fromHopId: 'step_1', toHopId: 'step_2', capabilityHandle: 'cap:hop_1:cap_1' }])
+    assertAllHopsReachTerminal(log.hops, log.edges, 'step_2')
+  })
+
+  it('prunes unreachable mutating dead branches via backward reachability and links mutating hops via idx>=1 path, query, and nested JSON entities', async () => {
+    // Dead branch: p_dead (POST) -> g_dead (GET) has an edge p_dead->g_dead, but neither reaches terminal!
+    // Genuine chain: m_nested (POST nested JSON body entity) -> m_query (PATCH query entity) -> m_path (POST idx=1 path entity, terminal)
+    const exchanges: RecordedRequestExchange[] = [
+      { exchangeId: 'p_dead', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/drafts', persona: 'member_a', status: 201, responseJson: { draftId: 'draft_555111' }, timestampMs: 10 },
+      { exchangeId: 'g_dead', origin: 'https://app.example.test', method: 'GET', pathAndQuery: '/api/drafts/draft_555111', persona: 'member_a', status: 200, responseJson: { ok: true }, timestampMs: 20 },
+      { exchangeId: 'm_nested', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/policies', persona: 'member_a', requestJson: { target: { account_id: 'acct_9042' } }, status: 200, responseJson: { updated: true }, timestampMs: 30 },
+      { exchangeId: 'm_query', origin: 'https://app.example.test', method: 'PATCH', pathAndQuery: '/api/payouts?account_id=acct_9042', persona: 'member_a', requestJson: { mode: 'instant' }, status: 200, responseJson: { ok: true }, timestampMs: 40 },
+      { exchangeId: 'm_term', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/acct_9042/settle', persona: 'member_a', status: 200, responseJson: { settled: true }, timestampMs: 50 },
+    ]
+
+    const compiled = compileTraceToKovoVerifyScript({
+      submission: {
+        title: 'Backward reachability and expanded entity extraction',
+        vulnClass: 'forged_settlement',
+        exchangeIds: ['p_dead', 'g_dead', 'm_nested', 'm_query', 'm_term'],
+        terminalExchangeId: 'm_term',
+      },
+      exchanges,
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(compiled.ok, true)
+    assert.ok(compiled.script)
+    assert.ok(compiled.warnings.some(w => /pruned unreachable exchange "p_dead"/i.test(w)))
+    assert.ok(compiled.warnings.some(w => /pruned unlinked read-only recon exchange "g_dead"/i.test(w)))
+
+    const fn = loadCompiledEntrypoint(compiled.script)
+    const { ctx, log } = createMockCtx([
+      { status: 403 },
+      { status: 200, json: { updated: true } },
+      { status: 200, json: { ok: true } },
+      { status: 200, json: { settled: true } },
+    ])
+    await fn(ctx)
+
+    assert.deepEqual(log.hops, ['step_1', 'step_2', 'step_3'])
+    assert.equal(log.stateTransitions.length, 2)
+    assert.deepEqual(
+      log.stateTransitions.map(e => `${e.fromHopId}->${e.toHopId}:${e.entityId}`),
+      ['step_1->step_2:acct_9042', 'step_2->step_3:acct_9042'],
+    )
+    assertAllHopsReachTerminal(log.hops, [...log.edges, ...log.stateTransitions], 'step_3')
   })
 })
