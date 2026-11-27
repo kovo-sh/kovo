@@ -81,6 +81,43 @@ const REPEATED_CHAR_RE = /^(.)\1+$/, JS_IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/,
 const AUTH_QUERY_KEYS = new Set(['sig', 'signature', 'hmac', 'mac', 'token', 'access_token', 'code', 'state', 'nonce', 'ts', 'timestamp', 'expires', 'exp'])
 const ECONOMIC_CONSERVATION_CLASSES = new Set(['economic_conservation', 'conserved_balance', 'ledger_overcredit', 'over_refund', 'double_spend', 'race_condition', 'race', 'race_double_spend', 'race_burst', 'split_refund_ledger_break'])
 const RACE_MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH'])
+const HIGH_PRIV_PERSONA_RE = /(?:^|[_-])(?:owner|admin|superadmin|root|system|service)(?:[_-]|$)/i
+const DUAL_PERSONA_RE = /(?:^|[_-])dual(?:[_-]|$)/i
+
+function personaPrivilegeRank(handle: string, allowedSet: ReadonlySet<string> | undefined, allowDual: boolean): number {
+  const inAllowed = !allowedSet || allowedSet.has(handle)
+  const isHigh = HIGH_PRIV_PERSONA_RE.test(handle), isDual = DUAL_PERSONA_RE.test(handle)
+  if (!isHigh && !isDual) return inAllowed ? 0 : 2
+  if (isDual) return allowDual ? (inAllowed ? 1 : 3) : (inAllowed ? 4 : 5)
+  return inAllowed ? 6 : 7
+}
+function isDisallowedRootPersona(handle: string, allowedSet: ReadonlySet<string> | undefined, allowDual: boolean): boolean {
+  return Boolean((allowedSet && !allowedSet.has(handle)) || HIGH_PRIV_PERSONA_RE.test(handle) || (!allowDual && DUAL_PERSONA_RE.test(handle)))
+}
+function inferAttackerPersona(
+  traceCandidates: Array<string | undefined>,
+  allowedPersonas: string[] | undefined,
+  allowedSet: ReadonlySet<string> | undefined,
+  allowDual: boolean,
+): string | undefined {
+  const pickBest = (list: readonly string[]): { handle: string; rank: number } | undefined => {
+    if (!list.length) return undefined
+    let best = list[0]!, bestRank = personaPrivilegeRank(best, allowedSet, allowDual)
+    for (let i = 1; i < list.length; i += 1) {
+      const cand = list[i]!, rank = personaPrivilegeRank(cand, allowedSet, allowDual)
+      if (rank < bestRank) { best = cand; bestRank = rank }
+    }
+    return { handle: best, rank: bestRank }
+  }
+  const traceUnique: string[] = []
+  for (const raw of traceCandidates) { const t = raw?.trim(); if (t && !traceUnique.includes(t)) traceUnique.push(t) }
+  const tracePick = pickBest(traceUnique)
+  if (tracePick && tracePick.rank <= 1) return tracePick.handle
+  const allowedLowPriv = (allowedPersonas ?? []).map(p => p.trim()).filter(p => p && !HIGH_PRIV_PERSONA_RE.test(p) && (!DUAL_PERSONA_RE.test(p) || allowDual))
+  const allowedPick = pickBest(allowedLowPriv)
+  if (allowedPick && (!tracePick || allowedPick.rank < tracePick.rank)) return allowedPick.handle
+  return tracePick?.handle
+}
 
 const slugifyChainId = (title: string): string => { const s = title.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 42); return s ? `trace_${s}` : 'trace_chain' }
 function normalizeVulnClass(raw: string, oracleFamily: string | undefined, hopCount: number, warnings: string[]) {
@@ -546,11 +583,12 @@ function collapseTrailingRaceExchanges(
     terminalIdx: start, explicitReadback: rb, raceConcurrency: Math.min(10, count),
   }
 }
-function formatRaceCall(p: StepPlan, concurrency: number, hasDynPreRb: boolean, runOrigin?: string): string {
+function formatRaceCall(p: StepPlan, concurrency: number, hasDynPreRb: boolean, runOrigin?: string, resolvedPersona?: string): string {
   const reqFields: string[] = [], orig = p.exchange.origin.trim()
   if (orig && (!runOrigin || orig !== runOrigin.trim())) reqFields.push(`origin: ${JSON.stringify(orig)}`)
   reqFields.push(`path: ${p.pathExpr}`, `method: ${JSON.stringify((p.exchange.method || 'POST').toUpperCase())}`)
-  if (!p.omitPersona && p.exchange.persona?.trim()) reqFields.push(`as: ${JSON.stringify(p.exchange.persona.trim())}`)
+  const persona = !p.omitPersona ? (resolvedPersona ?? p.exchange.persona?.trim()) : undefined
+  if (persona) reqFields.push(`as: ${JSON.stringify(persona)}`)
   if (p.primaryCapability) {
     const c = [`handle: ${p.primaryCapability.capVar}`, `target: ${JSON.stringify(p.primaryCapability.target)}`]
     if (p.primaryCapability.headerName) c.push(`headerName: ${JSON.stringify(p.primaryCapability.headerName)}`)
@@ -602,9 +640,7 @@ export function compileTraceToKovoVerifyScript(input: {
   causal = collapsed.causal; terminalIdx = collapsed.terminalIdx; explicitReadback = collapsed.explicitReadback
   const terminalEx = causal[terminalIdx]!, raceConcurrency = collapsed.raceConcurrency
   const allowedSet = allowedPersonas?.length ? new Set(allowedPersonas) : undefined
-  const attackerPersona = (submission.attackerPersona?.trim() || causal[0]?.persona?.trim() || causal.find(e => e.persona?.trim())?.persona?.trim()) || undefined
-  if (attackerPersona && allowedSet && !allowedSet.has(attackerPersona)) warnings.push(`Base attackerPersona "${attackerPersona}" is not in allowedPersonas.`)
-  const blocked = buildBlockedValues(exchanges, allowedPersonas, attackerPersona, runOrigin)
+  const blocked = buildBlockedValues(exchanges, allowedPersonas, submission.attackerPersona?.trim() || undefined, runOrigin)
 
   const passWarnings: string[] = []
   let { st, readbackPlan } = runBindingPass(causal, terminalIdx, explicitReadback, allowedSet, blocked, passWarnings)
@@ -638,6 +674,14 @@ export function compileTraceToKovoVerifyScript(input: {
   }
 
   const { terminalVulnClass, validOracleFamily } = normalizeVulnClass(submission.vulnClass, submission.oracleFamily, causal.length, warnings)
+  const allowDualPersona = validOracleFamily === 'dual_tenant_abac' || terminalVulnClass === 'dual_tenant_abac' || /^cross_tenant_/.test(terminalVulnClass)
+  const attackerPersona = inferAttackerPersona(
+    [submission.attackerPersona, ...causal.map(e => e.persona), explicitControl?.persona, explicitReadback?.persona, ...exchanges.map(e => e.persona)],
+    allowedPersonas,
+    allowedSet,
+    allowDualPersona,
+  )
+  if (attackerPersona && allowedSet && !allowedSet.has(attackerPersona)) warnings.push(`Base attackerPersona "${attackerPersona}" is not in allowedPersonas.`)
   const { plans } = st, termPlan = plans[terminalIdx]!
   const isTerminalMutation = !READ_ONLY_METHODS.has((terminalEx.method || 'GET').toUpperCase())
   const explicitControlMatches = Boolean(
@@ -672,7 +716,19 @@ export function compileTraceToKovoVerifyScript(input: {
     const cPath = (!effectiveControl && ctrlUsesDyn) ? termPlan.pathExpr : JSON.stringify(effectiveControl ? (srcEx.pathAndQuery || '/') : sanitizeControlPath(srcEx.pathAndQuery || '/'))
     lines.push(`  const ctrl = await ch.control(${formatTarget(srcEx.origin, cPath, runOrigin)}, ${formatHttpOpts({ method: srcEx.method || 'GET', persona: effectiveControl ? (effectiveControl.persona?.trim() || attackerPersona) : attackerPersona, headersExpr: sanitizeControlHeaders(srcEx.requestHeaders), bodyExpr: cBody, session: 'ctrl_clean' })})`)
   }
-  const planOpts = (p: StepPlan, fallbackPersona?: string, stepMeta?: { hopId: string; claimedDelta: string }, role?: 'control' | 'setup') => formatHttpOpts({ ...(stepMeta ?? {}), method: p.exchange.method || 'GET', persona: p.omitPersona ? undefined : (p.exchange.persona?.trim() || fallbackPersona), headersExpr: p.headersExpr, bodyExpr: p.bodyExpr, followRedirectsFalse: p.forceNoFollowRedirects, capability: p.primaryCapability, ...(role ? { role } : {}), entityIdExpr: p.entityIdExpr })
+  const resolveStepPersona = (p: StepPlan, isRoot: boolean): string | undefined => {
+    if (p.omitPersona) return undefined
+    const raw = p.exchange.persona?.trim()
+    if (!isRoot) return raw || undefined
+    if (!raw) return attackerPersona
+    if (attackerPersona && raw !== attackerPersona && isDisallowedRootPersona(raw, allowedSet, allowDualPersona)
+      && personaPrivilegeRank(attackerPersona, allowedSet, allowDualPersona) < personaPrivilegeRank(raw, allowedSet, allowDualPersona)) {
+      warnings.push(`Root hop ${p.hopId} persona "${raw}" replaced with lower-privilege attackerPersona "${attackerPersona}".`)
+      return attackerPersona
+    }
+    return raw
+  }
+  const planOpts = (p: StepPlan, fallbackPersona?: string, stepMeta?: { hopId: string; claimedDelta: string }, role?: 'control' | 'setup', explicitPersona?: string) => formatHttpOpts({ ...(stepMeta ?? {}), method: p.exchange.method || 'GET', persona: p.omitPersona ? undefined : (explicitPersona ?? (p.exchange.persona?.trim() || fallbackPersona)), headersExpr: p.headersExpr, bodyExpr: p.bodyExpr, followRedirectsFalse: p.forceNoFollowRedirects, capability: p.primaryCapability, ...(role ? { role } : {}), entityIdExpr: p.entityIdExpr })
 
   const dynPreRb = Boolean(emitBaselineReadback && readbackPlan && raceConcurrency >= 2 && readbackPlan.usesDynamicUrlOrBody)
   if (!skipSynthEconCtrl && ctrlAfterIdx < 0) emitCtrl()
@@ -684,13 +740,14 @@ export function compileTraceToKovoVerifyScript(input: {
   }
   for (let i = 0; i < plans.length; i += 1) {
     const p = plans[i]!, stepVar = `step_${p.stepNumber}`, isRaceStep = i === terminalIdx && raceConcurrency >= 2
+    const isRootHop = i === 0 || !st.edges.some(e => e.toStepIdx === i), stepPersona = resolveStepPersona(p, isRootHop)
     if (isRaceStep && dynPreRb && readbackPlan) {
       lines.push(`  const preRb = await ctx.http_send(${formatTarget(readbackPlan.exchange.origin, readbackPlan.pathExpr, runOrigin, Boolean(readbackPlan.signedUrlCapVar))}, ${planOpts(readbackPlan, attackerPersona, undefined, 'control')})`)
     }
     lines.push(
       isRaceStep
-        ? `  const ${stepVar} = await ${formatRaceCall(p, raceConcurrency, dynPreRb, runOrigin)}`
-        : `  const ${stepVar} = await ch.step(${formatTarget(p.exchange.origin, p.pathExpr, runOrigin, Boolean(p.signedUrlCapVar))}, ${planOpts(p, undefined, { hopId: p.hopId, claimedDelta: `${p.exchange.method.toUpperCase()} ${p.deltaPath}` })})`,
+        ? `  const ${stepVar} = await ${formatRaceCall(p, raceConcurrency, dynPreRb, runOrigin, stepPersona)}`
+        : `  const ${stepVar} = await ch.step(${formatTarget(p.exchange.origin, p.pathExpr, runOrigin, Boolean(p.signedUrlCapVar))}, ${planOpts(p, undefined, { hopId: p.hopId, claimedDelta: `${p.exchange.method.toUpperCase()} ${p.deltaPath}` }, undefined, stepPersona)})`,
       ...p.seals.map(s => `  ${formatSealCall(s, stepVar)}`),
       ...p.vars.map(v => `  const ${v.varName} = ${stepJsAccess(v.source.jsAccess, stepVar)}`),
       ...st.edges.filter(e => e.toStepIdx === i).map(e => formatEdgeLine(e, plans)),
