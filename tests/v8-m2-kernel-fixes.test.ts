@@ -465,7 +465,41 @@ test('Fix 3a: dual_tenant_abac auto-hydrates from host-observed exchanges with o
     assert.equal(res.terminalOracleFamily, 'dual_tenant_abac')
   }
 
-  // (b) Clean authenticated 401 control on non-cache-bleed 2-hop dual_tenant_abac chain (falls through to multiHopDualDag) -> CONFIRMS!
+  // (b) Clean authenticated 401 control on non-cache-bleed 2-hop dual_tenant_abac chain for genuine mixed dual persona (falls through to multiHopDualDag) -> CONFIRMS!
+  const dCtrl401 = signedEntry('d3-d-ctrl401', makeStep({
+    id: 'd3-d-ctrl401', arm: 'control', method: 'GET', status: 401, pathAndQuery: '/api/v1/orgs/org_b/exports/data',
+    actor: dualActor, json: { error: 'token_scope_required' },
+  }), { seq: 1, timestampMs: 900, actorPersona: 'dual_member', actorRoleLabel: dualLabel })
+  const dHop1 = signedEntry('d3-d-h1', makeStep({
+    id: 'd3-d-h1', arm: 'probe', method: 'POST', status: 200, pathAndQuery: '/api/v1/orgs/org_a/exports/token',
+    actor: dualActor, json: { exportToken: 'tok-99887766' },
+  }), { seq: 2, timestampMs: 1000, actorPersona: 'dual_member', actorRoleLabel: dualLabel, emittedCapabilities: [cap] })
+  const dHop2 = signedEntry('d3-d-h2', makeStep({
+    id: 'd3-d-h2', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/orgs/org_b/exports/data',
+    actor: dualActor, json: { tenantId: 'org_b', rows: [{ id: 'r1', amount: 5000 }] },
+  }), { seq: 3, timestampMs: 1100, actorPersona: 'dual_member', actorRoleLabel: dualLabel, consumedCapabilities: [cap] })
+  const res401 = verifyCompositeReceipt({
+    chainId: 'fix3a-multihop-401',
+    terminalVulnClass: 'dual_tenant_abac',
+    hops: [
+      { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/orgs/org_a/exports/token' }, exchangeIds: ['d3-d-h1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Obtained export token', producedCapabilities: [cap], consumedCapabilities: [] },
+      { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/orgs/org_b/exports/data' }, exchangeIds: ['d3-d-h2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Read foreign tenant export', producedCapabilities: [], consumedCapabilities: [cap] },
+    ],
+    causalEdges: [{ kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: cap }],
+    terminalImpact: {
+      terminalHopId: 'hop_2', terminalExchangeId: 'd3-d-h2',
+      summary: 'Multi-hop dual_tenant_abac confirmed with clean authenticated 401 control.',
+      claimedImpact: 'Multi-hop dual_tenant_abac confirmed with clean authenticated 401 control.',
+      preChainControlExchangeIds: ['d3-d-ctrl401'], postChainReadbackExchangeIds: [],
+    },
+    replayMode: 'fresh_clean_replay',
+  }, { entries: [dCtrl401, dHop1, dHop2] }, {
+    signingKey: SIGNING_KEY, dualTenantAbacPersonas: ['dual_member'], forbiddenShortcutPersonas: ['dual_member'],
+    attackerPersonas: ['member_a'], personaRoleLabels: { dual_member: dualLabel },
+  })
+  assert.equal(res401.confirmed, true, `multiHopDualDag with clean authenticated 401 for dual_member must confirm, got: ${res401.reason}`)
+
+  // (c) FP Rejects: missing denied control, unauthenticated bare 401, own-tenant-only data!
   const memberA = { handle: 'member_a', role: 'member' as const, tenant: 'org_a', auth: 'bearer' as const, sameSite: null }
   const mCtrl401 = signedEntry('d3-m-ctrl401', makeStep({
     id: 'd3-m-ctrl401', arm: 'control', method: 'GET', status: 401, pathAndQuery: '/api/v1/exports/data',
@@ -479,25 +513,6 @@ test('Fix 3a: dual_tenant_abac auto-hydrates from host-observed exchanges with o
     id: 'd3-m-h2', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/exports/data',
     actor: memberA, json: { tenantId: 'org_b', rows: [{ id: 'r1', amount: 5000 }] },
   }), { seq: 3, timestampMs: 1100, actorPersona: 'member_a', actorRoleLabel: 'member (org_a)', consumedCapabilities: [cap] })
-  const res401 = verifyCompositeReceipt({
-    chainId: 'fix3a-multihop-401',
-    terminalVulnClass: 'dual_tenant_abac',
-    hops: [
-      { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/exports/token' }, exchangeIds: ['d3-m-h1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Obtained export token', producedCapabilities: [cap], consumedCapabilities: [] },
-      { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/exports/data' }, exchangeIds: ['d3-m-h2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Read foreign tenant export', producedCapabilities: [], consumedCapabilities: [cap] },
-    ],
-    causalEdges: [{ kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: cap }],
-    terminalImpact: {
-      terminalHopId: 'hop_2', terminalExchangeId: 'd3-m-h2',
-      summary: 'Multi-hop dual_tenant_abac confirmed with clean authenticated 401 control.',
-      claimedImpact: 'Multi-hop dual_tenant_abac confirmed with clean authenticated 401 control.',
-      preChainControlExchangeIds: ['d3-m-ctrl401'], postChainReadbackExchangeIds: [],
-    },
-    replayMode: 'fresh_clean_replay',
-  }, { entries: [mCtrl401, mHop1, mHop2] }, { signingKey: SIGNING_KEY, attackerPersonas: ['member_a'] })
-  assert.equal(res401.confirmed, true, `multiHopDualDag with clean authenticated 401 must confirm, got: ${res401.reason}`)
-
-  // (c) FP Rejects: missing denied control, unauthenticated bare 401, own-tenant-only data!
   const missingCtrlRes = verifyCompositeReceipt({
     chainId: 'fix3a-fp-no-ctrl',
     terminalVulnClass: 'dual_tenant_abac',
@@ -861,4 +876,62 @@ test('R3-05 review guards: pre-effInput listing guard, R4-C-5 URL stripping, str
   }, { entries: [mCtrl403, mH1, mH2] }, { signingKey: SIGNING_KEY, attackerPersonas: ['member_a'] })
   assert.equal(singleTenantExplicitRes.confirmed, false, 'Finding 4: single-tenant persona must not confirm explicit oracleFamily dual_tenant_abac without oracleInput/dual-tenant role')
   assert.equal(singleTenantExplicitRes.failedStage, 'terminal_impact')
+
+  // Must-fix 1: explicit dual_tenant_abac input citing a read-only metadata listing as postTransferReadback MUST still reject!
+  const spoofPostTransferRes = verifyCompositeReceipt({
+    chainId: 'r305-mf1-post-transfer-metadata-escape',
+    terminalVulnClass: 'dual_tenant_abac',
+    hops: [
+      { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/orgs/org_a/cache/prime' }, exchangeIds: ['r5-prime'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Primed org_a', producedCapabilities: [cap], consumedCapabilities: [] },
+      { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/docs' }, exchangeIds: ['r5-bled-list'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Read metadata listing', producedCapabilities: [], consumedCapabilities: [cap] },
+    ],
+    causalEdges: [{ kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: cap }],
+    terminalImpact: {
+      terminalHopId: 'hop_2', terminalExchangeId: 'r5-bled-list',
+      summary: 'Explicit oracleInput citing read-only listing as postTransferReadback must not skip listing guard.',
+      claimedImpact: 'Explicit oracleInput citing read-only listing as postTransferReadback must not skip listing guard.',
+      oracleFamily: 'dual_tenant_abac',
+      oracleInput: {
+        mode: 'dual_org_cache_bleed',
+        baselineDeniedControl: 'r5-ctrl-list',
+        primeAction: 'r5-prime',
+        bledAccess: 'r5-bled-list',
+        postTransferReadback: 'r5-bled-list',
+      },
+      preChainControlExchangeIds: ['r5-ctrl-list'], postChainReadbackExchangeIds: [],
+    },
+    replayMode: 'fresh_clean_replay',
+  }, { entries: [ctrlList, prime, bledList] }, {
+    signingKey: SIGNING_KEY, dualTenantAbacPersonas: ['dual_member'], forbiddenShortcutPersonas: ['dual_member'],
+    attackerPersonas: ['member_a'], personaRoleLabels: { dual_member: dualLabel },
+  })
+  assert.equal(spoofPostTransferRes.confirmed, false, 'Must-fix 1: worker-supplied postTransferReadback must not bypass pre-effInput listing guard')
+  assert.equal(spoofPostTransferRes.failedStage, 'terminal_impact')
+
+  // Must-fix 2: single-tenant persona omitting oracleFamily (only terminalVulnClass=dual_tenant_abac) MUST also reject!
+  const singleTenantOmittedFamRes = verifyCompositeReceipt({
+    chainId: 'r305-mf2-single-tenant-omitted-family',
+    terminalVulnClass: 'dual_tenant_abac',
+    hops: [
+      { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/exports/token' }, exchangeIds: ['r5-m-h1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Obtained token', producedCapabilities: [cap], consumedCapabilities: [] },
+      { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/exports/data' }, exchangeIds: ['r5-m-h2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Read org_b data', producedCapabilities: [], consumedCapabilities: [cap] },
+    ],
+    causalEdges: [{ kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: cap }],
+    terminalImpact: {
+      terminalHopId: 'hop_2', terminalExchangeId: 'r5-m-h2',
+      summary: 'Single-tenant persona omitting oracleFamily on dual_tenant_abac must reject.',
+      claimedImpact: 'Single-tenant persona omitting oracleFamily on dual_tenant_abac must reject.',
+      preChainControlExchangeIds: ['r5-m-403'], postChainReadbackExchangeIds: [],
+    },
+    replayMode: 'fresh_clean_replay',
+  }, { entries: [mCtrl403, mH1, mH2] }, { signingKey: SIGNING_KEY, attackerPersonas: ['member_a'] })
+  assert.equal(singleTenantOmittedFamRes.confirmed, false, 'Must-fix 2: single-tenant persona must reject multiHopDualDag even when oracleFamily is omitted')
+  assert.equal(singleTenantOmittedFamRes.failedStage, 'terminal_impact')
+
+  // Allowlist cleanup: free-text content keys (`summary` / `description`) are NOT treated as metadata-only!
+  const summaryLeak = signedEntry('r5-summary-leak', makeStep({
+    id: 'r5-summary-leak', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/v1/docs/doc-9',
+    json: { id: 'doc-9', workspace: 'org_b', tenantId: 'org_b', title: 'Board Brief', summary: 'Confidential merger terms' },
+  }), { seq: 3, timestampMs: 1100 })
+  assert.equal(isReadOnlyDirectoryOrMetadataImpact(summaryLeak), false, 'summary/description free-text fields must not be suppressed as metadata-only')
 })

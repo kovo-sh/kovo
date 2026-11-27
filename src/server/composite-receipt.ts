@@ -565,7 +565,7 @@ function dispatchDefaultV8Oracle(
   const mapFail = (reason: string) => (reason === 'terminal_impact_unproven_intermediate_stub' || reason === 'bled_access_own_tenant_only') ? rejectFam(TERMINAL_IMPACT_UNPROVEN_HINT, [TERMINAL_IMPACT_UNPROVEN_HINT], 'terminal_impact_unproven') : rejectFam(`v8_oracle_failed (${family}): ${reason}`, [reason])
   const econCtx = { preChainControlExchangeIds: ti.preChainControlExchangeIds, termHopExchangeIds: dag.hopsById.get(ti.terminalHopId)!.exchangeIds, postChainReadbackExchangeIds: ti.postChainReadbackExchangeIds, citedExchangeIds: receipt.hops.flatMap(h => h.exchangeIds), ...(options.personaRoleLabels ? { personaRoleLabels: options.personaRoleLabels } : {}) }
   const freeFormDualFallback = family === 'dual_tenant_abac' && !ti.oracleFamily && !options.v8OracleInput && !inferredFam && Boolean(explicitInput && typeof explicitInput.mode !== 'string')
-  if (family === 'dual_tenant_abac' && !postMutRb && !explicitInput?.postTransferReadback && !explicitInput?.postMutationReadback) {
+  if (family === 'dual_tenant_abac' && !postMutRb) {
     if (ctx.isStub || isReadOnlyDirectoryOrMetadataImpact(termEx)) return mapFail('terminal_impact_unproven_intermediate_stub')
     if (ctx.ownTenantOnly) return mapFail('bled_access_own_tenant_only')
   }
@@ -589,8 +589,8 @@ function dispatchDefaultV8Oracle(
   if (ctx.isStub && !postMutRb) return mapFail('terminal_impact_unproven_intermediate_stub')
   if (ctx.ownTenantOnly && !postMutRb && family !== 'temporal_revocation') return mapFail('bled_access_own_tenant_only')
   const ctrlAct = terminalCtrl ? actorOf(terminalCtrl) : null, ctrlLbl = ctrlAct && options.personaRoleLabels?.[ctrlAct] ? `${options.personaRoleLabels[ctrlAct]}; ${terminalCtrl?.actorRoleLabel ?? ''}` : terminalCtrl?.actorRoleLabel
-  const ctrlValid401 = Boolean(terminalCtrl && ctrlAct && ctx.upstreamEntries.some(e => sameCredIdentity(terminalCtrl, e, ctx.capIdx))), ctrlDualOk = !ti.oracleFamily || parsePersonaPrivilegeProfile(ctrlAct, terminalCtrl ? roleOf(terminalCtrl) : null, ctrlLbl).isMixedDual
-  const multiHopDualDag = family === 'dual_tenant_abac' && ctrlDualOk && receipt.hops.length >= 2 && ctx.hasVerifiedTermEdge && Boolean(terminalCtrl && ctrlAct && !ANON_ACTOR_RE.test(ctrlAct) && (terminalCtrl.step.status === 403 || terminalCtrl.step.status === 404 || (terminalCtrl.step.status === 401 && ctrlValid401))) && (ctx.hasForeignTenantData || Boolean(postMutRb))
+  const ctrlMatchesTerm = Boolean(terminalCtrl && termEx && sameCredIdentity(terminalCtrl, termEx, ctx.capIdx)), ctrlValid401 = Boolean(terminalCtrl && ctrlAct && ctx.upstreamEntries.some(e => sameCredIdentity(terminalCtrl, e, ctx.capIdx)))
+  const multiHopDualDag = family === 'dual_tenant_abac' && parsePersonaPrivilegeProfile(ctrlAct, terminalCtrl ? roleOf(terminalCtrl) : null, ctrlLbl).isMixedDual && ctrlMatchesTerm && receipt.hops.length >= 2 && ctx.hasVerifiedTermEdge && Boolean(terminalCtrl && ctrlAct && !ANON_ACTOR_RE.test(ctrlAct) && (terminalCtrl.step.status === 403 || terminalCtrl.step.status === 404 || (terminalCtrl.step.status === 401 && ctrlValid401))) && (ctx.hasForeignTenantData || Boolean(postMutRb))
   if (multiHopDualDag) return { ok: true, family, explicit: false }
   const miss = family === 'economic_conservation' ? 'missing_economic_oracle_input' : 'missing_v8_oracle_input'
   return rejectFam(`v8_oracle_failed (${family}): ${miss} — provide terminalImpact.oracleInput.`, [miss, 'terminalImpact.oracleInput'])

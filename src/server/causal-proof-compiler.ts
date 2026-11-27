@@ -115,7 +115,7 @@ const DIRECTORY_KEY_ALLOWLIST = new Set([
   'parentid', 'parent_id', 'folderid', 'folder_id', 'page', 'limit', 'offset', 'cursor',
   'nextcursor', 'next_cursor', 'hasmore', 'has_more', 'archived', 'pinned', 'starred', 'version',
   'owner', 'ownerid', 'owner_id', 'mimetype', 'mime_type', 'contenttype', 'content_type',
-  'size', 'bytes', 'length', 'description', 'subtitle', 'summary', 'filename', 'file_name',
+  'size', 'bytes', 'length', 'filename', 'file_name',
   'extension', 'ext', 'etag', 'icon', 'color', 'order', 'position', 'readonly', 'read_only',
 ])
 const DIRECTORY_MARKER_KEYS = new Set([
