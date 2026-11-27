@@ -504,18 +504,18 @@ function inspectCheckpointTranscript(transcript: TranscriptStore): CheckpointTra
 }
 
 function formatCheckpointNextStepHint(summary: CheckpointTranscriptSummary): string {
-  const modeAGuidance = 'Mode-A requires Hop 1->N in ONE ctx.chain(...).prove() script (sealed handles do not survive across fresh Mode-A invocations; call ctx.prove_composite(...) in the same script to confirm).'
+  const modeAGuidance = 'NO cross-script state saved — sealed handles expire when this script exits! Combine Hop 1->N in ONE ctx.chain(...).prove() (or ctx.prove_composite(...)) single kovo_verify script to confirm.'
   const shapeSuffix = summary.httpShapes.length > 0 ? ` Observed HTTP: ${summary.httpShapes.join('; ')}.` : ''
   if (summary.sealedHandles.length > 0) {
     const preview = summary.sealedHandles.slice(0, 8).join(', ')
     const extra = summary.sealedHandles.length > 8 ? ` (+${summary.sealedHandles.length - 8} more)` : ''
-    return `Checkpoint saved (sealed: ${preview}${extra}). ${modeAGuidance}${shapeSuffix}`
+    return `Incomplete script — no proof claim submitted (ephemeral sealed: ${preview}${extra}). ${modeAGuidance}${shapeSuffix}`
   }
   const parts: string[] = []
   if (summary.cryptoOpCount > 0) parts.push(`${summary.cryptoOpCount} crypto op${summary.cryptoOpCount === 1 ? '' : 's'}`)
   if (summary.asyncPollCount > 0) parts.push(`${summary.asyncPollCount} async poll${summary.asyncPollCount === 1 ? '' : 's'}`)
-  const label = parts.length > 0 ? parts.join(', ') : 'host checkpoint operations'
-  return `Checkpoint saved (${label}). ${modeAGuidance}${shapeSuffix}`
+  const label = parts.length > 0 ? parts.join(', ') : 'host ops without proof'
+  return `Incomplete script — no proof claim submitted (${label}). ${modeAGuidance}${shapeSuffix}`
 }
 
 function describeFingerprint(fingerprint: CausalFingerprint): string {
