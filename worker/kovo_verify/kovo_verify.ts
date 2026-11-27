@@ -81,7 +81,7 @@ export interface BrowserExchange { exchangeId: string; status: number; url: stri
 export interface OobHandle { exchangeId: string; token: string; url: string; dnsHost: string }
 export interface OobCheck extends OobHandle { hit: boolean; checkExchangeId?: string; hits: Array<{ protocol: string; token: string; remoteIp?: string; timestamp?: number }> }
 
-export interface HttpOptions { as?: string; persona?: string; session?: string; role?: 'setup' | 'control' | 'probe' | 'cleanup'; arm?: 'setup' | 'control' | 'probe' | 'cleanup'; method?: string; headers?: Record<string, string>; body?: string | Record<string, unknown> | unknown[]; followRedirects?: boolean; timeoutMs?: number; capability?: string | CapabilityInjectionSpec; capabilityTarget?: 'bearer' | 'header' | 'cookie' | 'url'; capabilityHeaderName?: string; capabilityCookieName?: string; capabilityQueryParam?: string; authMutation?: Record<string, unknown>; entityId?: string; correlationIds?: string[]; evidenceRole?: string; replayAttempt?: 'mode_a' | 'ablation_control' | 'primary' }
+export interface HttpOptions { as?: string; persona?: string; session?: string; role?: 'setup' | 'control' | 'probe' | 'cleanup'; arm?: 'setup' | 'control' | 'probe' | 'cleanup'; isControl?: boolean; control?: boolean; method?: string; headers?: Record<string, string>; body?: string | Record<string, unknown> | unknown[]; followRedirects?: boolean; timeoutMs?: number; capability?: string | CapabilityInjectionSpec; capabilityTarget?: 'bearer' | 'header' | 'cookie' | 'url'; capabilityHeaderName?: string; capabilityCookieName?: string; capabilityQueryParam?: string; authMutation?: Record<string, unknown>; entityId?: string; correlationIds?: string[]; evidenceRole?: string; replayAttempt?: 'mode_a' | 'ablation_control' | 'primary' }
 export type HttpTarget = string | (HttpOptions & { url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; target?: HttpTarget; origin?: string })
 export interface Expectations {
   status(exchange: { exchangeId: string }, expected: number | number[], message?: string): StatusClaim; statusNot(exchange: { exchangeId: string }, unexpected: number, message?: string): StatusClaim
@@ -141,7 +141,7 @@ function splitTarget(input: HttpTarget, defaultOrigin: string | undefined): { or
   if (input.target !== undefined) { const nested = splitTarget(input.target, input.origin ?? defaultOrigin); return { ...(input.origin ? { origin: input.origin } : nested.origin ? { origin: nested.origin } : {}), path: nested.path } }
   throw new Error('HTTP target requires a path/URL string or an object with { url | path | pathAndQuery | endpoint }.')
 }
-const HTTP_OPT_KEYS = ['session', 'role', 'arm', 'followRedirects', 'timeoutMs', 'capability', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'authMutation', 'entityId', 'correlationIds', 'evidenceRole', 'replayAttempt'] as const
+const HTTP_OPT_KEYS = ['session', 'role', 'arm', 'isControl', 'control', 'followRedirects', 'timeoutMs', 'capability', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'authMutation', 'entityId', 'correlationIds', 'evidenceRole', 'replayAttempt'] as const
 function extractInlineHttpOptions(input: unknown): HttpOptions {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return {}
   const r = input as Record<string, unknown>, out: HttpOptions = pickDefined(r, HTTP_OPT_KEYS) as HttpOptions
@@ -161,17 +161,27 @@ export function hydrateExchange(raw: HttpExchange): HttpExchange {
 function hydrateFields<T extends Record<string, unknown>>(res: T, keys: readonly string[]): T {
   const out: Record<string, unknown> = { ...res }; for (const k of keys) { const v = out[k]; if (v && typeof v === 'object' && !Array.isArray(v) && 'exchangeId' in (v as Record<string, unknown>)) out[k] = hydrateExchange(v as HttpExchange) }; return out as T
 }
-const CAP_OBJ_KEYS = ['handle', 'derivedHandle', 'capability', 'capabilityHandle', 'capability_handle', 'sealedHandle', 'sealedCapability', 'cap', 'token', 'id'] as const
+const CAP_OBJ_KEYS = ['handle', 'derivedHandle', 'capability', 'capabilityHandle', 'capability_handle', 'sealedHandle', 'sealedCapability', 'cap', 'cap_id', 'capId', 'capabilityId', 'sourceCapabilityId', 'derivedCapabilityId', 'tokenHandle', 'artifactHandle', 'secretHandle', 'token', 'id'] as const
 export function unwrapCapabilityHandle(val: unknown, depth = 0): unknown {
   if (typeof val === 'string') return val.trim() || val
-  if (depth > 4 || !val || typeof val !== 'object' || Array.isArray(val)) return val
-  for (const k of CAP_OBJ_KEYS) { const c = (val as Record<string, unknown>)[k]; const u = typeof c === 'string' ? c.trim() : c && typeof c === 'object' && !Array.isArray(c) ? unwrapCapabilityHandle(c, depth + 1) : ''; if (typeof u === 'string' && u) return u }
+  if (depth > 4 || !val || typeof val !== 'object') return val
+  if (Array.isArray(val)) return val.length === 1 ? unwrapCapabilityHandle(val[0], depth + 1) : val
+  for (const k of CAP_OBJ_KEYS) { const c = (val as Record<string, unknown>)[k]; const u = typeof c === 'string' ? c.trim() : c && typeof c === 'object' ? unwrapCapabilityHandle(c, depth + 1) : ''; if (typeof u === 'string' && u) return u }
   return val
 }
-function normalizeCapabilityInjection(val: unknown): unknown {
-  if (!val || typeof val !== 'object' || Array.isArray(val)) return typeof val === 'string' ? val.trim() : val
+export function normalizeCapabilityInjection(val: unknown, depth = 0): unknown {
+  if (Array.isArray(val)) return depth < 4 && val.length === 1 ? normalizeCapabilityInjection(val[0], depth + 1) : val
+  if (!val || typeof val !== 'object') return typeof val === 'string' ? val.trim() : val
   const handle = unwrapCapabilityHandle(val); if (typeof handle !== 'string' || !handle) return val
-  const spec = pickDefined(val as Record<string, unknown>, ['target', 'headerName', 'cookieName', 'queryParam']); return Object.keys(spec).length > 0 ? { handle, ...spec } : handle
+  const spec = pickDefined(val as Record<string, unknown>, ['target', 'headerName', 'cookieName', 'queryParam', 'header_name', 'cookie_name', 'query_param']); return Object.keys(spec).length > 0 ? { handle, ...spec } : handle
+}
+const PROOF_NEST_KEYS = new Set(['control', 'probe', 'variant', 'baseline', 'ablation', 'before', 'after', 'attacker', 'victim', 'requests', 'steps', 'arms', 'options', 'controlOptions', 'control_options', 'probeOptions', 'probe_options', 'mutation', 'write', 'readRoute', 'read_route', 'route', 'probeRoute', 'probe_route', 'target', 'inject', 'serialRequest', 'serial_request'])
+export function normalizeProofCapabilities(val: unknown, depth = 0): unknown {
+  if (depth > 6 || !val || typeof val !== 'object') return val
+  if (Array.isArray(val)) return val.map(v => normalizeProofCapabilities(v, depth + 1))
+  const out: Record<string, unknown> = { ...(val as Record<string, unknown>) }; if (out.capability !== undefined) out.capability = normalizeCapabilityInjection(out.capability)
+  for (const k of Object.keys(out)) if (PROOF_NEST_KEYS.has(k) && out[k] && typeof out[k] === 'object') out[k] = normalizeProofCapabilities(out[k], depth + 1)
+  return out
 }
 const resolveCapHandle = (value: unknown): string => { const u = unwrapCapabilityHandle(value); return typeof u === 'string' ? u : '' }
 const normalizePayloadStr = (value: unknown): string => typeof value === 'string' ? value : value === undefined || value === null ? '' : JSON.stringify(value)
@@ -210,16 +220,16 @@ function normalizeEdgeKind(e: Record<string, unknown>, idx: number): CausalEdgeI
   if (typeof raw === 'string') { const mapped = EDGE_KIND_ALIASES[raw.trim().toLowerCase().replace(/[\s-]+/g, '_')]; if (mapped) return mapped }
   throw new Error(`Invalid causalEdges[${idx}].kind "${String(raw ?? '')}". Valid causalEdges[].kind values: value_binding | derived_crypto_binding | state_transition_binding | async_pivot_binding.`)
 }
+const EDGE_CAP_ALIASES = ['capability', 'cap', 'handle', 'capability_handle', 'sealedHandle', 'sealedCapability', 'derivedHandle', 'cap_id', 'capId', 'capabilityId', 'tokenHandle', 'artifactHandle', 'secretHandle'] as const
 function normalizeEdgeRecord(ed: unknown, idx: number): unknown {
   if (!ed || typeof ed !== 'object' || Array.isArray(ed)) return ed
-  const { type: _t, bindingKind: _bk, binding: _b, ablationExchange, capability, cap, handle, capability_handle, sealedHandle, sealedCapability, derivedHandle, ...e } = ed as Record<string, unknown>
-  const kind = normalizeEdgeKind(ed as Record<string, unknown>, idx)
+  const src = ed as Record<string, unknown>, kind = normalizeEdgeKind(src, idx), { type: _t, bindingKind: _bk, binding: _b, ablationExchange, ...e } = src
+  const aliasVals = EDGE_CAP_ALIASES.map(k => { const v = e[k]; delete e[k]; return v })
   const ab = e.ablationExchangeIds !== undefined ? normExList(e.ablationExchangeIds) : ablationExchange !== undefined ? extractExchangeIds(ablationExchange as ExchangeRef | ExchangeRef[]) : undefined
-  const rawCap = [e.capabilityHandle, capability, cap, handle, capability_handle, sealedHandle, sealedCapability, derivedHandle].find(v => v !== undefined && v !== null && (typeof v !== 'string' || v.trim().length > 0))
-  const normCap = rawCap !== undefined ? unwrapCapabilityHandle(rawCap) : undefined
-  const base: Record<string, unknown> = { ...e, kind, ...(ab !== undefined ? { ablationExchangeIds: ab } : {}) }
-  if (kind === 'value_binding') { if (normCap !== undefined && normCap !== '') base.capabilityHandle = normCap; else delete base.capabilityHandle }
-  else if (e.capabilityHandle !== undefined) base.capabilityHandle = unwrapCapabilityHandle(e.capabilityHandle)
+  const isVal = kind === 'value_binding', rawCap = [e.capabilityHandle, ...aliasVals, ...(isVal ? [e.derivedCapabilityId, e.sourceCapabilityId] : [])].find(v => v !== undefined && v !== null && (typeof v !== 'string' || v.trim().length > 0))
+  const normCap = rawCap !== undefined ? unwrapCapabilityHandle(rawCap) : undefined, base: Record<string, unknown> = { ...e, kind, ...(ab !== undefined ? { ablationExchangeIds: ab } : {}) }
+  if (isVal) { delete base.sourceCapabilityId; delete base.derivedCapabilityId; if (normCap !== undefined && normCap !== '') base.capabilityHandle = normCap; else delete base.capabilityHandle }
+  else { if (e.capabilityHandle !== undefined) base.capabilityHandle = unwrapCapabilityHandle(e.capabilityHandle); if (kind === 'derived_crypto_binding' && base.sourceCapabilityId === undefined && normCap !== undefined && normCap !== '') base.sourceCapabilityId = normCap }
   return mapFields(base, { sourceCapabilityId: unwrapCapabilityHandle, derivedCapabilityId: unwrapCapabilityHandle, sourceExchangeId: normExRef, targetExchangeId: normExRef })
 }
 function inferValueBindingCap(edge: Record<string, unknown>, hops: unknown[], capOrigins?: ReadonlyMap<string, string>): string | undefined {
@@ -471,8 +481,9 @@ export class VerifyContext {
 
   private buildHttpRpcArgs(input: HttpTarget, options: HttpOptions = {}): { args: Record<string, unknown>; timeoutMs: number } {
     const target = splitTarget(input, this.defaultOrigin), merged: HttpOptions = { ...extractInlineHttpOptions(input), ...options }
-    const { body, headers } = normalizeBodyAndHeaders(merged.body, merged.headers), persona = merged.as ?? merged.persona, sessionGroupRole = merged.role ?? merged.arm, capability = normalizeCapabilityInjection(merged.capability)
-    return { args: { ...(target.origin ? { origin: target.origin } : {}), path: target.path, method: (merged.method ?? 'GET').toUpperCase(), ...(headers ? { headers } : {}), ...(body !== undefined ? { body } : {}), ...(persona ? { persona } : {}), ...(sessionGroupRole ? { sessionGroupRole } : {}), ...(capability !== undefined && capability !== '' ? { capability } : {}), ...pickDefined(merged as Record<string, unknown>, ['session', 'followRedirects', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'authMutation', 'entityId', 'evidenceRole', 'replayAttempt']), ...(merged.correlationIds?.length ? { correlationIds: merged.correlationIds } : {}) }, timeoutMs: (merged.timeoutMs ?? 60_000) + 10_000 }
+    const { body, headers } = normalizeBodyAndHeaders(merged.body, merged.headers), persona = merged.as ?? merged.persona, capability = normalizeCapabilityInjection(merged.capability)
+    const arm = merged.arm ?? (merged.role === 'control' || merged.isControl === true || merged.control === true ? 'control' : undefined), sessionGroupRole = merged.role ?? arm
+    return { args: { ...(target.origin ? { origin: target.origin } : {}), path: target.path, method: (merged.method ?? 'GET').toUpperCase(), ...(headers ? { headers } : {}), ...(body !== undefined ? { body } : {}), ...(persona ? { persona } : {}), ...(sessionGroupRole ? { sessionGroupRole } : {}), ...(arm ? { arm } : {}), ...(capability !== undefined && capability !== '' ? { capability } : {}), ...pickDefined(merged as Record<string, unknown>, ['session', 'followRedirects', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'authMutation', 'entityId', 'evidenceRole', 'replayAttempt']), ...(merged.correlationIds?.length ? { correlationIds: merged.correlationIds } : {}) }, timeoutMs: (merged.timeoutMs ?? 60_000) + 10_000 }
   }
 
   private extractExDiag(raw: { status?: unknown; mediaType?: unknown; headers?: unknown; json?: unknown; body?: unknown }): ExSealDiag {
@@ -539,7 +550,7 @@ export class VerifyContext {
     this.rememberEx(ex)
     const hop = this.activeHop()
     if (hop) {
-      hop.onExchange(ex.exchangeId, args.sessionGroupRole === 'control')
+      hop.onExchange(ex.exchangeId, args.sessionGroupRole === 'control' || args.arm === 'control')
       if (!hop.target) hop.target = { origin: typeof args.origin === 'string' ? args.origin : this.targetOrigin, method: typeof args.method === 'string' ? args.method : ex.method, pathAndQuery: ex.pathAndQuery || (typeof args.path === 'string' ? args.path : '/') }
       this.recordExCaps(hop, ex, args.capability)
       if (!hop.entityId && typeof args.entityId === 'string' && args.entityId.trim()) hop.entityId = args.entityId.trim()
@@ -615,6 +626,7 @@ export class VerifyContext {
     const res = await this.callRpc('crypto.hmacSign', { secretHandle, payload: normalizePayloadStr(isPos ? payloadArg : r.payload), ...(alg ? { alg } : {}), ...(encoding ? { encoding } : {}) }, 30_000) as HmacSignResult
     const handle = res.handle ?? res.derivedHandle ?? res.signature
     const out = { ...res, signature: res.signature ?? handle, handle, derivedHandle: res.derivedHandle ?? handle }
+    if (out.derivedHandle && /^cap:/.test(out.derivedHandle) && out.exchangeId) this._capOrigins.set(out.derivedHandle, out.exchangeId)
     this.recordCrypto(secretHandle, out.exchangeId, out.derivedHandle, out.attestation?.alg ?? alg)
     return out
   }
@@ -695,10 +707,8 @@ export class VerifyContext {
 
   private async callProof<T extends { ok?: boolean; confirmed?: boolean; claim?: VerifyClaim; claims?: VerifyClaim[] }>(op: string, input: unknown, errMsg: string, timeoutMs: number, hydrateKeys?: readonly string[]): Promise<T> {
     if (!input || typeof input !== 'object') throw new Error(errMsg)
-    const raw = await this.callRpc(op, input as Record<string, unknown>, timeoutMs) as Record<string, unknown>
-    const res = (hydrateKeys ? hydrateFields(raw, hydrateKeys) : raw) as unknown as T
-    this.recordProofClaims(res.ok !== false && res.confirmed !== false, Array.isArray(res.claims) ? res.claims : res.claim ? [res.claim] : [])
-    return res
+    const raw = await this.callRpc(op, normalizeProofCapabilities(input) as Record<string, unknown>, timeoutMs) as Record<string, unknown>, res = (hydrateKeys ? hydrateFields(raw, hydrateKeys) : raw) as unknown as T
+    this.recordProofClaims(res.ok !== false && res.confirmed !== false, Array.isArray(res.claims) ? res.claims : res.claim ? [res.claim] : []); return res
   }
 
   prove_access_boundary(input: AccessBoundaryInput | Record<string, unknown>): Promise<AccessBoundaryProof> { return this.callProof<AccessBoundaryProof>('prove.accessBoundary', input, 'prove_access_boundary requires { controlPersona?, probePersona?, route, method?, boundaryClass?, vulnClass?, expectControlDenied? }.', 70_000, ['control', 'probe']) }
@@ -708,13 +718,9 @@ export class VerifyContext {
     if (payload.mutation === undefined && payload.write === undefined) { const m = raw.mutate ?? raw.mutationRoute ?? raw.writeRoute ?? raw.mutationTarget; if (m !== undefined) payload.mutation = m }
     if (payload.readRoute === undefined && payload.read_route === undefined) { const rr = raw.read ?? raw.beforeRoute ?? raw.readTarget ?? (payload.mutation !== undefined || payload.write !== undefined ? raw.route : undefined); if (rr !== undefined) payload.readRoute = rr }
     if (expectFn) { delete payload.expectDelta; payload.hasCustomExpectFn = true }
-    const res = hydrateFields(await this.callRpc('prove.persistedMutation', payload, 70_000) as Record<string, unknown>, ['before', 'mutation', 'after']) as unknown as PersistedMutationProof
-    if (expectFn && !Boolean(expectFn(res.delta.before, res.delta.after, res.delta))) {
-      if (res.claim) this.recordProofClaims(false, [res.claim])
-      return { ...res, ok: false, confirmed: false, expectationMatched: false, rejectedBy: res.rejectedBy ?? 'impact', missingEvidence: [...new Set([...res.missingEvidence, 'expected_delta'])] }
-    }
-    if (res.claim) this.recordProofClaims(res.ok !== false && res.confirmed !== false, [res.claim])
-    return res
+    const res = hydrateFields(await this.callRpc('prove.persistedMutation', normalizeProofCapabilities(payload) as Record<string, unknown>, 70_000) as Record<string, unknown>, ['before', 'mutation', 'after']) as unknown as PersistedMutationProof
+    if (expectFn && !Boolean(expectFn(res.delta.before, res.delta.after, res.delta))) { if (res.claim) this.recordProofClaims(false, [res.claim]); return { ...res, ok: false, confirmed: false, expectationMatched: false, rejectedBy: res.rejectedBy ?? 'impact', missingEvidence: [...new Set([...res.missingEvidence, 'expected_delta'])] } }
+    if (res.claim) this.recordProofClaims(res.ok !== false && res.confirmed !== false, [res.claim]); return res
   }
   async prove_boolean_or_timing_diff(input: BooleanOrTimingDiffInput | Record<string, unknown>): Promise<DifferentialProof> {
     const res = await this.callProof<DifferentialProof>('prove.differential', input, 'prove_boolean_or_timing_diff requires { control, variant, mode: "boolean"|"timing", rounds? }.', 120_000)
@@ -729,13 +735,13 @@ export class VerifyContext {
       let injection: HttpExchange | null = null, injectionError: string | null = null
       try { injection = (await injectFn(started.handle)) ?? null } catch (err) { injectionError = err instanceof Error ? err.message : 'OOB injection failed.' }
       res = await this.callRpc('prove.oob', { phase: 'finish', handle: started.handle, subscription: started.subscription, ...(injection ? { injection } : {}), ...(injectionError ? { injectionError } : {}), ...(raw.immediateMs !== undefined ? { immediateMs: Number(raw.immediateMs) } : {}), timeoutMs, ...(raw.message ? { message: raw.message } : {}) }, timeoutMs + 15_000) as OobCallbackProof
-    } else { res = await this.callRpc('prove.oob', raw, timeoutMs + 20_000) as OobCallbackProof }
+    } else { res = await this.callRpc('prove.oob', normalizeProofCapabilities(raw) as Record<string, unknown>, timeoutMs + 20_000) as OobCallbackProof }
     if (res.claim) this.recordProofClaims(res.ok !== false && res.confirmed !== false, [res.claim])
     return res
   }
   async prove_race_burst(input: RaceBurstInput | Record<string, unknown>): Promise<RaceBurstProof> {
     const raw = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>, reqCount = Array.isArray(raw.requests) ? raw.requests.length : 0
-    const res = hydrateFields(await this.callRpc('prove.race', raw, Math.max(40_000, Math.min(80_000, 25_000 + reqCount * 2_000))) as Record<string, unknown>, ['baseline', 'post', 'serial', 'serialPost']) as unknown as RaceBurstProof
+    const res = hydrateFields(await this.callRpc('prove.race', normalizeProofCapabilities(raw) as Record<string, unknown>, Math.max(40_000, Math.min(80_000, 25_000 + reqCount * 2_000))) as Record<string, unknown>, ['baseline', 'post', 'serial', 'serialPost']) as unknown as RaceBurstProof
     if (res.claim && Array.isArray(res.claim.exchangeIds) && res.claim.exchangeIds.length >= 2) this.recordProofClaims(res.ok !== false && res.confirmed !== false, [res.claim])
     const hop = this.activeHop()
     if (hop) {

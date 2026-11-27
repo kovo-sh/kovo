@@ -22,7 +22,9 @@ import {
 } from '../src/server/verify-rpc.ts'
 import {
   VerifyContext,
+  normalizeCapabilityInjection,
   normalizeCompositeReceipt,
+  normalizeProofCapabilities,
   unwrapCapabilityHandle,
 } from '../worker/kovo_verify/kovo_verify.ts'
 
@@ -61,6 +63,7 @@ async function startFixture(t: TestContext, runId: string): Promise<{ origin: st
   resetRunCustodyBudgets(runId)
   t.after(() => resetRunCustodyBudgets(runId))
 
+  let settingMode = 'standard'
   const httpServer = createServer((req, res) => {
     const u = new URL(req.url ?? '/', 'http://127.0.0.1')
     const auth = String(req.headers.authorization ?? '')
@@ -80,6 +83,28 @@ async function startFixture(t: TestContext, runId: string): Promise<{ origin: st
       res.writeHead(403, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ error: 'forbidden' }))
       return
+    }
+    if (u.pathname === '/api/v1/settings') {
+      if (req.method === 'GET') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ mode: settingMode }))
+        return
+      }
+      if (req.method === 'POST') {
+        if (auth !== `Bearer ${MINT_TOK}` && hdrTok !== MINT_TOK) {
+          res.writeHead(403, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: 'forbidden' }))
+          return
+        }
+        const chunks: Buffer[] = []
+        req.on('data', c => chunks.push(c))
+        req.on('end', () => {
+          try { const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { mode?: string }; if (parsed.mode) settingMode = parsed.mode } catch { /* ignore */ }
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, mode: settingMode }))
+        })
+        return
+      }
     }
     if (u.pathname === '/api/v1/signed' && req.method === 'POST') {
       const chunks: Buffer[] = []
@@ -431,4 +456,222 @@ test('live VerifyRpcServer: http_send, hmac_sign, jwt_sign, ChainBuilder, and pr
   chain.edge({ kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', sealedCapability: tokCap } as never)
   const provedChain = await chain.prove({ claimedImpact: 'Foreign tenant read via ChainBuilder unwrap.', terminalExchange: exHeaderAlias })
   assert.equal(provedChain.confirmed, true, `Expected ChainBuilder with unwrapped capability objects to confirm: ${JSON.stringify(provedChain)}`)
+})
+
+test('expanded CAP_OBJ_KEYS, single-element array unwrapping, and normalizeEdgeRecord aliases', () => {
+  const sealed = { handle: 'cap:hop_1:tok', meta: {}, exchangeId: 'ex-1' }
+  const extraKeys = [
+    'cap_id', 'capId', 'capabilityId', 'sourceCapabilityId',
+    'derivedCapabilityId', 'tokenHandle', 'artifactHandle', 'secretHandle',
+  ] as const
+
+  for (const key of extraKeys) {
+    assert.equal(unwrapCapabilityHandle({ [key]: 'cap:hop_1:tok' }), 'cap:hop_1:tok')
+    assert.equal(unwrapCapabilityHandle({ [key]: sealed }), 'cap:hop_1:tok')
+    assert.equal(normalizeCapabilityInjection({ [key]: 'cap:hop_1:tok' }), 'cap:hop_1:tok')
+    assert.deepEqual(
+      normalizeCapabilityInjection({ [key]: sealed, target: 'header', headerName: 'X-Export-Token' }),
+      { handle: 'cap:hop_1:tok', target: 'header', headerName: 'X-Export-Token' },
+    )
+  }
+
+  // Single-element capability arrays unwrap cleanly; empty/multi-element arrays are left untouched
+  assert.equal(unwrapCapabilityHandle(['cap:hop_1:tok']), 'cap:hop_1:tok')
+  assert.equal(unwrapCapabilityHandle([sealed]), 'cap:hop_1:tok')
+  assert.equal(normalizeCapabilityInjection(['cap:hop_1:tok']), 'cap:hop_1:tok')
+  assert.equal(normalizeCapabilityInjection([sealed]), 'cap:hop_1:tok')
+  assert.deepEqual(
+    normalizeCapabilityInjection([{ tokenHandle: sealed, target: 'header', headerName: 'X-Export-Token' }]),
+    { handle: 'cap:hop_1:tok', target: 'header', headerName: 'X-Export-Token' },
+  )
+  const emptyArr: unknown[] = []
+  const multiArr = ['cap:hop_1:a', 'cap:hop_1:b']
+  assert.strictEqual(normalizeCapabilityInjection(emptyArr), emptyArr)
+  assert.strictEqual(normalizeCapabilityInjection(multiArr), multiArr)
+  assert.strictEqual(unwrapCapabilityHandle(multiArr), multiArr)
+
+  // normalizeCompositeReceipt maps all expanded aliases on value_binding and strips alias keys
+  for (const key of extraKeys) {
+    const wrapped = normalizeCompositeReceipt({
+      chainId: `chain-extra-${key}`,
+      terminalVulnClass: 'cross_tenant_read',
+      hops: [
+        { hopId: 'hop_1', target: 'POST /api/v1/mint', exchangeIds: ['ex-1'], claimedDelta: 'Minted token.', producedCapabilities: [sealed] },
+        { hopId: 'hop_2', target: 'GET /api/v1/export', exchangeIds: ['ex-2'], claimedDelta: 'Read export.', consumedCapabilities: [sealed] },
+      ],
+      causalEdges: [{ kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', [key]: sealed }],
+      terminalImpact: { terminalHopId: 'hop_2', claimedImpact: 'Foreign tenant read.' },
+    }, ORIGIN)
+    const rec = wrapped.receipt as { causalEdges: Array<Record<string, unknown>> }
+    assert.equal(rec.causalEdges[0]!.capabilityHandle, 'cap:hop_1:tok')
+    assert.equal(key in rec.causalEdges[0]!, false, `alias key ${key} should be stripped from value_binding`)
+    assert.equal(compositeProofReceiptSchema.safeParse(rec).success, true, `Alias ${key} failed Zod schema`)
+  }
+
+  // derived_crypto_binding preserves sourceCapabilityId & derivedCapabilityId while unwrapping objects
+  const cryptoNorm = normalizeCompositeReceipt({
+    chainId: 'chain-derived-crypto',
+    terminalVulnClass: 'cross_tenant_read',
+    hops: [
+      { hopId: 'hop_1', target: 'POST /api/v1/mint', exchangeIds: ['ex-1'], claimedDelta: 'Minted key.', producedCapabilities: ['cap:hop_1:key'] },
+      { hopId: 'hop_2', target: 'POST /api/v1/signed', exchangeIds: ['ex-2'], claimedDelta: 'Signed request.', consumedCapabilities: ['cap:hop_1:key'] },
+    ],
+    causalEdges: [
+      { kind: 'derived_crypto_binding', fromHopId: 'hop_1', toHopId: 'hop_2', sourceCapabilityId: { cap_id: 'cap:hop_1:key' }, derivedCapabilityId: { tokenHandle: 'cap:hop_2:sig' } },
+    ],
+    terminalImpact: { terminalHopId: 'hop_2', claimedImpact: 'Forged signature accepted.' },
+  }, ORIGIN).receipt as { causalEdges: Array<Record<string, unknown>> }
+  assert.equal(cryptoNorm.causalEdges[0]!.sourceCapabilityId, 'cap:hop_1:key')
+  assert.equal(cryptoNorm.causalEdges[0]!.derivedCapabilityId, 'cap:hop_2:sig')
+  assert.equal(compositeProofReceiptSchema.safeParse(cryptoNorm).success, true)
+})
+
+test('normalizeProofCapabilities recursively normalizes proof arms & lists without touching request bodies', () => {
+  const sealed = { handle: 'cap:hop_1:tok', meta: {}, exchangeId: 'ex-1' }
+  const spec = { tokenHandle: sealed, target: 'header', headerName: 'X-Export-Token' }
+  const input = {
+    capability: [sealed],
+    control: { path: '/a', capability: { cap_id: 'cap:hop_1:tok' }, body: { capability: { preserve: true } } },
+    probe: { target: '/a', options: { capability: spec } },
+    before: { path: '/b', capability: sealed },
+    after: { path: '/b', capability: [spec] },
+    attacker: { path: '/c', capability: { secretHandle: 'cap:hop_1:tok' } },
+    victim: { path: '/c', capability: { artifactHandle: 'cap:hop_1:tok' } },
+    requests: [{ path: '/r1', capability: [sealed] }, { path: '/r2', options: { capability: { capId: 'cap:hop_1:tok' } } }],
+    steps: [{ path: '/s1', capability: { capabilityId: 'cap:hop_1:tok' } }],
+    arms: [{ path: '/m1', capability: { derivedCapabilityId: 'cap:hop_1:tok' } }],
+    controlBody: { capability: { untouched: 1 } },
+    probeBody: { capability: { untouched: 2 } },
+  }
+  const out = normalizeProofCapabilities(input) as Record<string, any>
+  assert.equal(out.capability, 'cap:hop_1:tok')
+  assert.equal(out.control.capability, 'cap:hop_1:tok')
+  assert.deepEqual(out.control.body, { capability: { preserve: true } })
+  assert.deepEqual(out.probe.options.capability, { handle: 'cap:hop_1:tok', target: 'header', headerName: 'X-Export-Token' })
+  assert.equal(out.before.capability, 'cap:hop_1:tok')
+  assert.deepEqual(out.after.capability, { handle: 'cap:hop_1:tok', target: 'header', headerName: 'X-Export-Token' })
+  assert.equal(out.attacker.capability, 'cap:hop_1:tok')
+  assert.equal(out.victim.capability, 'cap:hop_1:tok')
+  assert.equal(out.requests[0].capability, 'cap:hop_1:tok')
+  assert.equal(out.requests[1].options.capability, 'cap:hop_1:tok')
+  assert.equal(out.steps[0].capability, 'cap:hop_1:tok')
+  assert.equal(out.arms[0].capability, 'cap:hop_1:tok')
+  assert.deepEqual(out.controlBody, { capability: { untouched: 1 } })
+  assert.deepEqual(out.probeBody, { capability: { untouched: 2 } })
+})
+
+test('live VerifyRpcServer: prove_* capability normalization, hmac_sign _capOrigins inference, and control-arm normalization', async t => {
+  const { server, ctx } = await startFixture(t, 'run-sdk-norm-r4-live')
+
+  const mint = await ctx.http_send('/api/v1/mint', { method: 'POST', as: 'member_a', role: 'probe' })
+  assert.equal(mint.status, 200)
+  const tokCap = await ctx.seal_capability({ exchange: mint, hopReceiptId: 'hop_1', slot: 'tok', jsonPath: '$.token', kind: 'bearer_token' })
+  const keyCap = await ctx.seal_capability({ exchange: mint, hopReceiptId: 'hop_1', slot: 'key', jsonPath: '$.signingKey', kind: 'hmac_key' })
+
+  // 1) prove_* helpers normalize capability objects, single-element arrays, and aliased wrappers cleanly
+  const ab = await ctx.prove_access_boundary({
+    route: '/api/v1/export',
+    controlPersona: 'member_a',
+    probePersona: 'member_a',
+    probeOptions: { capability: [tokCap] as never },
+    boundaryClass: 'access',
+    vulnClass: 'bola',
+  })
+  assert.equal(ab.control.status, 403)
+  assert.equal(ab.probe.status, 200)
+
+  const pm = await ctx.prove_persisted_mutation({
+    readRoute: '/api/v1/settings',
+    mutation: { target: '/api/v1/settings', method: 'POST', body: JSON.stringify({ mode: 'elevated' }), capability: { tokenHandle: tokCap } as never } as never,
+    fieldPath: 'mode',
+    expectDelta: 'elevated',
+    readPersona: 'member_a',
+    mutatePersona: 'member_a',
+  })
+  assert.equal(pm.before.status, 200)
+  assert.equal(pm.mutation.status, 200)
+  assert.equal(pm.after.status, 200)
+  assert.equal(pm.delta.after, 'elevated')
+
+  const diff = await ctx.prove_boolean_or_timing_diff({
+    mode: 'boolean',
+    rounds: 1,
+    control: { target: '/api/v1/export?view=a', options: { as: 'member_a', capability: [tokCap] as never } },
+    variant: { target: '/api/v1/export?view=b', options: { as: 'member_a', capability: { cap_id: tokCap.handle } as never } },
+  })
+  assert.equal(diff.exchanges.control[0]?.status, 200)
+  assert.equal(diff.exchanges.variant[0]?.status, 200)
+
+  const race = await ctx.prove_race_burst({
+    requests: [
+      { path: '/api/v1/export', as: 'member_a', capability: [tokCap] as never } as never,
+      { path: '/api/v1/export', as: 'member_a', capability: { artifactHandle: tokCap } as never } as never,
+    ],
+  })
+  assert.equal(race.exchanges.length, 2)
+  assert.ok(race.exchanges.every(e => e.status === 200))
+
+  const inj = await ctx.prove_injection_differential({
+    control: { target: '/api/v1/export', options: { as: 'member_a' } },
+    probe: { target: '/api/v1/export', options: { as: 'member_a', capability: { capabilityId: tokCap.handle } as never } },
+  })
+  assert.equal(inj.control.status, 403)
+  assert.equal(inj.probe.status, 200)
+
+  const sum = await ctx.prove_signed_url_mint({
+    control: { target: '/api/v1/export', options: { as: 'member_a' } },
+    probe: { target: '/api/v1/export', options: { as: 'member_a', capability: [tokCap] as never } },
+  })
+  assert.equal(sum.control.status, 403)
+  assert.equal(sum.probe.status, 200)
+
+  // 2) hmac_sign records derived handle into _capOrigins so normalizeCompositeReceipt unambiguously infers value_binding.capabilityHandle
+  const payload = JSON.stringify({ action: 'sync' })
+  const sig = await ctx.hmac_sign({ secretHandle: { secretHandle: keyCap } as never, payload })
+  assert.match(sig.derivedHandle, /^cap:/)
+  assert.equal(ctx._capOriginOf(sig.derivedHandle), sig.exchangeId)
+  const signedRes = await ctx.http_send('/api/v1/signed', { method: 'POST', as: 'member_a', role: 'probe', headers: { 'x-sig': sig.derivedHandle, 'content-type': 'application/json' }, body: payload })
+  assert.equal(signedRes.status, 200)
+
+  const inferredHmac = normalizeCompositeReceipt({
+    chainId: 'chain-hmac-infer',
+    terminalVulnClass: 'cross_tenant_read',
+    hops: [
+      { hopId: 'hop_sign', target: 'POST /api/v1/signed', exchangeIds: [sig.exchangeId], claimedDelta: 'Signed payload.' },
+      { hopId: 'hop_use', target: 'POST /api/v1/signed', exchangeIds: [signedRes.exchangeId], claimedDelta: 'Used signature.' },
+    ],
+    causalEdges: [{ kind: 'value_binding', fromHopId: 'hop_sign', toHopId: 'hop_use' }],
+    terminalImpact: { terminalHopId: 'hop_use', claimedImpact: 'Accepted forged HMAC.' },
+  }, ORIGIN, new Map([[sig.derivedHandle, ctx._capOriginOf(sig.derivedHandle)!]]))
+  const hmacRec = inferredHmac.receipt as { causalEdges: Array<Record<string, unknown>> }
+  assert.equal(hmacRec.causalEdges[0]!.capabilityHandle, sig.derivedHandle)
+  assert.equal(compositeProofReceiptSchema.safeParse(hmacRec).success, true)
+
+  // 3) Control-arm normalization: role:'control', isControl:true, control:true set arm:'control' on host transcript & ChainBuilder
+  const cRole = await ctx.http('/api/v1/export', { as: 'member_a', role: 'control' })
+  const cIsCtrl = await ctx.http_send('/api/v1/export', { as: 'member_a', isControl: true })
+  const cFlag = await ctx.request('/api/v1/export', { as: 'member_a', control: true })
+  const cInline = await ctx.http_send({ path: '/api/v1/export', as: 'member_a', isControl: true })
+
+  const transcript = server.buildHostSignedTranscript()
+  const armByEx = new Map((transcript.entries ?? []).map(e => [e.exchangeId, e.step.arm]))
+  assert.equal(armByEx.get(cRole.exchangeId), 'control')
+  assert.equal(armByEx.get(cIsCtrl.exchangeId), 'control')
+  assert.equal(armByEx.get(cFlag.exchangeId), 'control')
+  assert.equal(armByEx.get(cInline.exchangeId), 'control')
+
+  // Control hop via isControl:true inside ChainBuilder is cleanly demoted to preChainControlExchangeIds (no dag_topology failure)
+  const chain = ctx.chain('chain-ctrl-arm-norm', 'cross_tenant_read')
+  await chain.hop('hop_ctrl', async () => {
+    const ex = await ctx.http_send('/api/v1/export', { as: 'member_a', isControl: true })
+    assert.equal(ex.status, 403)
+  })
+  const mEx = await chain.hop('hop_mint', () => ctx.http_send('/api/v1/mint', { method: 'POST', as: 'member_a', role: 'probe' }))
+  const cTok = await ctx.seal_capability({ exchange: mEx, hopReceiptId: 'hop_mint', slot: 'tok2', jsonPath: '$.token', kind: 'bearer_token' })
+  const expEx = await chain.hop('hop_export', () => ctx.http_send('/api/v1/export', { as: 'member_a', role: 'probe', capability: [cTok] as never }))
+  const built = chain.build({ claimedImpact: 'Foreign tenant read with demoted control hop.', terminalExchange: expEx })
+  assert.equal(built.hops.some(h => h.hopId === 'hop_ctrl'), false, 'Control-only hop should be demoted out of causal DAG')
+  assert.ok((built.terminalImpact.preChainControlExchangeIds?.length ?? 0) >= 1)
+  const proved = await ctx.prove_composite(built)
+  assert.equal(proved.confirmed, true, `Expected chain with isControl:true control hop to confirm: ${JSON.stringify(proved)}`)
 })
