@@ -122,7 +122,7 @@ export function generateDomainVariant(app: AppName, seed: number, salt?: string)
 
   const tenants = {
     a: tenant('org_a', aSlug, `${base} ${suffix}`, undefined),
-    b: tenant('org_b', bSlug, `${base} ${suffix} finance`, 'org_a'),
+    b: tenant('org_b', bSlug, `${base} ${suffix} finance`, undefined),
     c: tenant('org_c', cSlug, `${base} ${suffix} treasury`, 'org_b'),
   }
 
