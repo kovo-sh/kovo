@@ -4,11 +4,11 @@
  * Pure, deterministic, fail-closed helpers extracted from `v8-oracle-hydrate.ts` to keep
  * shared kernel modules within strict LOC ceilings.
  */
-import { ROLE_RANK, normalizeRole, routeFamily, stepReadsState } from './oracle-invariants.ts'
+import { ROLE_RANK, normalizeRole, resolvePersonaIdentity, routeFamily, stepReadsState } from './oracle-invariants.ts'
 import { resolveCompositeTerminalContract, type OracleTerminalContractKind } from './oracle-spec.ts'
 export { resolveCompositeTerminalContract }
 import type { HostSignedRecord } from './v8-oracle-families.ts'
-import type { HydratableEntry } from './v8-oracle-hydrate.ts'
+import type { EconomicAutoHydrateContext, HydratableEntry } from './v8-oracle-hydrate.ts'
 
 export const normalizeTerminalVulnClass = (cls: string): string => cls.trim().toLowerCase().replace(/[\s-]+/g, '_')
 
@@ -20,12 +20,55 @@ const OWN_ORG_BUSINESS_LOGIC_RE = /^business_logic$/i
 const OWN_ORG_SENSITIVE_READ_PATH_RE = /(?:^|\/)(?:vault|audit|secrets?|credentials?|keys?|tokens?|admin|owner|internal|treasury|backups?)(?:\/|$)/i
 const OWN_ORG_PRIVILEGED_WRITE_PATH_RE = /(?:^|\/)(?:admin|owner|internal|vault|scim|webhooks?|roles?|permissions?|secrets?|credentials?|keys?|tokens?)(?:\/|$)/i
 const OWN_ORG_INVITE_PATH_RE = /(?:^|\/)invites?(?:\/|$)/i
+const OWN_ORG_INVITE_RESOLVE_PATH_RE = /(?:^|\/)(?:(?:invites?|invitations?)\/(?:[^/]+\/)?(?:resolve|redeem|accept|claim|verify|exchange|activate|join)|(?:invites?|invitations?)[-_](?:resolve|redeem|accept|claim|verify|exchange|activate|join)|(?:resolve|redeem|accept|claim|verify|exchange|activate|join)[-_](?:invites?|invitations?))(?:\/|$)/i
+const OWN_ORG_BENIGN_SELF_READ_PATH_RE = /(?:^|\/)(?:me|whoami|userinfo|self|profile|health|healthz|ping|version)$/i
+const OWN_ORG_SESSION_TOK_KEY_RE = /^(?:token|access_?token|session_?token|id_?token|jwt|bearer_?token|auth_?token)$/i
+const OWN_ORG_TENANT_KEY_RE = /^(?:tenant|tenant_?id|org|org_?id|org_?slug|organization|organization_?id|workspace|workspace_?id)$/i
+const TENANT_ID_CHAR_RE = /[a-z0-9_-]/
 const OWN_ORG_SINGLE_ITEM_TAIL_RE = /^(?:content|download|raw|file|blob|body|secret|secrets|export|approve|reject|rebind|settle|settle-race|capture|refund|revoke|rotate|promote|demote|delete|cancel|sync|verify|redeem|resolve|callback|webhook|execute|run|trigger|commit|finalize|transfer|withdraw|deploy|publish|impersonate|escalate)$/i
 const OWN_ORG_TENANT_SCOPE_PATH_RE = /(?:^|\/)(?:orgs?|organizations?|tenants?|workspaces?)\/([^/]+)/i
 const OWN_ORG_PAGINATION_KEY_RE = /^(?:next_?(?:page_?)?token|prev(?:ious)?_?(?:page_?)?token|page_?token|continuation_?token|resume_?token|scroll_?token|sync_?token|cursor_?token|cursor|next_?cursor|prev_?cursor)$/i
 const OWN_ORG_SENSITIVE_WORD_RE = /^(?:secret|secrets|password|passwd|private|credential|credentials|apikey|api_key|vault|audit|token|tokens|signing|canary|ssn|card|iban|private_key|access_token|refresh_token|auth_token|session_token|id_token|bearer_token)$/i
-const OWN_ORG_SLUG_RE = /\bslug=([a-z0-9][a-z0-9._-]{0,63})/i
+const OWN_ORG_SLUG_RE = /\bslug=([a-z0-9][a-z0-9._-]{0,63})(?![a-z0-9._-])/i
 const OWN_ORG_DYNAMIC_SEG_RE = /^(?:\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|(?=[0-9a-f]*\d)[0-9a-f]{8,}|[0-9a-f]{16,}|(?=[a-z0-9]*\d)(?=[a-z0-9]*[a-z])[a-z0-9]{8,}|[a-z]+[_-][a-z0-9_-]*\d[a-z0-9_-]*|:id|<scrubbed>)$/i
+
+/**
+ * Exact identifier equality for tenant slugs/IDs (case-insensitive, trimmed).
+ * Hyphen `-` and underscore `_` are part of the identifier token, never word boundaries,
+ * so a shorter slug never prefix-matches a distinct hyphenated or underscored sibling tenant.
+ */
+export function matchesExactTenantIdentifier(
+  candidate: string | null | undefined,
+  tenant: string | null | undefined,
+): boolean {
+  const a = candidate?.trim().toLowerCase() ?? ''
+  const b = tenant?.trim().toLowerCase() ?? ''
+  return Boolean(a && b && a === b)
+}
+
+/**
+ * True when `text` contains `tenant` bounded on both sides by non-identifier characters
+ * (`[^a-z0-9_-]` or string boundary), preventing prefix/substring confusion across sibling slugs.
+ */
+export function containsExactTenantToken(
+  text: string | null | undefined,
+  tenant: string | null | undefined,
+): boolean {
+  const hay = text?.toLowerCase() ?? ''
+  const needle = tenant?.trim().toLowerCase() ?? ''
+  if (!hay || needle.length < 3) return false
+  let pos = hay.indexOf(needle)
+  while (pos >= 0) {
+    const before = pos === 0 ? '' : hay[pos - 1]!
+    const after = pos + needle.length >= hay.length ? '' : hay[pos + needle.length]!
+    if ((before === '' || !TENANT_ID_CHAR_RE.test(before)) && (after === '' || !TENANT_ID_CHAR_RE.test(after))) return true
+    pos = hay.indexOf(needle, pos + 1)
+  }
+  return false
+}
+
+const matchesAnyOwnTenant = (candidate: string | null | undefined, ownTokens: ReadonlySet<string>): boolean =>
+  Boolean(candidate && [...ownTokens].some(tok => matchesExactTenantIdentifier(candidate, tok)))
 
 const actorOfGuardEntry = (e: HydratableEntry): string | null =>
   e.actorPersona !== undefined ? e.actorPersona : (e.step.actor.handle ?? null)
@@ -73,7 +116,158 @@ function isNonSensitiveCollectionPayload(parsed: unknown): boolean {
   return hasArray && !hasSensitive
 }
 
-/** Generic fail-closed guard rejecting own-org directory/invite/collection GETs and plain own-org POST creates without verified impact. */
+function parseEntryJsonObj(entry: HydratableEntry | undefined): Record<string, unknown> | null {
+  if (!entry) return null
+  let parsed = entry.step.json
+  if (parsed === undefined && typeof entry.step.body === 'string' && /^[\[{]/.test(entry.step.body.trim())) {
+    try { parsed = JSON.parse(entry.step.body) } catch { parsed = undefined }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+  return parsed as Record<string, unknown>
+}
+
+function findTenantValueInObj(obj: unknown, depth = 0): string {
+  if (depth > 2 || !obj || typeof obj !== 'object' || Array.isArray(obj)) return ''
+  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+    if (OWN_ORG_TENANT_KEY_RE.test(k.trim()) && typeof v === 'string' && v.trim()) return v.trim().toLowerCase()
+  }
+  for (const v of Object.values(obj as Record<string, unknown>)) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const hit = findTenantValueInObj(v, depth + 1)
+      if (hit) return hit
+    }
+  }
+  return ''
+}
+
+function extractMintedInviteSession(entry: HydratableEntry): {
+  hasToken: boolean
+  verifiedFalse: boolean
+  grantedRole: ReturnType<typeof normalizeRole>
+  respTenant: string
+  reqTenant: string
+} {
+  const root = parseEntryJsonObj(entry)
+  const reqTenant = findTenantValueInObj(entry.step.requestJson)
+  if (!root) return { hasToken: false, verifiedFalse: false, grantedRole: null, respTenant: '', reqTenant }
+  const entries = Object.entries(root)
+  const target = entries.length === 1 && entries[0]![1] && typeof entries[0]![1] === 'object' && !Array.isArray(entries[0]![1])
+    ? (entries[0]![1] as Record<string, unknown>)
+    : root
+  let hasToken = false
+  let verifiedFalse = false
+  let grantedRole: ReturnType<typeof normalizeRole> = null
+  for (const [k, v] of Object.entries(target)) {
+    const lk = k.trim().toLowerCase()
+    if (OWN_ORG_SESSION_TOK_KEY_RE.test(lk) && typeof v === 'string' && v.trim().length >= 4) hasToken = true
+    if (lk === 'verified' && v === false) verifiedFalse = true
+    if (lk === 'role' && typeof v === 'string') grantedRole = normalizeRole(v)
+  }
+  return { hasToken, verifiedFalse, grantedRole, respTenant: findTenantValueInObj(target), reqTenant }
+}
+
+function isInviteResolutionWrite(entry: HydratableEntry): boolean {
+  const meth = entry.step.method.toUpperCase()
+  if (meth !== 'POST' && meth !== 'PUT' && meth !== 'PATCH') return false
+  const cleanPath = normalizeGuardPath(entry.step.route ?? entry.step.pathAndQuery)
+  return Boolean(cleanPath && OWN_ORG_INVITE_RESOLVE_PATH_RE.test(cleanPath))
+}
+
+function isBenignSelfReadEntry(entry: HydratableEntry): boolean {
+  if (!stepReadsState(entry.step)) return false
+  const cleanPath = normalizeGuardPath(entry.step.route ?? entry.step.pathAndQuery)
+  return Boolean(cleanPath && OWN_ORG_BENIGN_SELF_READ_PATH_RE.test(cleanPath))
+}
+
+function hasDeniedControlForEntry(
+  target: HydratableEntry,
+  preChainControlIds: readonly string[] | undefined,
+  entriesById: ReadonlyMap<string, HydratableEntry> | undefined,
+): boolean {
+  if (!preChainControlIds?.length || !entriesById) return false
+  const tMeth = target.step.method.toUpperCase()
+  const tFam = routeFamily(target.step.route ?? target.step.pathAndQuery)
+  if (!tFam) return false
+  return preChainControlIds.some(cid => {
+    const ctrl = entriesById.get(cid)
+    if (!ctrl || ctrl.exchangeId === target.exchangeId || ctrl.step.arm !== 'control') return false
+    const st = ctrl.step.status
+    if (st !== 401 && st !== 403) return false
+    return ctrl.step.method.toUpperCase() === tMeth && routeFamily(ctrl.step.route ?? ctrl.step.pathAndQuery) === tFam
+  })
+}
+
+function requestCitesOwnOrgToken(entry: HydratableEntry, ownTokens: ReadonlySet<string>): boolean {
+  if (ownTokens.size === 0) return false
+  const raw = (entry.step.pathAndQuery ?? entry.step.route ?? '').trim()
+  if (!raw) return false
+  const [pathPart = '', queryPart = ''] = raw.split('?', 2)
+  for (const seg of pathPart.split('/')) {
+    if (!seg) continue
+    let decoded = seg
+    if (seg.includes('%')) { try { decoded = decodeURIComponent(seg) } catch { decoded = seg } }
+    if (matchesAnyOwnTenant(decoded.split(';', 1)[0], ownTokens)) return true
+  }
+  if (queryPart) {
+    for (const v of new URLSearchParams(queryPart.split('#', 1)[0]!).values()) {
+      if (matchesAnyOwnTenant(v, ownTokens)) return true
+    }
+  }
+  return false
+}
+
+function evaluateOwnOrgInviteResolutionGuard(params: {
+  hopCount: number
+  ownOrgScoped: boolean
+  hasForeignTenantData: boolean
+  ownTokens: ReadonlySet<string>
+  termEx: HydratableEntry
+  upstreamEntries?: readonly HydratableEntry[]
+  preChainControlIds?: readonly string[]
+  entriesById?: ReadonlyMap<string, HydratableEntry>
+  personaRoleLabels?: Readonly<Record<string, string>>
+}): string | null {
+  // R3-05 review: benign self-identity reads (`/me`, `/whoami`, ...) and invite resolutions never
+  // count as upstream compromise provenance, so hop padding cannot lift a flow past this guard.
+  const hasSubstantiveUpstream = (params.upstreamEntries ?? []).some(u => !isInviteResolutionWrite(u) && !isBenignSelfReadEntry(u))
+
+  // Case A: own-org flow starting directly at an un-controlled own-org invite resolution
+  // without an upstream leak/compromise predecessor or denied control on the invite endpoint.
+  if (!(params.hopCount > 2 && hasSubstantiveUpstream) && !params.hasForeignTenantData && params.ownOrgScoped && params.upstreamEntries?.length) {
+    for (const up of params.upstreamEntries) {
+      if (!isInviteResolutionWrite(up)) continue
+      const sess = extractMintedInviteSession(up)
+      if (!sess.hasToken) continue
+      const upTenant = sess.respTenant || sess.reqTenant
+      const upTenantForeign = Boolean(upTenant && params.ownTokens.size > 0 && !matchesAnyOwnTenant(upTenant, params.ownTokens))
+      if ((sess.verifiedFalse || !upTenantForeign) && !hasDeniedControlForEntry(up, params.preChainControlIds, params.entriesById)) {
+        return 'terminal_impact_unproven: 2-hop own-org flow starting directly at an invite-resolution endpoint requires either an upstream compromise hop, a verified denied control on the invite-resolution endpoint, or foreign-tenant exposure.'
+      }
+    }
+  }
+
+  // Case B: Invite-resolution endpoint itself as the terminal hop (`hops <= 2`).
+  // Compare response tenant strictly against `ownTokens` (including exact `slug=...`) so an
+  // own-org slug never masquerades as foreign tenant evidence while distinct sibling slugs do.
+  if (isInviteResolutionWrite(params.termEx)) {
+    const sess = extractMintedInviteSession(params.termEx)
+    if (sess.hasToken) {
+      const respIsForeign = Boolean(sess.respTenant && params.ownTokens.size > 0 && !matchesAnyOwnTenant(sess.respTenant, params.ownTokens))
+      if (!respIsForeign) {
+        const termActor = actorOfGuardEntry(params.termEx)
+        const roleLbl = params.termEx.actorRoleLabel ?? (termActor ? params.personaRoleLabels?.[termActor] : undefined)
+        const baseRole = resolvePersonaIdentity({ roleLabel: roleLbl, privilege: params.termEx.actorPrivilege ?? params.termEx.step.actor.role ?? null }).role
+        const noEscalation = !sess.grantedRole || (baseRole !== null && ROLE_RANK[sess.grantedRole] <= ROLE_RANK[baseRole])
+        if (sess.verifiedFalse || !hasSubstantiveUpstream || noEscalation) {
+          return 'terminal_impact_unproven: own-org invite-resolution terminal requires genuine foreign-tenant exposure (exact tenant boundary match) or verified privilege-tier escalation with upstream compromise provenance.'
+        }
+      }
+    }
+  }
+  return null
+}
+
+/** Generic fail-closed guard rejecting own-org directory/invite/collection GETs, reflected-only reads, un-ablated own-org invite resolutions, and plain own-org POST creates without verified impact. */
 export function evaluateOwnOrgTerminalGuard(params: {
   normCls: string
   contract: OracleTerminalContractKind | null
@@ -85,33 +279,61 @@ export function evaluateOwnOrgTerminalGuard(params: {
   personaRoleLabels?: Readonly<Record<string, string>>
   ownTenantOnly: boolean
   hasForeignTenantData: boolean
+  reflectedTenantOnly?: boolean
   hasPostMutation: boolean
   hasV8Oracle: boolean
   isReadOnlyDir: boolean
   hasTermDerivedCrypto: boolean
   hasVerifiedTermStateTransition: boolean
   hasVerifiedTermValueBinding: boolean
+  hopCount?: number
+  upstreamEntries?: readonly HydratableEntry[]
+  preChainControlIds?: readonly string[]
+  entriesById?: ReadonlyMap<string, HydratableEntry>
 }): string | null {
-  if (params.hasV8Oracle || params.hasPostMutation || !params.termEx) return null
+  if (params.hasV8Oracle || !params.termEx) return null
   const isAccessOrLogic = (params.contract === 'access_control' && !OWN_ORG_ACCESS_CONTRACT_EXEMPT_RE.test(params.normCls))
     || OWN_ORG_AUTH_OR_LOGIC_RE.test(params.normCls)
   if (!params.isPrivEscCls && !params.isCrossTenantCls && !isAccessOrLogic) return null
-  if (params.isReadOnlyDir) {
-    return 'terminal_impact_unproven: privilege_escalation/bfla/cross-tenant/access-control/business-logic cannot confirm on a read-only directory/roster/metadata listing GET without private payload content, a state-mutating terminal action + postChainReadbackExchangeIds, or a verified v8 oracle family.'
-  }
 
   const cleanPath = normalizeGuardPath(params.termEx.step.route ?? params.termEx.step.pathAndQuery)
   const termActor = actorOfGuardEntry(params.termEx), ctrlActor = params.terminalCtrl ? actorOfGuardEntry(params.terminalCtrl) : null
-  const ownTokens = new Set<string>(params.attackerTenants)
-  for (const lbl of [params.termEx.actorRoleLabel, termActor ? params.personaRoleLabels?.[termActor] : undefined, ctrlActor ? params.personaRoleLabels?.[ctrlActor] : undefined]) {
+  const ownTokens = new Set<string>([...params.attackerTenants].map(t => t.trim().toLowerCase()).filter(Boolean))
+  const labelSources = [
+    params.termEx.actorRoleLabel,
+    termActor ? params.personaRoleLabels?.[termActor] : undefined,
+    ctrlActor ? params.personaRoleLabels?.[ctrlActor] : undefined,
+    ...(params.upstreamEntries ?? []).flatMap(u => {
+      const ua = actorOfGuardEntry(u)
+      return [u.actorRoleLabel, ua ? params.personaRoleLabels?.[ua] : undefined]
+    }),
+  ]
+  for (const lbl of labelSources) {
     const sm = lbl ? OWN_ORG_SLUG_RE.exec(lbl) : null
     if (sm?.[1]) ownTokens.add(sm[1].toLowerCase())
   }
   const scopeMatch = cleanPath ? OWN_ORG_TENANT_SCOPE_PATH_RE.exec(cleanPath) : null
   const scopeTenant = scopeMatch?.[1]?.toLowerCase() ?? null
-  const pathTargetsOwnTenant = Boolean(!params.hasForeignTenantData && scopeTenant && ownTokens.has(scopeTenant))
-  const pathTargetsForeignTenant = Boolean(scopeTenant && ownTokens.size > 0 && !ownTokens.has(scopeTenant))
+  const pathTargetsOwnTenant = Boolean(!params.hasForeignTenantData && scopeTenant && matchesAnyOwnTenant(scopeTenant, ownTokens))
+  const pathTargetsForeignTenant = Boolean(scopeTenant && ownTokens.size > 0 && !matchesAnyOwnTenant(scopeTenant, ownTokens))
   const ownOrgScoped = params.ownTenantOnly || pathTargetsOwnTenant
+
+  const inviteErr = evaluateOwnOrgInviteResolutionGuard({
+    hopCount: params.hopCount ?? 1, ownOrgScoped, hasForeignTenantData: params.hasForeignTenantData,
+    ownTokens, termEx: params.termEx, upstreamEntries: params.upstreamEntries,
+    preChainControlIds: params.preChainControlIds, entriesById: params.entriesById,
+    personaRoleLabels: params.personaRoleLabels,
+  })
+  if (inviteErr) return inviteErr
+
+  if (params.hasPostMutation) return null
+  if (params.isReadOnlyDir) {
+    return 'terminal_impact_unproven: privilege_escalation/bfla/cross-tenant/access-control/business-logic cannot confirm on a read-only directory/roster/metadata listing GET without private payload content, a state-mutating terminal action + postChainReadbackExchangeIds, or a verified v8 oracle family.'
+  }
+
+  if (stepReadsState(params.termEx.step) && params.reflectedTenantOnly && !params.hasForeignTenantData && requestCitesOwnOrgToken(params.termEx, ownTokens)) {
+    return 'terminal_impact_unproven: read-only terminal response contained only request-reflected tenant markers on an own-tenant-scoped request with zero host-verified non-reflected foreign-tenant evidence.'
+  }
 
   const ctrlStatus = params.terminalCtrl?.step.status ?? null
   const ctrlAuthzDenied = ctrlStatus === 401 || ctrlStatus === 403 || ctrlStatus === 409 || ctrlStatus === 412 || ctrlStatus === 422
@@ -234,20 +456,153 @@ export function extractLedgerBalanceMap(json: unknown): Record<string, number> |
   return out
 }
 
+const HOST_PSEUDO_OP_METHOD_RE = /^(?:SEAL|SIGN|DERIVE)$/i
+
+function isHostPseudoOpEntry(entry: HydratableEntry | undefined): boolean {
+  if (!entry) return false
+  return entry.evidenceRole === 'host_capability_op'
+    || entry.evidenceRole === 'host_crypto_op'
+    || entry.step.evidenceRole === 'host_capability_op'
+    || entry.step.evidenceRole === 'host_crypto_op'
+    || entry.op === 'capability'
+    || entry.op === 'crypto'
+    || HOST_PSEUDO_OP_METHOD_RE.test(entry.step.method)
+}
+
+function isRaceOpEntry(entry: HydratableEntry | undefined): boolean {
+  return Boolean(entry && (entry.op === 'race' || Boolean(entry.raceBatchId?.trim())))
+}
+
 /**
- * R2: Filter `economic_conservation` `actions` to mutating probe entries whenever at least one
- * mutating action exists, so intermediate read-only `GET` hops do not trip `action_not_mutating`.
+ * R2 + R8: Filter `economic_conservation` `actions` to real mutating probe entries whenever at
+ * least one mutating action exists, excluding host pseudo-ops (`SEAL`/capability/crypto) so
+ * intermediate read-only `GET` hops do not trip `action_not_mutating` and zero-mutating-action
+ * receipts always fail closed (`missing_action_records` or `action_not_mutating`).
  */
 export function filterEconomicActionRecords(
   actRecs: readonly HostSignedRecord[],
   entriesById: ReadonlyMap<string, HydratableEntry>,
 ): HostSignedRecord[] {
-  const mutating = actRecs.filter(a => {
+  const realRecs = actRecs.filter(a => !isHostPseudoOpEntry(entriesById.get(a.id)))
+  const mutating = realRecs.filter(a => {
     const entry = entriesById.get(a.id)
     if (entry) return !stepReadsState(entry.step)
     return !(a.method && /^(?:GET|HEAD|OPTIONS)$/i.test(a.method))
   })
-  return mutating.length > 0 ? mutating : [...actRecs]
+  return mutating.length > 0 ? mutating : realRecs
+}
+
+function isRaceActionCausallyBound(
+  entry: HydratableEntry,
+  citedEntries: readonly HydratableEntry[],
+  baseTs: number | null,
+  finTs: number | null,
+): boolean {
+  if (citedEntries.length === 0) return false
+  const batchId = entry.raceBatchId?.trim() ?? ''
+  if (batchId && citedEntries.some(c => c.raceBatchId?.trim() === batchId)) return true
+  const emittedCaps = new Set<string>()
+  const citedEntities = new Set<string>()
+  // R3-05 review: actor+window binding also requires the same method + route family as a cited
+  // action, so an unrelated same-actor `race` burst inside the readback window cannot inject actions.
+  const actorRouteKey = (e: HydratableEntry): string => {
+    const act = actorOfGuardEntry(e)?.trim().toLowerCase() ?? ''
+    const fam = routeFamily(e.step.route ?? e.step.pathAndQuery)
+    return act && fam ? `${act}|${e.step.method.toUpperCase()}|${fam}` : ''
+  }
+  const citedActorRoutes = new Set<string>()
+  for (const c of citedEntries) {
+    for (const cap of c.emittedCapabilities ?? []) emittedCaps.add(cap)
+    if (c.entityId?.trim()) citedEntities.add(c.entityId.trim().toLowerCase())
+    const key = actorRouteKey(c)
+    if (key) citedActorRoutes.add(key)
+  }
+  if ((entry.consumedCapabilities ?? []).some(cap => emittedCaps.has(cap))) return true
+  if (entry.entityId?.trim() && citedEntities.has(entry.entityId.trim().toLowerCase())) return true
+  const eKey = actorRouteKey(entry)
+  const eTs = typeof entry.timestampMs === 'number' && Number.isFinite(entry.timestampMs) ? entry.timestampMs : null
+  return Boolean(
+    eKey && citedActorRoutes.has(eKey)
+    && baseTs !== null && finTs !== null && eTs !== null
+    && eTs >= baseTs && eTs <= finTs,
+  )
+}
+
+/**
+ * Auto-select mutating probe actions for `economic_conservation` when `rawInput.actions` is
+ * omitted, expanding `raceBatchId` sub-exchanges and causally bound `race` op bursts while
+ * excluding host pseudo-ops and read-only entries.
+ */
+export function selectAutoEconomicActions(params: {
+  econCtx: EconomicAutoHydrateContext
+  entriesById: ReadonlyMap<string, HydratableEntry>
+  toRecord: (e: HydratableEntry) => HostSignedRecord
+}): HostSignedRecord[] {
+  const { econCtx, entriesById, toRecord } = params
+  const isPos = (ts: unknown): ts is number => typeof ts === 'number' && Number.isFinite(ts) && ts > 0
+  const is2xxSt = (st: number | null | undefined): boolean => typeof st === 'number' && st >= 200 && st < 300
+  const isMutProbe = (e: HydratableEntry | undefined): e is HydratableEntry =>
+    Boolean(e && e.step.arm === 'probe' && !isHostPseudoOpEntry(e) && !stepReadsState(e.step) && isPos(e.timestampMs))
+  const isOkMutProbe = (e: HydratableEntry | undefined): e is HydratableEntry => isMutProbe(e) && is2xxSt(e.step.status)
+
+  let actEntries = econCtx.termHopExchangeIds.map(id => entriesById.get(id)).filter(isOkMutProbe)
+  const citedIds = econCtx.citedExchangeIds ?? []
+  const citedEntries = citedIds.map(id => entriesById.get(id)).filter((e): e is HydratableEntry => Boolean(e))
+  if (actEntries.length === 0 && citedEntries.length > 0) {
+    const allMut = citedEntries.filter(isOkMutProbe)
+    const raceBatched = allMut.filter(isRaceOpEntry)
+    actEntries = raceBatched.length > 0 ? raceBatched : allMut
+  }
+  const batchIds = new Set(actEntries.map(e => e.raceBatchId?.trim()).filter((b): b is string => Boolean(b)))
+  if (batchIds.size > 0) {
+    const expanded = new Map<string, HydratableEntry>(actEntries.map(e => [e.exchangeId, e]))
+    for (const e of entriesById.values()) {
+      const b = e.raceBatchId?.trim()
+      if (b && batchIds.has(b) && isMutProbe(e)) expanded.set(e.exchangeId, e)
+    }
+    actEntries = [...expanded.values()].sort(compareChronoAsc)
+  } else if (actEntries.length === 0 && citedEntries.length > 0) {
+    const boundRace = [...entriesById.values()]
+      .filter(e => isRaceOpEntry(e) && isMutProbe(e) && isRaceActionCausallyBound(e, citedEntries, null, null))
+      .sort(compareChronoAsc)
+    if (boundRace.some(isOkMutProbe)) actEntries = boundRace
+  }
+  return actEntries.map(toRecord)
+}
+
+/**
+ * Deduplicate and host-bind `economic_conservation` `actions`, preserving explicitly cited
+ * mutating `race` op sub-exchanges bound to the receipt's DAG/readback window while stripping
+ * control/non-probe entries, uncited non-race exchanges, and host pseudo-ops.
+ */
+export function resolveEconomicActionRecords(params: {
+  rawActRecs: readonly HostSignedRecord[]
+  entriesById: ReadonlyMap<string, HydratableEntry>
+  citedExchangeIds?: readonly string[]
+  baseRec?: HostSignedRecord
+  finRec?: HostSignedRecord
+}): HostSignedRecord[] {
+  const { rawActRecs, entriesById, citedExchangeIds, baseRec, finRec } = params
+  const citedSet = citedExchangeIds?.length ? new Set(citedExchangeIds) : null
+  const citedEntries = citedSet
+    ? [...citedSet].map(id => entriesById.get(id)).filter((e): e is HydratableEntry => Boolean(e))
+    : []
+  const baseTs = typeof baseRec?.timestampMs === 'number' && Number.isFinite(baseRec.timestampMs) ? baseRec.timestampMs : null
+  const finTs = typeof finRec?.timestampMs === 'number' && Number.isFinite(finRec.timestampMs) ? finRec.timestampMs : null
+  const seenActIds = new Set<string>()
+  const actRecs: HostSignedRecord[] = []
+  for (const a of rawActRecs) {
+    if (seenActIds.has(a.id)) continue
+    seenActIds.add(a.id)
+    const entry = entriesById.get(a.id)
+    if (entry && (entry.step.arm !== 'probe' || isHostPseudoOpEntry(entry))) continue
+    if (citedSet && !citedSet.has(a.id)) {
+      const boundRace = Boolean(entry && isRaceOpEntry(entry) && !stepReadsState(entry.step) && isRaceActionCausallyBound(entry, citedEntries, baseTs, finTs))
+      if (!boundRace) continue
+    }
+    actRecs.push(a)
+  }
+  return filterEconomicActionRecords(actRecs, entriesById)
 }
 
 const SIG_CARRIER_KEY_RE = /(?:^|[-_])(?:sig|signature|hmac|digest|mac|derivation)(?:$|[-_])|signature|hmac/i
@@ -675,20 +1030,6 @@ export function findPreMutationDeniedControl<T extends GuardChronoEntry>(params:
   return cands[0]!
 }
 
-function bodyMentionsTenantToken(body: string, tenant: string): boolean {
-  const lowBody = body.toLowerCase()
-  const lowTenant = tenant.trim().toLowerCase()
-  if (lowTenant.length < 3) return false
-  let pos = lowBody.indexOf(lowTenant)
-  while (pos >= 0) {
-    const before = pos === 0 ? '' : lowBody[pos - 1]!
-    const after = pos + lowTenant.length >= lowBody.length ? '' : lowBody[pos + lowTenant.length]!
-    if ((before === '' || !/[a-z0-9_-]/.test(before)) && (after === '' || !/[a-z0-9_-]/.test(after))) return true
-    pos = lowBody.indexOf(lowTenant, pos + 1)
-  }
-  return false
-}
-
 /**
  * R8: When `bledAccess` is opaque plain-text (non-JSON body with zero structured tenant markers)
  * AND the actor genuinely holds mixed dual-tenant roles (elevated in one tenant, lower in another),
@@ -721,7 +1062,7 @@ export function resolveOpaqueDualCacheBleedTarget(params: {
   const upstreamForeign = new Set<string>()
   for (const ms of citedUpstreamMarkers) for (const m of ms) if (m && m !== prime) upstreamForeign.add(m)
   if (upstreamForeign.size === 1) return [...upstreamForeign][0]
-  const bodyForeign = [...hostKnownTenants].filter(t => t && t !== prime && bodyMentionsTenantToken(trimmedBody, t))
+  const bodyForeign = [...hostKnownTenants].filter(t => t && t !== prime && containsExactTenantToken(trimmedBody, t))
   if (bodyForeign.length === 1) return bodyForeign[0]
   return undefined
 }

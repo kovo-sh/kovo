@@ -1,0 +1,97 @@
+{
+  "id": "arch-kernel-race-v8-opus-bypass-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "arch-kernel-own-org-invite-resolution-alternate-spelling-bypass",
+  "description": "R3-05 independent-review FP (arch-kernel-race-v8, reviewer claude-opus-5-5-high): a 2-hop own-org chain whose first hop is the attacker's own invitation acceptance under an alternate REST spelling (plural `invitations` noun with an id segment before the verb) minting a session token whose response omits any tenant field, followed by an own-tenant payout approval with only a terminal-endpoint 403 control. There is no upstream leak/compromise hop, no denied control on the invite-resolution endpoint, and zero foreign-tenant exposure. evaluateOwnOrgInviteResolutionGuard must fail it closed regardless of invite path spelling (invites/invitations, id-before-verb, hyphen/underscore verb forms) and regardless of whether the minted session names a tenant; main confirmed it, and the authored branch missed both the alternate spelling and the tenant-less session.",
+  "covers": {
+    "files": [
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/composite-receipt.ts",
+      "src/server/own-org-terminal-guard.ts"
+    ],
+    "classes": [
+      "business_logic",
+      "privilege_escalation"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-269",
+    "category": "privilege-escalation",
+    "title": "Own-org invitation acceptance followed by own-tenant approval without compromise provenance",
+    "impact": "Accepting one's own invitation and then acting inside one's own tenant proves no boundary crossing; terminal impact must stay unproven without an upstream compromise hop, an invite-endpoint denied control, or foreign-tenant exposure.",
+    "claimedImpact": "other",
+    "claimedBoundary": "other",
+    "vulnClass": "business_logic"
+  },
+  "freeTextLabel": {
+    "title": "Invitation acceptance grants finance role to approve payouts"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member [slug=tenant-a] (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-akr8-opus-member-a"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "hop1_ex",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/api/v2/invitations/invq_5521/accept",
+      "persona": "member_a",
+      "requestJson": { "email": "member-a@tenant-a.example" },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"token\":\"sess_akr8_fin_5521abcd\",\"role\":\"finance\"}"
+    },
+    {
+      "id": "hop2_ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "POST",
+      "pathAndQuery": "/api/v2/disbursements/dsb_77/approve",
+      "persona": "member_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"finance_role_required\"}"
+    },
+    {
+      "id": "hop2_prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/api/v2/disbursements/dsb_77/approve",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"disbursement\":{\"id\":\"dsb_77\",\"tenantId\":\"tenant-a\",\"status\":\"approved\",\"amountCents\":49000}}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-ARCH-KERNEL-RACE-V8-OPUS-BYPASS-FP",
+    "terminalVulnClass": "business_logic",
+    "oracleFamily": "",
+    "capabilityToken": "sess_akr8_fin_5521abcd",
+    "attackerPersonas": ["member_a"],
+    "claimedDelta": "Own-tenant invitation acceptance minted a finance session that approved an own-tenant disbursement after a 403 member control."
+  }
+}
