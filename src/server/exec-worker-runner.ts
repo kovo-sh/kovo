@@ -2824,7 +2824,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           onProfileFailure: (pid, err, hard) => this.recordWorkerProfileFailure(turnState, pid, err, hard, baseLlmHooks.onProfileFailure),
         },
         onProofConfirmed: () => { confirmedDuringAssignment = true; this.host.schedulePlanner(run.id) },
-        onToolExecuted: () => { turnState.toolCallsInTurn += 1; turnState.totalToolCalls += 1 },
+        onToolExecuted: () => { turnState.toolCallsInTurn += 1; turnState.totalToolCalls += 1 }, isSessionCapabilityHandle: h => sessionSealedCapHandles.includes(h) || this.storage.capabilityLedger(run.id).listCapabilities().some(c => c.capId === h), recordNegativeEdge: neg => { this.recordNegativeEdgeCoverage(run.id, { origin: neg.origin, category: neg.vulnClass || step.category, summary: `Preflight non-2xx terminal (${neg.status}) on ${neg.method} ${neg.path}`, proofGapReason: 'control_blocked_cleanly', route: `${neg.method} ${neg.path}`, ...(neg.exchangeId ? { exchangeIds: [neg.exchangeId] } : {}), assignmentId: job.assignment.id }) },
       }) : undefined
       let sessionResult: Awaited<ReturnType<typeof runAgentSession>>
       try {
