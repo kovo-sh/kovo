@@ -42,7 +42,9 @@ moving — **not** doing hands-on codebase digging or editing yourself.
 - **Never `edit_file` or `write_file` production, benchmark, or test code** in
   the coordinator thread. Always delegate edits to a writer worker in an
   isolated worktree.
-- **Never load raw logs, dumps, or large transcripts** into coordinator context.
+- **Never load raw logs, dumps, benchmark failure details, or large transcripts**
+  into coordinator context (see
+  [Benchmark Output & Content-Filter Hygiene](#benchmark-output--content-filter-hygiene)).
 - **Never mutate the main checkout** while a verifier/benchmark worker using
   `workspace: "inherit"` is running; park completed writer branches and merge
   them once the verifier finishes.
@@ -63,13 +65,19 @@ When spawning native swarm workers (`swarm(action="add", model=...)`), route by 
 - Pin an immutable per-SHA Docker image (`docker tag kovo-worker:v4 kovo-worker:<sha>` + `KOVO_WORKER_IMAGE=kovo-worker:<sha>`) so `main` can keep merging PRs, rebuilding `kovo-worker:v4`, and refreshing `:8000` with zero interference.
 - Avoid launching heavy full-repo Docker builds or 264-file test sweeps simultaneously during peak 12-container benchmark load; normal merges, `tsc --noEmit`, targeted unit tests, and `vite build` are fine.
 
+## Benchmark Output & Content-Filter Hygiene
+
+1. **Main coordinator thread scorecard-only rule:** After a benchmark run completes, the coordinator may read **ONLY** the compact `certify-v8.ts` pass/fail scorecard and pure numeric counts (e.g., recall `6/12`, twin/unmatched FP counts, shortcut count, spend `$`, duration, funnel hop counts). **NEVER** print or load `topRejectDetails`, finding titles, routes/error signatures, `failureReason` detail strings, corpus entries, or `truth/blueprint.ts` files into the main coordinator context.
+2. **Isolate all detailed benchmark forensics in single-purpose subagents:** Never run forensics in the main coordinator thread. Any inspection of `report.json` reject signatures, `.meta.json` finding details, captured verification corpora, or per-chain failure causes **MUST** run inside a single-purpose subagent (e.g., `research` or a dedicated read-only worker) that returns only structured root-cause summaries (file paths, line numbers, mechanism class, fix lease — zero raw bodies, tokens, or probe strings).
+3. **Never point native workers at `benchmarks/multihop-saas/apps/*/truth/blueprint.ts` (or raw truth/solver files):** Native models (both Gemini and Claude) frequently trip content-safety filters on `truth/blueprint.ts` and raw truth/solver files. Keep native subagents and swarm workers scoped to `src/server/` plus numeric/structured metadata; if a task genuinely requires inspecting `truth/blueprint.ts` or raw truth/solver files and a native worker hits a filter block, immediately route that inspection through the OpenCode fallback below (`opencode run ...`).
+
 ## Content-Block Fallback: Delegate to OpenCode
 
 When a native swarm worker hits a content-safety filter block — e.g.:
 - executor error: `A response attempt was blocked by content safety filters`,
 - worker posts `[blocked]` due to safety filters, or
 - worker drops immediately back to `waiting` with zero output after reading
-  security/testing source files —
+  security/testing source files or `truth/blueprint.ts` / raw truth/solver files —
 
 **do NOT** inspect the file or make the edit yourself in the coordinator thread,
 and **do NOT** spin retrying the same blocked worker. Immediately delegate that
@@ -112,12 +120,17 @@ scoped task to **OpenCode** in an isolated git worktree:
 ## Per-Turn Coordinator Checklist
 
 Before issuing tool calls in any turn, verify:
-1. Am I about to `grep`, `read_file`, or `edit_file` repo code? **Stop — delegate
-   to a worker instead.**
+1. Am I about to `grep`, `read_file`, or `edit_file` repo code, or print
+   benchmark forensics (`topRejectDetails`, finding titles, routes/error
+   signatures, `failureReason`, corpus entries, `truth/blueprint.ts`)? **Stop —
+   keep the main thread scorecard-only and delegate to a single-purpose
+   subagent/worker instead.**
 2. Do all active writers (native swarm + OpenCode worktrees) have **100%
    disjoint file leases**?
-3. Did any worker hit a content-safety block? **Kill/salvage and delegate that
-   lease to `opencode run --auto` in a worktree.**
+3. Did any worker hit a content-safety block (or genuinely need to inspect
+   `truth/blueprint.ts` / raw truth/solver files)? **Keep native workers off
+   truth/solver files; kill/salvage any blocked worker and delegate that task to
+   `opencode run --auto`.**
 4. Is any clean, completed branch ready to merge (and is the main checkout
    free)? **Merge, gate, and kill the worker now.**
 5. Are all active streams running? **Park with `swarm_wait` or report concisely
