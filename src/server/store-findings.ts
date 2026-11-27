@@ -28,7 +28,9 @@ import type {
   VerificationTier,
 } from '../domain.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
-import { chainFindingDedupKey, mergeChainFindings } from '../report-summary.ts'
+import { chainFindingDedupKey } from '../report-summary.ts'
+import { classifyCompositeChainOverlap, compositeChainOriginsEquivalent, compositeChainRichnessScore, extractCompositeChainDedupSignature, extractRowCompositeSignature, isGenericSharedAuthOrUtilityEndpoint, matchSubstantialUpstreamCompositeOverlap, matchesSameClassCompositeDuplicateRow, mergeChainFindingWithCompositeUpgrade, sortChainDuplicateRows, type CompositeChainDedupSignature } from './composite-chain-dedup.ts'
+export { classifyCompositeChainOverlap, compositeChainOriginsEquivalent, compositeChainRichnessScore, extractCompositeChainDedupSignature, extractRowCompositeSignature, isGenericSharedAuthOrUtilityEndpoint, matchSubstantialUpstreamCompositeOverlap, sortChainDuplicateRows, type CompositeChainDedupSignature }
 import type { FindingProvenance, FindingVerificationClass } from '../report-summary.ts'
 import { isTerminalRunStatus } from './run-status.ts'
 import {
@@ -2267,13 +2269,13 @@ export class FindingsRepository {
       method?: string | null
       param?: string | null
       graphqlField?: string | null
+      evidence?: Record<string, unknown> | null
+      compositeSignature?: CompositeChainDedupSignature | null
     },
     excludeId?: string,
   ) {
     const originWide = isOriginWideCwe(candidate.cwe, candidate.category)
     const legacyKey = chainFindingDedupKey(candidate)
-    // Prefer the structural fingerprint: (origin, endpoint, method, param/resolver, cwe). Two BOLA
-    // routes, two verbs, two parameters or two GraphQL resolvers on one host stay distinct.
     const candidateHash = candidate.fingerprintHash ?? (candidate.endpoint
       ? computeFindingFingerprint({
           origin: candidate.origin,
@@ -2287,31 +2289,29 @@ export class FindingsRepository {
       : null)
     const candidateOrigin = candidate.origin.trim().toLowerCase()
     const candidateCwe = (candidate.cwe ?? '').trim().toUpperCase()
-    const rows = this.session.db.select().from(tables.findings).where(and(
-      eq(tables.findings.runId, runId),
-      eq(tables.findings.goalRevision, goalRevision),
-      eq(tables.findings.findingKind, 'multi_step_chain'),
-    )).all()
+    const candidateCompSig = candidate.compositeSignature ?? extractCompositeChainDedupSignature({ origin: candidate.origin, evidence: candidate.evidence })
+    const rows = this.session.db.select().from(tables.findings).where(and(eq(tables.findings.runId, runId), eq(tables.findings.goalRevision, goalRevision), eq(tables.findings.findingKind, 'multi_step_chain'))).all()
+    const rowCompSigById = new Map<string, CompositeChainDedupSignature | null>()
     const matches = rows.filter(row => {
-      if (row.id === excludeId) return false
-      // Origin-wide classes (CORS/CSP/HSTS/TLS/cookies) collapse per host even across routes.
-      if (originWide) {
-        const rowOrigin = row.finding.origin.trim().toLowerCase()
-        const rowCwe = (row.finding.cwe ?? '').trim().toUpperCase()
-        if (rowOrigin === candidateOrigin && rowCwe === candidateCwe) return true
-      }
+      if (row.id === excludeId || row.supersededByFindingId || row.finding.supersededByFindingId) return false
+      if (originWide && row.finding.origin.trim().toLowerCase() === candidateOrigin && (row.finding.cwe ?? '').trim().toUpperCase() === candidateCwe) return true
       const rowHash = row.fingerprintHash ?? row.finding.fingerprintHash ?? null
-      if (candidateHash && rowHash) return candidateHash === rowHash
-      // Legacy rows without a fingerprint may only collapse via the fingerprint-free key.
+      if (candidateHash && rowHash && candidateHash === rowHash) return true
+      const sameClass = Boolean(candidateCwe && (row.finding.cwe ?? '').trim().toUpperCase() === candidateCwe)
+      if (candidateHash && rowHash && !sameClass) return false
+      if (candidateCompSig && candidateCompSig.hopCount >= 2 && sameClass) {
+        const res = matchesSameClassCompositeDuplicateRow(candidate.origin, candidateCompSig, row)
+        rowCompSigById.set(row.id, res.rowSig)
+        if (res.matched) return true
+      }
+      if (candidateHash && rowHash) return false
       return !candidateHash && !rowHash && chainFindingDedupKey(row.finding) === legacyKey
     })
     if (!matches.length) return undefined
-    // Prefer confirmed duplicate first, then static_verified, then pending, then others
     const order: Record<Finding['status'], number> = {
       confirmed: 0, static_verified: 1, pending: 2, inconclusive: 3, dismissed: 4,
     }
-    matches.sort((a, b) => order[a.finding.status] - order[b.finding.status])
-    return matches[0]
+    return sortChainDuplicateRows(matches, order, r => rowCompSigById.get(r.id) ?? extractRowCompositeSignature(r))[0]
   }
 
   /**
@@ -2408,7 +2408,7 @@ export class FindingsRepository {
       }
 
       const rawStoredFinding: Finding = targetRow
-        ? mergeChainFindings(targetRow.finding, incoming)
+        ? mergeChainFindingWithCompositeUpgrade(targetRow.finding, incoming)
         : incoming
       const targetIsConfirmed = Boolean(targetRow && targetRow.finding.status === 'confirmed')
       const preservesConfirmedIdentity = targetIsConfirmed && targetRow!.finding.status === rawStoredFinding.status

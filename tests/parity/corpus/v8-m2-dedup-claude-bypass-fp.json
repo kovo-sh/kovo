@@ -1,0 +1,116 @@
+{
+  "id": "v8-m2-dedup-claude-bypass-fp",
+  "side": "fp",
+  "archetype": "bfla-in-policy-write",
+  "description": "Dedup/supersession bypass variant: same-tenant admin hits a decoy sibling of a confirmed chain terminal; 200 ack but post-state unchanged, so it must not confirm nor ride a confirmed chain.",
+  "covers": {
+    "files": [
+      "src/server/exec-verify.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "bfla",
+      "authorization"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-862",
+    "category": "bfla",
+    "title": "Vertical BFLA on admin settings mirror update",
+    "impact": "Admin updates same-tenant settings mirror.",
+    "claimedImpact": "bfla",
+    "claimedBoundary": "access",
+    "vulnClass": "bfla"
+  },
+  "freeTextLabel": {
+    "title": "Privilege escalation on settings mirror update"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "admin_a",
+      "roleLabel": "admin (tenant-a)",
+      "role": "admin",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-admin-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "before",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/settings-mirror",
+      "persona": "admin_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"theme\":\"light\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "PATCH",
+      "pathAndQuery": "/api/admin/settings-mirror",
+      "persona": "admin_a",
+      "requestJson": {
+        "theme": "dark"
+      },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"ok\":true}"
+    },
+    {
+      "id": "after",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/settings-mirror",
+      "persona": "admin_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"theme\":\"light\"}"
+    }
+  ],
+  "replaySpec": {
+    "requiredRole": "admin",
+    "assertionsJq": "{ controlPassed: (.steps.before.json.theme == \"light\"), confirmed: (.steps.prb.status == 200 and .steps.after.json.theme == \"dark\"), observed: .steps.after.json.theme, expected: \"light\" }"
+  },
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "bfla",
+      "beforeExchangeId": "before",
+      "probeExchangeId": "prb",
+      "afterExchangeId": "after",
+      "controlExchangeIds": [
+        "before",
+        "after"
+      ],
+      "requiredRole": "admin"
+    }
+  ]
+}

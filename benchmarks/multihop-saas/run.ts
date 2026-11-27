@@ -434,6 +434,7 @@ export interface ProductSubmittedFinding {
   params?: string[]
   severity?: string
   status?: string
+  supersededByFindingId?: string | null
   evidenceSummary?: string
 }
 
@@ -1251,9 +1252,10 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
   const gt = input.groundTruth
   const oracleExport = input.oracleExport ?? groundTruthOracleMap.get(gt)?.()
   const evalByChain = new Map((oracleExport?.evaluations ?? []).map((ev) => [ev.chainId, ev]))
-  const receipts = input.compositeReceipts ?? []
-  const findings = input.findings ?? []
+  const rawReceipts = input.compositeReceipts ?? []
+  const rawFindings = input.findings ?? []
   const chainSpecs = groundTruthChainsMap.get(gt) ?? []
+  const isHardenedOrTwinRun = gt.labMode === 'hardened' || Boolean(gt.twinId)
 
   const oracleEventsByChain = new Map<string, Array<{ seq: number; eventKind?: string; hopId?: string }>>()
   for (const raw of input.oracleEvents ?? []) {
@@ -1286,19 +1288,50 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
     oracleObservedByChain.set(expected.chainId, oracleObserved)
   }
 
+  const allSpecChainIds = new Set(chainSpecs.map((spec) => spec.chainId))
+  const chainSpecById = new Map(chainSpecs.map((spec) => [spec.chainId, spec]))
+  const rawSupersededFindingIds = new Set<string>()
+  for (const f of rawFindings) {
+    if (typeof f.supersededByFindingId === 'string' && f.supersededByFindingId.trim()) {
+      if (f.id) rawSupersededFindingIds.add(f.id)
+      if (f.findingId) rawSupersededFindingIds.add(f.findingId)
+    }
+  }
+
   const receiptByChain = new Map<string, ProductSubmittedCompositeProof>()
   const resolvedChainByReceipt = new Map<ProductSubmittedCompositeProof, string>()
-  for (const receipt of receipts) {
-    const resolvedChainId = resolveReceiptChainId(receipt, expectedChainIds, chainSpecs, oracleObservedByChain)
-    if (!resolvedChainId) continue
-    resolvedChainByReceipt.set(receipt, resolvedChainId)
-    const existing = receiptByChain.get(resolvedChainId)
-    if (!existing || receiptPriority(receipt) > receiptPriority(existing)) {
-      receiptByChain.set(resolvedChainId, receipt)
+  const resolvedChainsByFindingId = new Map<string, Set<string>>()
+  const confirmedReceiptChainsByFindingId = new Map<string, Set<string>>()
+  for (const receipt of rawReceipts) {
+    const resolvedExpected = resolveReceiptChainId(receipt, expectedChainIds, chainSpecs, oracleObservedByChain)
+    const resolvedAny = resolvedExpected
+      ?? resolveReceiptChainId(receipt, allSpecChainIds, chainSpecs, oracleObservedByChain)
+    if (resolvedAny && receipt.findingId) {
+      const set = resolvedChainsByFindingId.get(receipt.findingId) ?? new Set<string>()
+      set.add(resolvedAny)
+      resolvedChainsByFindingId.set(receipt.findingId, set)
+      if (receipt.confirmed && receipt.attackerProvenanceValid && receipt.replayMode === 'fresh_clean_replay') {
+        const cset = confirmedReceiptChainsByFindingId.get(receipt.findingId) ?? new Set<string>()
+        cset.add(resolvedAny)
+        confirmedReceiptChainsByFindingId.set(receipt.findingId, cset)
+      }
+    }
+    if (!resolvedExpected) continue
+    resolvedChainByReceipt.set(receipt, resolvedExpected)
+    const existing = receiptByChain.get(resolvedExpected)
+    const incomingSuperseded = !isHardenedOrTwinRun && Boolean(receipt.findingId && rawSupersededFindingIds.has(receipt.findingId))
+    const existingSuperseded = !isHardenedOrTwinRun && Boolean(existing?.findingId && rawSupersededFindingIds.has(existing.findingId))
+    if (
+      !existing
+      || (existingSuperseded && !incomingSuperseded)
+      || (existingSuperseded === incomingSuperseded && receiptPriority(receipt) > receiptPriority(existing))
+    ) {
+      receiptByChain.set(resolvedExpected, receipt)
     }
   }
 
   const confirmedFindingIds = new Set<string>()
+  const confirmedChainByFindingId = new Map<string, string>()
   const chains: ProductChainVerdict[] = gt.expectedChains.map((expected) => {
     const evaluation = evalByChain.get(expected.chainId)
     const chainEvents = oracleEventsByChain.get(expected.chainId) ?? []
@@ -1322,7 +1355,10 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
     const matchedFindingIds: string[] = []
     if (matchedReceipt?.findingId) {
       matchedFindingIds.push(matchedReceipt.findingId)
-      if (twoSideConfirmed) confirmedFindingIds.add(matchedReceipt.findingId)
+      if (twoSideConfirmed) {
+        confirmedFindingIds.add(matchedReceipt.findingId)
+        confirmedChainByFindingId.set(matchedReceipt.findingId, expected.chainId)
+      }
     }
 
     let dropReason: ProductDropReason | null = null
@@ -1352,13 +1388,72 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
     }
   })
 
+  // Filter findings marked `supersededByFindingId` ONLY in vulnerable mode (NEVER in hardened/twin mode),
+  // and ONLY when:
+  //  - the superseding winner is present with explicit `status === 'confirmed'`,
+  //  - the winner is an actual two-side confirmed non-decoy TP (`confirmedFindingIds`), AND
+  //  - the superseded loser is genuinely related to the winner (shares winner's resolved chainId OR
+  //    matches winner's terminal/chain endpoint templates).
+  const ignoredSupersededIds = new Set<string>()
+  let findings = rawFindings
+  let receipts = rawReceipts
+  if (!isHardenedOrTwinRun) {
+    const explicitConfirmedWinnerById = new Map<string, ProductSubmittedFinding>()
+    for (const f of rawFindings) {
+      if (f.supersededByFindingId || f.twinId) continue
+      if (f.status !== 'confirmed') continue
+      const fIds = [f.findingId, f.id].filter((x): x is string => Boolean(x))
+      if (!fIds.some((fid) => confirmedFindingIds.has(fid))) continue
+      for (const fid of fIds) explicitConfirmedWinnerById.set(fid, f)
+    }
+
+    const loserRelatedToWinner = (loser: ProductSubmittedFinding, winner: ProductSubmittedFinding, supId: string): boolean => {
+      const winnerChainId = confirmedChainByFindingId.get(supId)
+        ?? (winner.findingId ? confirmedChainByFindingId.get(winner.findingId) : undefined)
+        ?? (winner.id ? confirmedChainByFindingId.get(winner.id) : undefined)
+      const loserIds = [loser.findingId, loser.id].filter((x): x is string => Boolean(x))
+      if (winnerChainId && loserIds.some((lid) => resolvedChainsByFindingId.get(lid)?.has(winnerChainId))) {
+        return true
+      }
+      const loserEps = findingEndpoints(loser)
+        .map((ep) => parseEndpointCandidate(ep.path, ep.method))
+        .filter((p): p is ParsedEndpointCandidate => Boolean(p))
+      if (!loserEps.length) return false
+      const winnerSpec = winnerChainId ? chainSpecById.get(winnerChainId) : undefined
+      if (winnerSpec) {
+        const specTemplates = [...winnerSpec.terminalEndpoints, ...winnerSpec.upstreamHopEndpoints]
+        if (loserEps.some((lep) => specTemplates.some((tmpl) => endpointMatchesTemplate(lep, tmpl)))) {
+          return true
+        }
+      }
+      const winnerEps = findingEndpoints(winner)
+        .map((ep) => parseEndpointCandidate(ep.path, ep.method))
+        .filter((p): p is ParsedEndpointCandidate => Boolean(p))
+      return loserEps.some((lep) => winnerEps.some((wep) =>
+        (!lep.method || !wep.method || lep.method === wep.method)
+        && pathMatchesTemplate(lep.path, wep.path),
+      ))
+    }
+
+    findings = rawFindings.filter((f) => {
+      const supId = typeof f.supersededByFindingId === 'string' ? f.supersededByFindingId.trim() : ''
+      if (!supId) return true
+      const ownIds = [f.findingId, f.id].filter((x): x is string => Boolean(x))
+      if (ownIds.includes(supId)) return true
+      const winner = explicitConfirmedWinnerById.get(supId)
+      if (!winner || !loserRelatedToWinner(f, winner, supId)) return true
+      for (const oid of ownIds) ignoredSupersededIds.add(oid)
+      return false
+    })
+    receipts = rawReceipts.filter((r) => !(r.findingId && ignoredSupersededIds.has(r.findingId)))
+  }
+
   const confirmedChainIds = new Set(chains.filter((c) => c.twoSideConfirmed).map((c) => c.chainId))
   const shortcutViolationChainIds = new Set(
     chains.filter((c) => c.forbiddenShortcutViolation).map((c) => c.chainId),
   )
   const shortcutFindingIds = new Set<string>()
   const shortcutReceiptFallbackIds = new Set<string>()
-  const chainSpecById = new Map(chainSpecs.map((spec) => [spec.chainId, spec]))
   if (gt.labMode === 'vulnerable' && shortcutViolationChainIds.size > 0) {
     for (const chain of chains) {
       if (!chain.forbiddenShortcutViolation) continue
@@ -1375,7 +1470,6 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
     }
   }
 
-  const allSpecChainIds = new Set(chainSpecs.map((spec) => spec.chainId))
   const resolvedTwins = resolveProductTwins(gt)
   const twinClaimFindingIds = new Set<string>()
   const hardenedTwins: ProductTwinVerdict[] = resolvedTwins.map((decoy) => {
@@ -1410,6 +1504,41 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
       const id = f.findingId ?? f.id ?? `finding:${i}`
       if (!isTwinMode && confirmedFindingIds.has(id)) continue
       if (matchedIds.includes(id)) continue
+      if (
+        !isTwinMode
+        && baseChainConfirmed
+        && f.twinId !== decoy.twinId
+        && f.chainId !== decoy.twinId
+      ) {
+        // Vulnerable mode with the base chain already two-side confirmed: exempt ONLY a verified
+        // duplicate Mode-A composite receipt resolving to `decoy.baseChainId` (ignoring self-declared
+        // `f.chainId` and never exempting findings matching any decoy endpoint outside the base chain's
+        // own templates or hitting decoy's enforced terminal without a confirmed base receipt).
+        const receiptConfirmedBase = Boolean(
+          confirmedReceiptChainsByFindingId.get(id)?.has(decoy.baseChainId)
+          || (f.id && confirmedReceiptChainsByFindingId.get(f.id)?.has(decoy.baseChainId))
+          || (f.findingId && confirmedReceiptChainsByFindingId.get(f.findingId)?.has(decoy.baseChainId)),
+        )
+        const eps = findingEndpoints(f)
+        const baseSpecTemplates = baseChainSpec
+          ? [...baseChainSpec.terminalEndpoints, ...baseChainSpec.upstreamHopEndpoints]
+          : []
+        const hitsDecoyOutsideBase = decoy.endpoints.some((twinEp) => {
+          const twinParsed = parseEndpointCandidate(twinEp.path, twinEp.method)
+          const inBaseSpec = Boolean(
+            twinParsed && baseSpecTemplates.some((tmpl) => endpointMatchesTemplate(twinParsed, tmpl)),
+          )
+          if (inBaseSpec) return false
+          return eps.some((ep) => {
+            const epMethod = ep.method?.trim().toUpperCase()
+            if (epMethod && twinEp.method && epMethod !== twinEp.method.toUpperCase()) return false
+            return pathMatchesTemplate(ep.path, twinEp.path)
+          })
+        })
+        if (receiptConfirmedBase && !hitsDecoyOutsideBase) {
+          continue
+        }
+      }
       if (isVulnerableShortcutBase) {
         const eps = findingEndpoints(f)
         const hitsBaseTerminal = Boolean(
