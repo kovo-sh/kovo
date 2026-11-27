@@ -1,0 +1,88 @@
+{
+  "id": "kernel-fp-guard-claude-bypass-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "kernel-fp-guard-own-org-listing-bypass-variants",
+  "description": "R3-05 independent review bypass FP: an honest own-org paginated collection listing (member reads its own tenant's payouts, same-persona 403 control from a prior unauthenticated-style attempt) claimed under an access-control alias class. The variant stacks three evasions against the own-org benign-read guard: an alias terminal class outside the original closed class list, a dot-segment path that appends a sensitive-looking segment then traverses back out, and a nested data wrapper with an ordinary pagination token key. All three must be normalized so the listing is still rejected as terminal_impact_unproven (no foreign-tenant data, no mutation readback, no v8 oracle).",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/own-org-terminal-guard.ts",
+      "src/server/v8-oracle-hydrate.ts"
+    ],
+    "classes": [
+      "authorization_bypass",
+      "broken_access_control"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-862",
+    "category": "access-control",
+    "title": "Own-org paginated collection listing falsely claimed as authorization bypass",
+    "impact": "A plain own-org collection GET with no foreign-tenant data, no state mutation and no verified oracle is not terminal impact, regardless of class alias, path dot-segments or payload nesting.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "authorization_bypass"
+  },
+  "freeTextLabel": {
+    "title": "Authorization bypass claimed from own-organization payout listing"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (org_a)",
+      "role": "member",
+      "tenant": "org_a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-kernelfp-member-a"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ex_ctrl_403",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/payouts/vault/%2e%2e/",
+      "persona": "member_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "ex_list_200",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/payouts/vault/%2e%2e/",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"data\":{\"payouts\":[{\"id\":\"po_1\",\"tenant\":\"org_a\",\"amountCents\":2500}]},\"next_page_token\":\"pg2\"}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-KERNEL-FP-GUARD-CLAUDE-BYPASS-FP",
+    "terminalVulnClass": "authorization_bypass",
+    "oracleFamily": "",
+    "singleHop": true,
+    "terminalExchangeId": "ex_list_200",
+    "preChainControlIds": ["ex_ctrl_403"],
+    "attackerPersonas": ["member_a"],
+    "expectedFailedStage": "terminal_impact",
+    "claimedDelta": "Own-org paginated collection listing under an alias class must fail closed; dot-segment, nested-wrapper and pagination-key variants must not bypass the guard."
+  }
+}
