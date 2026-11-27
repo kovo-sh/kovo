@@ -75,6 +75,10 @@ test('buildProofWriterSystemPrompt is short (<2500 chars), teaches ctx.chain() +
     'ch.control',
     'ch.hop',
     'ch.step',
+    'ch.seal',
+    'ch.race',
+    'ch.edge',
+    'ch.stateTransition',
     'ctx.seal_capability',
     'ctx.hmac_sign',
     'ctx.jwt_sign',
@@ -82,6 +86,7 @@ test('buildProofWriterSystemPrompt is short (<2500 chars), teaches ctx.chain() +
     'ctx.await_async',
     'ch.readback',
     'ch.prove',
+    'terminalHopId',
     'dual_tenant_abac',
     'economic_conservation',
     'draftScript',
@@ -90,6 +95,8 @@ test('buildProofWriterSystemPrompt is short (<2500 chars), teaches ctx.chain() +
   ]) {
     assert.ok(prompt.includes(requiredToken), `system prompt should include ${requiredToken}`)
   }
+  assert.match(prompt, /OUTSIDE any hop/i)
+  assert.match(prompt, /orphan `hop_\*`/i)
 
   for (const forbiddenReconTool of [
     'request_http',
@@ -133,6 +140,7 @@ test('buildProofWriterUserPrompt caps body previews <= 1500 chars, masks sensiti
     compilerWarnings: ['dynamic_id_detected: path segment may vary across replays'],
     compilerFailure: {
       rejectedBy: 'missing_pre_chain_control',
+      compositeRejectedBy: 'dag_topology',
       reason: 'Missing denied baseline control exchange',
       detail: 'Add pre-chain arm:"control" call on terminal route before hop_1.',
       missingEvidence: ['preChainControlExchangeIds'],
@@ -144,6 +152,9 @@ test('buildProofWriterUserPrompt caps body previews <= 1500 chars, masks sensiti
   assert.ok(prompt.includes('actor_low (role=member, tenant=tenant_a)'))
   assert.ok(prompt.includes('draft') || prompt.includes('Draft Script'))
   assert.ok(prompt.includes('missing_pre_chain_control'))
+  assert.ok(prompt.includes('compositeRejectedBy: dag_topology'))
+  assert.ok(prompt.includes('ChainBuilder'))
+  assert.ok(prompt.includes('terminalHopId'))
   assert.ok(prompt.includes('preChainControlExchangeIds'))
   assert.ok(prompt.includes('dynamic_id_detected'))
   assert.ok(prompt.includes('trace-42'))

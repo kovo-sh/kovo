@@ -1882,7 +1882,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           return rows
             .filter(ex => status === undefined || ex.status === status)
             .map(ex => ({
-              id: ex.id, origin: ex.origin, method: ex.method, pathAndQuery: ex.pathAndQuery,
+              id: ex.id, exchangeId: ex.id, origin: ex.origin, method: ex.method, pathAndQuery: ex.pathAndQuery,
               status: ex.status, mediaType: ex.mediaType, bodyPreview: ex.bodyPreview.slice(0, 600),
             }))
         },
@@ -1899,7 +1899,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             stagedPath = await session.stage(`exchanges/${ex.id}.json`, JSON.stringify(ex, null, 2), signal).catch(() => null)
           }
           return {
-            ...ex,
+            ...ex, exchangeId: ex.id,
             body: includeBody ? ex.body.slice(0, 12_000) : undefined,
             stagedPath,
           }
@@ -2505,12 +2505,12 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               })
             }
             if (!proof.verdict.confirmed) {
-              return checkpointOnlyGuard.summarizeOutcome({
-                verdict: proof.verdict,
-                sealedCapabilities: ledgerSync.sealedCapabilities,
+              const summarized = checkpointOnlyGuard.summarizeOutcome({
+                verdict: proof.verdict, sealedCapabilities: ledgerSync.sealedCapabilities,
                 verifiedHops: ledgerSync.verifiedHops,
                 ...(compositeReceipt ? { compositeReceipt } : {}),
               })
+              return proof.compositeReceipt?.verification.rejectedBy ? { ...summarized, compositeRejectedBy: proof.compositeReceipt.verification.rejectedBy } : summarized
             }
             confirmedDuringAssignment = true
             const persisted = this.host.persistAgentScriptProof({
@@ -2810,7 +2810,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           const fid = typeof out?.findingId === 'string' ? out.findingId : detail?.match(/Finding\s+([^\s]+)\s+cites/)?.[1]
           return {
             confirmed: out?.confirmed === true, ...(fid ? { findingId: fid } : {}),
-            ...(typeof out?.rejectedBy === 'string' ? { rejectedBy: out.rejectedBy } : {}),
+            ...(typeof out?.rejectedBy === 'string' ? { rejectedBy: out.rejectedBy } : {}), ...(typeof out?.compositeRejectedBy === 'string' ? { compositeRejectedBy: out.compositeRejectedBy } : {}),
             ...(typeof out?.reason === 'string' ? { reason: out.reason } : {}),
             ...(detail ? { detail } : {}),
             ...(Array.isArray(out?.missingEvidence) ? { missingEvidence: out.missingEvidence.map(String) } : {}),
@@ -2829,7 +2829,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       let sessionResult: Awaited<ReturnType<typeof runAgentSession>>
       try {
         sessionResult = await runAgentSession({
-          directory: this.storage.directory, sessionId: job.assignment.sessionId,
+          directory: this.storage.directory, sessionId: job.assignment.sessionId, ...(reposDir ? { reposDir } : {}),
           requestId: `investigate:${step.id}:attempt-${job.assignment.attempt}`,
           profiles: resolveProfilePoolForRole(specialistConfig.roleAffinity, profiles),
           scenario: 'worker-investigation', roleAffinity: specialistConfig.roleAffinity,

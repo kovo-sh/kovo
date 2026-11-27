@@ -37,7 +37,7 @@ export interface ProofWriterInput {
   exchanges: ProofWriterExchangeSummary[]
   draftScript?: string
   compilerWarnings?: string[]
-  compilerFailure?: { rejectedBy?: string; reason?: string; detail?: string; missingEvidence?: string[] }
+  compilerFailure?: { rejectedBy?: string; compositeRejectedBy?: string; reason?: string; detail?: string; missingEvidence?: string[] }
   maxTurns?: number
   wallClockMs?: number
   budgetCapUsd?: number
@@ -57,6 +57,7 @@ export interface ProofWriterVerifyResult {
   confirmed: boolean
   findingId?: string
   rejectedBy?: string
+  compositeRejectedBy?: string
   reason?: string
   detail?: string
   missingEvidence?: string[]
@@ -90,28 +91,28 @@ const VALID_TERMINAL_CLASSES =
 
 export function buildProofWriterSystemPrompt(): string {
   return [
-    'Focused Proof-Writer Specialist: your ONLY job is writing or repairing a short TypeScript `kovo_verify` script turning the candidate exchanges into a Mode-A (`fresh_clean_replay`) confirmed `CompositeProofReceipt`.',
+    'Proof-Writer Specialist: write/repair a short TS `kovo_verify` script turning candidate exchanges into a Mode-A (`fresh_clean_replay`) confirmed `CompositeProofReceipt`.',
     '',
-    'Pattern (`ctx.chain()` — Mode A runs twice on clean state):',
+    'ChainBuilder v2 (`ctx.chain()` — Mode A runs twice on clean state):',
     '```ts',
-    'const ch = ctx.chain({ chainId: "chain_1", terminalVulnClass: "<valid_class>" })',
-    'ch.control(await ctx.http_send(target, { as: attacker, arm: "control", role: "control", session: "ctrl" }))',
-    'const h1 = await ch.hop("hop_1", { claimedDelta: "..." }, () => ctx.http_send(hop1, { as: attacker, role: "probe" })) // or ch.step(...)',
-    'const cap = await ctx.seal_capability(h1, { slot: "tok", jsonPath: "$.token", kind: "bearer_token" })',
-    'await ch.hop("hop_2", { claimedDelta: "..." }, () => ctx.http_send(target, { capability: { handle: cap.handle, target: "bearer" }, role: "probe" })) // omit `as`',
-    'ch.readback(fin) // optional post-chain readback',
-    'await ch.prove({ claimedImpact: "..." })',
+    'const ch = ctx.chain({ chainId: "chain_1", terminalVulnClass: "<class>" })',
+    'const ctrl = await ch.control(target, { as: attacker }) // ALWAYS OUTSIDE any hop',
+    'const h1 = await ch.step(hop1, { hopId: "hop_1", method: "POST", as: attacker, body: {}, claimedDelta: "..." })',
+    'const cap = await ch.seal(h1, { jsonPath: "$.token", kind: "bearer_token" }) // prefer ch.seal over ctx.seal_capability',
+    'const h2 = await ch.hop("hop_2", { claimedDelta: "..." }, () => ctx.http_send(target, { capability: { handle: cap, target: "bearer" }, role: "probe" }))',
+    'await ch.readback(target, { as: attacker }) // optional readback',
+    'await ch.prove({ terminalHopId: "hop_2", claimedImpact: "..." })',
     'return ctx.result({ title: "..." })',
     '```',
     '',
-    'Helpers: `ctx.seal_capability` (`jsonPath`/`header`/`cookie`/`locationQuery`/`value`, never regex), `ctx.hmac_sign`, `ctx.jwt_sign`, `ctx.race_burst`, `ctx.await_async`, `ch.stateTransition({ fromHopId, toHopId, entityId, ablationExchange })`.',
-    `Valid TERMINAL_CLASS_CONTRACT classes: ${VALID_TERMINAL_CLASSES}. NEVER use \`cross_tenant_data_access\`.`,
+    'Helpers: `ch.seal` (`jsonPath|header|setCookie|locationQuery`, `kind: "bearer_token"|"cookie"|"hmac_key"|"jwt"`, never regex; prefer over `ctx.seal_capability`), `ch.race` / `ctx.race_burst`, `ctx.hmac_sign`, `ctx.jwt_sign`, `ctx.await_async`, `ch.stateTransition({ fromHopId, toHopId, entityId, ablationExchange: ctrl })`, `ch.edge({ kind, fromHopId, toHopId, ... })`.',
+    `Valid classes: ${VALID_TERMINAL_CLASSES}. Never use \`cross_tenant_data_access\`.`,
     '',
     'Rules:',
-    '1. If `draftScript` + `compilerFailure` are provided, patch the exact failure (`rejectedBy`/`reason`/`detail`/`missingEvidence`) directly instead of rewriting from scratch.',
-    '2. Keep Mode-A idempotent: extract dynamic IDs/tokens at runtime; use `ctx.nonce` for fresh records.',
-    '3. Run `{ arm: "control", role: "control" }` baseline BEFORE mutating hops; use one low-priv/derived persona on probe hops.',
-    '4. Stop immediately once `kovo_verify` returns `confirmed: true`. Call `complete_intent` only if unconfirmable.',
+    '1. Every hop MUST connect to `terminalHopId` via a host-attested edge (`ch.seal` + `capability: { handle }`, `ch.stateTransition`, or `ch.edge`). Prune unlinked recon/listing hops instead of leaving orphan `hop_*` nodes.',
+    '2. Run `await ch.control(target, { as: attacker })` BEFORE mutating hops and OUTSIDE any hop.',
+    '3. With `draftScript` + `compilerFailure`, patch the exact failure (`rejectedBy`/`reason`/`detail`/`missingEvidence`) directly.',
+    '4. Keep Mode-A idempotent (extract IDs/tokens at runtime; use `ctx.nonce`). Stop once `kovo_verify` returns `confirmed: true`; call `complete_intent` only if unconfirmable.',
   ].join('\n')
 }
 
@@ -181,6 +182,7 @@ export function buildProofWriterUserPrompt(input: ProofWriterInput): string {
     sections.push([
       '\n## Compiler Verification Failure (FIX THIS DIRECTLY)',
       ...(cf.rejectedBy ? [`- rejectedBy: ${cf.rejectedBy}`] : []),
+      ...(cf.compositeRejectedBy ? [`- compositeRejectedBy: ${cf.compositeRejectedBy}`] : []),
       ...(cf.reason ? [`- reason: ${clampText(cf.reason, 500)}`] : []),
       ...(cf.detail ? [`- detail: ${clampText(cf.detail, 800)}`] : []),
       ...(cf.missingEvidence?.length ? [`- missingEvidence: ${cf.missingEvidence.join(', ')}`] : []),
@@ -190,7 +192,7 @@ export function buildProofWriterUserPrompt(input: ProofWriterInput): string {
     const label = input.compilerFailure ? ' (Edit directly to fix the failure above)' : ''
     sections.push(`\n## Draft Script${label}\n\`\`\`ts\n${clampText(input.draftScript, MAX_DRAFT_SCRIPT_CHARS)}\n\`\`\``)
   }
-  sections.push('\n## Action\nCall `kovo_verify` with inline TypeScript (`runtime: "ts"`). Stop immediately when `confirmed: true`.')
+  sections.push('\n## Action\nCall `kovo_verify` with inline TypeScript (`runtime: "ts"`) using `ChainBuilder` v2 (`ch.control` outside hops, `ch.step`/`ch.hop`, `ch.seal`, `ch.readback`/`ch.race`/`ch.stateTransition`/`ch.edge`). Prune any unlinked recon/listing hops so every hop connects to `terminalHopId`. Stop immediately when `confirmed: true`.')
   return sections.join('\n')
 }
 
