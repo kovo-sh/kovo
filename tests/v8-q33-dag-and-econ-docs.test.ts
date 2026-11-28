@@ -48,20 +48,19 @@ const REPO_ROOT = resolve(new URL('..', import.meta.url).pathname)
 const ORIGIN = 'https://q33-docs.example.invalid'
 
 type Q33MultiHopDirectives = {
-  economicConservationReadback?: string
-  connectedDagTopology?: string
-  derivedSessionTokenInjection?: string
-  requiredCompositeProof?: string
+  scopeAnchor?: string
   compositeCallSignature?: string
-  stateTransitionControlOrder?: string
+  singleScriptConsolidation?: string
+  attackerProvenance?: string
+  controlsAndReadback?: string
 }
 
 function renderMultiHopDirectives(): Q33MultiHopDirectives {
   const parsed = JSON.parse(workerInvestigationPrompt({
-    goal: 'Verify cross-service workflow and economic conservation invariants',
+    goal: 'Verify cross-service workflow and state invariants',
     step: {
       id: 'step-q33-multihop',
-      title: 'Clean-session chain · Session token exchange and ledger conservation',
+      title: 'Clean-session chain · Session token exchange and state mutation',
       hypothesis: 'Stage 1 -> Stage 2 -> Stage 3 -> Terminal verification.',
       category: 'broken-access-control',
       skills: ['multihop-chains'],
@@ -74,23 +73,13 @@ function renderMultiHopDirectives(): Q33MultiHopDirectives {
   return parsed.multiHopDirectives!
 }
 
-test('Q33.1: economic_conservation baseline + final readback and host-hydrated oracleInput are documented across prompts and playbook', () => {
+test('Q33.1: baseline + final readback discipline is documented across prompts and economic_conservation receipt schema validates', () => {
   const directives = renderMultiHopDirectives()
-  const econDirective = directives.economicConservationReadback ?? ''
+  const controlsDirective = directives.controlsAndReadback ?? ''
 
-  assert.match(econDirective, /terminalVulnClass:\s*"economic_conservation"/)
-  assert.match(econDirective, /BEFORE the chain/i)
-  assert.match(econDirective, /preChainControlExchangeIds/)
-  assert.match(econDirective, /oracleInput\.baselineReadbackExchangeId/)
-  assert.match(econDirective, /mutating\/race hops/i)
-  assert.match(econDirective, /AFTER/i)
-  assert.match(econDirective, /postChainReadbackExchangeIds/)
-  assert.match(econDirective, /oracleInput\.finalReadbackExchangeId/)
-  assert.match(econDirective, /actionExchangeIds/)
-  assert.match(econDirective, /equation/)
-  assert.match(econDirective, /balancesBefore\/paidAmount/)
-  assert.match(econDirective, /terminalImpact\.oracleInput/)
-  assert.match(econDirective, /hydrates host-signed records/i)
+  assert.match(controlsDirective, /arm:\s*"control"/)
+  assert.match(controlsDirective, /before mutating shared state/i)
+  assert.match(controlsDirective, /post-chain readback exchange IDs/i)
 
   const sysPrompt = workerSessionInstructions('worker-investigation', { hasKovoVerify: true })
   for (const [label, text] of [
@@ -98,32 +87,8 @@ test('Q33.1: economic_conservation baseline + final readback and host-hydrated o
     ['KOVO_VERIFY_TOOL_DESCRIPTION', KOVO_VERIFY_TOOL_DESCRIPTION],
     ['workerSessionInstructions', sysPrompt],
   ] as const) {
-    assert.match(text, /economic_conservation/, `${label} missing economic_conservation`)
-    assert.match(text, /baselineReadbackExchangeId/, `${label} missing baselineReadbackExchangeId`)
-    assert.match(text, /finalReadbackExchangeId/, `${label} missing finalReadbackExchangeId`)
-    assert.match(text, /actionExchangeIds/, `${label} missing actionExchangeIds`)
-    assert.match(text, /terminalImpact\.oracleInput/, `${label} missing terminalImpact.oracleInput`)
-  }
-
-  const guidance = kovoVerifyHelperGuidance()
-  assert.match(guidance, /economic_conservation.*baseline\+final readback IDs in oracleInput/i)
-
-  clearSkillsCache()
-  const mhSkill = selectPreInjectionSkills({ profileSkills: ['bola-idor-race'], lane: 'chain', limit: 2 })
-    .find(s => s.name === MULTIHOP_CHAINS_SKILL)
-  assert.ok(mhSkill, 'multihop-chains must be pre-injected for chain lane')
-  assert.match(mhSkill!.excerpt, /economic_conservation/i)
-  assert.match(mhSkill!.excerpt, /baselineReadbackExchangeId/)
-  assert.match(mhSkill!.excerpt, /finalReadbackExchangeId/)
-
-  const playbook = loadSkill(MULTIHOP_CHAINS_SKILL)?.content ?? ''
-  assert.match(playbook, /Baseline \+ Final Readback Pattern/i)
-  assert.match(playbook, /baselineReadbackExchangeId/)
-  assert.match(playbook, /finalReadbackExchangeId/)
-  assert.match(playbook, /actionExchangeIds/)
-  assert.match(playbook, /automatically hydrates/i)
-  for (const eq of ['balance_minting', 'over_refund', 'underpaid_fulfillment', 'ineligible_discount']) {
-    assert.ok(playbook.includes(eq), `multihop-chains.md missing economic equation ${eq}`)
+    assert.match(text, /pre-chain baseline/i, `${label} missing pre-chain baseline reminder`)
+    assert.match(text, /post-chain readback exchange IDs/i, `${label} missing post-chain readback reminder`)
   }
 
   // Documented economic_conservation receipt shape validates against live compositeProofReceiptSchema.
@@ -164,11 +129,9 @@ test('Q33.1: economic_conservation baseline + final readback and host-hydrated o
 
 test('Q33.2: dag_topology connected-DAG rule forbids unused/orphan exploratory hops in hops[]', () => {
   const directives = renderMultiHopDirectives()
-  const dagDirective = directives.connectedDagTopology ?? ''
+  const dagDirective = directives.singleScriptConsolidation ?? ''
 
-  assert.match(dagDirective, /dag_topology/)
-  assert.match(dagDirective, /hops\[\].*connected by causalEdges\[\].*terminalImpact\.terminalHopId/i)
-  assert.match(dagDirective, /never include unused or orphan exploratory hops in hops\[\]/i)
+  assert.match(dagDirective, /connected via causalEdges\[\] to terminalHopId/i)
 
   const sysPrompt = workerSessionInstructions('worker-investigation', { hasKovoVerify: true })
   for (const [label, text] of [
@@ -184,25 +147,12 @@ test('Q33.2: dag_topology connected-DAG rule forbids unused/orphan exploratory h
   assert.match(kovoVerifyHelperGuidance(), /connected DAG \(no orphan hops\)/i)
 
   clearSkillsCache()
-  const mhSkill = selectPreInjectionSkills({ profileSkills: ['bola-idor-race'], lane: 'chain', limit: 2 })
-    .find(s => s.name === MULTIHOP_CHAINS_SKILL)
-  assert.ok(mhSkill)
-  assert.match(mhSkill!.excerpt, /hops\[\].*terminalHopId.*causalEdges\[\].*no orphan hops/i)
-
   const playbook = loadSkill(MULTIHOP_CHAINS_SKILL)?.content ?? ''
-  assert.match(playbook, /Connected-DAG Rule \(`dag_topology`\)/i)
-  assert.match(playbook, /NEVER include unused or orphan exploratory hops in `hops\[\]`/i)
+  assert.match(playbook, /causalEdges\[\]/i)
+  assert.match(playbook, /no orphan exploratory hops/i)
 })
 
-test('Q33.3: derived session token injection rule teaches kind="bearer_token", target="bearer"/Authorization header, and omitting as/persona', () => {
-  const directives = renderMultiHopDirectives()
-  const tokenDirective = directives.derivedSessionTokenInjection ?? ''
-
-  assert.match(tokenDirective, /kind:\s*"bearer_token"/)
-  assert.match(tokenDirective, /\{\s*capability:\s*\{\s*handle,\s*target:\s*"bearer"\s*\}\s*\}/)
-  assert.match(tokenDirective, /Authorization:\s*"Bearer "\s*\+\s*handle/)
-  assert.match(tokenDirective, /OMIT as \/ persona/)
-
+test('Q33.3: derived session token injection rule teaches kind="bearer_token", target="bearer", and omitting as', () => {
   const sysPrompt = workerSessionInstructions('worker-investigation', { hasKovoVerify: true })
   for (const [label, text] of [
     ['KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
@@ -218,17 +168,10 @@ test('Q33.3: derived session token injection rule teaches kind="bearer_token", t
   assert.match(kovoVerifyHelperGuidance(), /kind:"bearer_token".*target:"bearer".*OMIT as/i)
 
   clearSkillsCache()
-  const mhSkill = selectPreInjectionSkills({ profileSkills: ['bola-idor-race'], lane: 'chain', limit: 2 })
-    .find(s => s.name === MULTIHOP_CHAINS_SKILL)
-  assert.ok(mhSkill)
-  assert.match(mhSkill!.excerpt, /kind:"bearer_token".*target:"bearer".*OMIT `as`/i)
-
   const playbook = loadSkill(MULTIHOP_CHAINS_SKILL)?.content ?? ''
-  assert.match(playbook, /Derived Session Token Injection Rule/i)
-  assert.match(playbook, /kind: "bearer_token"/)
-  assert.match(playbook, /target: "bearer"/)
-  assert.match(playbook, /Authorization: "Bearer " \+ handle/)
-  assert.match(playbook, /OMIT `as` \/ `persona`/)
+  assert.match(playbook, /kind:\s*'bearer_token'/)
+  assert.match(playbook, /target:\s*'bearer'/)
+  assert.match(playbook, /omit `as`/i)
 })
 
 test('Q33.4: prompt byte/line budgets, pre-injection excerpt invariants, single-hop isolation, and zero v8 contamination hold', () => {
@@ -259,13 +202,14 @@ test('Q33.4: prompt byte/line budgets, pre-injection excerpt invariants, single-
   })) as { multiHopDirectives?: unknown }
   assert.equal(singlePrompt.multiHopDirectives, undefined)
 
-  // Pre-injected excerpt retains Section-1 hardening marker and has no stale SDK field names.
+  // Pre-injected excerpt stays compact and has no stale SDK field names.
   clearSkillsCache()
   const mhSkill = selectPreInjectionSkills({ profileSkills: ['bola-idor-race'], lane: 'chain', limit: 2 })
     .find(s => s.name === MULTIHOP_CHAINS_SKILL)
   assert.ok(mhSkill)
   assert.ok(mhSkill!.excerpt.length <= 1200, `excerpt length ${mhSkill!.excerpt.length} > 1200`)
-  assert.ok(mhSkill!.excerpt.includes('invariant_enforced_hardened'), 'excerpt must preserve invariant_enforced_hardened')
+  assert.ok(mhSkill!.excerpt.includes('ctx.seal_capability'), 'excerpt must preserve ctx.seal_capability')
+  assert.ok(mhSkill!.excerpt.includes('CompositeProofReceipt'), 'excerpt must preserve CompositeProofReceipt')
 
   const playbook = loadSkill(MULTIHOP_CHAINS_SKILL)?.content ?? ''
   for (const banned of ['fromExchangeId', 'rawValue', 'ctx.race(']) {

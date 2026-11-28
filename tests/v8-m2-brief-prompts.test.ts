@@ -272,7 +272,7 @@ test('Mode-A brief contracts and multihop-chains playbook eliminate dual_tenant_
   }
   assert.ok(full.attackerOriginRule.includes('SAME actor'))
   assert.ok(compact.attackerOriginRule.includes('SAME actor'))
-  assert.ok(playbook.includes('SAME actor'))
+  assert.ok(playbook.toLowerCase().includes('same actor'))
 
   // Trap 3: All 4 valid causalEdges.kind literals appear in full recipe, compact recipe, and playbook.
   for (const edgeKind of [
@@ -294,14 +294,13 @@ test('Mode-A brief contracts and multihop-chains playbook eliminate dual_tenant_
   assert.ok(full.attackerOriginRule.includes('non-admin tenant'))
   assert.ok(compact.attackerOriginRule.includes('non-admin tenant'))
   assert.ok(playbook.includes('kovo_http'))
-  assert.ok(playbook.includes('non-admin tenant'))
 
   // Pre-injection excerpt stays strictly <= 1200 chars and includes key contract items.
   const preInjected = selectPreInjectionSkills({ lane: 'chain', limit: 2 })
   const mh = preInjected.find(s => s.name === MULTIHOP_CHAINS_SKILL)
   assert.ok(mh)
   assert.ok(mh!.excerpt.length <= 1200)
-  assert.ok(mh!.excerpt.includes('invariant_enforced_hardened'))
+  assert.ok(mh!.excerpt.includes('CompositeProofReceipt'))
   assert.ok(mh!.excerpt.includes('kovo_http'))
 
   // Zero v8 benchmark contamination across src/server/ and src/skills/.

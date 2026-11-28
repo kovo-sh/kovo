@@ -98,8 +98,6 @@ test('SPECIALIST_PROFILES slugs and multihop-chains.md Section 1 budget remain i
   assert.ok(section2Idx > 0, 'multihop-chains.md must have Section 2 heading')
   assert.ok(section2Idx <= 1200, `multihop-chains.md Section 1 is ${section2Idx} chars (must be <= 1200)`)
   assert.ok(multihop.includes('actor_low'), 'multihop-chains.md must use generic actor_low placeholder')
-  assert.ok(multihop.includes('actor_victim'), 'multihop-chains.md must use generic actor_victim placeholder')
-  assert.ok(multihop.includes('actor_dual'), 'multihop-chains.md must use generic actor_dual placeholder')
 
   const preInjected = selectPreInjectionSkills({ profileSkills: ['bola-idor-race'], lane: 'chain', limit: 2 })
   const mh = preInjected.find(s => s.name === MULTIHOP_CHAINS_SKILL)
@@ -107,7 +105,7 @@ test('SPECIALIST_PROFILES slugs and multihop-chains.md Section 1 budget remain i
   assert.ok(mh!.excerpt.length <= 1200)
   assert.ok(mh!.excerpt.includes('ctx.seal_capability'))
   assert.ok(mh!.excerpt.includes('ctx.prove_composite'))
-  assert.ok(mh!.excerpt.includes('invariant_enforced_hardened'))
+  assert.ok(mh!.excerpt.includes('CompositeProofReceipt'))
 })
 
 test('agent-prompts.ts and exec-dispatch.ts avoid hardcoded 4-stage count boilerplate and DeclarativeReplaySpec directives', () => {

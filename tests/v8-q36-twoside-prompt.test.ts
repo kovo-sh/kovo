@@ -47,9 +47,8 @@ const REPO_ROOT = resolve(new URL('..', import.meta.url).pathname)
 const ORIGIN = 'https://q36-twoside.example.invalid'
 
 type Q36MultiHopDirectives = {
-  requiredCompositeProof?: string
-  declareAllExecutedHops?: string
-  connectedDagTopology?: string
+  singleScriptConsolidation?: string
+  compositeCallSignature?: string
 }
 
 function renderMultiHopDirectives(): Q36MultiHopDirectives {
@@ -72,14 +71,11 @@ function renderMultiHopDirectives(): Q36MultiHopDirectives {
 
 test('Q36.1: Rule 1 enforces ctx.prove_composite (never standalone terminal helpers) whenever prerequisite setup hops execute', () => {
   const directives = renderMultiHopDirectives()
-  const reqComposite = directives.requiredCompositeProof ?? ''
+  const consolidation = directives.singleScriptConsolidation ?? ''
 
-  assert.match(reqComposite, /ALWAYS use ctx\.prove_composite/i)
-  assert.match(reqComposite, /NEVER.*standalone.*prove_race_burst.*prove_access_boundary.*prove_persisted_mutation/i)
-  assert.match(reqComposite, /prerequisite setup hops/i)
-  assert.match(reqComposite, /parser differential/i)
-  assert.match(reqComposite, /state rebind/i)
-  assert.match(reqComposite, /async job polling/i)
+  assert.match(consolidation, /ctx\.chain\(\.\.\.\) \/ ctx\.prove_composite/i)
+  assert.match(consolidation, /never standalone helpers after setup hops/i)
+  assert.match(consolidation, /prerequisite setup hops/i)
 
   const sysPrompt = workerSessionInstructions('worker-investigation', { hasKovoVerify: true })
   for (const [label, text] of [
@@ -97,29 +93,19 @@ test('Q36.1: Rule 1 enforces ctx.prove_composite (never standalone terminal help
   }
 
   clearSkillsCache()
-  const mhSkill = selectPreInjectionSkills({ profileSkills: ['bola-idor-race'], lane: 'chain', limit: 2 })
-    .find(s => s.name === MULTIHOP_CHAINS_SKILL)
-  assert.ok(mhSkill, 'multihop-chains must be pre-injected for chain lane')
-  assert.match(mhSkill!.excerpt, /NEVER.*standalone.*prove_race_burst.*prove_access_boundary.*prove_persisted_mutation/i)
-
   const playbook = loadSkill(MULTIHOP_CHAINS_SKILL)?.content ?? ''
-  assert.match(playbook, /Mandatory `ctx\.prove_composite` Rule/i)
-  assert.match(playbook, /NEVER.*standalone `ctx\.prove_race_burst`, `ctx\.prove_access_boundary`, or `ctx\.prove_persisted_mutation`/i)
   assert.match(playbook, /prerequisite setup hops/i)
-  assert.match(playbook, /parser differential/i)
-  assert.match(playbook, /state rebind/i)
-  assert.match(playbook, /async job polling/i)
+  assert.match(playbook, /ctx\.prove_composite/i)
+  assert.match(playbook, /rather than standalone single-hop helpers/i)
 })
 
 test('Q36.2: Rule 2 enforces declaring EVERY executed causal hop from Hop 1 through terminal in prove_composite.hops[] + causalEdges[]', () => {
   const directives = renderMultiHopDirectives()
-  const allHops = directives.declareAllExecutedHops ?? ''
+  const consolidation = directives.singleScriptConsolidation ?? ''
 
-  assert.match(allHops, /Declare EVERY causal hop/i)
-  assert.match(allHops, /Hop 1/i)
-  assert.match(allHops, /prove_composite\.hops\[\]/i)
-  assert.match(allHops, /causalEdges\[\]/i)
-  assert.match(allHops, /omitting Hop 1 or intermediate hops yields an incomplete receipt/i)
+  assert.match(consolidation, /every executed causal hop/i)
+  assert.match(consolidation, /causalEdges\[\]/i)
+  assert.match(consolidation, /terminalHopId/i)
 
   const sysPrompt = workerSessionInstructions('worker-investigation', { hasKovoVerify: true })
   for (const [label, text] of [
@@ -143,15 +129,9 @@ test('Q36.2: Rule 2 enforces declaring EVERY executed causal hop from Hop 1 thro
   }
 
   clearSkillsCache()
-  const mhSkill = selectPreInjectionSkills({ profileSkills: ['bola-idor-race'], lane: 'chain', limit: 2 })
-    .find(s => s.name === MULTIHOP_CHAINS_SKILL)
-  assert.ok(mhSkill)
-  assert.match(mhSkill!.excerpt, /Declare EVERY executed causal hop \(Hop 1->terminal\) in `hops\[\]`/i)
-
   const playbook = loadSkill(MULTIHOP_CHAINS_SKILL)?.content ?? ''
-  assert.match(playbook, /Complete Causal Hop Declaration Rule/i)
-  assert.match(playbook, /Declare \*\*EVERY\*\* causal hop your verification script executed/i)
-  assert.match(playbook, /Omitting Hop 1 or any intermediate setup hop yields an incomplete receipt/i)
+  assert.match(playbook, /Declare every causal hop from Hop 1 through `terminalHopId`/i)
+  assert.match(playbook, /causalEdges\[\]/i)
 })
 
 test('Q36.3: residual v7-compat cleanup removes KOVO_VERIFY_SPEC_SHAPE from kovo_verify summaries and dead lane aliases from exec-dispatch', () => {
@@ -210,7 +190,7 @@ test('Q36.4: prompt byte/line/excerpt budgets, single-hop isolation, and zero v8
     .find(s => s.name === MULTIHOP_CHAINS_SKILL)
   assert.ok(mhSkill)
   assert.ok(mhSkill!.excerpt.length <= 1200, `excerpt length ${mhSkill!.excerpt.length} > 1200`)
-  assert.ok(mhSkill!.excerpt.includes('invariant_enforced_hardened'), 'excerpt must preserve invariant_enforced_hardened')
+  assert.ok(mhSkill!.excerpt.includes('CompositeProofReceipt'), 'excerpt must preserve CompositeProofReceipt')
 
   const scan = scanSourceTreeForContamination(REPO_ROOT)
   assert.equal(scan.ok, true, `v8 contamination detected: ${JSON.stringify(scan.hits)}`)

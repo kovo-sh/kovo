@@ -4,7 +4,7 @@ Summary: Verify multi-hop causal chains end-to-end with ctx.chain, sealed capabi
 
 ## 1. Checkpoint & Exploration Discipline
 - When given a `hopCheckpoint` (`doNotRediscover: true`), start from its verified `capabilityHandles[]` (`cap:hop_<id>:<slot>`) and advance `nextGoal` instead of repeating earlier hops or re-probing `prunedBranches[]`.
-- Explore routes and parameters with `http_request`/`kovo_http` first; never call `kovo_verify` solely to seal a single hop. Execute the full causal sequence inside one `kovo_verify` script.
+- Explore routes and parameters with `http_request`/`kovo_http` first; never call `kovo_verify` solely to seal a single hop. Execute the full causal sequence inside one `kovo_verify` script ending in `ctx.chain(...).prove()` / `ctx.prove_composite`.
 
 ## 2. Derived Capability Custody & Helpers
 - **Seal intermediate artifacts (`ctx.seal_capability`):** Assert `2xx` before sealing, and use structured selectors (`jsonPath`, `header`, `cookie`, or `value` — NEVER `regex`). Inject sealed handles (`cap:hop_<id>:<slot>`) into downstream requests via `{ capability: { handle, target: "bearer" | "header" | "cookie" | "url" }, role: "probe" }` (omit `as` when sending a minted bearer/session token).
