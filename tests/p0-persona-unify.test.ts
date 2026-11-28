@@ -1,22 +1,60 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
 import { describe, test } from 'node:test'
+import type { WorkerToolHandlers } from '../src/server/agent-prompts.ts'
 import {
   buildAssignmentBriefPacket,
   buildMultiHopProofContract,
   classifyPersonaPrivilege as classifyFromBrief,
   isMultiHopBriefInput,
 } from '../src/server/assignment-brief.ts'
+import {
+  buildConsolidatedExploiterToolset,
+  resolveExploiterActingPersona,
+} from '../src/server/exploiter-tools.ts'
 import { classifyPersonaMetadata, classifyPersonaPrivilege } from '../src/server/persona-privilege.ts'
 import {
   compileTraceToKovoVerifyScript,
   type RecordedRequestExchange,
 } from '../src/server/trace-proof-compiler.ts'
 
+const API_ORIGIN = 'https://api.saas.example'
+
+function makeDummyHandlers(overrides?: Partial<WorkerToolHandlers>): WorkerToolHandlers {
+  return {
+    request_http: async () => ({ exchangeId: 'ex-1', status: 200, bodySha256: 'abc', bodyPreview: '{}' }),
+    request_http_batch: async args => ({ count: args.requests.length, results: args.requests.map((_, i) => ({ exchangeId: `ex-b-${i}`, status: 200 })) }),
+    request_http_race: async args => ({ count: args.requests.length, results: args.requests.map((_, i) => ({ exchangeId: `ex-r-${i}`, status: 200 })) }),
+    browser_visit: async () => ({ status: 200 }),
+    browser_session: async () => ({ ok: true }),
+    crawl_state_graph: async () => ({ pages: [] }),
+    probe_websocket: async () => ({ frames: [] }),
+    probe_surface: async () => ({ hits: [] }),
+    probe_differential: async () => ({ anomalies: [] }),
+    run_safe_templates: async () => ({ matches: [] }),
+    inspect_dns: async () => ({ records: [] }),
+    inspect_tls: async () => ({ valid: true }),
+    mint_canary: async () => ({ token: 'tok-1' }),
+    check_canary: async () => ({ hits: [] }),
+    mint_second_order_canary: async () => ({ marker: 'gn2o_1' }),
+    list_second_order_canaries: async () => ({ items: [] }),
+    run_offline_script: async args => ({ runtime: args.runtime, stdout: 'ok' }),
+    derive_evidence: async args => ({ command: args.command, stdout: 'sliced' }),
+    analyze_artifact: async args => ({ tool: args.tool, findings: [] }),
+    run_sast_scan: async args => ({ repo: args.repo, engines: args.engines, findings: [] }),
+    search_exchanges: async () => ({ items: [] }),
+    get_exchange: async args => ({ id: args.exchangeId, status: 200 }),
+    search_facts: async () => ({ items: [] }),
+    read_peer_trace: async () => ({ turns: [] }),
+    query_cves: async args => ({ package: args.package, cves: [] }),
+    record_fact: async args => ({ recorded: true, kind: args.kind }),
+    suggest_candidate_host: async args => ({ suggested: true, origin: args.origin }),
+    complete_intent: async c => ({ ok: true, status: c.status }),
+    ...overrides,
+  }
+}
+
 describe('Phase 0 persona-privilege unification & overfitting cleanup', () => {
   test('classifyPersonaMetadata prefers explicit structured config fields over handle substrings and never parses _a/_b or dual regexes', () => {
-    // Re-export from assignment-brief points to the exact same authoritative function
     assert.equal(classifyFromBrief, classifyPersonaPrivilege)
 
     // Real-world SaaS handles that old regexes misclassified
@@ -82,13 +120,7 @@ describe('Phase 0 persona-privilege unification & overfitting cleanup', () => {
     assert.deepEqual(multiAllAdmin.tenants, ['tenant_alpha', 'tenant_beta'])
   })
 
-  test('assignment-brief removes fast_lab, hardened-twin rule, helper-signal regexes, and 2-origin auto-trigger', () => {
-    const briefSrc = readFileSync(join(process.cwd(), 'src/server/assignment-brief.ts'), 'utf8')
-    assert.equal(briefSrc.includes('MULTIHOP_HARDENED_TWIN_RULE'), false)
-    assert.equal(briefSrc.includes('fast_lab'), false)
-    assert.equal(briefSrc.includes('CRYPTO_HELPER_SIGNAL_RE'), false)
-    assert.equal(briefSrc.includes('ASYNC_HELPER_SIGNAL_RE'), false)
-
+  test('assignment-brief avoids 2-origin DSL flooding, fast_lab, hardenedTwinRule, and signal-regex helperPatterns', () => {
     // 2-subdomain SaaS running class_scan must NOT auto-trigger multiHopProofContract DSL flooding
     assert.equal(
       isMultiHopBriefInput({
@@ -110,20 +142,26 @@ describe('Phase 0 persona-privilege unification & overfitting cleanup', () => {
     ) as { multiHopProofContract?: unknown }
     assert.equal(twoSubdomainBrief.multiHopProofContract, undefined)
 
-    // Explicit multihop_chain contract stays clean without fast_lab or hardenedTwinRule
-    const contract = buildMultiHopProofContract(false)
-    assert.equal('hardenedTwinRule' in contract, false)
-    assert.equal(JSON.stringify(contract).includes('fast_lab'), false)
+    // Explicit multihop_chain contract stays clean without fast_lab, hardenedTwinRule, or helperPatterns
+    const fullContract = buildMultiHopProofContract(false, {
+      missionKind: 'multihop_chain',
+      origin: API_ORIGIN,
+      routes: [{ method: 'POST', path: '/api/webhooks/hmac/jobs/export' }],
+    })
+    const compactContract = buildMultiHopProofContract(true, {
+      missionKind: 'multihop_chain',
+      origin: API_ORIGIN,
+      routes: [{ method: 'POST', path: '/api/webhooks/hmac/jobs/export' }],
+    })
+    assert.equal('hardenedTwinRule' in fullContract, false)
+    assert.equal('helperPatterns' in fullContract, false)
+    assert.equal('hardenedTwinRule' in compactContract, false)
+    assert.equal('helperPatterns' in compactContract, false)
+    assert.equal(JSON.stringify(fullContract).includes('fast_lab'), false)
+    assert.equal(JSON.stringify(compactContract).includes('fast_lab'), false)
   })
 
-  test('trace-proof-compiler removes DUAL_PERSONA_RE, benchmark chain labels, and 400ms setTimeout (uses ctx.await_async)', () => {
-    const compilerSrc = readFileSync(join(process.cwd(), 'src/server/trace-proof-compiler.ts'), 'utf8')
-    assert.equal(compilerSrc.includes('DUAL_PERSONA_RE'), false)
-    assert.equal(compilerSrc.includes('split_refund_ledger_break'), false)
-    assert.equal(compilerSrc.includes('forged_settlement'), false)
-    assert.equal(compilerSrc.includes('ledger_overcredit'), false)
-    assert.equal(compilerSrc.includes('setTimeout(r, 400)'), false)
-
+  test('trace-proof-compiler uses ctx.await_async instead of 400ms setTimeout and avoids benchmark chain aliases / DUAL_PERSONA_RE', () => {
     const jobId = 'job_async_99112233'
     const exchanges: RecordedRequestExchange[] = [
       {
@@ -179,7 +217,7 @@ describe('Phase 0 persona-privilege unification & overfitting cleanup', () => {
     assert.match(compiled.script, /equals:\s*"ready"/)
     assert.doesNotMatch(compiled.script, /fast_lab/)
 
-    // When a 202 step has no recorded poll exchange, do not emit any hardcoded setTimeout either
+    // When a 202 step has no recorded poll exchange, do not emit any hardcoded setTimeout
     const compiledNoPoll = compileTraceToKovoVerifyScript({
       submission: {
         title: 'Async job without poll exchange',
@@ -194,21 +232,108 @@ describe('Phase 0 persona-privilege unification & overfitting cleanup', () => {
     assert.equal(compiledNoPoll.ok, true)
     assert.doesNotMatch(compiledNoPoll.script!, /setTimeout/)
     assert.doesNotMatch(compiledNoPoll.script!, /ctx\.await_async\(/)
+
+    // Unrecognized benchmark alias settlement_forgery falls back generically instead of forged_settlement
+    const aliasCheck = compileTraceToKovoVerifyScript({
+      submission: {
+        title: 'Settlement check',
+        vulnClass: 'settlement_forgery',
+        exchangeIds: ['a2'],
+        terminalExchangeId: 'a2',
+      },
+      exchanges: [exchanges[2]!],
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(aliasCheck.ok, true)
+    assert.equal(aliasCheck.terminalVulnClass, 'broken_access_control')
+
+    // Handle containing "dual" without structured multi-tenant metadata is treated as ordinary low-priv persona
+    const dualHandleTrace: RecordedRequestExchange[] = [
+      { exchangeId: 'dh1', origin: 'https://app.example.test', method: 'GET', pathAndQuery: '/api/items/1', persona: 'dual_qa_user', status: 200, responseJson: { ok: true }, timestampMs: 10 },
+    ]
+    const dualCompiled = compileTraceToKovoVerifyScript({
+      submission: { title: 'Standard read', vulnClass: 'bola', exchangeIds: ['dh1'], terminalExchangeId: 'dh1' },
+      exchanges: dualHandleTrace,
+      allowedPersonas: ['dual_qa_user', 'viewer_other'],
+      runOrigin: 'https://app.example.test',
+    })
+    assert.equal(dualCompiled.ok, true)
+    assert.match(dualCompiled.script!, /as:\s*"dual_qa_user"/)
   })
 
-  test('exploiter-tools removes overfit persona/continuation regexes and forced complete_intent gates', () => {
-    const exploiterSrc = readFileSync(join(process.cwd(), 'src/server/exploiter-tools.ts'), 'utf8')
-    for (const removed of [
-      'DUAL_TENANT_FLOW_RE',
-      'INVITE_ENTRY_FLOW_RE',
-      'SHORT_TENANT_PREFIXES',
-      'PRIVILEGED_TERMINAL_PATH_RE',
-      'checkCompleteIntentRaceEscalationGate',
-      'checkCompleteIntentPostEscalationGate',
-      'evaluateConfirmedContinuation',
-      'dual_org_cache_bleed',
-    ]) {
-      assert.equal(exploiterSrc.includes(removed), false, `exploiter-tools.ts must not contain ${removed}`)
-    }
+  test('exploiter-tools allows switching across non-elevated personas, blocks elevated personas, and never forces race/path-regex complete_intent gates', async () => {
+    const personas = [
+      { handle: 'alice', roleLabel: 'member', tenant: 'org_one', originAllowlist: [API_ORIGIN] },
+      { handle: 'bob', roleLabel: 'member', tenant: 'org_two', originAllowlist: [API_ORIGIN] },
+      { handle: 'support_bot_free', roleLabel: 'member', tenant: 'org_three', originAllowlist: [API_ORIGIN] },
+      { handle: 'admin_corp', roleLabel: 'owner', tenant: 'org_one', originAllowlist: [API_ORIGIN] },
+    ]
+    // No implicit attackerBase[0] -> attackerBase[1] swap when no tenant is named in invite flow
+    assert.equal(
+      resolveExploiterActingPersona({
+        personas,
+        step: { title: 'Invite flow', hypothesis: 'Probe /invites/resolve endpoint', category: 'auth' },
+      }),
+      'alice',
+    )
+
+    const recorded = new Map<string, RecordedRequestExchange>([
+      ['m1', { exchangeId: 'm1', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/orders/1/refund', persona: 'bob', status: 200, responseJson: { ok: true }, timestampMs: 100 }],
+    ])
+    let completed = 0
+    const tools = buildConsolidatedExploiterToolset({
+      handlers: makeDummyHandlers(),
+      runId: 'run-p0-behav',
+      assignmentId: 'asg-p0-behav',
+      publicOrigins: [API_ORIGIN],
+      personasPub: personas.map(p => ({ handle: p.handle, role: p.roleLabel, tenant: p.tenant })),
+      recordedExchanges: recorded,
+      hasMountedRepos: false,
+      allowWebSearch: false,
+      scrub: v => v,
+      rootSignal: new AbortController().signal,
+      inlineLimit: 16_384,
+      onCompleteIntent: () => { completed += 1 },
+      runKovoVerify: async () => ({ confirmed: true, findingId: 'f-p0-1' }),
+    })
+
+    const httpTool = tools.find(t => t.name === 'http')!
+    const bobRes = await httpTool.execute(
+      { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/items', persona: 'bob' },
+      {} as never,
+      { abortSignal: new AbortController().signal } as never,
+    ) as { isError?: boolean }
+    assert.equal(bobRes.isError, undefined, 'any non-elevated persona must be allowed on purpose="attacker"')
+
+    const botFreeRes = await httpTool.execute(
+      { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/items', persona: 'support_bot_free' },
+      {} as never,
+      { abortSignal: new AbortController().signal } as never,
+    ) as { isError?: boolean }
+    assert.equal(botFreeRes.isError, undefined, 'real handle support_bot_free with role=member must not be falsely banned')
+
+    const adminRes = await httpTool.execute(
+      { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/items', persona: 'admin_corp' },
+      {} as never,
+      { abortSignal: new AbortController().signal } as never,
+    ) as { isError?: boolean; output: Array<{ text?: string }> }
+    assert.equal(adminRes.isError, true, 'elevated persona must be blocked on purpose="attacker"')
+    assert.match(adminRes.output.map(o => o.text ?? '').join('\n'), /elevated_persona_violation/)
+
+    // Confirmed mutating finding completes immediately on first complete_intent call without forced N>=5 race gate
+    const submitTool = tools.find(t => t.name === 'submit_exploit_trace')!
+    await submitTool.execute(
+      { title: 'Refund mutation', vulnClass: 'economic_conservation', exchangeIds: ['m1'], terminalExchangeId: 'm1' },
+      {} as never,
+      { abortSignal: new AbortController().signal } as never,
+    )
+    const completeTool = tools.find(t => t.name === 'complete_intent')!
+    const doneRes = await completeTool.execute(
+      { status: 'proved', summary: 'Confirmed refund mutation' },
+      {} as never,
+      { abortSignal: new AbortController().signal } as never,
+    ) as { isError?: boolean }
+    assert.equal(doneRes.isError, undefined)
+    assert.equal(completed, 1)
   })
 })
