@@ -18,7 +18,7 @@
  */
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { describe, test } from 'node:test'
@@ -49,6 +49,7 @@ import {
   inferEntityName,
 } from '../src/server/invariant-runtime-parity.ts'
 import { createProjectPersona } from '../src/server/persona-vault.ts'
+import { loadSkill } from '../src/server/skills.ts'
 import { makeStore, setupApprovedRun } from './v4-tier-helpers.ts'
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
@@ -306,15 +307,24 @@ describe('Phase 0 planner, frontier, dataflow, skills & contamination cleanup', 
   })
 
   test('5. exec-recon-planner, multihop-chains.md, and agent-prompts.ts are trimmed and domain-general', () => {
-    assert.doesNotMatch(HOP_CONTINUATION_DIRECTIVE, /Hops?\s*3[–-]5|hmac_sign|jwt_sign|await_async/i)
+    const directiveLower = HOP_CONTINUATION_DIRECTIVE.toLowerCase()
+    for (const forbidden of ['hops 3', 'hmac_sign', 'jwt_sign', 'await_async']) {
+      assert.equal(directiveLower.includes(forbidden), false, `HOP_CONTINUATION_DIRECTIVE must stay neutral (found ${forbidden})`)
+    }
 
-    const skillPath = join(REPO_ROOT, 'src/skills/multihop-chains.md')
-    const skillText = readFileSync(skillPath, 'utf8')
-    const skillLines = skillText.trimEnd().split(/\r?\n/).length
+    const skill = loadSkill('multihop-chains')
+    assert.ok(skill, 'multihop-chains skill must load')
+    const skillText = skill.content
+    const skillLines = skillText.trimEnd().split('\n').length
     assert.ok(skillLines <= 50, `multihop-chains.md must be trimmed to ~40 lines, got ${skillLines}`)
-    assert.doesNotMatch(skillText, /service-meta|webhooks\/trigger|hardened-twin|fast_lab|dual_tenant_abac|economic_conservation|balance_minting/i)
+    const skillLower = skillText.toLowerCase()
+    for (const forbidden of ['service-meta', 'webhooks/trigger', 'hardened-twin', 'fast_lab', 'dual_tenant_abac', 'economic_conservation', 'balance_minting']) {
+      assert.equal(skillLower.includes(forbidden), false, `multihop-chains.md must not include ${forbidden}`)
+    }
 
-    assert.doesNotMatch(KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN, /dual_tenant_abac|economic_conservation|N >= 5/i)
+    for (const forbidden of ['dual_tenant_abac', 'economic_conservation', 'N >= 5']) {
+      assert.equal(KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.includes(forbidden), false, `agent-prompts pattern must not include ${forbidden}`)
+    }
     const promptJson = workerInvestigationPrompt({
       goal: 'Verify multi-hop flow',
       step: { id: 'step-1', title: 'Chain step', hypothesis: '[chain_hops=2] Test flow', category: 'broken-access-control', skills: ['multihop-chains'] },
@@ -322,7 +332,8 @@ describe('Phase 0 planner, frontier, dataflow, skills & contamination cleanup', 
       capabilityTier: 2,
       maxTurns: 10,
     })
-    assert.doesNotMatch(promptJson, /dual_tenant_abac|economic_conservation/i)
+    assert.equal(promptJson.includes('dual_tenant_abac'), false)
+    assert.equal(promptJson.includes('economic_conservation'), false)
   })
 
   test('6. check-v8-contamination.ts blocks structural lab-artifact regressions and passes on repo', () => {

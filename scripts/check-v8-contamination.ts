@@ -160,9 +160,7 @@ export const V8_CONTAMINATION_RULES: readonly ContaminationRule[] = [
 export const TEMPORARY_STRUCTURAL_ALLOWLIST: Readonly<Record<string, ReadonlySet<string>>> = {
   // Legitimate outbound Stripe webhook secret redactor (not overfitting):
   'src/server/redact.ts': new Set(['lab-whsec-prefix']),
-  // TODO(Phase 0): retired by sibling Phase 0 non-kernel cleanup streams:
-  'src/server/assignment-brief.ts': new Set(['lab-fast-lab-profile', 'lab-hardened-twin']),
-  'src/server/exploiter-tools.ts': new Set(['lab-dual-org-cache-bleed']),
+  // TODO(Phase 0): retired by sibling Phase 0 non-kernel cleanup stream:
   'src/server/probes/xxe.ts': new Set(['lab-rbs-prefix']),
   // TODO(Phase 1-2): confirmation-kernel & compiler files retired in Phases 1–2 (Opus R3-05 reviewed):
   'src/server/evidence-provenance.ts': new Set(['lab-rbs-prefix']),
@@ -170,7 +168,6 @@ export const TEMPORARY_STRUCTURAL_ALLOWLIST: Readonly<Record<string, ReadonlySet
   'src/server/v8-oracle-families.ts': new Set(['lab-dual-org-cache-bleed']),
   'src/server/v8-oracle-hydrate.ts': new Set(['lab-dual-org-cache-bleed']),
   'src/server/causal-proof-compiler.ts': new Set(['lab-dual-org-cache-bleed']),
-  'src/server/trace-proof-compiler.ts': new Set(['lab-split-refund-ledger-break']),
   'src/server/derived-custody.ts': new Set(['lab-fast-lab-profile']),
   'src/server/verify-rpc.ts': new Set(['lab-fast-lab-profile']),
 }
