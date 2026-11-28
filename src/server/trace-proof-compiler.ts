@@ -4,6 +4,7 @@
  * TypeScript `kovo_verify` script (`<= 64 KiB`) using `ctx.chain()`. Zero app/route hardcoding.
  */
 import { buildTerminalClassContractMap } from './oracle-spec.ts'
+import { classifyPersonaMetadata, type PersonaMetadataInput } from './persona-privilege.ts'
 import { canonicalNonAuthQuery } from './v8-oracle-hydrate.ts'
 
 export interface RecordedRequestExchange {
@@ -63,7 +64,6 @@ const VULN_ALIASES: Readonly<Record<string, string>> = Object.fromEntries(([
   ['cryptographic_scope_replay', 'token_replay hmac_forgery signature_forgery scope_replay scope_escalation jwt_confusion'],
   ['parser_cache_differential', 'cache_bleed web_cache_deception web_cache_poisoning request_smuggling path_confusion'],
   ['cross_surface_pivot', 'cross_surface internal_pivot ssrf_pivot'],
-  ['forged_settlement', 'settlement_forgery'],
 ] as const).flatMap(([c, list]) => list.split(' ').map(a => [a, c])))
 const HOP_BY_HOP = new Set('host content-length connection keep-alive proxy-connection transfer-encoding te trailer upgrade accept-encoding dnt'.split(' '))
 const SKIP_TAINT_HDRS = new Set([...HOP_BY_HOP, ...'authorization cookie proxy-authorization content-type accept accept-language user-agent origin referer cache-control pragma'.split(' ')])
@@ -81,32 +81,50 @@ const REPEATED_CHAR_RE = /^(.)\1+$/, JS_IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/,
 const SIGNATURE_QUERY_KEYS = new Set(['sig', 'signature', 'hmac', 'x-amz-signature'])
 const INVALID_CONTROL_SIGNATURE = '0'.repeat(16)
 const AUTH_QUERY_KEYS = new Set(['sig', 'signature', 'hmac', 'mac', 'x-amz-signature', 'token', 'jwt', 'access_token', 'code', 'state', 'nonce', 'ts', 'timestamp', 'expires', 'exp'])
-const ECONOMIC_CONSERVATION_CLASSES = new Set(['economic_conservation', 'conserved_balance', 'ledger_overcredit', 'over_refund', 'double_spend', 'race_condition', 'race', 'race_double_spend', 'race_burst', 'split_refund_ledger_break'])
+const ECONOMIC_CONSERVATION_CLASSES = new Set(['economic_conservation', 'conserved_balance', 'over_refund', 'double_spend', 'race_condition', 'race', 'race_double_spend', 'race_burst'])
 const RACE_MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH'])
-const HIGH_PRIV_PERSONA_RE = /(?:^|[_-])(?:owner|admin|superadmin|root|system|service)(?:[_-]|$)/i
-const DUAL_PERSONA_RE = /(?:^|[_-])dual(?:[_-]|$)/i
 
-function personaPrivilegeRank(handle: string, allowedSet: ReadonlySet<string> | undefined, allowDual: boolean): number {
+function classifyTracePersona(
+  handle: string,
+  metaByHandle: ReadonlyMap<string, PersonaMetadataInput> | undefined,
+) {
+  return classifyPersonaMetadata(metaByHandle?.get(handle) ?? { handle })
+}
+
+function personaPrivilegeRank(
+  handle: string,
+  allowedSet: ReadonlySet<string> | undefined,
+  allowMultiTenant: boolean,
+  metaByHandle?: ReadonlyMap<string, PersonaMetadataInput>,
+): number {
   const inAllowed = !allowedSet || allowedSet.has(handle)
-  const isHigh = HIGH_PRIV_PERSONA_RE.test(handle), isDual = DUAL_PERSONA_RE.test(handle)
-  if (!isHigh && !isDual) return inAllowed ? 0 : 2
-  if (isDual) return allowDual ? (inAllowed ? 1 : 3) : (inAllowed ? 4 : 5)
+  const cls = classifyTracePersona(handle, metaByHandle)
+  if (!cls.elevated && !cls.multiTenant && !cls.revokedStale) return inAllowed ? 0 : 2
+  if (cls.multiTenant) return allowMultiTenant ? (inAllowed ? 1 : 3) : (inAllowed ? 4 : 5)
+  if (cls.revokedStale) return inAllowed ? 4 : 5
   return inAllowed ? 6 : 7
 }
-function isDisallowedRootPersona(handle: string, allowedSet: ReadonlySet<string> | undefined, allowDual: boolean): boolean {
-  return Boolean((allowedSet && !allowedSet.has(handle)) || HIGH_PRIV_PERSONA_RE.test(handle) || (!allowDual && DUAL_PERSONA_RE.test(handle)))
+function isDisallowedRootPersona(
+  handle: string,
+  allowedSet: ReadonlySet<string> | undefined,
+  allowMultiTenant: boolean,
+  metaByHandle?: ReadonlyMap<string, PersonaMetadataInput>,
+): boolean {
+  const cls = classifyTracePersona(handle, metaByHandle)
+  return Boolean((allowedSet && !allowedSet.has(handle)) || cls.elevated || (!allowMultiTenant && cls.multiTenant))
 }
 function inferAttackerPersona(
   traceCandidates: Array<string | undefined>,
   allowedPersonas: string[] | undefined,
   allowedSet: ReadonlySet<string> | undefined,
-  allowDual: boolean,
+  allowMultiTenant: boolean,
+  metaByHandle?: ReadonlyMap<string, PersonaMetadataInput>,
 ): string | undefined {
   const pickBest = (list: readonly string[]): { handle: string; rank: number } | undefined => {
     if (!list.length) return undefined
-    let best = list[0]!, bestRank = personaPrivilegeRank(best, allowedSet, allowDual)
+    let best = list[0]!, bestRank = personaPrivilegeRank(best, allowedSet, allowMultiTenant, metaByHandle)
     for (let i = 1; i < list.length; i += 1) {
-      const cand = list[i]!, rank = personaPrivilegeRank(cand, allowedSet, allowDual)
+      const cand = list[i]!, rank = personaPrivilegeRank(cand, allowedSet, allowMultiTenant, metaByHandle)
       if (rank < bestRank) { best = cand; bestRank = rank }
     }
     return { handle: best, rank: bestRank }
@@ -115,7 +133,11 @@ function inferAttackerPersona(
   for (const raw of traceCandidates) { const t = raw?.trim(); if (t && !traceUnique.includes(t)) traceUnique.push(t) }
   const tracePick = pickBest(traceUnique)
   if (tracePick && tracePick.rank <= 1) return tracePick.handle
-  const allowedLowPriv = (allowedPersonas ?? []).map(p => p.trim()).filter(p => p && !HIGH_PRIV_PERSONA_RE.test(p) && (!DUAL_PERSONA_RE.test(p) || allowDual))
+  const allowedLowPriv = (allowedPersonas ?? []).map(p => p.trim()).filter(p => {
+    if (!p) return false
+    const cls = classifyTracePersona(p, metaByHandle)
+    return !cls.elevated && !cls.revokedStale && (!cls.multiTenant || allowMultiTenant)
+  })
   const allowedPick = pickBest(allowedLowPriv)
   if (allowedPick && (!tracePick || allowedPick.rank < tracePick.rank)) return allowedPick.handle
   return tracePick?.handle
@@ -638,16 +660,53 @@ function formatRaceCall(p: StepPlan, concurrency: number, hasDynPreRb: boolean, 
   return `ch.race({ ${raceFields.join(', ')} })`
 }
 
+function formatAsyncAwaitLine(
+  stepVar: string,
+  pollPlan: StepPlan,
+  attackerPersona: string | undefined,
+  runOrigin?: string,
+): string {
+  const pollReqFields: string[] = []
+  const pollOrig = pollPlan.exchange.origin.trim()
+  if (pollOrig && (!runOrigin || pollOrig !== runOrigin.trim())) pollReqFields.push(`origin: ${JSON.stringify(pollOrig)}`)
+  pollReqFields.push(`path: ${pollPlan.pathExpr}`, `method: ${JSON.stringify((pollPlan.exchange.method || 'GET').toUpperCase())}`)
+  const pollPersona = !pollPlan.omitPersona ? (pollPlan.exchange.persona?.trim() || attackerPersona) : undefined
+  if (pollPersona) pollReqFields.push(`as: ${JSON.stringify(pollPersona)}`)
+  if (pollPlan.primaryCapability) {
+    const c = [`handle: ${pollPlan.primaryCapability.capVar}`, `target: ${JSON.stringify(pollPlan.primaryCapability.target)}`]
+    if (pollPlan.primaryCapability.headerName) c.push(`headerName: ${JSON.stringify(pollPlan.primaryCapability.headerName)}`)
+    if (pollPlan.primaryCapability.cookieName) c.push(`cookieName: ${JSON.stringify(pollPlan.primaryCapability.cookieName)}`)
+    if (pollPlan.primaryCapability.queryParam) c.push(`queryParam: ${JSON.stringify(pollPlan.primaryCapability.queryParam)}`)
+    pollReqFields.push(`capability: { ${c.join(', ')} }`)
+  }
+  if (pollPlan.headersExpr) pollReqFields.push(`headers: ${pollPlan.headersExpr}`)
+  pollReqFields.push('role: "setup"')
+  const pollPredFields: string[] = [`status: ${pollPlan.exchange.status}`]
+  const pollJson = pollPlan.exchange.responseJson !== undefined ? pollPlan.exchange.responseJson : tryParseJson(pollPlan.exchange.responseBody)
+  if (pollJson && typeof pollJson === 'object' && !Array.isArray(pollJson)) {
+    const rec = pollJson as Record<string, unknown>
+    for (const field of ['status', 'state'] as const) {
+      const v = rec[field]
+      if (typeof v === 'string' && v.trim() && v.trim().length <= 32) {
+        pollPredFields.push(`jsonPath: ${JSON.stringify(`$.${field}`)}`, `equals: ${JSON.stringify(v.trim())}`)
+        break
+      }
+    }
+  }
+  return `  if (${stepVar}.status === 202) await ctx.await_async({ pollRequest: { ${pollReqFields.join(', ')} }, matchPredicate: { ${pollPredFields.join(', ')} }, triggerExchangeId: ${stepVar}.exchangeId })`
+}
+
 function resolveStepPersona(
   p: StepPlan, isRoot: boolean, attackerPersona: string | undefined,
-  allowedSet: ReadonlySet<string> | undefined, allowDual: boolean, warnings: string[],
+  allowedSet: ReadonlySet<string> | undefined, allowMultiTenant: boolean, warnings: string[],
+  metaByHandle?: ReadonlyMap<string, PersonaMetadataInput>,
 ): string | undefined {
   if (p.omitPersona) return undefined
   const raw = p.exchange.persona?.trim()
   if (!isRoot) return raw || undefined
   if (!raw) return attackerPersona
-  if (attackerPersona && raw !== attackerPersona && isDisallowedRootPersona(raw, allowedSet, allowDual)
-    && personaPrivilegeRank(attackerPersona, allowedSet, allowDual) < personaPrivilegeRank(raw, allowedSet, allowDual)) {
+  if (attackerPersona && raw !== attackerPersona && isDisallowedRootPersona(raw, allowedSet, allowMultiTenant, metaByHandle)
+    && personaPrivilegeRank(attackerPersona, allowedSet, allowMultiTenant, metaByHandle) < personaPrivilegeRank(raw, allowedSet, allowMultiTenant, metaByHandle)) {
     warnings.push(`Root hop ${p.hopId} persona "${raw}" replaced with lower-privilege attackerPersona "${attackerPersona}".`)
     return attackerPersona
   }
@@ -694,9 +753,16 @@ function pruneAndBindCausalExchanges(
 }
 
 export function compileTraceToKovoVerifyScript(input: {
-  submission: ExploitTraceSubmission; exchanges: RecordedRequestExchange[]; allowedPersonas?: string[]; runOrigin?: string
+  submission: ExploitTraceSubmission
+  exchanges: RecordedRequestExchange[]
+  allowedPersonas?: string[]
+  personaMetadata?: readonly PersonaMetadataInput[]
+  runOrigin?: string
 }): CompiledTraceResult {
-  const { submission, exchanges, allowedPersonas, runOrigin } = input
+  const { submission, exchanges, allowedPersonas, personaMetadata, runOrigin } = input
+  const metaByHandle = personaMetadata?.length
+    ? new Map(personaMetadata.map(p => [p.handle, p] as const))
+    : undefined
   const warnings: string[] = [], uncompilableReasons: string[] = [], chainId = slugifyChainId(submission.title || 'trace')
   const fail = (reason: string, n = 0): CompiledTraceResult => ({
     ok: false, chainId, terminalVulnClass: normalizeVulnClass(submission.vulnClass, submission.oracleFamily, n, warnings).terminalVulnClass,
@@ -734,12 +800,13 @@ export function compileTraceToKovoVerifyScript(input: {
   const { st, readbackPlan, asyncPollsByStep } = bound
 
   const { terminalVulnClass, validOracleFamily } = normalizeVulnClass(submission.vulnClass, submission.oracleFamily, causal.length, warnings)
-  const allowDualPersona = validOracleFamily === 'dual_tenant_abac' || terminalVulnClass === 'dual_tenant_abac' || /^cross_tenant_/.test(terminalVulnClass)
+  const allowMultiTenantPersona = validOracleFamily === 'dual_tenant_abac' || terminalVulnClass === 'dual_tenant_abac' || /^cross_tenant_/.test(terminalVulnClass)
   const attackerPersona = inferAttackerPersona(
     [submission.attackerPersona, ...causal.map(e => e.persona), explicitControl?.persona, explicitReadback?.persona, ...exchanges.map(e => e.persona)],
     allowedPersonas,
     allowedSet,
-    allowDualPersona,
+    allowMultiTenantPersona,
+    metaByHandle,
   )
   if (attackerPersona && allowedSet && !allowedSet.has(attackerPersona)) warnings.push(`Base attackerPersona "${attackerPersona}" is not in allowedPersonas.`)
   const { plans } = st, termPlan = plans[terminalIdx]!
@@ -789,7 +856,7 @@ export function compileTraceToKovoVerifyScript(input: {
   for (let i = 0; i < plans.length; i += 1) {
     const p = plans[i]!, stepVar = `step_${p.stepNumber}`, isRaceStep = i === terminalIdx && raceConcurrency >= 2
     const isRootHop = i === 0 || !st.edges.some(e => e.toStepIdx === i)
-    const stepPersona = resolveStepPersona(p, isRootHop, attackerPersona, allowedSet, allowDualPersona, warnings)
+    const stepPersona = resolveStepPersona(p, isRootHop, attackerPersona, allowedSet, allowMultiTenantPersona, warnings, metaByHandle)
     if (isRaceStep && dynPreRb && readbackPlan) {
       lines.push(`  const preRb = await ctx.http_send(${formatTarget(readbackPlan.exchange.origin, readbackPlan.pathExpr, runOrigin, Boolean(readbackPlan.signedUrlCapVar))}, ${planOpts(readbackPlan, attackerPersona, undefined, 'control')})`)
     }
@@ -802,9 +869,8 @@ export function compileTraceToKovoVerifyScript(input: {
       ...st.edges.filter(e => e.toStepIdx === i).map(e => formatEdgeLine(e, plans)),
     )
     if (!isRaceStep && p.exchange.status === 202 && (i < plans.length - 1 || Boolean(readbackPlan))) {
-      lines.push(`  if (${stepVar}.status === 202) await new Promise((r) => setTimeout(r, 400))`)
       const pollPlan = asyncPollsByStep.get(i)
-      if (pollPlan) lines.push(`  if (${stepVar}.status === 202) await ctx.http_send(${formatTarget(pollPlan.exchange.origin, pollPlan.pathExpr, runOrigin, Boolean(pollPlan.signedUrlCapVar))}, ${planOpts(pollPlan, attackerPersona, undefined, 'setup')})`)
+      if (pollPlan) lines.push(formatAsyncAwaitLine(stepVar, pollPlan, attackerPersona, runOrigin))
     }
     if (!skipSynthEconCtrl && ctrlAfterIdx === i) emitCtrl()
   }

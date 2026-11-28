@@ -59,7 +59,6 @@ import {
 } from '../src/server/agent-prompts.ts'
 import { buildWorkerTools } from '../src/server/agent-session.ts'
 import {
-  MULTIHOP_HARDENED_TWIN_RULE,
   RECORD_COVERAGE_BRIEF_GUIDANCE,
   buildAssignmentBrief,
   renderSettlementSpecDirective,
@@ -1642,7 +1641,6 @@ test('Check 7: R3-15 — record_coverage tool schema, store-findings validation,
   assert.match(briefSrc, /\bbuildRecordCoverageBriefGuidance\s*\(/, 'assignment-brief.ts must derive coverage guidance from RECORD_COVERAGE_CONTRACT')
   const expectedGuidance = buildRecordCoverageBriefGuidance()
   assert.equal(RECORD_COVERAGE_BRIEF_GUIDANCE, expectedGuidance)
-  assert.ok(MULTIHOP_HARDENED_TWIN_RULE.includes('enforcingControl+exchangeIds'))
   const briefJson = buildAssignmentBrief({
     missionKind: 'class_scan',
     origin: 'https://canary-coverage.example.invalid',

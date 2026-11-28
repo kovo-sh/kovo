@@ -21,7 +21,6 @@ import { buildWorkerTools } from '../src/server/agent-session.ts'
 import {
   ASSIGNMENT_BRIEF_MAX_BYTES,
   ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE,
-  MULTIHOP_HARDENED_TWIN_RULE,
   buildAssignmentBriefPacket,
   renderSettlementSpecDirective,
 } from '../src/server/assignment-brief.ts'
@@ -506,7 +505,6 @@ test('R3-15.3: schema-store-prompt contract parity — zero COVERAGE_EVIDENCE_RE
     routes: [{ method: 'POST', path: '/api/transfer', riskScore: 95 }],
   })
   assert.ok(chainPacket.bytes <= ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE, `chain brief ${chainPacket.bytes} B > 4 KB`)
-  assert.ok(MULTIHOP_HARDENED_TWIN_RULE.includes('enforcingControl+exchangeIds'))
   const directive = renderSettlementSpecDirective(
     { method: 'GET', path: '/api/orders/:id', origin: ORIGIN },
     'kovo_verify({ script })',

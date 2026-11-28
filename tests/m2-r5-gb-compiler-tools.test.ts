@@ -424,7 +424,7 @@ describe('M2 R5: assignment-brief & exploiter-tools persona ordering, precheck, 
       maxTurns: 15,
       personas: [
         { handle: 'owner_a', roleLabel: 'owner', originAllowlist: [API_ORIGIN] },
-        { handle: 'dual_member', roleLabel: 'dual tenant', originAllowlist: [API_ORIGIN] },
+        { handle: 'dual_member', roleLabel: 'memberships=admin:org_a,viewer:org_b', originAllowlist: [API_ORIGIN] },
         { handle: 'svc_worker', roleLabel: 'service', originAllowlist: [API_ORIGIN] },
         { handle: 'member_b', roleLabel: 'member', originAllowlist: [API_ORIGIN] },
       ],

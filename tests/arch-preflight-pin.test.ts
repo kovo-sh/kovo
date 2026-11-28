@@ -124,7 +124,7 @@ async function withMockVerifyRpc(
   return { ctx: new VerifyContext(), rpcOps }
 }
 
-describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter request layer', () => {
+describe('Move 1b: Elevated-persona guard and purpose controls in exploiter request layer', () => {
   const personas = [
     { handle: 'owner_a', roleLabel: 'owner', originAllowlist: [API_ORIGIN] },
     { handle: 'member_a', roleLabel: 'member', originAllowlist: [API_ORIGIN] },
@@ -133,19 +133,14 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
     { handle: 'revoked_user', roleLabel: 'revoked member', originAllowlist: [API_ORIGIN] },
   ]
 
-  test('resolveExploiterActingPersona pins primaryAttackerBasePersona by default and multiTenantBase[0] ONLY on dual-tenant / cross-org privilege-bleed hypotheses', () => {
+  test('resolveExploiterActingPersona picks primary low-priv persona cleanly using explicit structured tenant metadata without _a/_b or dual regex heuristics', () => {
     const standard = resolveExploiterActingPersona({
       personas,
       step: { title: 'BOLA check', hypothesis: 'Access another tenant invoice via ID enumeration', category: 'broken-access-control' },
     })
     assert.equal(standard, 'member_a')
 
-    const dualTenant = resolveExploiterActingPersona({
-      personas,
-      step: { title: 'Cache bleed check', hypothesis: 'Dual-tenant cross-org privilege bleed across cached responses', category: 'dual_tenant_abac' },
-    })
-    assert.equal(dualTenant, 'dual_member')
-
+    // Without benchmark DUAL_TENANT_FLOW_RE, default actingPersona stays primary low-priv while any non-elevated persona is freely usable.
     const promptStandard = JSON.parse(buildExploiterUserPrompt({
       goal: 'Verify tenant isolation',
       step: { id: 's1', title: 'BOLA', hypothesis: 'Read victim record', category: 'bola' },
@@ -157,38 +152,16 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
     assert.equal(promptStandard.actingPersona, 'member_a')
     assert.equal(promptStandard.primaryAttackerBasePersona, 'member_a')
 
-    const promptDual = JSON.parse(buildExploiterUserPrompt({
-      goal: 'Verify tenant isolation',
-      step: { id: 's2', title: 'Dual-tenant ABAC', hypothesis: 'Test dual_tenant_abac cache bleed', category: 'dual_tenant_abac' },
-      origins: [API_ORIGIN],
-      capabilityTier: 2,
-      maxTurns: 12,
-      personas,
-    })) as { actingPersona?: string }
-    assert.equal(promptDual.actingPersona, 'dual_member')
-
-    // Regression A guard: boilerplate assignmentBrief / specialistFocus mentioning "dual-tenant" / "dual_tenant_abac" MUST NOT pin dual_member!
+    // Boilerplate assignmentBrief / specialistFocus never overrides actingPersona
     const withBoilerplate = resolveExploiterActingPersona({
       personas,
       step: { title: 'Webhook replay check', hypothesis: 'Verify webhook HMAC validation on settlement endpoint', category: 'business-logic' },
-      assignmentBrief: `${MULTIHOP_ATTACKER_ORIGIN_RULE} Always check dual-tenant and dual_tenant_abac rules.`,
-      specialistFocus: 'Check dual-tenant cross-org privilege bleed where applicable.',
+      assignmentBrief: `${MULTIHOP_ATTACKER_ORIGIN_RULE} Always check multi-tenant rules.`,
+      specialistFocus: 'Check cross-org isolation where applicable.',
     })
-    assert.equal(withBoilerplate, 'member_a', 'boilerplate assignmentBrief/specialistFocus must NEVER pin dual_member')
+    assert.equal(withBoilerplate, 'member_a')
 
-    const promptWithBoilerplate = JSON.parse(buildExploiterUserPrompt({
-      goal: 'Verify cross-tenant and dual-tenant isolation',
-      step: { id: 's3', title: 'Standard BOLA', hypothesis: 'Access invoice by ID', category: 'bola' },
-      origins: [API_ORIGIN],
-      capabilityTier: 2,
-      maxTurns: 12,
-      personas,
-      assignmentBrief: MULTIHOP_ATTACKER_ORIGIN_RULE,
-      specialistFocus: 'Focus on dual_tenant_abac when dual-tenant personas exist',
-    })) as { actingPersona?: string }
-    assert.equal(promptWithBoilerplate.actingPersona, 'member_a')
-
-    // Explicit [acting_persona=...] tags honor low-priv attackerBase, ignore cap: and elevated/non-dual-tenant dual_member
+    // Explicit [acting_persona=...] honors any non-elevated active persona (attackerBase or multiTenantBase), rejects cap: and elevated owner_a
     assert.equal(
       resolveExploiterActingPersona({ personas, step: { title: 'Pivot', hypothesis: '[acting_persona=member_b] Probe route', category: 'bola' } }),
       'member_b',
@@ -202,15 +175,11 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
       'member_a',
     )
     assert.equal(
-      resolveExploiterActingPersona({ personas, step: { title: 'Pivot', hypothesis: '[acting_persona=dual_member] Standard BOLA probe', category: 'bola' } }),
-      'member_a',
-    )
-    assert.equal(
-      resolveExploiterActingPersona({ personas, step: { title: 'Cache bleed', hypothesis: '[acting_persona=dual_member] Test cache-bleed across orgs', category: 'cache' } }),
+      resolveExploiterActingPersona({ personas, step: { title: 'Pivot', hypothesis: '[acting_persona=dual_member] Probe route', category: 'bola' } }),
       'dual_member',
     )
 
-    // R10 outsider-first persona selection: prefer non-target-tenant low-priv persona over target-tenant insider
+    // Structured tenant metadata selects an outsider when the step explicitly names the primary persona's tenant
     const tenantLabeledPersonas = [
       { handle: 'owner_a', roleLabel: 'owner [quanta] (org_a)', originAllowlist: [API_ORIGIN] },
       { handle: 'member_a', roleLabel: 'member [quanta] (org_a)', originAllowlist: [API_ORIGIN] },
@@ -220,10 +189,10 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
     assert.equal(
       resolveExploiterActingPersona({
         personas: tenantLabeledPersonas,
-        step: { title: 'Invite collision takeover', hypothesis: 'Resolve org_a invite via NFKC email collision to rebind org_a payouts', category: 'broken-access-control' },
+        step: { title: 'Cross-tenant takeover', hypothesis: 'Access org_a billing records from outside', category: 'broken-access-control' },
       }),
       'member_b',
-      'step targeting org_a must select outsider member_b instead of org_a insider member_a',
+      'step naming structured tenant org_a selects outsider member_b',
     )
     assert.equal(
       resolveExploiterActingPersona({
@@ -231,15 +200,7 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
         step: { title: 'Cross-tenant workspace read', hypothesis: 'Access quanta workspace billing records from outside', category: 'bola' },
       }),
       'member_b',
-      'step naming bracketed org label [quanta] must select outsider member_b',
-    )
-    assert.equal(
-      resolveExploiterActingPersona({
-        personas: personas,
-        step: { title: 'Cross-tenant org_a read', hypothesis: 'Read org_a invoice ledger via horizontal bypass', category: 'bola' },
-      }),
-      'member_b',
-      'handle-suffix tenant inference must also select outsider member_b when targeting org_a',
+      'step naming structured tenant [quanta] selects outsider member_b',
     )
     assert.equal(
       resolveExploiterActingPersona({
@@ -252,18 +213,27 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
     assert.equal(
       resolveExploiterActingPersona({
         personas: tenantLabeledPersonas,
-        step: { title: 'Explicit outsider flow', hypothesis: 'As org_b outsider, hijack org_a invite to take over account', category: 'auth' },
+        step: { title: 'Explicit outsider flow', hypothesis: 'As org_b outsider, probe org_a account', category: 'auth' },
       }),
       'member_b',
-      'explicit actor tenant ("as org_b") targeting org_a selects member_b',
+      'explicit actor tenant ("as org_b") selects member_b',
+    )
+    // No _a/_b handle-suffix parsing and no implicit attackerBase[0]->attackerBase[1] swap on invite flows without named tenant
+    assert.equal(
+      resolveExploiterActingPersona({
+        personas,
+        step: { title: 'Cross-tenant org_a read', hypothesis: 'Read org_a invoice ledger via horizontal bypass', category: 'bola' },
+      }),
+      'member_a',
+      'no single-letter _a/_b handle suffix tenant guessing',
     )
     assert.equal(
       resolveExploiterActingPersona({
         personas: tenantLabeledPersonas,
-        step: { title: 'Invite resolve collision', hypothesis: 'Probe /invites/resolve NFKC email collision to mint cross-tenant session', category: 'auth' },
+        step: { title: 'Invite entry flow', hypothesis: 'Probe /invites/resolve without naming any tenant', category: 'auth' },
       }),
-      'member_b',
-      'invite/resolve entry flow without named target tenant avoids forcing primary-tenant insider member_a',
+      'member_a',
+      'no implicit attackerBase[0]=victim swap when no target tenant is named',
     )
     const explicitTenantFieldPersonas = [
       { handle: 'alice', roleLabel: 'member', tenant: 'tenant_alpha', originAllowlist: [API_ORIGIN] },
@@ -275,11 +245,11 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
         step: { title: 'Tenant alpha takeover', hypothesis: 'Redeem invite for tenant_alpha resource', category: 'auth' },
       }),
       'bob',
-      'explicit tenant field must pick outsider bob over tenant_alpha insider alice',
+      'explicit tenant field picks outsider bob over tenant_alpha insider alice',
     )
   })
 
-  test('20-call run-scale mixed sequence: enforces actingPersona pin, allows cap: handles, control arm tagging, read-only victim_setup, and blocks mutating victim_setup', async () => {
+  test('20-call run-scale mixed sequence: elevated-persona guard blocks elevated personas on attacker arm, allows all non-elevated personas freely, allows minted cap: handles, control arm tagging, read-only victim_setup, and blocks mutating victim_setup', async () => {
     const sentRequests: Array<{ mode: 'single' | 'batch' | 'race'; method: string; path: string; persona?: string }> = []
     const tracker = new SpecSubmissionTracker()
     const mintedCaps = new Set(['cap:hop_1:derived_tok'])
@@ -330,7 +300,7 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
     })
     const httpTool = tools.find(t => t.name === 'http')!
     assert.match(httpTool.description, /\{\s*capability:\s*cap\.handle\s*\}/, 'http tool description must instruct { capability: cap.handle } for kovo_verify')
-    assert.doesNotMatch(httpTool.description, /pinned to actingPersona or cap: handle/i, 'http tool description must never imply passing cap: as persona/as')
+    assert.doesNotMatch(httpTool.description, /pinned to actingPersona/i, 'http tool description must reflect elevated-only guard rather than rigid single-actor pin')
     const call = (args: Record<string, unknown>) =>
       httpTool.execute(args, {} as never, { abortSignal: new AbortController().signal } as never) as Promise<{
         isError?: boolean; output: Array<{ type: string; text?: string }>
@@ -342,24 +312,24 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
       expectError?: RegExp
       expectControlTag?: boolean
     }> = [
-      // 1-3: pinned attacker allowed (single, batch, race)
-      { label: 'pinned single', args: { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/items/1', persona: 'member_a' } },
-      { label: 'pinned explicit attacker', args: { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/items', persona: 'member_a', purpose: 'attacker' } },
-      { label: 'pinned batch', args: { mode: 'batch', requests: [{ origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/a', persona: 'member_a' }, { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/b', persona: 'member_a' }] } },
-      // 4-8: non-pinned personas blocked on attacker arm in <1ms
-      { label: 'block member_b', args: { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/items/2', persona: 'member_b' }, expectError: /persona_pin_violation.*actingPersona "member_a".*\{\s*capability:\s*cap\.handle\s*\}.*outsider.*unauthenticated/ },
-      { label: 'block dual_member', args: { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/cache/prime', persona: 'dual_member' }, expectError: /persona_pin_violation.*actingPersona "member_a"/ },
-      { label: 'block owner_a', args: { origin: API_ORIGIN, method: 'DELETE', pathAndQuery: '/v1/items/9', persona: 'owner_a' }, expectError: /persona_pin_violation.*actingPersona "member_a"/ },
-      { label: 'block batch with member_b', args: { mode: 'batch', requests: [{ origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/ok', persona: 'member_a' }, { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/bad', persona: 'member_b' }] }, expectError: /persona_pin_violation/ },
-      { label: 'block race with dual_member', args: { mode: 'race', requests: [{ origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/pay', persona: 'dual_member' }, { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/pay', persona: 'dual_member' }] }, expectError: /persona_pin_violation/ },
+      // 1-5: ANY non-elevated persona allowed freely on attacker arm (single, batch, race)
+      { label: 'member_a single', args: { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/items/1', persona: 'member_a' } },
+      { label: 'member_a explicit attacker', args: { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/items', persona: 'member_a', purpose: 'attacker' } },
+      { label: 'member_b freely allowed', args: { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/items/2', persona: 'member_b' } },
+      { label: 'dual_member freely allowed', args: { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/cache/prime', persona: 'dual_member' } },
+      { label: 'mixed non-elevated batch', args: { mode: 'batch', requests: [{ origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/ok', persona: 'member_a' }, { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/other', persona: 'member_b' }] } },
+      // 6-8: configured elevated persona (owner_a) blocked on attacker arm in <1ms (single, batch, race)
+      { label: 'block elevated owner_a single', args: { origin: API_ORIGIN, method: 'DELETE', pathAndQuery: '/v1/items/9', persona: 'owner_a' }, expectError: /elevated_persona_violation.*owner_a.*\{\s*capability:\s*cap\.handle\s*\}/ },
+      { label: 'block elevated owner_a batch', args: { mode: 'batch', requests: [{ origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/ok', persona: 'member_a' }, { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/bad', persona: 'owner_a' }] }, expectError: /elevated_persona_violation/ },
+      { label: 'block elevated owner_a race', args: { mode: 'race', requests: [{ origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/pay', persona: 'owner_a' }, { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/pay', persona: 'owner_a' }] }, expectError: /elevated_persona_violation/ },
       // 9-10: derived cap: handle allowed if session-minted, blocked if unknown
       { label: 'allow minted cap:', args: { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/vault', persona: 'cap:hop_1:derived_tok' } },
       { label: 'block unminted cap:', args: { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/vault', persona: 'cap:hop_9:forged' }, expectError: /persona_pin_violation/ },
-      // 11-13: purpose="control" allowed & tagged cleanly as control arm
-      { label: 'control same actor', args: { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/admin/secret', persona: 'member_a', purpose: 'control' }, expectControlTag: true },
-      { label: 'control alt actor', args: { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/admin/secret', persona: 'member_b', purpose: 'control' }, expectControlTag: true },
+      // 11-13: purpose="control" allowed (even for elevated personas) & tagged cleanly as control arm
+      { label: 'control member_a', args: { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/admin/secret', persona: 'member_a', purpose: 'control' }, expectControlTag: true },
+      { label: 'control owner_a', args: { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/admin/secret', persona: 'owner_a', purpose: 'control' }, expectControlTag: true },
       { label: 'control batch', args: { mode: 'batch', purpose: 'control', requests: [{ origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/ctrl1', persona: 'member_a' }] }, expectControlTag: true },
-      // 14-15: purpose="victim_setup" allows read-only GET/HEAD for other personas
+      // 14-15: purpose="victim_setup" allows read-only GET/HEAD for elevated or other personas
       { label: 'victim_setup GET owner_a', args: { origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/org-b/records', persona: 'owner_a', purpose: 'victim_setup' } },
       { label: 'victim_setup HEAD member_b', args: { origin: API_ORIGIN, method: 'HEAD', pathAndQuery: '/v1/org-b/records/7', persona: 'member_b', purpose: 'victim_setup' } },
       // 16-19: purpose="victim_setup" blocks ALL mutating methods (POST/PATCH/PUT/DELETE)
@@ -367,12 +337,12 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
       { label: 'victim_setup PATCH blocked', args: { origin: API_ORIGIN, method: 'PATCH', pathAndQuery: '/v1/org-b/records/7', persona: 'member_b', purpose: 'victim_setup' }, expectError: /victim_setup_readonly_violation/ },
       { label: 'victim_setup PUT blocked', args: { origin: API_ORIGIN, method: 'PUT', pathAndQuery: '/v1/org-b/records/7', persona: 'dual_member', purpose: 'victim_setup' }, expectError: /victim_setup_readonly_violation/ },
       { label: 'victim_setup DELETE batch blocked', args: { mode: 'batch', purpose: 'victim_setup', requests: [{ origin: API_ORIGIN, method: 'DELETE', pathAndQuery: '/v1/org-b/records/7', persona: 'owner_a' }] }, expectError: /victim_setup_readonly_violation/ },
-      // 20: pinned race succeeds
-      { label: 'pinned race', args: { mode: 'race', requests: [{ origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/redeem', persona: 'member_a' }, { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/redeem', persona: 'member_a' }] } },
+      // 20: non-elevated race succeeds
+      { label: 'non-elevated race', args: { mode: 'race', requests: [{ origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/redeem', persona: 'dual_member' }, { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/redeem', persona: 'dual_member' }] } },
     ]
     assert.equal(sequence.length, 20)
 
-    const allowedNonPinnedPaths = new Set(['/v1/admin/secret', '/v1/org-b/records', '/v1/org-b/records/7'])
+    const allowedElevatedPaths = new Set(['/v1/admin/secret', '/v1/org-b/records'])
     for (const step of sequence) {
       const t0 = performance.now()
       const res = await call(step.args)
@@ -392,14 +362,13 @@ describe('Move 1b: Enforced actingPersona pin and purpose controls in exploiter 
       }
     }
 
-    // Zero unauthorized non-attacker-persona exchanges ever hit the broker!
-    const rogueAttackerCalls = sentRequests.filter(r =>
-      r.persona
-      && r.persona !== 'member_a'
-      && !r.persona.startsWith('cap:')
-      && !allowedNonPinnedPaths.has(r.path),
+    // Zero elevated attacker-arm exchanges ever hit the broker!
+    const rogueElevatedCalls = sentRequests.filter(r =>
+      r.persona === 'owner_a' && !allowedElevatedPaths.has(r.path),
     )
-    assert.deepEqual(rogueAttackerCalls, [], '0 unauthorized non-pinned attacker exchanges must reach broker')
+    assert.deepEqual(rogueElevatedCalls, [], '0 elevated attacker-arm exchanges must reach broker')
+    assert.ok(sentRequests.some(r => r.persona === 'member_b'), 'non-elevated member_b must be allowed freely')
+    assert.ok(sentRequests.some(r => r.persona === 'dual_member'), 'non-elevated dual_member must be allowed freely')
     assert.ok(sentRequests.some(r => r.persona === 'cap:hop_1:derived_tok'), 'session cap: handle must pass through')
   })
 })
@@ -803,8 +772,8 @@ describe('Move B: <1ms Pre-Flight Rejection, Negative-Edge Recording, and Litera
   })
 })
 
-describe('R9: Generic post-escalation continuation nudge in complete_intent', () => {
-  test('nudges ONCE when a privilege/role mutation succeeds without probing a privileged terminal resource, and never loops', async () => {
+describe('Phase 0 cleanup: complete_intent has no forced race-burst or path-regex continuation blocks', () => {
+  test('complete_intent succeeds cleanly on first call after mutating or role-update exchanges without forced race/escalation blocking loops', async () => {
     const recorded = new Map<string, RecordedRequestExchange>([
       ['ex-role-patch', {
         exchangeId: 'ex-role-patch', origin: API_ORIGIN, method: 'PATCH', pathAndQuery: '/scim/v2/Users/u_42',
@@ -815,8 +784,8 @@ describe('R9: Generic post-escalation continuation nudge in complete_intent', ()
     let completed = 0
     const tools = buildConsolidatedExploiterToolset({
       handlers: makeDummyHandlers(),
-      runId: 'run-post-esc',
-      assignmentId: 'asg-post-esc',
+      runId: 'run-no-forced-gate',
+      assignmentId: 'asg-no-forced-gate',
       publicOrigins: [API_ORIGIN],
       personasPub: [{ handle: 'member_a', role: 'member' }],
       recordedExchanges: recorded,
@@ -827,95 +796,23 @@ describe('R9: Generic post-escalation continuation nudge in complete_intent', ()
       inlineLimit: 16_384,
       hasRemainingBudget: () => true,
       onCompleteIntent: () => { completed += 1 },
-      runKovoVerify: async () => ({ confirmed: true }),
+      runKovoVerify: async () => ({ confirmed: true, findingId: 'f-1' }),
     })
-    const completeTool = tools.find(t => t.name === 'complete_intent')!
+    const submitTool = tools.find(t => t.name === 'submit_exploit_trace')!
+    const submitOut = JSON.parse(extractText(await submitTool.execute({
+      title: 'Role escalation via PATCH', vulnClass: 'privilege_escalation',
+      exchangeIds: ['ex-role-patch'], terminalExchangeId: 'ex-role-patch',
+    }, {} as never, { abortSignal: new AbortController().signal } as never))) as { confirmed?: boolean; keepChaining?: boolean }
+    assert.equal(submitOut.confirmed, true)
+    assert.equal(submitOut.keepChaining, undefined, 'confirmed mutating finding must not force race/escalation continuation loops')
 
-    // First call -> blocked ONCE with keepChaining: true
+    const completeTool = tools.find(t => t.name === 'complete_intent')!
     const first = await completeTool.execute(
       { status: 'proved', summary: 'Escalated role to admin via PATCH' },
       {} as never,
       { abortSignal: new AbortController().signal } as never,
-    ) as { isError?: boolean; output: Array<{ type: string; text?: string }> }
-    assert.equal(first.isError, true)
-    const firstBody = JSON.parse(extractText(first)) as { blocked?: boolean; keepChaining?: boolean; reason?: string }
-    assert.equal(firstBody.blocked, true)
-    assert.equal(firstBody.keepChaining, true)
-    assert.equal(firstBody.reason, 'post_escalation_terminal_probe_required')
-    assert.equal(completed, 0)
-
-    // Second call -> allowed (bounded to 1 nudge per assignment, never loops!)
-    const second = await completeTool.execute(
-      { status: 'proved', summary: 'Escalated role to admin via PATCH' },
-      {} as never,
-      { abortSignal: new AbortController().signal } as never,
-    ) as { isError?: boolean; output: Array<{ type: string; text?: string }> }
-    assert.equal(second.isError, undefined)
-    assert.equal(completed, 1)
-  })
-
-  test('does NOT nudge when a privileged terminal resource was already probed after escalation OR when budget is exhausted', async () => {
-    const recordedWithTerminal = new Map<string, RecordedRequestExchange>([
-      ['ex-role-patch', {
-        exchangeId: 'ex-role-patch', origin: API_ORIGIN, method: 'PATCH', pathAndQuery: '/api/users/42/role',
-        persona: 'member_a', requestJson: { role: 'admin' }, status: 200, responseJson: { role: 'admin' }, timestampMs: 200,
-      }],
-      ['ex-admin-read', {
-        exchangeId: 'ex-admin-read', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/api/admin/vault/secrets',
-        persona: 'member_a', status: 200, responseJson: { items: ['s1'] }, timestampMs: 250,
-      }],
-    ])
-    let completed = 0
-    const toolsDone = buildConsolidatedExploiterToolset({
-      handlers: makeDummyHandlers(),
-      runId: 'run-post-esc-done',
-      assignmentId: 'asg-post-esc-done',
-      publicOrigins: [API_ORIGIN],
-      personasPub: [{ handle: 'member_a', role: 'member' }],
-      recordedExchanges: recordedWithTerminal,
-      hasMountedRepos: false,
-      allowWebSearch: false,
-      scrub: v => v,
-      rootSignal: new AbortController().signal,
-      inlineLimit: 16_384,
-      hasRemainingBudget: () => true,
-      onCompleteIntent: () => { completed += 1 },
-      runKovoVerify: async () => ({ confirmed: true }),
-    })
-    const resDone = await toolsDone.find(t => t.name === 'complete_intent')!.execute(
-      { status: 'proved', summary: 'Escalated and read admin vault' },
-      {} as never,
-      { abortSignal: new AbortController().signal } as never,
     ) as { isError?: boolean }
-    assert.equal(resDone.isError, undefined)
+    assert.equal(first.isError, undefined, 'complete_intent must not block on path-regex or race-burst gates')
     assert.equal(completed, 1)
-
-    // Budget exhausted -> no nudge
-    const recordedNoBudget = new Map<string, RecordedRequestExchange>([
-      ['ex-role-patch', recordedWithTerminal.get('ex-role-patch')!],
-    ])
-    const toolsNoBudget = buildConsolidatedExploiterToolset({
-      handlers: makeDummyHandlers(),
-      runId: 'run-post-esc-nb',
-      assignmentId: 'asg-post-esc-nb',
-      publicOrigins: [API_ORIGIN],
-      personasPub: [{ handle: 'member_a', role: 'member' }],
-      recordedExchanges: recordedNoBudget,
-      hasMountedRepos: false,
-      allowWebSearch: false,
-      scrub: v => v,
-      rootSignal: new AbortController().signal,
-      inlineLimit: 16_384,
-      hasRemainingBudget: () => false,
-      onCompleteIntent: () => { completed += 1 },
-      runKovoVerify: async () => ({ confirmed: true }),
-    })
-    const resNoBudget = await toolsNoBudget.find(t => t.name === 'complete_intent')!.execute(
-      { status: 'partial', summary: 'Out of budget after escalation' },
-      {} as never,
-      { abortSignal: new AbortController().signal } as never,
-    ) as { isError?: boolean }
-    assert.equal(resNoBudget.isError, undefined)
-    assert.equal(completed, 2)
   })
 })
