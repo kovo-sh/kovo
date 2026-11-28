@@ -21,7 +21,7 @@ import { approvalPolicyMeta, capabilityTierMeta } from '../run-state.ts'
 import { Dialog, DialogContent, DialogTitle } from '../ui/dialog.tsx'
 import { useRun, useRunModel } from './data.tsx'
 import type { Command } from './data.tsx'
-import { Tag } from './display.tsx'
+import { HostLabel, Tag } from './display.tsx'
 import { fmtAgo, fmtDur, fmtFullDateTime, fmtN, fmtTime, fmtUsd, host, plural, short } from './format.ts'
 import { PhaseTrack, StatusGlyph, TierBars } from './glyphs.tsx'
 import { Icon } from './icons.tsx'
@@ -73,21 +73,34 @@ export function buildBudgetCommand(
 
 type Popover = 'menu' | 'budget' | 'policy' | 'leases' | 'scope' | 'goal' | null
 
-/** Hide run-line items by priority (data-p, lowest first) until the line fits. */
+/**
+ * Fit the run line without ever slicing a number: hide denominators
+ * (`data-rl-sub`) first, then items/parts by priority (`data-p`, lowest
+ * first), and finally drop trailing items whole while the line still overflows.
+ */
+export function fitRunline(rl: HTMLElement): void {
+  const overflows = () => rl.scrollWidth > rl.clientWidth + 1
+  const all = [...rl.querySelectorAll<HTMLElement>('[data-rl-sub], [data-p], [data-rl]')]
+  all.forEach(i => { i.style.display = '' })
+  const subs = [...rl.querySelectorAll<HTMLElement>('[data-rl-sub]')]
+  for (const it of subs) { if (!overflows()) break; it.style.display = 'none' }
+  const ranked = [...rl.querySelectorAll<HTMLElement>('[data-p]')].sort((a, b) => Number(a.dataset.p) - Number(b.dataset.p))
+  for (const it of ranked) { if (!overflows()) break; it.style.display = 'none' }
+  const shown = () => [...rl.querySelectorAll<HTMLElement>('[data-rl]')].filter(x => x.style.display !== 'none')
+  for (let vis = shown(); overflows() && vis.length > 1; vis = shown()) vis[vis.length - 1]!.style.display = 'none'
+  const vis = shown()
+  rl.querySelectorAll<HTMLElement>('[data-rl]').forEach(x => {
+    if (x === vis[vis.length - 1]) x.dataset.lastv = 'true'
+    else delete x.dataset.lastv
+  })
+}
+
+/** Re-fit the run line on resize and whenever its content changes. */
 function useFitRunline(ref: RefObject<HTMLDivElement | null>, deps: unknown[]) {
   useLayoutEffect(() => {
     const rl = ref.current
     if (!rl) return
-    const fit = () => {
-      const items = [...rl.querySelectorAll<HTMLElement>('[data-rl][data-p]')].sort((a, b) => Number(a.dataset.p) - Number(b.dataset.p))
-      items.forEach(i => { i.style.display = '' })
-      for (const it of items) { if (rl.scrollWidth <= rl.clientWidth + 1) break; it.style.display = 'none' }
-      const vis = [...rl.querySelectorAll<HTMLElement>('[data-rl]')].filter(x => x.style.display !== 'none')
-      rl.querySelectorAll<HTMLElement>('[data-rl]').forEach(x => {
-        if (x === vis[vis.length - 1]) x.dataset.lastv = 'true'
-        else delete x.dataset.lastv
-      })
-    }
+    const fit = () => fitRunline(rl)
     fit()
     const ro = new ResizeObserver(fit)
     ro.observe(rl)
@@ -118,7 +131,7 @@ function deriveActiveLeaseGrants(detail: ReturnType<typeof useRun>['detail'], no
 }
 
 const rlItemClass =
-  'mr-3 inline-flex h-3.5 flex-none items-center gap-1.5 whitespace-nowrap border-r border-line pr-3 last:border-r-0 data-[lastv=true]:border-r-0'
+  'mr-3 inline-flex h-4 flex-none items-center gap-1.5 whitespace-nowrap border-r border-line pr-3 leading-4 last:border-r-0 data-[lastv=true]:border-r-0'
 const rlBtnClass =
   'group/rlb mr-3 inline-flex h-auto min-h-[22px] flex-none cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-none border-0 border-r border-line bg-transparent py-0.5 pl-0 pr-3 font-sans text-[12.5px] font-normal text-inherit shadow-none last:border-r-0 data-[lastv=true]:border-r-0 hover:bg-transparent'
 
@@ -155,7 +168,8 @@ export function RunHeader() {
   const editable = isRunEditable(detail.activity ?? r.status)
   const hasRunningLab = Boolean(detail.labTarget)
     || Boolean(detail.activity?.blockingReasons.some(reason => reason.code === 'running_lab_container'))
-  useFitRunline(rl, [r.status, r.phase, r.spentUsd, r.spentRequests, scopeN, totalGrants])
+  const durLabel = fmtDur(dur)
+  useFitRunline(rl, [r.status, r.phase, r.spentUsd, r.budgetUsd, r.spentRequests, r.budgetRequests, scopeN, totalGrants, durLabel.length])
 
   useEffect(() => {
     if (!pop) return
@@ -165,16 +179,22 @@ export function RunHeader() {
   }, [pop])
   useShortcuts([{ key: 'Escape', allowInInput: true, run: () => setPop(null) }], { priority: 50, enabled: pop != null })
 
+  const copyRunId = () => {
+    const done = () => toast.show('Copied run ID', { icon: 'check', sub: short(r.id) })
+    const fail = () => toast.show('Could not copy run ID', { tone: 'error' })
+    if (!navigator.clipboard) { fail(); return }
+    void navigator.clipboard.writeText(r.id).then(done, fail)
+  }
   const run = (cmd: Parameters<typeof send>[0], done?: string) => send(cmd).then(() => { if (done) toast.show(done) }, () => {})
 
   let action: ReactNode = null
   if (canOfferResumeButton(r)) {
     action = <button type="button" className={runBtn()} disabled={pending > 0} onClick={() => run({ action: 'resume' }, 'Resuming the run')}><Icon name="play" />Resume</button>
   } else if (r.status === 'budget_paused') {
-    action = <button type="button" className={runBtn({ variant: 'primary' })} onClick={() => setPop(pop === 'budget' ? null : 'budget')}><Icon name="budget" />Raise budget</button>
+    action = <button type="button" className={runBtn()} onClick={() => setPop(pop === 'budget' ? null : 'budget')}><Icon name="budget" />Raise budget</button>
   } else if (r.status === 'running') {
     action = <button type="button" className={runBtn()} disabled={pending > 0} onClick={() => run({ action: 'pause' }, 'Pausing the run')}><Icon name="pause" />Pause</button>
-  } else if (r.status === 'waiting') {
+  } else if (r.status === 'waiting' && nav.view !== 'overview') {
     action = <button type="button" className={runBtn({ variant: 'primary' })} onClick={() => nav.setView('overview')}>Review scope</button>
   } else if (model.report && nav.view !== 'report') {
     action = <button type="button" className={runBtn()} onClick={() => nav.setView('report')}><Icon name="report" />Report</button>
@@ -189,27 +209,24 @@ export function RunHeader() {
 
   return <header className="flex-none border-b border-line px-[18px]">
     <div className="flex h-11 min-w-0 items-center gap-2">
-      <Link to="/projects/$projectId" params={{ projectId: detail.project.id }} className="whitespace-nowrap text-fg-subtle hover:text-fg" title="Open project">
+      <Link to="/projects/$projectId" params={{ projectId: detail.project.id }} className="min-w-0 max-w-[clamp(96px,22%,260px)] shrink truncate whitespace-nowrap text-fg-subtle hover:text-fg" title={detail.project.name ? `Open project · ${detail.project.name}` : 'Open project'} data-testid="run-crumb-project">
         {detail.project.name}
       </Link>
-      <span className="text-fg-faint">/</span>
+      <span className="flex-none text-fg-faint">/</span>
       <button
         type="button"
-        className="group/cc num -mx-1 -my-0.5 inline-flex h-auto cursor-pointer items-center gap-[5px] whitespace-nowrap rounded-[5px] border-0 bg-transparent px-1.5 py-0.5 font-sans text-[13px] font-normal text-fg-muted shadow-none transition-[background-color,color] duration-[var(--d1)] hover:bg-hover hover:text-fg"
+        className="group/cc num -mx-1 flex-none max-[1360px]:hidden -my-0.5 inline-flex h-auto cursor-pointer items-center gap-[5px] whitespace-nowrap rounded-[5px] border-0 bg-transparent px-1.5 py-0.5 font-sans text-[13px] font-normal text-fg-muted shadow-none transition-[background-color,color] duration-[var(--d1)] hover:bg-hover hover:text-fg"
         title={`Copy run ID (${short(r.id)}) · Started ${fmtFullDateTime(r.createdAt)}`}
         aria-label={`Copy run ID ${short(r.id)}`}
         suppressHydrationWarning
-        onClick={() => void navigator.clipboard?.writeText(r.id).then(
-          () => toast.show('Copied run ID', { icon: 'check', sub: short(r.id) }),
-          () => toast.show('Could not copy run ID', { tone: 'error' }),
-        )}
+        onClick={copyRunId}
       >
         <span suppressHydrationWarning>{fmtAgo(r.createdAt)}</span>
         <Icon name="copy" size={11} className="text-fg-subtle opacity-65 transition-[opacity,color] duration-[var(--d1)] group-hover/cc:text-fg-muted group-hover/cc:opacity-100" />
       </button>
       {editingLabel ? (
         <form
-          className="flex min-w-0 flex-1 items-center gap-1.5"
+          className="flex min-w-[140px] flex-1 items-center gap-1.5"
           onSubmit={e => {
             e.preventDefault()
             const trimmed = labelDraft.trim()
@@ -253,7 +270,7 @@ export function RunHeader() {
           </button>
         </form>
       ) : (
-        <div className="flex min-w-0 flex-1 items-center gap-1">
+        <div className="flex min-w-[140px] flex-1 items-center gap-1" data-testid="run-title">
           <span
             className="min-w-0 cursor-default truncate font-medium text-fg"
             title={r.label ? `${r.label} — Goal: ${r.goal}` : r.goal}
@@ -278,7 +295,7 @@ export function RunHeader() {
           </button>
         </div>
       )}
-      <span className="relative flex items-center gap-1.5" ref={wrap}>
+      <span className="relative flex flex-none items-center gap-1.5" ref={wrap} data-testid="run-header-actions">
         {action}
         <button
           type="button"
@@ -306,6 +323,7 @@ export function RunHeader() {
           {r.capabilityTier === 3 && item('shield', 'Approval policy…', () => setPop('policy'), { right: approvalPolicyMeta[r.approvalPolicy ?? 'auto_review'].short })}
           {(totalGrants > 0 || r.capabilityTier === 3) && item('lock', 'Approval leases…', () => setPop('leases'), { right: totalGrants > 0 ? String(totalGrants) : 'None' })}
           {item('globe', 'Scope hosts…', () => setPop('scope'), { right: plural(scopeN, 'host') })}
+          {item('copy', 'Copy run ID', () => { setPop(null); copyRunId() }, { right: short(r.id) })}
           {item('edit', 'Rename run', () => { setPop(null); setLabelDraft(r.label ?? ''); setEditingLabel(true) })}
           {item('edit', 'Revise goal…', () => setPop('goal'), { disabled: !editable })}
           <div className={RW.menuSep} />
@@ -338,7 +356,8 @@ export function RunHeader() {
         {pop === 'goal' && <GoalPopover onClose={() => setPop(null)} />}
       </span>
     </div>
-    {deleteOpen && <DeleteRunDialog
+    <DeleteRunDialog
+      open={deleteOpen}
       activity={detail.activity}
       hasRunningLab={hasRunningLab}
       onClose={() => setDeleteOpen(false)}
@@ -348,10 +367,14 @@ export function RunHeader() {
         await router.invalidate()
         await navigate({ to: '/projects/$projectId', params: { projectId: detail.project.id }, replace: true })
       }}
-    />}
-    <div className="num -mt-1.5 flex h-[34px] items-center overflow-hidden whitespace-nowrap text-[12.5px] text-fg-muted" ref={rl}>
+    />
+    <div
+      className="num -mt-1.5 flex h-[34px] items-center overflow-hidden whitespace-nowrap text-[12.5px] text-fg-muted [mask-image:linear-gradient(90deg,#000_calc(100%-24px),transparent)]"
+      ref={rl}
+      data-testid="run-line"
+    >
       <span className={rlItemClass} data-rl=""><StatusGlyph status={r.status} /><b className="font-medium text-fg">{runStatusLabel(r.status)}</b></span>
-      <span className={rlItemClass} data-rl="">
+      <span className={rlItemClass} data-rl="" data-p="4">
         <PhaseTrack phase={r.phase} />
         {r.phase !== 'complete' && <span>{PHASE_LABEL[r.phase] ?? r.phase}</span>}
         <span className="text-fg-subtle">{r.phase === 'complete' ? '' : '· '}Round {r.roundNo}</span>
@@ -361,24 +384,32 @@ export function RunHeader() {
         className={rlBtnClass}
         data-rl=""
         data-rl-btn=""
+        data-p="8"
         title={`Budget ${fmtUsd(r.spentUsd)} of ${fmtUsd(r.budgetUsd)} · ${fmtN(r.spentTokens)} tokens`}
         onClick={() => setPop(pop === 'budget' ? null : 'budget')}
       >
-        <Meter id="hdr.budget" value={bPct} />
+        <span className="inline-flex" data-p="5"><Meter id="hdr.budget" value={bPct} /></span>
         <b className="font-medium text-fg">{fmtUsd(r.spentUsd)}</b>
-        <span className="text-fg-subtle group-hover/rlb:text-fg-muted">/ {fmtUsd(r.budgetUsd)}</span>
+        <span className="text-fg-subtle group-hover/rlb:text-fg-muted" data-rl-sub="">/ {fmtUsd(r.budgetUsd)}</span>
       </button>
-      <span className={rlItemClass} data-rl="" title="HTTP requests sent through the safety proxy">
-        {r.budgetRequests > 0 && <Meter id="hdr.req" value={rPct} />}
+      <span
+        className={rlItemClass}
+        data-rl=""
+        data-p="7"
+        title={r.budgetRequests ? `${fmtN(r.spentRequests)} of ${fmtN(r.budgetRequests)} HTTP requests sent through the safety proxy` : 'HTTP requests sent through the safety proxy (uncapped)'}
+      >
+        {r.budgetRequests > 0 && <span className="inline-flex" data-p="5"><Meter id="hdr.req" value={rPct} /></span>}
         <b className="font-medium text-fg">{fmtN(r.spentRequests)}</b>
-        <span className="text-fg-subtle">{r.budgetRequests ? '/ ' + fmtN(r.budgetRequests) + ' req' : 'req · uncapped'}</span>
+        {r.budgetRequests > 0 && <span className="text-fg-subtle" data-rl-sub="">/ {fmtN(r.budgetRequests)}</span>}
+        <span className="text-fg-subtle">req</span>
+        {!r.budgetRequests && <span className="text-fg-subtle" data-rl-sub="">· uncapped</span>}
       </span>
       <button
         type="button"
         className={rlBtnClass}
         data-rl=""
         data-rl-btn=""
-        data-p="2"
+        data-p="1"
         title={`${capabilityTierMeta[r.capabilityTier].name} · ${approvalPolicyMeta[r.approvalPolicy ?? 'auto_review'].label}`}
         onClick={() => setPop(pop === 'scope' ? null : 'scope')}
       >
@@ -390,7 +421,7 @@ export function RunHeader() {
         className={rlBtnClass}
         data-rl=""
         data-rl-btn=""
-        data-p="3"
+        data-p="2"
         title="Active route approval leases — click to inspect or revoke"
         onClick={() => setPop(pop === 'leases' ? null : 'leases')}
       >
@@ -398,7 +429,7 @@ export function RunHeader() {
         <span className="group-hover/rlb:text-fg">Leases</span>
         <span className="text-fg-subtle group-hover/rlb:text-fg-muted">· {totalGrants}</span>
       </button>}
-      <span className={rlItemClass} data-rl="" data-p="1" title={`Started ${fmtFullDateTime(r.createdAt)}`}>
+      <span className={rlItemClass} data-rl="" data-p={r.status === 'running' ? '6' : '3'} data-rl-elapsed="" title={`Started ${fmtFullDateTime(r.createdAt)}`}>
         <span className="text-fg-subtle" suppressHydrationWarning>{r.status === 'running' || dur > 60_000 ? fmtDur(dur) : 'Created ' + fmtTime(r.createdAt)}</span>
       </span>
     </div>
@@ -409,7 +440,7 @@ function PopShell({ title, sub, children, footer, wide = false }: { title: React
   return <div className={cn('absolute right-0 top-8 z-[31] max-w-[calc(100vw-24px)] origin-top-right overflow-hidden rounded-card bg-raise shadow-popover', wide ? 'w-[388px]' : 'w-[340px]')} role="dialog" aria-label={typeof title === 'string' ? title : undefined}>
     <div className="flex items-center gap-2 border-b border-line px-3.5 pb-[9px] pt-[11px] font-medium text-fg">
       {title}
-      {sub != null && <span className="ml-auto text-[12px] font-normal text-fg-subtle">{sub}</span>}
+      {sub != null && <span className="ml-auto text-[12px] font-normal tabular-nums text-fg-subtle">{sub}</span>}
     </div>
     <div className="flex max-h-[60vh] flex-col gap-2.5 overflow-auto px-3.5 pb-3 pt-2.5 [&_p]:m-0 [&_p]:text-[12px] [&_p]:leading-[18px] [&_p]:text-fg-subtle">{children}</div>
     {footer && <div className="flex items-center justify-end gap-1.5 border-t border-line bg-sunk px-3 py-[9px]">{footer}</div>}
@@ -642,7 +673,7 @@ function ScopePopover({ onClose, onEdit }: { onClose: () => void; onEdit: () => 
       {model.scopeOrigins.map(o => {
         const t = model.risk.get(o)
         return <div key={o} className="flex h-[26px] items-center gap-2 rounded-[5px] px-1.5 text-[12px] text-fg-muted hover:bg-hover" title={o}>
-          <span className="truncate">{host(o)}</span>
+          <HostLabel host={host(o)} max={36} quiet className="min-w-0" />
           {t && <TierBars tier={t.riskTier as RiskTier} className="ml-auto" />}
         </div>
       })}
@@ -673,8 +704,10 @@ function GoalPopover({ onClose }: { onClose: () => void }) {
   </form>
 }
 
-function DeleteRunDialog({ activity, hasRunningLab, onClose, onDeleted }: {
-  activity: RunActivity
+function DeleteRunDialog({ open, activity: activityIn, hasRunningLab, onClose, onDeleted }: {
+  open: boolean
+  /** Stays mounted for exit motion, so tolerate a detail payload without derived activity. */
+  activity: RunActivity | null | undefined
   hasRunningLab: boolean
   onClose: () => void
   onDeleted: () => Promise<void>
@@ -682,6 +715,7 @@ function DeleteRunDialog({ activity, hasRunningLab, onClose, onDeleted }: {
   const { detail } = useRun()
   const model = useRunModel()
   const r = detail.run
+  const activity: RunActivity = activityIn ?? { lifecycle: r.status, hasLiveWork: false, hasParkedApprovals: false, blockingReasons: [] }
   const [deleting, setDeleting] = useState(false)
   const [err, setErr] = useState('')
   const totalFindings = model.findings.length
@@ -698,7 +732,12 @@ function DeleteRunDialog({ activity, hasRunningLab, onClose, onDeleted }: {
         : 'A local lab container is still running. Confirming will stop and clean it up before deleting.'
   const confirmBusyLabel = stopNeeded ? 'Stopping & deleting…' : hasRunningLab ? 'Stopping lab & deleting…' : 'Deleting…'
 
-  useShortcuts([{ key: 'Escape', allowInInput: true, run: () => { if (!deleting) onClose() } }], { priority: 100, exclusive: true })
+  useEffect(() => {
+    if (!open) return
+    setDeleting(false)
+    setErr('')
+  }, [open])
+  useShortcuts([{ key: 'Escape', allowInInput: true, run: () => { if (!deleting) onClose() } }], { priority: 100, exclusive: true, enabled: open })
 
   async function handleConfirm() {
     if (deleting) return
@@ -713,7 +752,7 @@ function DeleteRunDialog({ activity, hasRunningLab, onClose, onDeleted }: {
     }
   }
 
-  return <Dialog open closeOnEscape={!deleting} onOpenChange={open => { if (!open && !deleting) onClose() }}>
+  return <Dialog open={open} closeOnEscape={!deleting} onOpenChange={open => { if (!open && !deleting) onClose() }}>
     <DialogContent className="max-w-[460px] overflow-hidden rounded-2xl border-line-2 p-0" role="alertdialog">
       <div className={RW.sheetH}>
         <Icon name="trash" className="text-danger" />

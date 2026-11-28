@@ -9,8 +9,9 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, ReactNode, RefObject } from 'react'
 import type { OperatorTriage, OperatorTriageStatus } from '../../../actions-triage.ts'
 import { Dropdown, FilterBox, Tabs } from '../controls.tsx'
-import { useRunModel, useVerdict } from '../data.tsx'
-import { EmptyState, KbdGroup, Seg, Tag } from '../display.tsx'
+import { canOfferResumeButton } from '../../../server/run-status.ts'
+import { useRun, useRunModel, useVerdict } from '../data.tsx'
+import { EmptyState, FindingTitle, KbdGroup, Seg, Tag } from '../display.tsx'
 import { host } from '../format.ts'
 import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
@@ -154,12 +155,16 @@ function Toolbar({ tabs, tab, setTab, filter, setFilter, filterRef, onFilterEnte
 
 // ---------------------------------------------------------------- rows
 
+/** True when FindingTriageBadges renders anything (status ≠ open, severity override, or notes). */
+function hasTriageBadges(triage: OperatorTriage | null | undefined): boolean {
+  return Boolean(triage && (triage.status !== 'open' || triage.severityOverride || triage.notes?.trim()))
+}
+
 function FindingTriageBadges({ triage }: { triage: OperatorTriage | null | undefined }) {
-  if (!triage) return null
+  if (!triage || !hasTriageBadges(triage)) return null
   const hasStatus = triage.status !== 'open'
   const hasOverride = Boolean(triage.severityOverride)
   const hasNotes = Boolean(triage.notes?.trim())
-  if (!hasStatus && !hasOverride && !hasNotes) return null
   const meta = getTriageStatusMeta(triage.status)
   return <span className="flex flex-none items-center gap-1" data-slot="finding-triage-badges">
     {hasStatus && <Tag tone={meta.tone} title={triage.notes || meta.label}>{meta.short}</Tag>}
@@ -177,6 +182,7 @@ function FindingRowView({ f, group, cur, onClick, style }: {
 }) {
   const st = normFStatus(f.status)
   const triage = (f as FindingWithTriage).operatorTriage
+  const badges = hasTriageBadges(triage)
   return <div
     className={cn(RW.row, 'cursor-pointer', cur && RW.rowCur)}
     data-id={f.id}
@@ -186,9 +192,11 @@ function FindingRowView({ f, group, cur, onClick, style }: {
   >
     {group !== 'severity' && <span className="inline-flex size-3.5 flex-none items-center justify-center" title={SEV_LABEL[f.severity] ?? f.severity}><SevGlyph sev={f.severity} /></span>}
     <span className="inline-flex size-3.5 flex-none items-center justify-center" title={stLabel(st)}><StatusGlyph status={st} /></span>
-    <span className="min-w-0 flex-1 truncate text-fg">{f.title}</span>
+    <span data-slot="finding-title" className="min-w-[38%] flex-1 truncate text-fg" title={f.title || undefined}>
+      <FindingTitle title={f.title} />
+    </span>
     <FindingTriageBadges triage={triage} />
-    {f.category && <span className="max-w-[155px] flex-none truncate text-[12px] text-fg-subtle">{prettyCat(f.category)}</span>}
+    {f.category && <span className={cn('min-w-0 max-w-[155px] shrink truncate text-[12px] text-fg-subtle', badges && 'max-[1440px]:hidden')} title={prettyCat(f.category)}>{prettyCat(f.category)}</span>}
     {group !== 'origin' && <span className="w-[150px] flex-none truncate text-right font-mono text-[12px] text-fg-subtle max-[1320px]:w-[120px] max-[1180px]:hidden">{host(f.origin)}</span>}
   </div>
 }
@@ -333,19 +341,19 @@ export function FindingsView() {
     group={group} setGroup={setGroup} sort={sort} setSort={setSort} />
 
   if (!model.findings.length) {
+    // No filter / display controls: there is nothing to filter or group yet.
     return <>
       <VerdictStrip />
-      {toolbar}
-      <EmptyState icon="findings" title="No findings yet"
-        action={model.run.status === 'waiting' ? <button type="button" className={runBtn()} onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
-        Findings appear here as workers propose them; each one is verified by automated replay before it is marked confirmed.
-      </EmptyState>
+      <FindingsEmpty />
     </>
   }
 
   let body: ReactNode
   if (!items.length) {
-    body = <EmptyState icon="search" title="Nothing matches" className="items-start pt-20">Try a different filter or switch tabs.</EmptyState>
+    body = <EmptyState icon="search" title="Nothing matches"
+      action={<button type="button" className={runBtn()} onClick={() => { setFilter(''); setTab('all') }}>Clear filter</button>}>
+      Try a different filter or switch tabs.
+    </EmptyState>
   } else if (virtual) {
     // current group head pinned at the top while scrolling (heads in the window scroll normally)
     let pinned: G | null = null
@@ -375,6 +383,32 @@ export function FindingsView() {
     {toolbar}
     <div className={RW.list} ref={listRef} tabIndex={-1}>{body}</div>
   </>
+}
+
+/** Zero-findings empty state, worded by run state (finished, paused, waiting, in progress). */
+function FindingsEmpty() {
+  const model = useRunModel()
+  const { send, pending } = useRun()
+  const nav = useNav()
+  const toast = useToast()
+  const run = model.run
+  if (run.status === 'complete') {
+    return <EmptyState icon="findings" title="No weaknesses confirmed"
+      action={<button type="button" className={runBtn()} onClick={() => nav.setView('report')}><Icon name="report" />Open report</button>}>
+      Every proposed finding was ruled out by replay.
+    </EmptyState>
+  }
+  if (canOfferResumeButton(run)) {
+    const resume = () => send({ action: 'resume' }).then(() => toast.show('Resuming the run'), () => {})
+    return <EmptyState icon="findings" title="Paused before any findings"
+      action={<button type="button" className={runBtn()} disabled={pending > 0} onClick={() => void resume()}><Icon name="play" />Resume</button>}>
+      Resume the run to let workers continue proposing findings.
+    </EmptyState>
+  }
+  return <EmptyState icon="findings" title="No findings yet"
+    action={run.status === 'waiting' ? <button type="button" className={runBtn()} onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
+    Findings appear here as workers propose them; each one is verified by automated replay before it is marked confirmed.
+  </EmptyState>
 }
 
 /** Rows above which the list is windowed. `localStorage['kovo-rw-virtual-at']` overrides it (testing). */

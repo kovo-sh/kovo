@@ -2,7 +2,7 @@
 // Graph mode: phase columns of worker cards, handoff + causal edges, stacks,
 // lineage highlight, camera, minimap, phase nav, replay. List mode: grouped
 // worker rows. Inspectors: worker, stack, queued steps, step, graph digest.
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { isTerminalRunStatus } from '../../../server/run-status.ts'
 import { Dropdown, FilterBox, Tabs } from '../controls.tsx'
@@ -19,9 +19,11 @@ import { useListNav, useNav, useViewState } from '../nav.tsx'
 import { usePaletteCommands } from '../palette.tsx'
 import type { InspectorMap } from '../pane.tsx'
 import { cn, runBtn, runDdItem, RW } from '../tw.ts'
-import { WorkflowGraph } from './workflow-graph.tsx'
 import { DigestInspector, StackInspector, StepInspector, StepsInspector, WorkerInspector } from './workflow-inspector.tsx'
 import { isLive, QUEUE_ID, setExpanded, useWorkflowLayout } from './workflow-layout.ts'
+
+// The graph canvas is an opt-in mode (~45 KB); load it on demand so the run route chunk stays inside its budget.
+const WorkflowGraph = lazy(() => import('./workflow-graph.tsx').then(m => ({ default: m.WorkflowGraph })))
 
 type Filter = 'all' | 'live' | 'complete' | 'findings' | 'failed'
 type Mode = 'graph' | 'list'
@@ -29,7 +31,7 @@ const isWorkflowMode = (v: string | null): v is Mode => v === 'graph' || v === '
 type Group = 'phase' | 'step' | 'status' | 'none'
 const GROUPS: [Group, string][] = [['phase', 'Phase'], ['step', 'Plan step'], ['status', 'Status'], ['none', 'None']]
 const ICON_SLOT = 'inline-flex size-3.5 flex-none items-center justify-center'
-const PILL = 'inline-flex h-[17px] flex-none items-center gap-1 rounded-[9px] px-1.5 text-[11px] font-medium shadow-[inset_0_0_0_1px_var(--line-2)]'
+const PILL = 'inline-flex h-[17px] flex-none items-center gap-1 rounded-[9px] px-1.5 text-[11px] font-medium tabular-nums shadow-[inset_0_0_0_1px_var(--line-2)]'
 
 export function WorkflowView() {
   const { detail } = useRun()
@@ -42,6 +44,8 @@ export function WorkflowView() {
   const [filter, setFilter] = useViewState<Filter>('wf.filter', 'all')
   const [query, setQuery] = useViewState('wf.q', '')
   const [replay, setReplay] = useState(false)
+  // Graph opened from the keyboard (L / palette) renders settled, without the entrance (A-137).
+  const [viaKeyboard, setViaKeyboard] = useState(false)
   const setMode = useCallback((next: Mode) => {
     setModeState(next)
     syncRunUrlParam('mode', next === 'list' ? null : next)
@@ -77,6 +81,8 @@ export function WorkflowView() {
     return all.filter(([k]) => k === 'all' || t[k]).map(([k, l]) => ({ k, l, n: t[k] }))
   }, [assignments, model, terminal])
   const effFilter: Filter = tabs.some(t => t.k === filter) ? filter : 'all'
+  // Failed and Active tabs never fold into "More" (A-102).
+  const pinnedTabs = useMemo(() => tabs.filter(t => t.k === 'failed' || t.k === 'live').map(t => t.k), [tabs])
   const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean)
   const matches = useCallback((a: Assignment) => {
     if (effFilter === 'live' && (terminal || !isLive(a))) return false
@@ -140,13 +146,13 @@ export function WorkflowView() {
     setReplay(r => !r)
   }, [assignments.length, setMode])
   useShortcuts([
-    { key: 'l', run: () => { setReplay(false); setMode(mode === 'graph' ? 'list' : 'graph') } },
+    { key: 'l', run: () => { setReplay(false); setViaKeyboard(true); setMode(mode === 'graph' ? 'list' : 'graph') } },
     { key: 'R', run: startReplay },
     { key: 'Escape', run: () => { if (!replay) return false; setReplay(false) } },
   ])
   usePaletteCommands([
     { id: 'wf.replay', section: 'Actions', label: replay ? 'Stop the workflow replay' : 'Replay the run in the workflow graph', icon: 'replay', keys: ['⇧', 'R'], run: startReplay },
-    { id: 'wf.mode', section: 'Actions', label: mode === 'graph' ? 'Show workers as a list' : 'Show the workflow graph', icon: mode === 'graph' ? 'list' : 'graph', keys: ['L'], run: () => setMode(mode === 'graph' ? 'list' : 'graph') },
+    { id: 'wf.mode', section: 'Actions', label: mode === 'graph' ? 'Show workers as a list' : 'Show the workflow graph', icon: mode === 'graph' ? 'list' : 'graph', keys: ['L'], run: () => { setViaKeyboard(true); setMode(mode === 'graph' ? 'list' : 'graph') } },
   ])
 
   const firstMatch = () => {
@@ -170,14 +176,14 @@ export function WorkflowView() {
   )
 
   const toolbar = <div className={cn(RW.toolbar, 'relative @container/wftb')} data-tb="workflow">
-    <Tabs tabs={tabs.map(t => [t.k, t.l, t.n] as [Filter, string, number])} value={effFilter} onChange={setFilter} label="Filter workers" />
+    <Tabs tabs={tabs.map(t => [t.k, t.l, t.n] as [Filter, string, number])} value={effFilter} onChange={setFilter} label="Filter workers" pinned={pinnedTabs} />
     <FilterBox
       ref={filterRef}
       value={query}
       onChange={setQuery}
       onEnter={firstMatch}
       label="Filter workers"
-      className="@max-[760px]/wftb:w-24 @max-[760px]/wftb:focus-within:w-40"
+      className="flex-none @max-[760px]/wftb:w-24"
     />
     {mode === 'list' && <GroupMenu />}
     {detail.digests.length > 0 && <DigestMenu />}
@@ -198,7 +204,7 @@ export function WorkflowView() {
       <button type="button" role="radio" aria-label="List" aria-checked={mode === 'list'} className={modeBtnCls(mode === 'list')} onClick={() => { setReplay(false); setMode('list') }}>
         <Icon name="list" /><span className="@max-[760px]/wftb:hidden">List</span>
       </button>
-      <button type="button" role="radio" aria-label="Graph" aria-checked={mode === 'graph'} className={modeBtnCls(mode === 'graph')} onClick={() => setMode('graph')}>
+      <button type="button" role="radio" aria-label="Graph" aria-checked={mode === 'graph'} className={modeBtnCls(mode === 'graph')} onClick={() => { setViaKeyboard(false); setMode('graph') }}>
         <Icon name="graph" /><span className="@max-[760px]/wftb:hidden">Graph</span>
       </button>
     </div>
@@ -207,16 +213,40 @@ export function WorkflowView() {
   if (!assignments.length) {
     return <>{toolbar}<EmptyState icon="workers" title="No workers dispatched"
       action={detail.run.status === 'waiting' ? <button type="button" className={runBtn()} onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
-      The coordinator plans chain steps after scope consent, then dispatches sandboxed workers.
+      {workflowEmptyCopy(detail.run.status)}
     </EmptyState></>
   }
   return <>
     {toolbar}
     {mode === 'graph'
-      ? <WorkflowGraph L={L} selId={selId} focusSet={focusSet} nomatch={nomatch} onSelect={select} onExpand={expand}
-        onReport={() => nav.setView('report')} replay={replay} onReplayClose={() => setReplay(false)} />
+      ? <Suspense fallback={<div className="relative min-h-0 flex-1 bg-canvas" aria-busy="true" aria-label="Loading workflow graph" />}>
+        <WorkflowGraph L={L} selId={selId} focusSet={focusSet} nomatch={nomatch} onSelect={select} onExpand={expand}
+          onReport={() => nav.setView('report')} replay={replay} onReplayClose={() => setReplay(false)} skipEntrance={viaKeyboard} />
+      </Suspense>
       : <WorkerList matches={matches} terminal={terminal} />}
   </>
+}
+
+/** Empty-workflow body copy that matches the run status (A-134). */
+function workflowEmptyCopy(status: string): string {
+  if (status === 'complete') return 'This run finished without dispatching workers.'
+  if (status === 'waiting') return 'The coordinator plans chain steps after scope consent, then dispatches sandboxed workers.'
+  return 'No workers have been dispatched yet. The coordinator plans chain steps first, then dispatches sandboxed workers.'
+}
+
+/** Static live marker for pinned rows; the single pulse lives in the Active-now header (A-130). */
+function StaticLiveDot({ paused }: { paused: boolean }) {
+  return <span className={cn('mx-[3px] inline-block size-2 flex-none rounded-full', paused ? 'bg-warn' : 'bg-accent')} aria-hidden="true" />
+}
+
+/** "{n} threat model · {m} investigation" breakdown for the Active-now header (A-128). */
+function phaseBreakdown(items: readonly Assignment[]): string {
+  const by = new Map<string, number>()
+  for (const a of items) by.set(a.phase, (by.get(a.phase) ?? 0) + 1)
+  return [...by.entries()]
+    .sort((a, b) => (PHASE_ORDER[a[0]] ?? 9) - (PHASE_ORDER[b[0]] ?? 9))
+    .map(([p, n]) => `${fmtN(n)} ${(PHASE_LABEL[p] ?? p).toLowerCase()}`)
+    .join(' · ')
 }
 
 // ---------------------------------------------------------------- toolbar menus
@@ -313,37 +343,40 @@ function WorkerList({ matches, terminal }: { matches: (a: Assignment) => boolean
       className={cn(RW.row, pinned && 'bg-panel/85 border-l-accent last:border-b-0 hover:bg-panel', cur && RW.rowCur)}
       data-id={a.id}
       data-n={a.id}
+      data-wf-row=""
       onClick={() => nav.select({ kind: 'worker', id: a.id })}
     >
       <span className={ICON_SLOT} title={stLabel(a.status)}>
-        {live ? <LiveDot paused={a.status !== 'running'} className="mx-[3px]" /> : <StatusGlyph status={a.status} />}
+        {live ? <StaticLiveDot paused={a.status !== 'running'} /> : <StatusGlyph status={a.status} />}
       </span>
-      <span className={cn('min-w-0 flex-1 truncate text-fg', pinned && 'font-medium')}>{a.title}</span>
+      <span className={cn('min-w-[30%] flex-1 truncate text-fg', pinned && 'font-medium')} title={a.title}>{a.title}</span>
       {pinned && <Tag tone={a.status === 'running' ? 'accent' : 'warn'}>{stLabel(a.status)}</Tag>}
-      {fs.length > 0 && <span className={cn(PILL, 'bg-panel text-fg')} title="Findings"><SevGlyph sev={worstSeverity(fs)} />{fs.length}</span>}
-      {!r0 && nfa > 0 && <span className={cn(PILL, 'bg-sunk text-fg-muted')}>{nfa} facts</span>}
+      {fs.length > 0 && <span className={cn(PILL, 'bg-panel text-fg')} title="Findings"><SevGlyph sev={worstSeverity(fs)} />{fmtN(fs.length)}</span>}
+      {!r0 && nfa > 0 && <span className={cn(PILL, 'bg-sunk text-fg-muted')}>{fmtN(nfa)} facts</span>}
       {r0 ? <>
         <Tag tone={live ? 'accent' : 'solid'}>{r0.stageShort}</Tag>
         {r0.counts.totalHosts > 0 && <span className="flex-none text-[12px] text-fg-subtle tabular-nums">{r0.counts.mappedHosts}/{r0.counts.totalHosts} hosts</span>}
       </> : <>
-        {(pinned || group !== 'phase') && <span className="max-w-[140px] flex-none truncate"><Tag>{PHASE_LABEL[a.phase] ?? a.phase}</Tag></span>}
-        <span className="w-[120px] flex-none truncate text-right font-mono text-[12px] text-fg-subtle max-[1340px]:hidden">{host(a.sourceOrigins[0] ?? '')}</span>
-        <span className="flex w-[84px] flex-none items-center justify-end gap-1.5 text-fg-subtle tabular-nums" title="Turns used">
-          <span className="relative h-[3px] w-8 overflow-hidden rounded bg-line-2"><i className={cn('absolute inset-y-0 left-0', live ? 'bg-accent' : 'bg-fg-subtle')} style={{ width: pct + '%' }} /></span>
-          {a.turnsUsed}/{a.maxTurns}
+        {(pinned || group !== 'phase') && <span className="min-w-0 max-w-[140px] shrink truncate"><Tag>{PHASE_LABEL[a.phase] ?? a.phase}</Tag></span>}
+        {a.status === 'failed' && a.outcome
+          ? <span className="min-w-0 max-w-[260px] shrink truncate text-[12px] text-danger" title={a.outcome} data-wf-reason="">{a.outcome}</span>
+          : <span className="w-[120px] flex-none truncate text-right font-mono text-[12px] text-fg-subtle @max-[720px]/wfl:hidden">{host(a.sourceOrigins[0] ?? '')}</span>}
+        <span className="flex min-w-[84px] flex-none items-center justify-end gap-1.5 whitespace-nowrap text-fg-subtle tabular-nums" title="Turns used" data-wf-turns="">
+          <span className="relative h-[3px] w-8 flex-none overflow-hidden rounded bg-line-2"><i className={cn('absolute inset-y-0 left-0', live ? 'bg-accent' : 'bg-fg-subtle')} style={{ width: pct + '%' }} /></span>
+          {`${fmtN(a.turnsUsed)}/${fmtN(a.maxTurns)}`}
         </span>
       </>}
-      <span className="w-[52px] flex-none text-right text-fg-subtle tabular-nums" title="Requests">{fmtN(r0 ? r0.counts.requests : a.requestsUsed)} req</span>
+      <span className="min-w-[72px] flex-none whitespace-nowrap text-right text-fg-subtle tabular-nums" title="Requests" data-wf-req="">{fmtN(r0 ? r0.counts.requests : a.requestsUsed)} req</span>
     </div>
   }
   if (!items.length) return <EmptyState icon="search" title="Nothing matches" style={{ paddingTop: 80 }}>Try a different filter or switch tabs.</EmptyState>
-  return <div className={RW.list} ref={listRef} tabIndex={-1} role="region" aria-label="Worker list">
+  return <div className={cn(RW.list, '@container/wfl')} ref={listRef} tabIndex={-1} role="region" aria-label="Worker list">
     {activeItems.length > 0 && (
       <section data-testid="workflow-active-section" aria-label={`Active now (${activeItems.length})`} className="mx-3 my-2.5 overflow-hidden rounded-lg border border-accent-line bg-accent-soft/45">
         <div className="flex h-8 items-center gap-2 border-b border-accent-line/60 bg-accent-soft px-3 text-[12px] font-medium text-fg">
           <LiveDot paused={!activeItems.some(a => a.status === 'running')} />
-          <span>Active now ({activeItems.length})</span>
-          <span className="ml-auto text-[11.5px] font-normal text-fg-muted">{PHASE_LABEL[model.detail.run.phase] ?? model.detail.run.phase}</span>
+          <span className="flex-none tabular-nums">Active now ({fmtN(activeItems.length)})</span>
+          <span className="ml-auto min-w-0 truncate text-[11.5px] font-normal text-fg-muted tabular-nums" data-wf-active-breakdown="">{phaseBreakdown(activeItems)}</span>
         </div>
         {activeItems.map(a => row(a, true))}
       </section>
@@ -355,10 +388,10 @@ function WorkerList({ matches, terminal }: { matches: (a: Assignment) => boolean
         <div className={RW.ghead} role="button" tabIndex={0} aria-expanded={!col}
           onClick={() => setCollapsed(c => ({ ...c, [ck(g.key)]: !col }))}
           onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setCollapsed(c => ({ ...c, [ck(g.key)]: !col })) } }}>
-          <Icon name="chev" className={cn('text-fg-subtle transition-transform', col && '-rotate-90')} />
+          <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-kovo', col && '-rotate-90')} />
           <span className={ICON_SLOT}>{g.glyph}</span>
           <span>{g.label}</span>
-          <span className="font-normal text-fg-subtle tabular-nums">{g.items.length}</span>
+          <span className="font-normal text-fg-subtle tabular-nums">{fmtN(g.items.length)}</span>
           <span className="ml-auto flex items-center gap-2 font-normal text-fg-subtle tabular-nums">{fmtN(tu)} turns · {fmtN(req)} req</span>
         </div>
         {!col && g.items.map(a => row(a))}

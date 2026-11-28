@@ -61,13 +61,24 @@ export function Dropdown({ label, icon, children, title, className, menuClassNam
 
 /**
  * Toolbar tabs. Tabs that don't fit fold into "More · n" instead of clipping;
- * the current tab always stays visible.
+ * the current tab and any `pinned` tabs (e.g. Failed, Live) always stay visible.
  */
-export function Tabs<T extends string>({ tabs, value, onChange, label }: { tabs: [T, string, number][]; value: T; onChange: (v: T) => void; label?: string }) {
+const tabCount = (n: number, of?: number) => (of != null && of > n ? `${fmtN(n)} of ${fmtN(of)}` : fmtN(n))
+
+export function Tabs<T extends string>({ tabs, value, onChange, label, pinned }: {
+  /** `[id, label, count, total?]` — a total renders the count as "n of total" (e.g. a capped client window). */
+  tabs: [T, string, number, number?][]
+  value: T
+  onChange: (v: T) => void
+  label?: string
+  /** Tab ids that never fold into "More" (callers pin e.g. `failed` when > 0, `live` while running). */
+  pinned?: readonly T[]
+}) {
   const wrap = useRef<HTMLDivElement>(null)
   const widths = useRef(new Map<string, number>())
   const [cut, setCut] = useState<Set<string>>(new Set())
-  const sig = tabs.map(t => t[0] + t[2]).join(',') + '|' + value
+  const keep = new Set<string>([value, ...(pinned ?? [])])
+  const sig = tabs.map(t => t[0] + t[2]).join(',') + '|' + [...keep].join(',')
   useLayoutEffect(() => {
     const el = wrap.current
     if (!el) return
@@ -78,9 +89,9 @@ export function Tabs<T extends string>({ tabs, value, onChange, label }: { tabs:
       const total = tabs.reduce((a, t) => a + w(t[0]), 0)
       const hidden = new Set<string>()
       if (total > avail + 1) {
-        let used = 86 + (tabs.some(t => t[0] === value) ? w(value) : 0) // "More · n" + the current tab
+        let used = 86 + tabs.reduce((a, t) => a + (keep.has(t[0]) ? w(t[0]) : 0), 0) // "More · n" + current/pinned tabs
         for (const [k] of tabs) {
-          if (k === value) continue
+          if (keep.has(k)) continue
           if (used + w(k) <= avail) used += w(k)
           else hidden.add(k)
         }
@@ -91,10 +102,10 @@ export function Tabs<T extends string>({ tabs, value, onChange, label }: { tabs:
     const ro = new ResizeObserver(measure)
     ro.observe(el)
     return () => ro.disconnect()
-  }, [sig, value]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sig]) // eslint-disable-line react-hooks/exhaustive-deps
   const folded = tabs.filter(t => cut.has(t[0]))
   return <div className="flex min-w-0 flex-1 gap-0.5 overflow-visible" role="tablist" aria-label={label} ref={wrap}>
-    {tabs.filter(t => !cut.has(t[0])).map(([k, l, n]) => {
+    {tabs.filter(t => !cut.has(t[0])).map(([k, l, n, of]) => {
       const on = value === k
       return <button
         key={k}
@@ -108,18 +119,18 @@ export function Tabs<T extends string>({ tabs, value, onChange, label }: { tabs:
         )}
         onClick={() => onChange(k)}
       >
-        {l}<span className="num font-normal text-fg-subtle">{fmtN(n)}</span>
+        {l}<span className="num font-normal text-fg-subtle">{tabCount(n, of)}</span>
       </button>
     })}
     {folded.length > 0 && <Dropdown
       className="flex-none"
-      btnClassName="inline-flex h-[26px] flex-none cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-control border-0 bg-transparent px-[9px] text-[12.5px] font-normal text-fg-subtle shadow-none transition-[background-color,color] duration-[var(--d1)] hover:bg-hover hover:text-fg"
+      btnClassName="inline-flex h-[26px] flex-none cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-control border-0 bg-transparent px-[9px] text-[12.5px] font-normal tabular-nums text-fg-subtle shadow-none transition-[background-color,color] duration-[var(--d1)] hover:bg-hover hover:text-fg"
       label={'More · ' + folded.length}
       menuClassName="top-[30px] w-[200px] p-1.5"
       align="left"
     >
-      {close => folded.map(([k, l, n]) => <button key={k} type="button" className={runDdItem()} onClick={() => { onChange(k); close() }}>
-        {l}<span className="num ml-auto text-fg-subtle">{fmtN(n)}</span>
+      {close => folded.map(([k, l, n, of]) => <button key={k} type="button" className={runDdItem()} onClick={() => { onChange(k); close() }}>
+        {l}<span className="num ml-auto text-fg-subtle">{tabCount(n, of)}</span>
       </button>)}
     </Dropdown>}
   </div>
@@ -135,7 +146,7 @@ export const FilterBox = forwardRef<HTMLInputElement, { value: string; onChange:
     useImperativeHandle(ref, () => inner.current!, [])
     useShortcuts([{ key: '/', run: () => { inner.current?.focus(); inner.current?.select() } }])
     return <label className={cn(
-      'flex h-[26px] w-[120px] flex-none items-center gap-1.5 rounded-control px-2 text-fg-subtle transition-[width,background-color,box-shadow] duration-[var(--d2)] ease-kovo hover:bg-hover focus-within:w-[200px] focus-within:bg-sunk focus-within:text-fg-muted focus-within:shadow-hairline',
+      'flex h-[26px] w-[160px] min-w-0 shrink items-center gap-1.5 rounded-control px-2 text-fg-subtle transition-[background-color,box-shadow] duration-[var(--d2)] ease-kovo hover:bg-hover focus-within:bg-sunk focus-within:text-fg-muted focus-within:shadow-hairline',
       className,
     )}>
       <Icon name="search" />
@@ -285,8 +296,8 @@ export const Tip = forwardRef<TipHandle>(function Tip(_, ref) {
   return <div
     ref={el}
     className={cn(
-      'pointer-events-none fixed z-[80] max-w-[300px] rounded-[7px] bg-raise px-[9px] py-[7px] text-[12px] leading-[17px] text-fg-muted shadow-popover transition-[opacity,transform] duration-[var(--d1)] [&_b]:font-medium [&_b]:text-fg',
-      on ? 'translate-y-0 opacity-100' : 'translate-y-0.5 opacity-0',
+      'pointer-events-none fixed z-[80] max-w-[300px] rounded-[7px] bg-raise px-[9px] py-[7px] text-[12px] leading-[17px] text-fg-muted shadow-popover transition-[opacity,translate] duration-[var(--d1)] ease-kovo [&_b]:font-medium [&_b]:text-fg',
+      on ? 'translate-y-0 opacity-100' : 'translate-y-0.5 opacity-0 motion-reduce:translate-y-0',
     )}
     role="tooltip"
     aria-hidden={!on}

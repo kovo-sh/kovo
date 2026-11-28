@@ -4,8 +4,15 @@ export const host = (origin: string | null | undefined) =>
   String(origin ?? '').replace(/^https?:\/\//, '').replace(/\/$/, '')
 
 export const fmtN = (n: number | null | undefined) => (n == null ? '—' : Number(n).toLocaleString('en-US'))
-export const fmtUsd = (n: number | null | undefined) => '$' + Number(n || 0).toFixed(2)
-export const fmtTok = (n: number) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'k' : String(n || 0)
+const USD = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' })
+/** Grouped USD ("$1,234.56"); matches the grouping of `fmtN` counts beside it. */
+export const fmtUsd = (n: number | null | undefined) => USD.format(Number(n || 0))
+/** Compact token count: "950", "12k", "1.0M", "1.0B" (tiers switch before rounding up to "1000k"/"1000.0M"). */
+export const fmtTok = (n: number) =>
+  n >= 999_950_000 ? (n / 1e9).toFixed(1) + 'B'
+    : n >= 999_500 ? (n / 1e6).toFixed(1) + 'M'
+      : n >= 1e3 ? Math.round(n / 1e3) + 'k'
+        : String(n || 0)
 export const short = (id: string | null | undefined) => String(id ?? '').slice(0, 8)
 
 const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -185,19 +192,41 @@ export function fmtEventKind(kind: string): string {
   const clean = kind.replace(/[._]+/g, ' ').trim()
   return clean ? clean.charAt(0).toUpperCase() + clean.slice(1) : 'Event'
 }
-/** "+mm:ss" / "h:mm:ss" offset from the run start, used in time columns. */
+/**
+ * Offset from the run start for time columns: "+mm:ss" under an hour, "+h:mm:ss" under a day,
+ * "+7d 08h" beyond (the exact timestamp belongs in the cell `title`).
+ */
 export const fmtRel = (ms: number, base: number) => {
   let s = Math.max(0, Math.round((ms - base) / 1000))
+  const d = Math.floor(s / 86_400); s -= d * 86_400
   const h = Math.floor(s / 3600); s -= h * 3600
   const m = Math.floor(s / 60); s -= m * 60
-  return (h ? h + ':' + pad(m) : '+' + pad(m)) + ':' + pad(s)
+  if (d) return '+' + d + 'd ' + pad(h) + 'h'
+  return '+' + (h ? h + ':' + pad(m) : pad(m)) + ':' + pad(s)
 }
+/** Duration: "42s", "3m 07s", "5h 04m", "7d 8h". */
 export const fmtDur = (ms: number) => {
   const s = Math.round(ms / 1000)
   if (s < 60) return s + 's'
   const m = Math.floor(s / 60)
   if (m < 60) return m + 'm ' + pad(s % 60) + 's'
-  return Math.floor(m / 60) + 'h ' + pad(m % 60) + 'm'
+  const h = Math.floor(m / 60)
+  if (h < 24) return h + 'h ' + pad(m % 60) + 'm'
+  return Math.floor(h / 24) + 'd ' + (h % 24) + 'h'
+}
+
+const UNREACHABLE_RE = /failed to fetch|networkerror|load failed|network request failed/i
+/**
+ * Operator-facing copy for a thrown error. Browser network failures ("Failed to fetch",
+ * Firefox "NetworkError…", Safari "Load failed") become an actionable sentence; anything
+ * else keeps its message. Never returns "undefined"/"null"/empty.
+ */
+export function operatorErrorCopy(err: unknown): string {
+  const raw = err instanceof Error ? err.message : typeof err === 'string' ? err : ''
+  const msg = String(raw ?? '').trim()
+  if (UNREACHABLE_RE.test(msg)) return 'Kovo is unreachable. Check that the local server is running.'
+  if (!msg || msg === 'undefined' || msg === 'null') return 'Something went wrong.'
+  return msg
 }
 export const cap = (s: string | null | undefined) => String(s ?? '').replace(/_/g, ' ').replace(/^./, c => c.toUpperCase())
 export const capF = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)

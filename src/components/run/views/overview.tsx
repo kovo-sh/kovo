@@ -5,11 +5,11 @@ import { useMemo, useState } from 'react'
 import { capabilityTierMeta } from '../../run-state.ts'
 import { useRun, useRunModel, useVerdict } from '../data.tsx'
 import { useDecisions } from '../decisions.tsx'
-import { HostLabel } from '../display.tsx'
+import { FindingTitle, HostLabel } from '../display.tsx'
 import { fmtDate, fmtN, fmtTime, fmtTok, host, plural } from '../format.ts'
 import { CovSwatch, LiveDot, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
-import { normFStatus, PHASE_LABEL, SEV, SEV_COL, SEV_LABEL, stLabel } from '../meta.ts'
+import { normFStatus, PHASE_LABEL, runStatusLabel, SEV, SEV_COL, SEV_LABEL, stLabel } from '../meta.ts'
 import type { ViewId } from '../meta.ts'
 import { bySeriousness, coverageCounts, trafficHistogram } from '../model.ts'
 import { AnimatedNumber, Meter } from '../motion.tsx'
@@ -94,6 +94,7 @@ function RunOverview() {
   const runningWorkers = useMemo(() => detail.assignments.filter(a => a.status === 'running'), [detail.assignments])
   const top = useMemo(() => model.findings.filter(f => f.status !== 'dismissed').slice().sort(bySeriousness).slice(0, 7), [model])
   const hist = useMemo(() => trafficHistogram(model, events), [model, events])
+  const axisFmt = hist.t1 - hist.t0 > 86_400_000 ? fmtDate : fmtTime
   const cov = coverageCounts(detail.coverageEntries)
   const s = q.sections
   const needsAny = s.decide.length + s.review.length + s.follow.length > 0
@@ -105,6 +106,10 @@ function RunOverview() {
   }
 
   const phases = model.workflow.phases
+  const failed = detail.assignments.filter(a => a.status === 'failed').length
+  const eyebrow = rep && !live
+    ? `Report v${rep.version} · ${fmtDate(rep.createdAt)}`
+    : r.status === 'running' ? `As of ${fmtDate(model.end)}` : `${runStatusLabel(r.status)} ${fmtDate(hist.t1)}`
   const maxP = Math.max(1, ...phases.map(p => model.workflow.byPhase.get(p)?.length ?? 0))
   const liveSummary = liveOverviewSummary({
     phase: r.phase,
@@ -137,17 +142,17 @@ function RunOverview() {
       <div className="num mb-2 flex items-center gap-2 overflow-hidden whitespace-nowrap text-[12px] text-fg-subtle">
         <span className="font-medium text-fg-muted">{r.status === 'complete' ? 'Run summary' : 'Provisional summary'}</span>
         <span className="text-fg-faint">·</span>
-        <span>{rep && !live ? `Report v${rep.version} · ${fmtDate(rep.createdAt)}` : `As of ${fmtDate(model.end)}`}</span>
+        <span>{eyebrow}</span>
         <span className="text-fg-faint">·</span>
         <span title={capabilityTierMeta[r.capabilityTier].name}>{capabilityTierMeta[r.capabilityTier].short}</span>
       </div>
 
       <h1 className="m-0 max-w-[820px] text-pretty text-[18px] font-semibold leading-[26px] tracking-[-0.017em] text-fg">{v.hed}</h1>
-      {worst && <p className="m-0 mt-1.5 flex min-w-0 items-center gap-2 text-[13px] leading-5 text-fg-muted">
+      {worst && <p data-ov-worst="" className="m-0 mt-1.5 flex min-w-0 items-center gap-2 text-[13px] leading-5 text-fg-muted">
         <span className="flex-none text-fg-subtle">{live ? 'Most severe so far' : 'Most serious'}</span>
         <SevGlyph sev={worst.severity} />
         <a
-          className="min-w-0 cursor-pointer truncate border-b border-line-strong text-fg no-underline hover:border-fg-muted"
+          className="min-w-[120px] flex-1 cursor-pointer truncate border-b border-line-strong text-fg no-underline hover:border-fg-muted"
           role="link"
           tabIndex={0}
           title={worst.title}
@@ -156,7 +161,7 @@ function RunOverview() {
         >
           {worst.title.replace(/\.$/, '')}
         </a>
-        <span className="flex-none font-mono text-[12px] text-fg-subtle">{host(worst.origin)}</span>
+        {worst.origin && <span className="min-w-0 max-w-[38%] shrink truncate font-mono text-[12px] text-fg-subtle" title={worst.origin}><HostLabel host={host(worst.origin)} quiet max={28} /></span>}
       </p>}
       {v.dek && <p className="m-0 mt-1 flex min-w-0 items-center gap-2 text-[13px] leading-5 text-fg-muted"><span>{v.dek}</span></p>}
 
@@ -168,13 +173,13 @@ function RunOverview() {
         </div>
         <div className="min-w-0 border-l border-line px-[18px] pb-3.5 pt-3 max-[1180px]:border-l-0 max-[1180px]:pl-0">
           <h3 className="m-0 mb-1.5 text-[11.5px] font-medium text-fg-subtle">What Kovo found</h3>
-          <div className="num grid grid-cols-[62px_1fr_26px] items-center gap-x-2 gap-y-[3px] text-[12px]">
+          <div className="num grid grid-cols-[minmax(68px,max-content)_1fr_26px] items-center gap-x-2 gap-y-[3px] text-[12px]">
             {tally.map(([sev, k]) => [
-              <span key={sev + 'l'} className={cn('flex items-center gap-1.5', k ? 'text-fg-muted' : 'text-fg-faint')}><SevGlyph sev={sev} />{SEV_LABEL[sev]}</span>,
+              <span key={sev + 'l'} className={cn('flex items-center gap-1.5 whitespace-nowrap', k ? 'text-fg-muted' : 'text-fg-subtle')}><SevGlyph sev={sev} />{SEV_LABEL[sev]}</span>,
               <span key={sev + 'b'} className="block h-1 overflow-hidden rounded-[3px] bg-line">
                 <TallyBar id={'ov.t.' + sev} value={k / maxT} color={SEV_COL[sev] === 'var(--fg-4)' ? 'var(--fg-3)' : SEV_COL[sev]} />
               </span>,
-              <span key={sev + 'n'} className={cn('text-right', k ? 'text-fg-muted' : 'text-fg-faint')}>{k}</span>,
+              <span key={sev + 'n'} className={cn('text-right', k ? 'text-fg-muted' : 'text-fg-subtle')}>{fmtN(k)}</span>,
             ])}
           </div>
         </div>
@@ -200,7 +205,7 @@ function RunOverview() {
           <div className="flex items-center gap-1.5 whitespace-nowrap text-[11.5px] text-fg-subtle">Workers</div>
           <div className="whitespace-nowrap text-[15px] font-medium leading-[22px] tracking-[-0.01em] text-fg">
             <AnimatedNumber id="ov.wk" value={detail.assignments.length} />
-            <small className="ml-[3px] text-[12px] font-normal text-fg-subtle">{runningWorkers.length ? `${fmtN(runningWorkers.length)} running · ` : ''}{fmtN(done)} complete</small>
+            <small className="ml-[3px] text-[12px] font-normal text-fg-subtle">{runningWorkers.length ? `${fmtN(runningWorkers.length)} running · ` : ''}{fmtN(done)} complete{failed > 0 && <> · <span className="text-danger">{fmtN(failed)} failed</span></>}</small>
           </div>
         </div>
         <div className="min-w-0 border-l border-line pb-[11px] pl-3.5 pt-2.5">
@@ -241,14 +246,14 @@ function RunOverview() {
                 })}
               </div>
               : <div className="flex items-center gap-2.5 rounded-lg border border-line px-3 py-2.5 text-[12.5px] text-fg-muted">
-                <StatusGlyph status="complete" />Nothing needs you. Every finding is decided or verified.
+                <StatusGlyph status="complete" />{model.findings.length ? 'Nothing needs you. Every finding is decided or verified.' : 'Nothing needs you.'}
               </div>}
           </div>
 
           <div className="pt-4">
             <h4 className="m-0 mb-1.5 flex items-center gap-2 text-[12px] font-medium text-fg-muted">
               Most serious findings
-              <span className="num font-normal text-fg-subtle">{top.length} of {model.findings.length}</span>
+              {model.findings.length > 0 && <span className="num font-normal text-fg-subtle">{fmtN(top.length)} of {fmtN(model.findings.length)}</span>}
               <Go to="findings">All findings</Go>
             </h4>
             <div className="border-t border-line">
@@ -262,7 +267,7 @@ function RunOverview() {
               >
                 <span className="inline-flex size-3.5 flex-none items-center justify-center"><SevGlyph sev={f.severity} /></span>
                 <span className="inline-flex size-3.5 flex-none items-center justify-center" title={stLabel(normFStatus(f.status))}><StatusGlyph status={normFStatus(f.status)} /></span>
-                <span className="min-w-0 flex-1 truncate text-fg">{f.title}</span>
+                <span className="min-w-0 flex-1 truncate text-fg" title={f.title || undefined}><FindingTitle title={f.title} /></span>
                 <span className="w-[130px] flex-none truncate text-right font-mono text-[12px] text-fg-subtle max-[1180px]:hidden">
                   <HostLabel host={host(f.origin)} quiet max={22} />
                 </span>
@@ -281,6 +286,7 @@ function RunOverview() {
               <Go to="workflow">Graph</Go>
             </h4>
             <div
+              data-ov-workflow=""
               className="cursor-pointer rounded-lg border border-line px-2.5 py-1 transition-colors duration-[var(--d1)] hover:border-line-strong"
               role="button"
               tabIndex={0}
@@ -295,24 +301,22 @@ function RunOverview() {
                 const pz = ws.filter(a => a.status === 'paused' || a.status === 'waiting_approval').length
                 const run = ws.filter(a => a.status === 'running').length
                 const fl = ws.filter(a => a.status === 'failed').length
-                return <div key={p} className="grid h-6 grid-cols-[104px_1fr_30px_58px] items-center gap-2.5 text-[12px]">
-                  <span className="truncate text-fg-muted">{PHASE_LABEL[p] ?? p}</span>
+                return <div key={p} data-ov-phase={p} className={cn('grid h-6 items-center gap-2 text-[12px]', WF_SUMMARY_COLS)}>
+                  <span className="min-w-0 truncate text-fg-muted">{PHASE_LABEL[p] ?? p}</span>
                   <span className="relative h-1 overflow-hidden rounded-[2px] bg-line">
                     <i className="absolute inset-y-0 left-0 block rounded-[2px] bg-fg-subtle" style={{ width: `${ws.length / maxP * 100}%` }} />
                     {pz > 0 && <i className="absolute inset-y-0 left-0 block rounded-[2px] bg-warn" style={{ width: `${pz / maxP * 100}%` }} />}
                   </span>
-                  <span className="num text-right font-medium text-fg">{ws.length}</span>
-                  <span className="num whitespace-nowrap text-[11.5px] text-fg-subtle">
-                    {ws.length ? (pz ? pz + ' paused' : run ? run + ' running' : fl ? fl + ' failed' : dn === ws.length ? 'done' : dn + ' done') : '—'}
-                  </span>
+                  <span className="num min-w-[7ch] whitespace-nowrap text-right font-medium text-fg">{fmtN(ws.length)}</span>
+                  <PhaseStatusWord total={ws.length} done={dn} paused={pz} running={run} failed={fl} />
                 </div>
               })}
-              {rep && <div className="grid h-6 grid-cols-[104px_1fr_30px_58px] items-center gap-2.5 text-[12px]">
-                <span className="truncate text-fg-muted">Report</span>
+              {rep && <div className={cn('grid h-6 items-center gap-2 text-[12px]', WF_SUMMARY_COLS)}>
+                <span className="min-w-0 truncate text-fg-muted">Report</span>
                 <span className="relative h-1 overflow-hidden rounded-[2px] bg-line">
                   <i className="absolute inset-y-0 left-0 block rounded-[2px] bg-fg" style={{ width: '4%' }} />
                 </span>
-                <span className="num text-right font-medium text-fg">v{rep.version}</span>
+                <span className="num min-w-[7ch] whitespace-nowrap text-right font-medium text-fg">v{rep.version}</span>
                 <span className="whitespace-nowrap text-[11.5px] text-fg-subtle">{rep.partial ? 'partial' : 'ready'}</span>
               </div>}
             </div>
@@ -324,7 +328,9 @@ function RunOverview() {
               <span className="num font-normal text-fg-subtle">{fmtN(counts.exchanges)} exchanges</span>
               <Go to="exchanges">Exchanges</Go>
             </h4>
-            <div className="flex h-11 items-end gap-0.5 overflow-hidden border-b border-line" title="HTTP exchanges over time; red marks requests blocked by scope or rate limits">
+            {counts.exchanges === 0
+              ? <p data-ov-traffic-empty="" className="m-0 text-[12.5px] text-fg-subtle">No traffic recorded.</p>
+              : <><div className="flex h-11 items-end gap-0.5 overflow-hidden border-b border-line" title="HTTP exchanges over time; red marks requests blocked by scope or rate limits">
               {hist.bins.map((b, i) => <i
                 key={i}
                 className="relative min-h-px flex-1 overflow-hidden rounded-t-[1px] bg-fg-faint"
@@ -334,11 +340,11 @@ function RunOverview() {
                 {b[1] > 0 && <em className="absolute inset-x-0 top-0 bg-danger" style={{ height: Math.max(2, b[1] / (b[0] + b[1]) * 100) + '%' }} />}
               </i>)}
             </div>
-            <div className="num mt-[3px] flex justify-between text-[11px] text-fg-subtle">
-              <span>{fmtTime(hist.t0)}</span>
-              <span>{fmtTime(hist.t0 + (hist.t1 - hist.t0) / 2)}</span>
-              <span>{fmtTime(hist.t1)}</span>
-            </div>
+            <div data-ov-traffic-axis="" className="num mt-[3px] flex justify-between gap-2 whitespace-nowrap text-[11px] text-fg-subtle">
+              <span>{axisFmt(hist.t0)}</span>
+              <span>{axisFmt(hist.t0 + (hist.t1 - hist.t0) / 2)}</span>
+              <span>{axisFmt(hist.t1)}</span>
+            </div></>}
           </div>
 
           <div className="pt-4">
@@ -364,6 +370,22 @@ function RunOverview() {
       </div>
     </div>
   </div>
+}
+
+/** Workflow summary row columns: label / bar (never below 36px) / count / status word. */
+const WF_SUMMARY_COLS = 'grid-cols-[minmax(64px,104px)_minmax(36px,1fr)_auto_minmax(44px,auto)]'
+
+/** Phase status word listing every live state ("5 running · 1 paused"), failures in danger. */
+function PhaseStatusWord({ total, done, paused, running, failed }: { total: number; done: number; paused: number; running: number; failed: number }) {
+  const parts = [
+    running > 0 && <span key="r">{fmtN(running)} running</span>,
+    paused > 0 && <span key="p">{fmtN(paused)} paused</span>,
+    failed > 0 && <span key="f" className="text-danger">{fmtN(failed)} failed</span>,
+  ].filter(Boolean)
+  const fallback = !total ? '—' : done === total ? 'done' : `${fmtN(done)} done`
+  return <span className="num min-w-0 truncate whitespace-nowrap text-[11.5px] text-fg-subtle">
+    {parts.length ? parts.flatMap((x, i) => i ? [<span key={'s' + i}> · </span>, x] : [x]) : fallback}
+  </span>
 }
 
 /** Tally bar that grows from its previous value (keyed per severity so it animates on run switch). */

@@ -5,7 +5,7 @@ import { useMemo, useRef } from 'react'
 import type { ReactNode } from 'react'
 import { FilterBox, matchQ, Tabs, VList } from '../controls.tsx'
 import { useRun, useRunModel } from '../data.tsx'
-import { EmptyState, LinkRow, Props, Section, Skeleton, Tag } from '../display.tsx'
+import { EmptyState, FindingTitle, LinkRow, Props, Section, Skeleton, Tag } from '../display.tsx'
 import { fmtAgo, fmtEventKind, fmtFullDateTime, fmtN, fmtRel, fmtTimeS, host } from '../format.ts'
 import { EventGlyph, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import type { RunEvent } from '../model.ts'
@@ -44,7 +44,7 @@ export function isErrorActivityEvent(kind: string): boolean {
 }
 
 export function ActivityView() {
-  const { events, eventsReady, counts: runCounts, detail, refresh } = useRun()
+  const { events, eventsReady, counts: runCounts, detail, refresh, hasOlderEvents, loadingOlderEvents, loadOlderEvents } = useRun()
   const model = useRunModel()
   const nav = useNav()
   const rm = useReducedMotion()
@@ -65,7 +65,11 @@ export function ActivityView() {
     for (const e of events) { const f = actFam(e.kind); t[f] = (t[f] ?? 0) + 1 }
     return t
   }, [events])
-  const tabs = useMemo(() => FAMS.filter(([k]) => counts[k] || k === tab).map(([k, l]) => [k, l, counts[k] ?? 0] as [Fam, string, number]), [counts, tab])
+  // When older history is not loaded, "All" is the client window, not the run total: show "n of total".
+  const tabs = useMemo(() => FAMS.filter(([k]) => counts[k] || k === tab)
+    .map(([k, l]) => (k === 'all' && hasOlderEvents
+      ? [k, l, counts[k] ?? 0, runCounts.events]
+      : [k, l, counts[k] ?? 0]) as [Fam, string, number, number?]), [counts, tab, hasOlderEvents, runCounts.events])
   const items = useMemo(() => {
     const out: RunEvent[] = []
     for (let i = events.length - 1; i >= 0; i--) {
@@ -107,6 +111,7 @@ export function ActivityView() {
     </div>
     {!eventsReady && !events.length ? <Skeleton /> :
       <VList items={items} itemKey={e => String(e.id)} height={height} anchor scrollToIndex={index}
+        footer={hasOlderEvents && items.length ? <OlderEventsFooter loaded={events.length} total={runCounts.events} loading={loadingOlderEvents} onLoad={() => { void loadOlderEvents() }} /> : undefined}
         empty={<EmptyState icon="search" title="Nothing matches" style={{ paddingTop: 80 }}>Try a different filter or switch tabs.</EmptyState>}
         render={(e, _i, style) => {
           const id = String(e.id)
@@ -120,13 +125,15 @@ export function ActivityView() {
               RW.row,
               selId === id && RW.rowCur,
               isBad && selId !== id && 'bg-danger-soft/40',
-              !rm && e.id > fresh && 'transition-[background-color,opacity] duration-700 ease-kovo starting:bg-accent-soft starting:opacity-0',
+              e.id > fresh && (rm
+                ? '[transition:background-color_700ms_ease] starting:bg-accent-soft'
+                : '[transition:opacity_150ms_cubic-bezier(.2,.8,.2,1),background-color_700ms_ease] starting:bg-accent-soft starting:opacity-0'),
             )}
             onClick={() => nav.select({ kind: 'event', id })}
           >
-            <span className="w-16 flex-none font-mono text-[12px] tabular-nums text-fg-subtle" title={fmtFullDateTime(e.createdAt)}>{fmtRel(e.createdAt, model.base)}</span>
+            <span className="w-[72px] flex-none whitespace-nowrap font-mono text-[12px] tabular-nums text-fg-subtle" title={fmtFullDateTime(e.createdAt)}>{fmtRel(e.createdAt, model.base)}</span>
             <span className="inline-flex size-3.5 flex-none items-center justify-center"><EventGlyph kind={e.kind} /></span>
-            <span className={cn('w-[132px] flex-none truncate', isBad ? 'font-medium text-danger' : 'text-fg-subtle')} title={`${e.kind} · Event #${e.id}`}>{label}</span>
+            <span className={cn('w-[156px] flex-none truncate', isBad ? 'font-medium text-danger' : 'text-fg-subtle')} title={`${e.kind} · Event #${e.id}`}>{label}</span>
             <span className={cn('min-w-0 flex-1 truncate', isBad ? 'text-danger' : 'text-fg')}>{e.message}</span>
           </div>
         }} />}
@@ -134,6 +141,16 @@ export function ActivityView() {
 }
 
 // ---------------------------------------------------------------- inspector
+
+/** List footer when the client holds only the newest window of a longer event log. */
+function OlderEventsFooter({ loaded, total, loading, onLoad }: { loaded: number; total: number; loading: boolean; onLoad: () => void }) {
+  return <div className={RW.listnote} data-activity-older="">
+    <span className="tabular-nums">Showing the latest {fmtN(loaded)} of {fmtN(total)} events.</span>
+    <button type="button" className={runBtn({ variant: 'ghost', size: 'sm' })} disabled={loading} aria-busy={loading} onClick={onLoad}>
+      {loading ? 'Loading older…' : 'Load older'}
+    </button>
+  </div>
+}
 
 const str = (v: unknown) => (typeof v === 'string' && v ? v : null)
 
@@ -161,7 +178,7 @@ function EventInspector({ sel }: InspectorProps) {
   if (w) rel.push(<LinkRow key="w" glyph={<StatusGlyph status={w.status} />} trailing="workflow" onClick={() => links.worker(w.id)}>{w.title}</LinkRow>)
   const fid = str(d.findingId)
   const f = fid ? model.findingById.get(fid) : undefined
-  if (f) rel.push(<LinkRow key="f" glyph={<SevGlyph sev={f.severity} />} trailing="findings" onClick={() => links.finding(f.id)}>{f.title}</LinkRow>)
+  if (f) rel.push(<LinkRow key="f" glyph={<SevGlyph sev={f.severity} />} trailing="findings" onClick={() => links.finding(f.id)}><FindingTitle title={f.title} /></LinkRow>)
   const apId = str(d.approvalId) ?? str(d.requestId)
   const ap = apId ? model.approvalById.get(apId) : undefined
   if (ap) {
