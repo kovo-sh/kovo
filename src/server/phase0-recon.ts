@@ -347,8 +347,13 @@ const PHASE0_SEED_PATHS: readonly string[] = [
   '/trpc',
 ]
 
+const UNEXPANDED_JS_TEMPLATE_RE = /(?:(?:\$|%24)(?:\{|%7b)|`|%60)/i
+/** Return true when a candidate route contains unexpanded JS template literal artifacts (`${...}`, `$%7B...%7D`, `%24%7B...%7D`, backticks). */
+export const hasUnexpandedJsTemplateArtifact = (rawPath: string): boolean => UNEXPANDED_JS_TEMPLATE_RE.test(rawPath)
 function sanitizePathCandidate(raw: string, baseOrigin: string): string | null {
-  return sanitizeSameOriginPath(raw, baseOrigin)
+  if (hasUnexpandedJsTemplateArtifact(raw)) return null
+  const clean = sanitizeSameOriginPath(raw, baseOrigin)
+  return clean && !hasUnexpandedJsTemplateArtifact(clean) ? clean : null
 }
 
 /**
@@ -3228,7 +3233,6 @@ export interface ParsedOpenApiOperation {
 }
 
 const OPENAPI_AUTH_HEADER_RE = /^(?:authorization|x-api-key|api-key|x-auth-token|x-access-token)$/i
-const SPA_LIFECYCLE_ACTION_RE = /\b(approve|reject|cancel|revoke|demote|promote|transfer|refund|credit|debit|payout|settle|release|publish|archive|export|download|invite|impersonate|grant|webhook|dispute|reopen|checkout|billing|quota|balance|roleUpdate|selfApprove)\b/gi
 const SPA_ROLE_GUARD_PATTERNS: readonly RegExp[] = [
   /\b(?:requiredRoles?|allowedRoles?|roles?)\s*[:=]\s*\[\s*([^\]]{1,120})\]/g,
   /\b(?:requiredRole|minRole|roleGuard|allowRole)\s*[:=(]\s*["'`]([A-Za-z0-9_:-]{2,32})["'`]/g,
@@ -3312,12 +3316,13 @@ export function extractRuntimeSpaRoutesFromJs(
   const apiCalls: Array<{ method: string; path: string; surface: ReturnType<typeof classifySurface>; serviceOrigin?: string }> = []
   const seenCall = new Set<string>()
   const pushCall = (method: string, rawUrl: string): void => {
-    if (apiCalls.length >= 24) return
+    if (apiCalls.length >= 24 || hasUnexpandedJsTemplateArtifact(rawUrl)) return
     let callOrigin: string | undefined
     let cleanPath: string | null = null
     if (/^https?:\/\//i.test(rawUrl.trim())) {
       try {
         const parsed = new URL(rawUrl.trim())
+        if (hasUnexpandedJsTemplateArtifact(parsed.pathname)) return
         callOrigin = parsed.origin
         cleanPath = normalizeDiscoveryTemplate(parsed.pathname || '/')
       } catch { /* ignore */ }
@@ -3325,7 +3330,7 @@ export function extractRuntimeSpaRoutesFromJs(
       const clean = sanitizePathCandidate(rawUrl, origin)
       if (clean && !STATIC_ASSET_RE.test(clean)) cleanPath = normalizeDiscoveryTemplate(clean.split('?')[0] || '/')
     }
-    if (!cleanPath || cleanPath === '/') return
+    if (!cleanPath || cleanPath === '/' || hasUnexpandedJsTemplateArtifact(cleanPath)) return
     const upper = (method || 'GET').toUpperCase()
     const key = `${callOrigin ?? origin}|${upper}|${cleanPath}`
     if (seenCall.has(key)) return
@@ -3368,10 +3373,10 @@ export function extractRuntimeSpaRoutesFromJs(
   }
 
   const stateActions = new Set<string>()
-  SPA_LIFECYCLE_ACTION_RE.lastIndex = 0
-  for (const m of code.matchAll(SPA_LIFECYCLE_ACTION_RE)) {
-    if (m[1]) stateActions.add(m[1].toLowerCase())
-    if (stateActions.size >= 16) break
+  for (const call of apiCalls) {
+    if (!/^(?:POST|PUT|PATCH|DELETE)$/.test(call.method) || stateActions.size >= 16) continue
+    const tail = call.path.split('/').filter(s => s && !/^[:{]/.test(s)).pop()?.toLowerCase()
+    if (tail) stateActions.add(tail)
   }
 
   const candidateRoutes = new Set<string>()
@@ -3673,7 +3678,7 @@ export function parseOpenApiDoc(
 
   for (const [rawPath, rawPathItem] of Object.entries(pathsObj as Record<string, unknown>)) {
     const pathItem = resolveNode(rawPathItem)
-    if (!pathItem) continue
+    if (!pathItem || hasUnexpandedJsTemplateArtifact(rawPath)) continue
     let leading = rawPath.startsWith('/') ? rawPath : `/${rawPath}`
     if (basePrefix && leading !== basePrefix && !leading.startsWith(`${basePrefix}/`)) {
       leading = `${basePrefix}${leading}`
@@ -4083,15 +4088,8 @@ function ingestDeclaredApiSurfaceWithDocs(
       } catch { /* metrics only */ }
     }
     for (const op of tolerantOps) {
-      const ep = storage.upsertEndpoint({
-        runId,
-        scopeRevision,
-        origin,
-        method: op.method,
-        pathTemplate: op.pathTemplate,
-        source: 'openapi',
-        riskScore: scoreEndpointRisk(op.method, op.pathTemplate),
-      })
+      if (hasUnexpandedJsTemplateArtifact(op.pathTemplate)) continue
+      const ep = storage.upsertEndpoint({ runId, scopeRevision, origin, method: op.method, pathTemplate: op.pathTemplate, source: 'openapi', riskScore: scoreEndpointRisk(op.method, op.pathTemplate) })
       dynamicPaths.add(op.pathTemplate)
       for (const p of op.params) {
         storage.upsertEndpointParam({
@@ -4655,11 +4653,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     for (const fw of regexExtracted.frameworks) frameworksDetected.add(fw)
     let unmappedRoutes = 0
     for (const route of merged.routes) {
-      // Never silently misattribute genuinely unmapped multi-origin microservice routes to origins[0].
-      if (normalizedOrigins.length > 1 && route.originConfidence === 'unmapped' && !route.origin) {
-        unmappedRoutes += 1
-        continue
-      }
+      if (hasUnexpandedJsTemplateArtifact(route.pathTemplate)) continue
+      if (normalizedOrigins.length > 1 && route.originConfidence === 'unmapped' && !route.origin) { unmappedRoutes += 1; continue }
       const origin = route.origin ?? primaryOrigin
       const ep = storage.upsertEndpoint({
         runId,
@@ -5746,9 +5741,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       const addJsEndpoint = (method: string, rawPath: string, bodyKeys: string[] = []): string | null => {
         const clean = sanitizePathCandidate(rawPath, origin)
         if (!clean || STATIC_ASSET_RE.test(clean)) return null
-        const tmpl = /(?:^|\/):[A-Za-z_][A-Za-z0-9_-]*/.test(clean)
-          ? normalizeDiscoveryTemplate(clean)
-          : normalizeRouteTemplate(clean)
+        const tmpl = /(?:^|\/):[A-Za-z_][A-Za-z0-9_-]*/.test(clean) ? normalizeDiscoveryTemplate(clean) : normalizeRouteTemplate(clean)
+        if (hasUnexpandedJsTemplateArtifact(tmpl)) return null
         const key = `${method.toUpperCase()} ${tmpl}`
         const existingId = seenJsRoutes.get(key)
         // The same route is often referenced by several sources (harvested calls, regex literal scan,
@@ -5939,7 +5933,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           // they stay on the document's own origin; manifest entries resolve against the document.
           const docOrigin = (() => { try { return new URL(origin).origin } catch { return origin } })()
           const recordDeclared = (method: string, pathname: string): void => {
-            if (!pathname.startsWith('/') || pathname.startsWith('//') || /[:{}\s]/.test(pathname)) return
+            if (!pathname.startsWith('/') || pathname.startsWith('//') || /[:{}\s]/.test(pathname) || hasUnexpandedJsTemplateArtifact(pathname)) return
             recordEndpoint(method, pathname, 'spa_crawl', { authRequirement: 'none' })
             queueDiscoveredRoute(method, pathname)
           }
@@ -6710,24 +6704,23 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           if (kind === 'signed_url') for (const c of storageConsumers.slice(0, 4)) emitCross(ep, c, field, 'signed_url')
         }
       }
-      // Synthesize create -> rebind -> finalize lifecycle chains on shared collection entities.
-      const lifeByBase = new Map<string, { creates: typeof originEndpoints; rebinds: typeof originEndpoints; finalizes: typeof originEndpoints }>()
+      // Synthesize structural collection -> member -> sub-route mutation chains on shared entities.
+      const mutByEntity = new Map<string, { root?: typeof originEndpoints[number]; member?: typeof originEndpoints[number]; subs: typeof originEndpoints }>()
       for (const ep of originEndpoints) {
-        const segs = ep.pathTemplate.split('/').filter(s => s && !/^[:{]/.test(s) && !/^(?:api|v\d+)$/i.test(s))
-        const entitySeg = segs[0]?.toLowerCase()
-        if (!entitySeg) continue
-        const b = lifeByBase.get(entitySeg) ?? { creates: [], rebinds: [], finalizes: [] }
         const m = ep.method.toUpperCase()
-        if (m === 'POST' && !/\/(?:rebind|update|approve|transfer|finalize|settle|release|export|complete|cancel)(?:\/|$)/i.test(ep.pathTemplate)) b.creates.push(ep)
-        else if (m === 'PATCH' || m === 'PUT' || /\/(?:rebind|update|assign|delegate|transfer|approve)(?:\/|$)/i.test(ep.pathTemplate)) b.rebinds.push(ep)
-        if (/\/(?:finalize|settle|release|complete|commit|publish|capture|export|dispatch|confirm|payout)(?:\/|$)/i.test(ep.pathTemplate)) b.finalizes.push(ep)
-        lifeByBase.set(entitySeg, b)
+        if (!/^(?:POST|PUT|PATCH|DELETE)$/.test(m)) continue
+        const parts = ep.pathTemplate.split('/').filter(Boolean).filter((s, i) => !(i < 2 && /^(?:api|v\d+)$/i.test(s)))
+        const entitySeg = parts.find(s => !/^[:{]/.test(s))?.toLowerCase()
+        if (!entitySeg) continue
+        const b = mutByEntity.get(entitySeg) ?? { subs: [] }, paramIdx = parts.findIndex(s => /^[:{]/.test(s))
+        if (paramIdx < 0 && parts.length === 1) { if (!b.root || m === 'POST') b.root = ep }
+        else if (paramIdx === parts.length - 1) { if (!b.member) b.member = ep }
+        else if (!b.subs.some(s => s.id === ep.id)) b.subs.push(ep)
+        mutByEntity.set(entitySeg, b)
       }
-      for (const [entitySeg, b] of lifeByBase) {
-        const cr = b.creates[0], rb = b.rebinds[0], fn = b.finalizes.find(f => f.id !== cr?.id && f.id !== rb?.id)
-        if (cr && rb) emitCross(cr, rb, `${entitySeg}Id`, 'lifecycle_chain')
-        if (rb && fn) emitCross(rb, fn, `${entitySeg}Id`, 'lifecycle_chain')
-        else if (cr && fn) emitCross(cr, fn, `${entitySeg}Id`, 'lifecycle_chain')
+      for (const [entitySeg, b] of mutByEntity) {
+        const seq = [b.root, b.member, ...b.subs.slice(0, 2)].filter((e): e is typeof originEndpoints[number] => Boolean(e))
+        for (let i = 0; i + 1 < seq.length; i += 1) emitCross(seq[i]!, seq[i + 1]!, `${entitySeg}Id`, 'lifecycle_chain')
       }
     } catch { /* best-effort static edge inference */ }
 
@@ -7233,11 +7226,9 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
         })
       }
     }
-    if (actionText) {
-      SPA_LIFECYCLE_ACTION_RE.lastIndex = 0
-      for (const m of actionText.matchAll(SPA_LIFECYCLE_ACTION_RE)) {
-        if (m[1] && entry.stateActions.size < 10) entry.stateActions.add(m[1].toLowerCase())
-      }
+    if (call && /^(?:POST|PUT|PATCH|DELETE)$/i.test(call.method) && entry.stateActions.size < 10) {
+      const tail = call.path.split('/').filter(s => s && !/^[:{]/.test(s)).pop()?.toLowerCase()
+      if (tail) entry.stateActions.add(tail)
     }
   }
 
@@ -7562,8 +7553,9 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
         const record = req as { body?: unknown; postData?: unknown }
         const rawBody = typeof record.body === 'string' ? record.body : typeof record.postData === 'string' ? record.postData : null
         const shape = inferXhrRequestShape({ url: req.url, method: req.method, body: rawBody })
-        if (!shape) continue
+        if (!shape || hasUnexpandedJsTemplateArtifact(shape.path)) continue
         const tmpl = normalizeRouteTemplate(shape.path)
+        if (hasUnexpandedJsTemplateArtifact(tmpl)) continue
         const src: EndpointSource = /graphql|trpc/i.test(tmpl) ? 'graphql' : 'spa_crawl'
         const ep = noteCrawlEndpoint(storage.upsertEndpoint({
           runId,

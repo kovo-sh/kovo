@@ -6,7 +6,7 @@ import {
   readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync,
 } from 'node:fs'
 import { basename, dirname, isAbsolute, join, posix, relative, resolve as resolvePath, sep } from 'node:path'
-import { tmpdir } from 'node:os'
+import { cpus as osCpus, freemem as osFreemem, tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import ipaddr from 'ipaddr.js'
 import { z } from 'zod'
@@ -298,132 +298,55 @@ export const sastScanResultSchema = z.object({
 })
 
 export const offlineScriptRequestSchema = z.object({
-  runtime: z.enum(['python', 'node']),
-  code: z.string().min(1).max(256 * 1024),
-  timeoutMs: z.number().int().min(1_000).max(60_000).optional(),
+  runtime: z.enum(['python', 'node']), code: z.string().min(1).max(256 * 1024), timeoutMs: z.number().int().min(1_000).max(60_000).optional(),
 })
-
 export const offlineScriptResultSchema = z.object({
-  runtime: z.enum(['python', 'node']),
-  exitCode: z.number().int(),
-  stdout: z.string().max(256 * 1024),
-  stderr: z.string().max(256 * 1024),
-  durationMs: z.number().int().min(0),
-  timedOut: z.boolean(),
+  runtime: z.enum(['python', 'node']), exitCode: z.number().int(), stdout: z.string().max(256 * 1024),
+  stderr: z.string().max(256 * 1024), durationMs: z.number().int().min(0), timedOut: z.boolean(),
 })
-
 export const verifyScriptRequestSchema = z.object({
-  runtime: z.literal('ts'),
-  code: z.string().min(1).max(256 * 1024),
-  nonce: z.string().regex(/^[a-f0-9]{16,128}$/i),
-  title: z.string().max(300).optional(),
-  timeoutMs: z.number().int().min(1_000).max(120_000).optional(),
+  runtime: z.literal('ts'), code: z.string().min(1).max(256 * 1024), nonce: z.string().regex(/^[a-f0-9]{16,128}$/i),
+  title: z.string().max(300).optional(), timeoutMs: z.number().int().min(1_000).max(120_000).optional(),
 })
-
 export const verifyScriptResultSchema = z.object({
-  runtime: z.literal('ts'),
-  exitCode: z.number().int(),
-  result: z.unknown(),
-  stdout: z.string().max(256 * 1024),
-  stderr: z.string().max(256 * 1024),
-  durationMs: z.number().int().min(0),
-  timedOut: z.boolean(),
+  runtime: z.literal('ts'), exitCode: z.number().int(), result: z.unknown(), stdout: z.string().max(256 * 1024),
+  stderr: z.string().max(256 * 1024), durationMs: z.number().int().min(0), timedOut: z.boolean(),
 })
-
 export const astVerifyRequestSchema = z.object({
-  repo: repoIdentifierSchema,
-  file: repoRelativePathSchema,
-  startLine: z.number().int().min(1),
-  endLine: z.number().int().min(1),
-  engine: z.enum(['opengrep', 'ast-grep']),
-  ruleOrPattern: z.string().min(1).max(32 * 1024),
-  timeoutMs: z.number().int().min(5_000).max(60_000).optional(),
+  repo: repoIdentifierSchema, file: repoRelativePathSchema, startLine: z.number().int().min(1), endLine: z.number().int().min(1),
+  engine: z.enum(['opengrep', 'ast-grep']), ruleOrPattern: z.string().min(1).max(32 * 1024), timeoutMs: z.number().int().min(5_000).max(60_000).optional(),
 }).refine(v => v.endLine >= v.startLine, 'endLine must be >= startLine.')
-
 export const astVerifyResultSchema = z.object({
-  verified: z.boolean(),
-  engine: z.enum(['opengrep', 'ast-grep']),
-  repo: z.string(),
-  file: z.string(),
-  startLine: z.number().int().min(1),
-  endLine: z.number().int().min(1),
-  matchedLines: z.array(z.number().int().min(1)),
-  codeExcerpt: z.string().max(4096),
-  matchCount: z.number().int().min(0),
-  durationMs: z.number().int().min(0),
-  reason: z.string().optional(),
+  verified: z.boolean(), engine: z.enum(['opengrep', 'ast-grep']), repo: z.string(), file: z.string(),
+  startLine: z.number().int().min(1), endLine: z.number().int().min(1), matchedLines: z.array(z.number().int().min(1)),
+  codeExcerpt: z.string().max(4096), matchCount: z.number().int().min(0), durationMs: z.number().int().min(0), reason: z.string().optional(),
 })
-
 export const callGraphSinkKindSchema = z.enum([
-  'api_route', 'server_action', 'webhook', 'db_query', 'outbound_fetch',
-  'redirect', 'postmessage_iframe', 'upload_storage', 'auth_config', 'other',
+  'api_route', 'server_action', 'webhook', 'db_query', 'outbound_fetch', 'redirect', 'postmessage_iframe', 'upload_storage', 'auth_config', 'other',
 ])
-
 export const callGraphRequestSchema = z.object({
-  repo: repoIdentifierSchema,
-  paths: z.array(repoRelativePathSchema).max(32).optional(),
-  maxDepth: z.number().int().min(2).max(12).optional(),
-  customGuardPatterns: z.array(z.string().min(1).max(200)).max(40).optional(),
-  customSanitizerPatterns: z.array(z.string().min(1).max(200)).max(40).optional(),
-  customSinkPatterns: z.array(z.object({
-    pattern: z.string().min(1).max(200),
-    sinkKind: callGraphSinkKindSchema,
-  })).max(40).optional(),
+  repo: repoIdentifierSchema, paths: z.array(repoRelativePathSchema).max(32).optional(), maxDepth: z.number().int().min(2).max(12).optional(),
+  customGuardPatterns: z.array(z.string().min(1).max(200)).max(40).optional(), customSanitizerPatterns: z.array(z.string().min(1).max(200)).max(40).optional(),
+  customSinkPatterns: z.array(z.object({ pattern: z.string().min(1).max(200), sinkKind: callGraphSinkKindSchema })).max(40).optional(),
   timeoutMs: z.number().int().min(5_000).max(120_000).optional(),
 })
-
 export const callGraphResultSchema = z.object({
-  repo: z.string(),
-  filesScanned: z.number().int().min(0),
+  repo: z.string(), filesScanned: z.number().int().min(0),
   nodes: z.array(z.object({
-    id: z.string(),
-    file: z.string(),
-    line: z.number().int().min(0),
-    endLine: z.number().int().min(0).optional(),
-    symbol: z.string(),
-    kind: z.enum(['entrypoint', 'function', 'middleware', 'sink', 'guard', 'sanitizer']),
-    httpMethod: z.string().optional(),
-    routePath: z.string().optional(),
-    sinkKind: callGraphSinkKindSchema.optional(),
-    guards: z.array(z.string()),
-    sanitizers: z.array(z.string()),
-    calls: z.array(z.string()),
+    id: z.string(), file: z.string(), line: z.number().int().min(0), endLine: z.number().int().min(0).optional(), symbol: z.string(),
+    kind: z.enum(['entrypoint', 'function', 'middleware', 'sink', 'guard', 'sanitizer']), httpMethod: z.string().optional(),
+    routePath: z.string().optional(), sinkKind: callGraphSinkKindSchema.optional(), guards: z.array(z.string()), sanitizers: z.array(z.string()), calls: z.array(z.string()),
   })),
-  edges: z.array(z.object({
-    fromId: z.string(),
-    toId: z.string(),
-    file: z.string(),
-    line: z.number().int().min(0),
-  })),
+  edges: z.array(z.object({ fromId: z.string(), toId: z.string(), file: z.string(), line: z.number().int().min(0) })),
   taintPaths: z.array(z.object({
-    entrypointId: z.string(),
-    entrypointSymbol: z.string(),
-    entrypointFile: z.string(),
-    entrypointLine: z.number().int().min(0),
-    routeOrAction: z.string(),
-    httpMethod: z.string().optional(),
-    sinkId: z.string(),
-    sinkSymbol: z.string(),
-    sinkFile: z.string(),
-    sinkLine: z.number().int().min(0),
-    sinkKind: callGraphSinkKindSchema,
-    callChain: z.array(z.object({
-      file: z.string(),
-      line: z.number().int().min(0),
-      symbol: z.string(),
-      role: z.enum(['entrypoint', 'intermediate', 'guard', 'sanitizer', 'sink']),
-    })),
-    dominatingGuards: z.array(z.string()),
-    partialGuards: z.array(z.string()),
-    dominatingSanitizers: z.array(z.string()),
-    isUnguardedPath: z.boolean(),
-    authCheck: z.string(),
-    ownershipCheck: z.string(),
-    severity: z.enum(['critical', 'high', 'medium', 'low']),
-    maskedSnippet: z.string(),
+    entrypointId: z.string(), entrypointSymbol: z.string(), entrypointFile: z.string(), entrypointLine: z.number().int().min(0),
+    routeOrAction: z.string(), httpMethod: z.string().optional(), sinkId: z.string(), sinkSymbol: z.string(), sinkFile: z.string(),
+    sinkLine: z.number().int().min(0), sinkKind: callGraphSinkKindSchema,
+    callChain: z.array(z.object({ file: z.string(), line: z.number().int().min(0), symbol: z.string(), role: z.enum(['entrypoint', 'intermediate', 'guard', 'sanitizer', 'sink']) })),
+    dominatingGuards: z.array(z.string()), partialGuards: z.array(z.string()), dominatingSanitizers: z.array(z.string()),
+    isUnguardedPath: z.boolean(), authCheck: z.string(), ownershipCheck: z.string(), severity: z.enum(['critical', 'high', 'medium', 'low']), maskedSnippet: z.string(),
   })),
-  evidencePath: z.string().optional(),
-  durationMs: z.number().int().min(0),
+  evidencePath: z.string().optional(), durationMs: z.number().int().min(0),
 })
 
 export type WorkerJob = z.input<typeof jobSchema>
@@ -517,6 +440,76 @@ export interface WorkerBackend {
   evictRunWarmPool?(runId: string): Promise<void>
   /** Remove idle warm containers on teardown instead of leaving them on the host. */
   closeWarmPool?(): Promise<void>
+}
+
+export const DOCKER_VERIFY_RAM_GB_PER_SLOT = 1.0
+export const DOCKER_VERIFY_MAX_CEILING = 8
+
+function readHostAvailMemBytes(): number {
+  try {
+    const m = /^MemAvailable:\s+(\d+)\s+kB$/m.exec(readFileSync('/proc/meminfo', 'utf8'))
+    if (m) { const kb = Number(m[1]); if (Number.isFinite(kb) && kb > 0) return kb * 1024 }
+  } catch { /* non-Linux fallback */ }
+  return osFreemem()
+}
+
+/** Hardware concurrency cap for CPU/RAM-bound Docker verification containers (`max(1, min(cpu, floor(availGb / 1.0)))`). */
+export function computeDockerVerifyHardwareCap(input: {
+  cpuCount?: number; availMemBytes?: number; ceiling?: number; env?: NodeJS.ProcessEnv
+} = {}): number {
+  const envRaw = (input.env ?? process.env).KOVO_DOCKER_VERIFY_CONCURRENCY?.trim()
+  if (envRaw) {
+    const parsed = Number(envRaw)
+    if (Number.isFinite(parsed) && parsed > 0) return Math.max(1, Math.min(DOCKER_VERIFY_MAX_CEILING, Math.floor(parsed)))
+  }
+  const hardCeiling = Math.max(1, Math.floor(input.ceiling ?? DOCKER_VERIFY_MAX_CEILING))
+  const cpuCount = Math.max(1, Math.floor(input.cpuCount ?? osCpus().length))
+  const availGb = Math.max(0, input.availMemBytes ?? readHostAvailMemBytes()) / (1024 ** 3)
+  const ramCap = Math.max(1, Math.floor(availGb / DOCKER_VERIFY_RAM_GB_PER_SLOT))
+  return Math.max(1, Math.min(hardCeiling, cpuCount, ramCap))
+}
+
+/** Race-free FIFO bounded semaphore gating concurrent Docker verification container executions. */
+export class DockerVerifySemaphore {
+  readonly maxConcurrent: number
+  private active = 0
+  private peak = 0
+  private readonly waiters: Array<() => void> = []
+  constructor(maxConcurrent: number) { this.maxConcurrent = Math.max(1, Math.floor(maxConcurrent)) }
+  get activeCount(): number { return this.active }
+  get queuedCount(): number { return this.waiters.length }
+  get peakActiveCount(): number { return this.peak }
+  private releasePermit(): void {
+    const next = this.waiters.shift()
+    if (next) { next(); return }
+    this.active = Math.max(0, this.active - 1)
+  }
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    signal?.throwIfAborted()
+    if (this.active < this.maxConcurrent && this.waiters.length === 0) {
+      this.active += 1
+      if (this.active > this.peak) this.peak = this.active
+    } else {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false
+        const onAbort = () => {
+          if (settled) return; settled = true
+          const idx = this.waiters.indexOf(grant); if (idx >= 0) this.waiters.splice(idx, 1)
+          reject(signal?.reason instanceof Error ? signal.reason : new Error('Aborted'))
+        }
+        const grant = () => {
+          if (settled) { this.releasePermit(); return }
+          settled = true; signal?.removeEventListener('abort', onAbort)
+          if (signal?.aborted) { this.releasePermit(); reject(signal.reason instanceof Error ? signal.reason : new Error('Aborted')); return }
+          resolve()
+        }
+        signal?.addEventListener('abort', onAbort, { once: true })
+        this.waiters.push(grant)
+      })
+    }
+    let released = false
+    return () => { if (!released) { released = true; this.releasePermit() } }
+  }
 }
 
 function clamp(val: number | undefined, fallback: number, min: number, max: number): number {
@@ -2130,6 +2123,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
   private readonly warmPools = new Map<string, WarmPoolSlot>()
   private readonly runRepoSnapshots = new Map<string, RunRepoSnapshotLease>()
   private readonly runVerifyPool: RunContainerPool
+  private readonly verifySemaphore: DockerVerifySemaphore
   private activeWarmPoolPolicy?: string
   private readonly maxWarmPools: number
   private desiredWarmCapacity?: number
@@ -2140,6 +2134,10 @@ export class LinuxWorkerBackend implements WorkerBackend {
   private sessionsServed = 0
   private coldSessionCreates = 0
   private reclaiming?: Promise<void>
+  get dockerVerifyHardwareCap(): number { return this.verifySemaphore.maxConcurrent }
+  get verifySemaphoreStats() {
+    return { maxConcurrent: this.verifySemaphore.maxConcurrent, activeCount: this.verifySemaphore.activeCount, queuedCount: this.verifySemaphore.queuedCount, peakActiveCount: this.verifySemaphore.peakActiveCount }
+  }
 
   constructor(input: {
     image?: string
@@ -2157,11 +2155,15 @@ export class LinuxWorkerBackend implements WorkerBackend {
     isPidAlive?: (pid: number) => boolean
     readPidStartTime?: (pid: number) => string | null
     maxWarmPools?: number
+    maxConcurrentVerifyContainers?: number
   } = {}) {
     const {
       image = 'kovo-worker:v4', imageId, sourceHash, workspace, runId, dockerRunner, sessionSpawner, execSpawner,
-      staleCreatedMs, foreignOwnerTtlMs, ownerPidNs, cell, isPidAlive, readPidStartTime, maxWarmPools,
+      staleCreatedMs, foreignOwnerTtlMs, ownerPidNs, cell, isPidAlive, readPidStartTime, maxWarmPools, maxConcurrentVerifyContainers,
     } = input
+    this.verifySemaphore = new DockerVerifySemaphore(
+      maxConcurrentVerifyContainers !== undefined ? Math.max(1, Math.floor(maxConcurrentVerifyContainers)) : computeDockerVerifyHardwareCap(),
+    )
     this.image = input.image ?? (process.env.KOVO_WORKER_IMAGE?.trim() || image)
     this.customDockerRunner = dockerRunner !== undefined
     this.explicitImageId = imageId !== undefined ? (imageId?.trim() || null) : undefined
@@ -2758,6 +2760,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     await ensureWorkerImageAvailable(this.image, this.docker, signal)
     await this.reclaimInactive()
     signal.throwIfAborted()
+    const releaseVerify = await this.verifySemaphore.acquire(signal)
     const name = 'kovo-' + randomUUID()
     const timeoutMs = (req.timeoutMs ?? 30_000) + 15_000
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
@@ -2774,6 +2777,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       repoAcquisition?.release()
       this.activeContainers.delete(name)
       liveContainers.delete(name)
+      releaseVerify()
     }
   }
 
@@ -2782,14 +2786,14 @@ export class LinuxWorkerBackend implements WorkerBackend {
     await ensureWorkerImageAvailable(this.image, this.docker, signal)
     await this.reclaimInactive()
     signal.throwIfAborted()
-    // Per-run warm verify container first when `rpcMountDir` is set without `/repos`:
-    // reuses at most one hardened `--network none` verify container per run with disjoint per-attempt RPC dirs.
+    const releaseVerify = options?.rpcMountDir ? await this.verifySemaphore.acquire(signal) : undefined
     const verifyRunKey = options?.rpcMountDir && !options.reposDir && warmWorkersEnabled()
-      ? (this.resolveRunKeyForOptions(options) ?? readVerifyContextRunId(options.rpcMountDir))
-      : undefined
-    let verifyLease: RunVerifyAttemptLease | null = verifyRunKey && options?.rpcMountDir
-      ? await this.runVerifyPool.acquireVerifyAttempt({ runKey: verifyRunKey, rpcMountDir: options.rpcMountDir, signal, options })
-      : null
+      ? (this.resolveRunKeyForOptions(options) ?? readVerifyContextRunId(options.rpcMountDir)) : undefined
+    let verifyLease: RunVerifyAttemptLease | null = null
+    if (verifyRunKey && options?.rpcMountDir) {
+      try { verifyLease = await this.runVerifyPool.acquireVerifyAttempt({ runKey: verifyRunKey, rpcMountDir: options.rpcMountDir, signal, options }) }
+      catch (err) { releaseVerify?.(); throw err }
+    }
     // Warm work-pool lookup: strictly scoped to caller's explicit `warmPoolPolicy` or `runId`
     // (never mutable backend-global state) so concurrent runs never steal each other's containers.
     const requestedPolicy = options?.warmPoolPolicy?.trim()
@@ -2873,7 +2877,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
         await createColdSessionContainer(name)
       } catch (error) {
         await this.removeContainer(name)
-        cleanupRepos(); releaseWarmRepos(); releaseSlot()
+        cleanupRepos(); releaseWarmRepos(); releaseSlot(); releaseVerify?.()
         this.activeContainers.delete(name); liveContainers.delete(name)
         throw error
       }
@@ -2893,20 +2897,17 @@ export class LinuxWorkerBackend implements WorkerBackend {
         cleanupRepos(); releaseWarmRepos(); releaseSlot()
         this.activeContainers.delete(name); liveContainers.delete(name)
       }
-      if (!pooled && !failedVerify) throw error
+      if (!pooled && !failedVerify) { releaseVerify?.(); throw error }
       pooled = false
       name = 'kovo-' + randomUUID()
       this.coldSessionCreates += 1
-      this.activeContainers.add(name)
-      trackLiveContainer(name)
+      this.activeContainers.add(name); trackLiveContainer(name)
       try {
         await createColdSessionContainer(name)
         cli = this.spawnSession(name)
       } catch (coldError) {
-        await this.removeContainer(name)
-        cleanupRepos()
-        this.activeContainers.delete(name)
-        liveContainers.delete(name)
+        await this.removeContainer(name); cleanupRepos(); releaseVerify?.()
+        this.activeContainers.delete(name); liveContainers.delete(name)
         throw coldError
       }
     }
@@ -2982,33 +2983,20 @@ export class LinuxWorkerBackend implements WorkerBackend {
       for (const line of lines) handleLine(line)
     })
     cli.once('close', code => {
-      closed = true
-      exited = true
-      resolveExit?.()
+      closed = true; exited = true; resolveExit?.()
       failAll(new Error(formatWorkerFailure(Buffer.concat(sessionStderr).toString('utf8'), code).replace(/^The isolated worker failed/, 'Isolated worker session exited unexpectedly')))
-      if (verifyLease) {
-        void verifyLease.release()
-        return
-      }
+      if (verifyLease) { void verifyLease.release().finally(() => releaseVerify?.()); return }
       this.activeContainers.delete(name)
       if (!preserveOnExit) {
         liveContainers.delete(name)
-        void removeContainer().finally(() => { cleanupRepos(); releaseWarmRepos(); releaseSlot() })
+        void removeContainer().finally(() => { cleanupRepos(); releaseWarmRepos(); releaseSlot(); releaseVerify?.() })
       }
     })
     cli.once('error', error => {
-      closed = true
-      exited = true
-      resolveExit?.()
-      failAll(error)
-      if (verifyLease) {
-        void verifyLease.release()
-        return
-      }
-      preserveOnExit = false
-      this.activeContainers.delete(name)
-      liveContainers.delete(name)
-      void removeContainer().finally(() => { cleanupRepos(); releaseWarmRepos(); releaseSlot() })
+      closed = true; exited = true; resolveExit?.(); failAll(error)
+      if (verifyLease) { void verifyLease.release().finally(() => releaseVerify?.()); return }
+      preserveOnExit = false; this.activeContainers.delete(name); liveContainers.delete(name)
+      void removeContainer().finally(() => { cleanupRepos(); releaseWarmRepos(); releaseSlot(); releaseVerify?.() })
     })
 
     const close = () => {
@@ -3018,9 +3006,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
         if (verifyLease) {
           try { if (cli.stdin && !cli.stdin.writableEnded && !cli.stdin.destroyed) cli.stdin.end(JSON.stringify({ id: 'shutdown', op: 'shutdown' }) + '\n') } catch { /* ignore */ }
           try { cli.kill() } catch { /* ignore */ }
-          failAll(new Error('Isolated worker session closed.'))
-          cli.stdout?.removeAllListeners('data')
-          await verifyLease.release()
+          failAll(new Error('Isolated worker session closed.')); cli.stdout?.removeAllListeners('data')
+          await verifyLease.release().finally(() => releaseVerify?.())
           return
         }
         const reusable = pooled && activePool?.enabled === true && activeSlot !== undefined
@@ -3074,12 +3061,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
         }
         preserveOnExit = false
         await this.removeContainer(name)
-        cleanupRepos()
-        releaseWarmRepos()
-        releaseSlot()
-        this.pooled.delete(name)
-        this.activeContainers.delete(name)
-        liveContainers.delete(name)
+        cleanupRepos(); releaseWarmRepos(); releaseSlot(); releaseVerify?.()
+        this.pooled.delete(name); this.activeContainers.delete(name); liveContainers.delete(name)
       })()
       return closing
     }
