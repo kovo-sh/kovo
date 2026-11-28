@@ -179,7 +179,11 @@ export function ModelProfileSheet({
               name: String(form.get('name') ?? '').trim() || defaults.name,
               endpoint: String(form.get('endpoint') ?? DEFAULT_PROVIDER.endpoint),
               model: String(form.get('model') ?? DEFAULT_PROVIDER.model),
-              protocol: form.get('protocol') === 'messages' ? 'messages' as const : 'responses' as const,
+              protocol: form.get('protocol') === 'messages'
+                ? 'messages' as const
+                : form.get('protocol') === 'chat-completions'
+                  ? 'chat-completions' as const
+                  : 'responses' as const,
               key: String(form.get('key') ?? ''),
               priority: Number(form.get('priority') ?? nextPriority),
               enabled: form.has('enabled'),
@@ -482,6 +486,7 @@ export function ModelProfileSheet({
                     Protocol
                     <NativeSelect className={SELECT_CLASS} name="protocol" defaultValue={defaults.protocol}>
                       <option value="responses">OpenAI Responses</option>
+                      <option value="chat-completions">OpenAI Chat Completions</option>
                       <option value="messages">Anthropic Messages</option>
                     </NativeSelect>
                   </label>

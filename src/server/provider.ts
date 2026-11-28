@@ -1,6 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { createModels, createProvider } from '@earendil-works/pi-ai/models'
 import { stream as responses, streamSimple as simpleResponses } from '@earendil-works/pi-ai/api/openai-responses'
+import { stream as chatCompletions, streamSimple as simpleChatCompletions } from '@earendil-works/pi-ai/api/openai-completions'
 import { stream as messages, streamSimple as simpleMessages } from '@earendil-works/pi-ai/api/anthropic-messages'
 import type { Api, Model, ProviderStreams } from '@earendil-works/pi-ai'
 import { obj, str } from '@earendil-works/pi-schema'
@@ -16,7 +17,13 @@ import {
   type ProviderRuntimePolicy,
 } from './provider-runtime-policy.ts'
 import {
+  SseUsageAccumulator,
+  applySessionAffinityHeaders,
+  clampProviderCooldownMs,
   defaultStreamResponseLimit,
+  extractChatCompletionsToolCallDeltas,
+  inspectMorphBurstCooldown,
+  noteProfileCooldownHandoff,
   redactProviderText,
   resolveSecretSource,
   sanitizeProviderStream,
@@ -24,7 +31,7 @@ import {
   scrubOutboundProviderRequest,
   verifyOutboundProviderRequestIntegrity,
 } from './provider-stream.ts'
-import type { ProviderStreamTelemetry, SecretSource } from './provider-stream.ts'
+import type { MorphBurstCooldown, ProviderStreamTelemetry, SecretSource } from './provider-stream.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import { computeProviderRetryBackoffMs, noteLatestProviderFailureForProfile, shouldRetryProviderTransport } from './retry-governor.ts'
@@ -36,7 +43,7 @@ import {
 
 export type { SecretSource }
 
-type Protocol = 'openai-responses' | 'anthropic-messages'
+type Protocol = 'openai-responses' | 'anthropic-messages' | 'openai-completions'
 
 const providerId = 'kovo'
 export const defaultMaxRequestBytes = 4 * 1024 * 1024
@@ -169,6 +176,17 @@ export class SseToolCallArgTracker {
 
   feedData(data: Record<string, unknown> | '[DONE]' | undefined): void {
     if (!data || data === '[DONE]') return
+    if (Array.isArray(data.choices)) {
+      const cc = extractChatCompletionsToolCallDeltas(data)
+      if (cc.truncatedByLength) this.truncatedByMaxTokens = true
+      for (const tc of cc.toolCalls) {
+        const slot = this.getOrCreateSlot(tc.index, [tc.callId])
+        if (tc.callId) slot.callId = tc.callId
+        if (tc.name) slot.name = tc.name
+        if (tc.argumentsDelta) slot.deltaText += tc.argumentsDelta
+      }
+      return
+    }
     const type = typeof data.type === 'string' ? data.type : ''
 
     // OpenAI Responses API events
@@ -798,8 +816,17 @@ export function evaluateRoleProviderCircuit(
 
 export type ProviderConfig = Pick<ProviderSettings, 'endpoint' | 'model' | 'protocol' | 'key'> & Partial<ProviderSettings>
 
+export interface ProviderFailureCallbackMeta {
+  kind?: ProviderFailureKind
+  status?: number | null
+  retryAfterMs?: number | null
+  burstExhausted?: boolean
+}
+
 export type ProviderOptions = {
   signal?: AbortSignal
+  /** Optional session identifier propagated to prompt_cache_key and session-affinity headers. */
+  sessionId?: string
   record?: CallRecorder
   secrets?: SecretSource
   maxCalls?: number
@@ -831,7 +858,7 @@ export type ProviderOptions = {
   /** Called in real time on each upstream SSE data frame (resets no-token stall watchdogs). */
   onStreamActivity?: () => void
   onProfileSuccess?: (profileId: string) => void
-  onProfileFailure?: (profileId: string, err: string, hard: boolean) => void
+  onProfileFailure?: (profileId: string, err: string, hard: boolean, meta?: ProviderFailureCallbackMeta) => void
   /** Optional test/embedder fetch seam (production traffic always routes through `EgressGateway`). */
   fetch?: typeof fetch
   /** Optional injectable DNS resolver passed to `EgressGateway` for deterministic SSRF/rebinding tests. */
@@ -854,135 +881,9 @@ export function estimateCostUsd(
   ) / 1_000_000
 }
 
-const STREAM_DELTA_TEXT_EVENT_TYPES = new Set([
-  'response.output_text.delta',
-  'response.refusal.delta',
-  'response.reasoning_text.delta',
-  'response.reasoning_summary_text.delta',
-  'response.function_call_arguments.delta',
-  'response.custom_tool_call_input.delta',
-])
-
-function readFiniteNonNegativeNumber(value: unknown): number | undefined {
-  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value
-  if (typeof value === 'string' && value.trim()) {
-    const parsed = Number(value)
-    if (Number.isFinite(parsed) && parsed >= 0) return parsed
-  }
-  return undefined
-}
-
-class SseUsageAccumulator {
-  private rawInputTokens = 0
-  private cachedInputTokens = 0
-  private outputTokens = 0
-  private anthropicCacheRead = 0
-  private reasoningTokens = 0
-  private providerReportedCostUsd: number | undefined
-  private streamedDeltaChars = 0
-
-  feedData(data: Record<string, unknown> | '[DONE]' | undefined): void {
-    if (!data || data === '[DONE]') return
-    const type = typeof data.type === 'string' ? data.type : ''
-    if (STREAM_DELTA_TEXT_EVENT_TYPES.has(type) && typeof data.delta === 'string') {
-      this.streamedDeltaChars += data.delta.length
-    } else if (type === 'content_block_delta') {
-      const delta = data.delta && typeof data.delta === 'object' && !Array.isArray(data.delta)
-        ? data.delta as Record<string, unknown>
-        : undefined
-      if (delta) {
-        if (typeof delta.text === 'string') this.streamedDeltaChars += delta.text.length
-        if (typeof delta.thinking === 'string') this.streamedDeltaChars += delta.thinking.length
-        if (typeof delta.partial_json === 'string') this.streamedDeltaChars += delta.partial_json.length
-      }
-    }
-
-    const responseObj = data.response as Record<string, unknown> | undefined
-    const responseUsage = responseObj?.usage as Record<string, unknown> | undefined
-    const topUsage = data.usage as Record<string, unknown> | undefined
-    const msgUsage = (data.message as Record<string, unknown> | undefined)?.usage as Record<string, unknown> | undefined
-    const usage = responseUsage ?? topUsage ?? msgUsage
-
-    const reportedCost =
-      readFiniteNonNegativeNumber(usage?.cost) ??
-      readFiniteNonNegativeNumber(usage?.total_cost) ??
-      readFiniteNonNegativeNumber(usage?.cost_usd) ??
-      readFiniteNonNegativeNumber(responseObj?.cost) ??
-      readFiniteNonNegativeNumber(data.cost)
-    if (reportedCost !== undefined) {
-      if (this.providerReportedCostUsd === undefined || reportedCost > this.providerReportedCostUsd) {
-        this.providerReportedCostUsd = reportedCost
-      }
-    }
-
-    if (!usage) return
-    const inp = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0)
-    const out = Number(usage.output_tokens ?? usage.completion_tokens ?? 0)
-    const inputDetails = usage.input_tokens_details as Record<string, unknown> | undefined
-    const promptDetails = usage.prompt_tokens_details as Record<string, unknown> | undefined
-    const outputDetails = usage.output_tokens_details as Record<string, unknown> | undefined
-    const completionDetails = usage.completion_tokens_details as Record<string, unknown> | undefined
-    const openaiCached = Number(inputDetails?.cached_tokens ?? promptDetails?.cached_tokens ?? 0)
-    const msgCached = Number(usage.cache_read_input_tokens ?? 0)
-    const reasoning = Number(
-      outputDetails?.reasoning_tokens
-      ?? completionDetails?.reasoning_tokens
-      ?? usage.reasoning_tokens
-      ?? usage.thinking_tokens
-      ?? 0,
-    )
-    if (Number.isFinite(inp) && inp > this.rawInputTokens) this.rawInputTokens = inp
-    if (Number.isFinite(out) && out > this.outputTokens) this.outputTokens = out
-    if (Number.isFinite(openaiCached) && openaiCached > this.cachedInputTokens) this.cachedInputTokens = openaiCached
-    if (Number.isFinite(msgCached) && msgCached > this.anthropicCacheRead) this.anthropicCacheRead = msgCached
-    if (Number.isFinite(reasoning) && reasoning > this.reasoningTokens) this.reasoningTokens = reasoning
-  }
-
-  feedSseText(sseText: string): void {
-    for (const line of sseText.split('\n')) {
-      if (!line.startsWith('data: ') || line === 'data: [DONE]') continue
-      try {
-        const data = JSON.parse(line.slice(6)) as Record<string, unknown>
-        this.feedData(data)
-      } catch {
-        // Ignore unparseable frames.
-      }
-    }
-  }
-
-  reasoningSnapshot(): number {
-    return this.reasoningTokens
-  }
-
-  reportedCostSnapshot(): number | undefined {
-    return this.providerReportedCostUsd
-  }
-
-  streamedDeltaCharsSnapshot(): number {
-    return this.streamedDeltaChars
-  }
-
-  snapshot(protocol: 'responses' | 'messages' = 'responses'): {
-    inputTokens: number
-    cachedInputTokens: number
-    outputTokens: number
-  } {
-    if (protocol === 'messages' && this.anthropicCacheRead > 0) {
-      // Anthropic Messages reports `input_tokens` excluding `cache_read_input_tokens`.
-      return {
-        inputTokens: this.rawInputTokens + this.anthropicCacheRead,
-        cachedInputTokens: this.anthropicCacheRead,
-        outputTokens: this.outputTokens,
-      }
-    }
-    const effectiveCached = Math.min(this.rawInputTokens, Math.max(this.cachedInputTokens, this.anthropicCacheRead))
-    return { inputTokens: this.rawInputTokens, cachedInputTokens: effectiveCached, outputTokens: this.outputTokens }
-  }
-}
-
 export function extractUsageFromSse(
   sseText: string,
-  protocol: 'responses' | 'messages' = 'responses',
+  protocol: ProviderSettings['protocol'] = 'responses',
 ): { inputTokens: number; cachedInputTokens: number; outputTokens: number } {
   const acc = new SseUsageAccumulator()
   acc.feedSseText(sseText)
@@ -1088,6 +989,10 @@ interface MakeFetchInternalOptions {
   attemptTelemetryState?: { recorded: boolean }
   /** Optional per-attempt typed failure carrier populated by `makeFetch` for `providerPool` / callers. */
   attemptFailureState?: { error?: ProviderFailureError }
+  /** Optional per-attempt proactive burst cooldown carrier populated from Morph Ultra 2xx headers. */
+  attemptBurstCooldownState?: { cooldown?: MorphBurstCooldown }
+  /** Optional resolved session ID for session-affinity headers. */
+  sessionId?: string
   /** Resolved per-candidate `ProviderRuntimePolicy` (recomputed per failover candidate). */
   candidatePolicy?: ProviderRuntimePolicy
 }
@@ -1099,7 +1004,10 @@ function isStallAbortReason(reason: unknown): boolean {
   return typeof reason === 'string' && STALL_ERROR_RE.test(reason)
 }
 
-function createTelemetryEmitter(options: Pick<ProviderOptions, 'runId' | 'onTelemetry'>) {
+function createTelemetryEmitter(
+  options: Pick<ProviderOptions, 'runId' | 'onTelemetry'>,
+  defaults?: Pick<ProviderUsageTelemetryInput, 'profileId' | 'providerName' | 'model'>,
+) {
   const normalizedRunId = typeof options.runId === 'string' ? options.runId.trim() : ''
   const hasRunId = normalizedRunId.length > 0
   const onTelemetry = options.onTelemetry
@@ -1108,6 +1016,7 @@ function createTelemetryEmitter(options: Pick<ProviderOptions, 'runId' | 'onTele
   return (event: Omit<ProviderUsageTelemetryInput, 'runId'>) => {
     const payload: ProviderUsageTelemetryInput = {
       runId: effectiveRunId,
+      ...defaults,
       ...event,
     }
     if (hasRunId) {
@@ -1117,6 +1026,43 @@ function createTelemetryEmitter(options: Pick<ProviderOptions, 'runId' | 'onTele
       try { onTelemetry(payload) } catch { /* telemetry observer must never throw */ }
     }
   }
+}
+
+function resolveProviderEndpoint(settings: Pick<ProviderConfig, 'endpoint' | 'protocol'>): string {
+  if (settings.protocol === 'responses') return settings.endpoint + '/responses'
+  if (settings.protocol === 'chat-completions') return settings.endpoint + '/chat/completions'
+  return settings.endpoint.replace(/\/v1$/, '') + '/v1/messages'
+}
+
+function notifyProactiveBurstCooldown(
+  profileId: string | undefined,
+  status: number,
+  burst: MorphBurstCooldown,
+  onProfileFailure?: ProviderOptions['onProfileFailure'],
+): number {
+  const now = Date.now()
+  const cooldownUntilMs = now + clampProviderCooldownMs(burst.retryAfterMs)
+  if (profileId) {
+    noteLatestProviderFailureForProfile(profileId, {
+      kind: 'rate_limited',
+      hard: false,
+      status,
+      recordedAt: now,
+    })
+    noteProfileCooldownHandoff(profileId, {
+      retryAfterMs: burst.retryAfterMs,
+      cooldownUntilMs,
+      burstExhausted: true,
+      recordedAt: now,
+    })
+    onProfileFailure?.(profileId, burst.reason, false, {
+      kind: 'rate_limited',
+      status,
+      retryAfterMs: burst.retryAfterMs,
+      burstExhausted: true,
+    })
+  }
+  return cooldownUntilMs
 }
 
 function isTransientHttpStatus(status: number): boolean {
@@ -1133,10 +1079,12 @@ function makeFetch(
 ) {
   const chargeLogicalTurn = internal.chargeLogicalTurn ?? true
   const retryTransientInFetch = internal.retryTransientInFetch ?? false
-  const emitTelemetry = createTelemetryEmitter(options)
-  const endpoint = settings.protocol === 'responses'
-    ? settings.endpoint + '/responses'
-    : settings.endpoint.replace(/\/v1$/, '') + '/v1/messages'
+  const emitTelemetry = createTelemetryEmitter(options, {
+    ...(profileId ?? settings.id ? { profileId: profileId ?? settings.id } : {}),
+    ...(settings.name ? { providerName: settings.name } : {}),
+    ...(settings.model ? { model: settings.model } : {}),
+  })
+  const endpoint = resolveProviderEndpoint(settings)
   const maxRequestBytes = Math.max(
     64 * 1024,
     Math.min(maxRequestBytesCeiling, options.maxRequestBytes ?? defaultMaxRequestBytes),
@@ -1148,28 +1096,20 @@ function makeFetch(
   })
   const firstEventTimeoutMs = options.runtimePolicyManaged
     ? candidatePolicy.firstEventTimeoutMs
-    : (options.firstEventTimeoutMs ?? (Number.isFinite(Number(process.env.KOVO_PROVIDER_FIRST_EVENT_TIMEOUT_MS)) && Number(process.env.KOVO_PROVIDER_FIRST_EVENT_TIMEOUT_MS) > 0 ? Math.floor(Number(process.env.KOVO_PROVIDER_FIRST_EVENT_TIMEOUT_MS)) : defaultFirstEventTimeoutMs))
+    : (options.firstEventTimeoutMs ?? (Number(process.env.KOVO_PROVIDER_FIRST_EVENT_TIMEOUT_MS) > 0 ? Math.floor(Number(process.env.KOVO_PROVIDER_FIRST_EVENT_TIMEOUT_MS)) : defaultFirstEventTimeoutMs))
   const idleTimeoutMs = options.runtimePolicyManaged
     ? candidatePolicy.idleTimeoutMs
-    : (options.idleTimeoutMs ?? (Number.isFinite(Number(process.env.KOVO_PROVIDER_IDLE_TIMEOUT_MS)) && Number(process.env.KOVO_PROVIDER_IDLE_TIMEOUT_MS) > 0 ? Math.floor(Number(process.env.KOVO_PROVIDER_IDLE_TIMEOUT_MS)) : defaultIdleTimeoutMs))
-  const totalTimeoutMs = options.runtimePolicyManaged
-    ? candidatePolicy.totalTimeoutMs
-    : (options.totalTimeoutMs ?? defaultTotalTimeoutMs)
+    : (options.idleTimeoutMs ?? (Number(process.env.KOVO_PROVIDER_IDLE_TIMEOUT_MS) > 0 ? Math.floor(Number(process.env.KOVO_PROVIDER_IDLE_TIMEOUT_MS)) : defaultIdleTimeoutMs))
+  const totalTimeoutMs = options.runtimePolicyManaged ? candidatePolicy.totalTimeoutMs : (options.totalTimeoutMs ?? defaultTotalTimeoutMs)
   const responseLimit = options.responseLimit ?? defaultStreamResponseLimit
-  const maxTransportRetries = options.maxTransportRetries !== undefined
-    ? Math.max(0, Math.floor(options.maxTransportRetries))
-    : defaultMaxTransportRetries
-  const retryBaseMs = options.transportRetryBaseMs !== undefined && Number.isFinite(options.transportRetryBaseMs)
-    ? Math.max(0, Math.floor(options.transportRetryBaseMs))
-    : defaultTransportRetryBaseMs
+  const maxTransportRetries = options.maxTransportRetries !== undefined ? Math.max(0, Math.floor(options.maxTransportRetries)) : defaultMaxTransportRetries
+  const retryBaseMs = options.transportRetryBaseMs !== undefined && Number.isFinite(options.transportRetryBaseMs) ? Math.max(0, Math.floor(options.transportRetryBaseMs)) : defaultTransportRetryBaseMs
   const getSecrets = (): readonly NamedSecret[] => resolveSecretSource(options.secrets)
 
   const send: typeof fetch = async (input, init) => {
     options.beforeCall?.()
     if (chargeLogicalTurn) {
-      if (callCounter.count + 1 > callCounter.maxCalls) {
-        throw new BudgetExceededError('The model call budget for this operation was reached.')
-      }
+      if (callCounter.count + 1 > callCounter.maxCalls) throw new BudgetExceededError('The model call budget for this operation was reached.')
       callCounter.count += 1
     }
     const request = new Request(input, init)
@@ -1181,41 +1121,30 @@ function makeFetch(
       throw new Error('Offline mode requires a loopback model fixture endpoint.')
     }
     const headers = new Headers(request.headers)
-    // R2-H-2: Explicitly strip any incoming auth headers (e.g. primary pool key injected by SDK
-    // auth resolver or caller opts) and stamp solely from this candidate profile's `settings.key`.
-    headers.delete('authorization')
-    headers.delete('x-api-key')
-    headers.delete('api-key')
+    // R2-H-2: Explicitly strip incoming auth headers and stamp solely from this candidate profile's `settings.key`.
+    headers.delete('authorization'); headers.delete('x-api-key'); headers.delete('api-key')
     const endpointOrigin = new URL(endpoint).origin
-    if (endpointOrigin === 'https://openrouter.ai' || settings.protocol === 'responses') {
+    if (endpointOrigin === 'https://openrouter.ai' || settings.protocol === 'responses' || settings.protocol === 'chat-completions') {
       headers.set('authorization', 'Bearer ' + settings.key)
     } else {
       headers.set('x-api-key', settings.key)
     }
+    applySessionAffinityHeaders(headers, actual, internal.sessionId ?? options.sessionId)
 
     const raw = await request.text()
-    if (Buffer.byteLength(raw) > maxRequestBytes) {
-      throw new Error('The model request exceeded Kovo’s size limit.')
-    }
+    if (Buffer.byteLength(raw) > maxRequestBytes) throw new Error('The model request exceeded Kovo’s size limit.')
     const payload = JSON.parse(raw) as Record<string, unknown>
-    // R3-H-10 / H-8: Scrub live registered/rotated secrets EXCLUSIVELY from content-bearing
-    // leaves in outbound model requests (never object keys, roles, types, enums, tool_choice,
-    // reasoning config, or tool definitions/schemas).
+    // R3-H-10 / H-8: Scrub live registered/rotated secrets EXCLUSIVELY from content-bearing leaves.
     const currentSecrets = getSecrets()
     const scrubbedPayload = scrubOutboundProviderRequest(payload, settings.key, currentSecrets)
     const integrityViolation = verifyOutboundProviderRequestIntegrity(payload, scrubbedPayload)
     if (integrityViolation) {
-      throw new ProviderRequestMutationError(
-        `Local provider request integrity check failed: protected protocol field "${integrityViolation}" was corrupted before egress.`,
-      )
+      throw new ProviderRequestMutationError(`Local provider request integrity check failed: protected protocol field "${integrityViolation}" was corrupted before egress.`)
     }
     const locallyMutated = scrubbedPayload !== payload
     const outboundRaw = locallyMutated ? JSON.stringify(scrubbedPayload) : raw
-    if (outboundRaw !== raw && Buffer.byteLength(outboundRaw) > maxRequestBytes) {
-      throw new Error('The model request exceeded Kovo’s size limit.')
-    }
+    if (outboundRaw !== raw && Buffer.byteLength(outboundRaw) > maxRequestBytes) throw new Error('The model request exceeded Kovo’s size limit.')
     const estimatedRequestInputTokens = Math.max(1, Math.ceil(Buffer.byteLength(outboundRaw, 'utf8') / 4))
-
     const targetUrl = beta ? endpoint + '?beta=true' : endpoint
     const allowLocalModel = isLocalModelEnvEnabled()
 
@@ -1311,7 +1240,8 @@ function makeFetch(
         if (!response.ok) {
           clearFirstEventTimer()
           const errText = await response.text().catch(() => '')
-          const retryAfterMs = parseRetryAfterMs(response.headers.get('retry-after'))
+          const morphBurst429 = response.status === 429 ? inspectMorphBurstCooldown(response.headers) : null
+          const retryAfterMs = parseRetryAfterMs(response.headers.get('retry-after')) ?? morphBurst429?.retryAfterMs
           const effectiveStatus = response.status === 429 && isQuotaBody(errText) ? 402 : response.status
           const localMutationDiagnostic = effectiveStatus === 400
             ? diagnoseLocalMutation400(errText, locallyMutated, settings.key, currentSecrets)
@@ -1361,6 +1291,11 @@ function makeFetch(
           return new Response(error, { status: effectiveStatus, headers: { 'content-type': 'application/json' } })
         }
 
+        const morphBurst2xx = inspectMorphBurstCooldown(response.headers)
+        if (morphBurst2xx) {
+          if (internal.attemptBurstCooldownState) internal.attemptBurstCooldownState.cooldown = morphBurst2xx
+          else notifyProactiveBurstCooldown(profileId, response.status, morphBurst2xx, options.onProfileFailure)
+        }
         if (!response.body || !contentType.toLowerCase().includes('text/event-stream')) {
           clearFirstEventTimer()
           await response.body?.cancel()
@@ -1788,6 +1723,52 @@ function wrapStreamWithToolCallIntegrity<TStream extends ReturnType<ProviderStre
   return wrapped as unknown as TStream
 }
 
+function buildModelCompat(settings: Pick<ProviderConfig, 'endpoint'>) {
+  let isOpenRouter = false
+  try {
+    const host = new URL(settings.endpoint).hostname.toLowerCase()
+    isOpenRouter = host === 'openrouter.ai' || host.endsWith('.openrouter.ai')
+  } catch {
+    isOpenRouter = settings.endpoint.toLowerCase().includes('openrouter.ai')
+  }
+  return {
+    promptCacheKeyMode: 'enabled' as const,
+    sendSessionAffinityHeaders: true,
+    sessionAffinityFormat: isOpenRouter ? ('openrouter' as const) : ('openai' as const),
+  }
+}
+
+function protocolToApi(protocol: ProviderSettings['protocol']): Protocol {
+  if (protocol === 'responses') return 'openai-responses'
+  if (protocol === 'chat-completions') return 'openai-completions'
+  return 'anthropic-messages'
+}
+
+function buildProviderModel(
+  settings: ProviderConfig,
+  api: Protocol,
+  candidatePolicy: ProviderRuntimePolicy,
+): Model<Protocol> {
+  return {
+    id: settings.model,
+    name: settings.model,
+    provider: providerId,
+    api,
+    baseUrl: settings.protocol === 'messages' ? settings.endpoint.replace(/\/v1$/, '') : settings.endpoint,
+    input: ['text'],
+    reasoning: candidatePolicy.thinkingLevel !== 'off',
+    contextWindow: candidatePolicy.contextWindow,
+    maxTokens: candidatePolicy.maxTokens,
+    cost: {
+      input: candidatePolicy.pricing.inputCostPerMtok,
+      output: candidatePolicy.pricing.outputCostPerMtok,
+      cacheRead: candidatePolicy.pricing.cachedInputCostPerMtok,
+      cacheWrite: 0,
+    },
+    compat: buildModelCompat(settings) as Model<Protocol>['compat'],
+  }
+}
+
 function buildSingleStreamImpl(
   settings: ProviderConfig,
   scenario: string,
@@ -1796,7 +1777,7 @@ function buildSingleStreamImpl(
   profileId?: string,
   fetchInternal: MakeFetchInternalOptions = {},
 ) {
-  const api: Protocol = settings.protocol === 'responses' ? 'openai-responses' : 'anthropic-messages'
+  const api = protocolToApi(settings.protocol)
   const effectiveThinking: ThinkingLevel = scenario === 'connection'
     ? 'off'
     : (options.thinkingLevel ?? settings.thinkingLevel ?? DEFAULT_PROVIDER.thinkingLevel)
@@ -1805,27 +1786,9 @@ function buildSingleStreamImpl(
     purpose: scenario === 'connection' ? 'connection' : options.purpose,
     thinkingLevel: effectiveThinking,
   })
-  const maxTokens = candidatePolicy.maxTokens
-  const contextWindow = candidatePolicy.contextWindow
   const activeThinking = candidatePolicy.thinkingLevel
   const thinkingEnabled = activeThinking !== 'off'
-  const model: Model<Protocol> = {
-    id: settings.model,
-    name: settings.model,
-    provider: providerId,
-    api,
-    baseUrl: settings.protocol === 'messages' ? settings.endpoint.replace(/\/v1$/, '') : settings.endpoint,
-    input: ['text'],
-    reasoning: thinkingEnabled,
-    contextWindow,
-    maxTokens,
-    cost: {
-      input: candidatePolicy.pricing.inputCostPerMtok,
-      output: candidatePolicy.pricing.outputCostPerMtok,
-      cacheRead: candidatePolicy.pricing.cachedInputCostPerMtok,
-      cacheWrite: 0,
-    },
-  }
+  const model = buildProviderModel(settings, api, candidatePolicy)
   const connection = scenario === 'connection'
   const chooseEvidenceTool = (transcript: { messages: { role: string }[] }) =>
     (scenario === 'worker-analysis' || scenario === 'response-analysis') && transcript.messages.at(-1)?.role === 'user'
@@ -1833,91 +1796,88 @@ function buildSingleStreamImpl(
   const effectiveTotalTimeoutMs = options.runtimePolicyManaged
     ? candidatePolicy.totalTimeoutMs
     : (options.totalTimeoutMs ?? defaultTotalTimeoutMs)
-  const makeCallContext = () => {
+  const makeCallContext = (effectiveSessionId?: string) => {
     options.onCandidatePolicy?.(candidatePolicy, settings)
     const tracker = new SseToolCallArgTracker()
     const send = makeFetch(settings, scenario, options, callCounter, profileId, {
       ...fetchInternal,
       argTracker: tracker,
       candidatePolicy,
+      ...(effectiveSessionId ? { sessionId: effectiveSessionId } : {}),
     })
     const streamOpts = {
       fetch: send,
-      maxTokens,
+      maxTokens: candidatePolicy.maxTokens,
       maxRetries: 0,
-      // Total call ceiling for the SDK; per-chunk idle timeouts are enforced inside `makeFetch`
-      // and reset in real time on every upstream SSE frame via `sanitizeProviderStream`.
       timeoutMs: effectiveTotalTimeoutMs,
-      // R2-H-2: Applied LAST in `streamOpts` so primary/caller `sOpts.apiKey` can never overwrite it.
+      ...(effectiveSessionId ? { sessionId: effectiveSessionId } : {}),
+      // R2-H-2: Applied LAST so primary/caller `sOpts.apiKey` can never overwrite it.
       apiKey: settings.key,
     }
     return { tracker, streamOpts }
   }
 
-  const implementation: ProviderStreams = api === 'openai-responses' ? {
-    stream: (selected, transcript, sOpts) => {
-      const { tracker, streamOpts } = makeCallContext()
-      return wrapStreamWithToolCallIntegrity(
-        responses(selected as Model<'openai-responses'>, transcript, {
-          ...sOpts,
-          ...streamOpts,
+  let implementation: ProviderStreams
+  if (api === 'openai-responses') {
+    implementation = {
+      stream: (selected, transcript, sOpts) => {
+        const { tracker, streamOpts } = makeCallContext(sOpts?.sessionId ?? options.sessionId)
+        return wrapStreamWithToolCallIntegrity(responses(selected as Model<'openai-responses'>, transcript, {
+          ...sOpts, ...streamOpts,
           ...(effectiveThinking !== 'off' ? { reasoningEffort: effectiveThinking } : { reasoningEffort: undefined }),
           ...(connection ? { toolChoice: 'required' as const } : {}),
-        }),
-        tracker,
-        redactError,
-      )
-    },
-    streamSimple: (selected, transcript, sOpts) => {
-      const { tracker, streamOpts } = makeCallContext()
-      return wrapStreamWithToolCallIntegrity(
-        chooseEvidenceTool(transcript)
-          ? responses({ ...(selected as Model<'openai-responses'>), reasoning: false }, transcript, {
-              ...sOpts,
-              ...streamOpts,
-              reasoningEffort: undefined,
-              toolChoice: 'required',
-            })
-          : simpleResponses(selected as Model<'openai-responses'>, transcript, {
-              ...sOpts,
-              ...streamOpts,
-              ...(effectiveThinking !== 'off' ? { reasoning: effectiveThinking } : { reasoning: undefined }),
-            }),
-        tracker,
-        redactError,
-      )
-    },
-  } : {
-    stream: (selected, transcript, sOpts) => {
-      const { tracker, streamOpts } = makeCallContext()
-      return wrapStreamWithToolCallIntegrity(
-        messages(selected as Model<'anthropic-messages'>, transcript, {
-          ...sOpts,
-          ...streamOpts,
-          thinkingEnabled,
+        }), tracker, redactError)
+      },
+      streamSimple: (selected, transcript, sOpts) => {
+        const { tracker, streamOpts } = makeCallContext(sOpts?.sessionId ?? options.sessionId)
+        return wrapStreamWithToolCallIntegrity(
+          chooseEvidenceTool(transcript)
+            ? responses({ ...(selected as Model<'openai-responses'>), reasoning: false }, transcript, { ...sOpts, ...streamOpts, reasoningEffort: undefined, toolChoice: 'required' })
+            : simpleResponses(selected as Model<'openai-responses'>, transcript, { ...sOpts, ...streamOpts, ...(effectiveThinking !== 'off' ? { reasoning: effectiveThinking } : { reasoning: undefined }) }),
+          tracker, redactError,
+        )
+      },
+    }
+  } else if (api === 'openai-completions') {
+    implementation = {
+      stream: (selected, transcript, sOpts) => {
+        const { tracker, streamOpts } = makeCallContext(sOpts?.sessionId ?? options.sessionId)
+        return wrapStreamWithToolCallIntegrity(chatCompletions(selected as Model<'openai-completions'>, transcript, {
+          ...sOpts, ...streamOpts,
+          ...(effectiveThinking !== 'off' ? { reasoningEffort: effectiveThinking } : { reasoningEffort: undefined }),
+          ...(connection ? { toolChoice: 'required' as const } : {}),
+        }), tracker, redactError)
+      },
+      streamSimple: (selected, transcript, sOpts) => {
+        const { tracker, streamOpts } = makeCallContext(sOpts?.sessionId ?? options.sessionId)
+        return wrapStreamWithToolCallIntegrity(
+          chooseEvidenceTool(transcript)
+            ? chatCompletions({ ...(selected as Model<'openai-completions'>), reasoning: false }, transcript, { ...sOpts, ...streamOpts, reasoningEffort: undefined, toolChoice: 'required' })
+            : simpleChatCompletions(selected as Model<'openai-completions'>, transcript, { ...sOpts, ...streamOpts, ...(effectiveThinking !== 'off' ? { reasoning: effectiveThinking } : { reasoning: undefined }) }),
+          tracker, redactError,
+        )
+      },
+    }
+  } else {
+    implementation = {
+      stream: (selected, transcript, sOpts) => {
+        const { tracker, streamOpts } = makeCallContext(sOpts?.sessionId ?? options.sessionId)
+        return wrapStreamWithToolCallIntegrity(messages(selected as Model<'anthropic-messages'>, transcript, {
+          ...sOpts, ...streamOpts, thinkingEnabled,
           ...(activeThinking !== 'off' ? { effort: activeThinking } : {}),
           ...(connection ? { toolChoice: { type: 'tool' as const, name: 'kovo_connection' } } : {}),
-        }),
-        tracker,
-        redactError,
-      )
-    },
-    streamSimple: (selected, transcript, sOpts) => {
-      const { tracker, streamOpts } = makeCallContext()
-      return wrapStreamWithToolCallIntegrity(
-        chooseEvidenceTool(transcript)
-          ? messages(selected as Model<'anthropic-messages'>, transcript, {
-            ...sOpts, ...streamOpts, thinkingEnabled: false, toolChoice: { type: 'tool', name: 'derive_evidence' },
-          })
-          : simpleMessages(selected as Model<'anthropic-messages'>, transcript, {
-            ...sOpts,
-            ...streamOpts,
-            ...(activeThinking !== 'off' ? { reasoning: activeThinking } : {}),
-          }),
-        tracker,
-        redactError,
-      )
-    },
+        }), tracker, redactError)
+      },
+      streamSimple: (selected, transcript, sOpts) => {
+        const { tracker, streamOpts } = makeCallContext(sOpts?.sessionId ?? options.sessionId)
+        return wrapStreamWithToolCallIntegrity(
+          chooseEvidenceTool(transcript)
+            ? messages(selected as Model<'anthropic-messages'>, transcript, { ...sOpts, ...streamOpts, thinkingEnabled: false, toolChoice: { type: 'tool', name: 'derive_evidence' } })
+            : simpleMessages(selected as Model<'anthropic-messages'>, transcript, { ...sOpts, ...streamOpts, ...(activeThinking !== 'off' ? { reasoning: activeThinking } : {}) }),
+          tracker, redactError,
+        )
+      },
+    }
   }
 
   return { model, implementation }
@@ -1997,6 +1957,57 @@ export function orderProfiles(
   return out
 }
 
+type PoolHealthOverride = { healthState: 'closed' | 'open' | 'half_open'; cooldownUntil: number | null }
+
+function recordPoolAttemptFailureHelper(
+  emitTelemetry: ReturnType<typeof createTelemetryEmitter>,
+  candidate: ResolvedModelProfile,
+  attemptState: { recorded: boolean } | undefined,
+  willRetryOrFailover: boolean,
+): void {
+  if (!emitTelemetry) return
+  const meta = { profileId: candidate.id, providerName: candidate.name, model: candidate.model }
+  if (willRetryOrFailover) {
+    emitTelemetry({ ...meta, outcome: 'retried', retried: true, costUsd: 0, countCall: !(attemptState?.recorded) })
+  } else if (!attemptState?.recorded) {
+    emitTelemetry({ ...meta, outcome: 'error', costUsd: 0 })
+  }
+  if (attemptState) attemptState.recorded = true
+}
+
+function reportPoolCandidateFailureHelper(
+  candidate: ResolvedModelProfile,
+  typed: ProviderFailureError,
+  poolHealthOverrides: Map<string, PoolHealthOverride>,
+  onProfileFailure?: ProviderOptions['onProfileFailure'],
+): void {
+  const nowMs = Date.now()
+  const cooldownUntilMs = typed.hard
+    ? nowMs + 10 * 60_000
+    : typed.kind === 'rate_limited'
+      ? nowMs + clampProviderCooldownMs(typed.retryAfterMs)
+      : null
+  if (typed.kind === 'rate_limited' && cooldownUntilMs !== null) {
+    poolHealthOverrides.set(candidate.id, { healthState: 'open', cooldownUntil: cooldownUntilMs })
+  }
+  noteLatestProviderFailureForProfile(candidate.id, {
+    kind: typed.kind,
+    hard: typed.hard,
+    status: typed.status ?? null,
+    recordedAt: nowMs,
+  })
+  noteProfileCooldownHandoff(candidate.id, {
+    retryAfterMs: typed.retryAfterMs ?? null,
+    cooldownUntilMs,
+    recordedAt: nowMs,
+  })
+  onProfileFailure?.(candidate.id, typed.message, typed.hard, {
+    kind: typed.kind,
+    status: typed.status ?? null,
+    retryAfterMs: typed.retryAfterMs ?? null,
+  })
+}
+
 export function providerPool(
   profiles: readonly ResolvedModelProfile[],
   scenario: string,
@@ -2024,24 +2035,11 @@ export function providerPool(
   const retryBaseMs = options.transportRetryBaseMs !== undefined && Number.isFinite(options.transportRetryBaseMs)
     ? Math.max(0, Math.floor(options.transportRetryBaseMs))
     : defaultTransportRetryBaseMs
-
-  const recordPoolAttemptFailure = (
-    attemptState: { recorded: boolean } | undefined,
-    willRetryOrFailover: boolean,
-  ) => {
-    if (!emitTelemetry) return
-    if (willRetryOrFailover) {
-      emitTelemetry({
-        outcome: 'retried',
-        retried: true,
-        costUsd: 0,
-        countCall: !(attemptState?.recorded),
-      })
-    } else if (!attemptState?.recorded) {
-      emitTelemetry({ outcome: 'error', costUsd: 0 })
-    }
-    if (attemptState) attemptState.recorded = true
-  }
+  const poolHealthOverrides = new Map<string, PoolHealthOverride>()
+  const recordPoolAttemptFailure = (candidate: ResolvedModelProfile, attemptState: { recorded: boolean } | undefined, willRetryOrFailover: boolean) =>
+    recordPoolAttemptFailureHelper(emitTelemetry, candidate, attemptState, willRetryOrFailover)
+  const reportPoolCandidateFailure = (candidate: ResolvedModelProfile, typed: ProviderFailureError) =>
+    reportPoolCandidateFailureHelper(candidate, typed, poolHealthOverrides, options.onProfileFailure)
 
   type PoolCallBox = { thrown?: unknown; lastFailure?: ProviderFailureError }
   const pendingCallBoxes: PoolCallBox[] = []
@@ -2051,12 +2049,13 @@ export function providerPool(
     return (_selected, transcript, sOpts) => {
       const callBox = takeCallBox()
       const estimatedTokens = tokenEstimator.estimate(transcript)
-      const ordered = orderProfiles(sorted, estimatedTokens, options.roleAffinity)
+      const effectivePool = poolHealthOverrides.size
+        ? sorted.map(p => { const ov = poolHealthOverrides.get(p.id); return ov ? { ...p, ...ov } : p })
+        : sorted
+      const ordered = orderProfiles(effectivePool, estimatedTokens, options.roleAffinity)
 
       // Execute failover strictly inside the safe window (before yielding the first non-error event).
       const iter = (async function* () {
-        // Move O4: Charge logical turn budget ONCE per LLM turn (never per transient 429/5xx retry
-        // or failover hop), bounded separately by `maxTransportRetries`.
         options.beforeCall?.()
         if (callCounter.count + 1 > callCounter.maxCalls) {
           const budgetErr = new BudgetExceededError('The model call budget for this operation was reached.')
@@ -2083,10 +2082,12 @@ export function providerPool(
           for (;;) {
             const attemptTelemetryState = emitTelemetry ? { recorded: false } : undefined
             const attemptFailureState: { error?: ProviderFailureError } = {}
+            const attemptBurstCooldownState: { cooldown?: MorphBurstCooldown } = {}
             const built = buildSingleStreamImpl(candidate, scenario, poolOptions, callCounter, candidate.id, {
               chargeLogicalTurn: false,
               retryTransientInFetch: false,
               attemptFailureState,
+              attemptBurstCooldownState,
               ...(attemptTelemetryState ? { attemptTelemetryState } : {}),
             })
             const candidateOpts = { ...sOpts, apiKey: candidate.key }
@@ -2096,13 +2097,10 @@ export function providerPool(
             let retryWaitMs = 0
             let failedOver = false
 
-            const resolveTypedFailure = (errOrMsg: unknown, hasEmitted: boolean): ProviderFailureError | null => {
-              const fromFetch = attemptFailureState.error
-              if (fromFetch) {
-                return withProviderFailureContext(fromFetch, { emitted: hasEmitted, profileId: candidate.id })
-              }
-              return classifyProviderFailure(errOrMsg, { emitted: hasEmitted, profileId: candidate.id })
-            }
+            const resolveTypedFailure = (errOrMsg: unknown, hasEmitted: boolean): ProviderFailureError | null =>
+              attemptFailureState.error
+                ? withProviderFailureContext(attemptFailureState.error, { emitted: hasEmitted, profileId: candidate.id })
+                : classifyProviderFailure(errOrMsg, { emitted: hasEmitted, profileId: candidate.id })
 
             try {
               for await (const event of stream) {
@@ -2110,18 +2108,15 @@ export function providerPool(
                   const msg = String((event as { error?: { errorMessage?: string } }).error?.errorMessage ?? 'Model error')
                   const typed = resolveTypedFailure(msg, false)
                   if (typed && typed.kind !== 'context_overflow') {
-                    noteLatestProviderFailureForProfile(candidate.id, { kind: typed.kind, hard: typed.hard, status: typed.status ?? null, recordedAt: Date.now() })
-                    options.onProfileFailure?.(candidate.id, typed.message, typed.hard)
+                    reportPoolCandidateFailure(candidate, typed)
                     lastError = typed
                     if (callBox) callBox.lastFailure = typed
                     failedOver = true
                     if (shouldRetryProviderTransport({ retryable: typed.retryable, hard: typed.hard, isLastCandidate: idx === ordered.length - 1, transientAttempts, maxTransportRetries })) {
-                      transientAttempts++
-                      attempt++
-                      retrySame = true
+                      transientAttempts++; attempt++; retrySame = true
                       retryWaitMs = computeProviderRetryBackoffMs({ retryAfterMs: typed.retryAfterMs, attempt, baseMs: retryBaseMs })
                     }
-                    recordPoolAttemptFailure(attemptTelemetryState, retrySame || idx + 1 < ordered.length)
+                    recordPoolAttemptFailure(candidate, attemptTelemetryState, retrySame || idx + 1 < ordered.length)
                     break
                   }
                 }
@@ -2137,18 +2132,15 @@ export function providerPool(
 
               const res = await stream.result()
               if (!emitted && res.stopReason === 'error') {
-                const msg = res.errorMessage ?? 'Model error'
-                const typed = resolveTypedFailure(msg, false)
+                const typed = resolveTypedFailure(res.errorMessage ?? 'Model error', false)
                 if (typed && typed.kind !== 'context_overflow') {
-                  noteLatestProviderFailureForProfile(candidate.id, { kind: typed.kind, hard: typed.hard, status: typed.status ?? null, recordedAt: Date.now() })
-                  options.onProfileFailure?.(candidate.id, typed.message, typed.hard)
+                  reportPoolCandidateFailure(candidate, typed)
                   lastError = typed
                   if (callBox) callBox.lastFailure = typed
                   const willRetrySame = shouldRetryProviderTransport({ retryable: typed.retryable, hard: typed.hard, isLastCandidate: idx === ordered.length - 1, transientAttempts, maxTransportRetries })
-                  recordPoolAttemptFailure(attemptTelemetryState, willRetrySame || idx + 1 < ordered.length)
+                  recordPoolAttemptFailure(candidate, attemptTelemetryState, willRetrySame || idx + 1 < ordered.length)
                   if (willRetrySame) {
-                    transientAttempts++
-                    attempt++
+                    transientAttempts++; attempt++
                     const waitMs = computeProviderRetryBackoffMs({ retryAfterMs: typed.retryAfterMs, attempt, baseMs: retryBaseMs })
                     if (waitMs > 0) await delay(waitMs, undefined, { signal: options.signal })
                     continue
@@ -2159,8 +2151,12 @@ export function providerPool(
               if (res.stopReason === 'error') {
                 const midTyped = resolveTypedFailure(res.errorMessage ?? 'Model error', emitted)
                 if (midTyped && callBox) callBox.lastFailure = midTyped
-                recordPoolAttemptFailure(attemptTelemetryState, false)
+                recordPoolAttemptFailure(candidate, attemptTelemetryState, false)
+              } else if (attemptBurstCooldownState.cooldown) {
+                const until = notifyProactiveBurstCooldown(candidate.id, 200, attemptBurstCooldownState.cooldown, options.onProfileFailure)
+                poolHealthOverrides.set(candidate.id, { healthState: 'open', cooldownUntil: until })
               } else {
+                poolHealthOverrides.set(candidate.id, { healthState: 'closed', cooldownUntil: null })
                 options.onProfileSuccess?.(candidate.id)
               }
               return res
@@ -2168,31 +2164,23 @@ export function providerPool(
               if (emitted) {
                 const typed = resolveTypedFailure(error, true)
                 const finalErr = typed ?? error
-                if (callBox) {
-                  callBox.thrown = finalErr
-                  if (typed) callBox.lastFailure = typed
-                }
+                if (callBox) { callBox.thrown = finalErr; if (typed) callBox.lastFailure = typed }
                 throw finalErr
               }
               const typed = resolveTypedFailure(error, false)
               if (!typed || typed.kind === 'context_overflow') {
-                recordPoolAttemptFailure(attemptTelemetryState, false)
+                recordPoolAttemptFailure(candidate, attemptTelemetryState, false)
                 const finalErr = typed ?? error
-                if (callBox) {
-                  callBox.thrown = finalErr
-                  if (typed) callBox.lastFailure = typed
-                }
+                if (callBox) { callBox.thrown = finalErr; if (typed) callBox.lastFailure = typed }
                 throw finalErr
               }
-              noteLatestProviderFailureForProfile(candidate.id, { kind: typed.kind, hard: typed.hard, status: typed.status ?? null, recordedAt: Date.now() })
-              options.onProfileFailure?.(candidate.id, typed.message, typed.hard)
+              reportPoolCandidateFailure(candidate, typed)
               lastError = typed
               if (callBox) callBox.lastFailure = typed
               const willRetrySame = shouldRetryProviderTransport({ retryable: typed.retryable, hard: typed.hard, isLastCandidate: idx === ordered.length - 1, transientAttempts, maxTransportRetries })
-              recordPoolAttemptFailure(attemptTelemetryState, willRetrySame || idx + 1 < ordered.length)
+              recordPoolAttemptFailure(candidate, attemptTelemetryState, willRetrySame || idx + 1 < ordered.length)
               if (willRetrySame) {
-                transientAttempts++
-                attempt++
+                transientAttempts++; attempt++
                 const waitMs = computeProviderRetryBackoffMs({ retryAfterMs: typed.retryAfterMs, attempt, baseMs: retryBaseMs })
                 if (waitMs > 0) await delay(waitMs, undefined, { signal: options.signal })
                 continue

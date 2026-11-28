@@ -894,7 +894,13 @@ function SettingsWorkbenchPage() {
                               </span>
                             </div>
                             <div className="flex flex-wrap items-center gap-2 text-[12px] text-fg-subtle">
-                              <span>{profile.protocol === 'messages' ? 'Anthropic Messages' : 'OpenAI Responses'}</span>
+                              <span>
+                                {profile.protocol === 'messages'
+                                  ? 'Anthropic Messages'
+                                  : profile.protocol === 'chat-completions'
+                                    ? 'OpenAI Chat Completions'
+                                    : 'OpenAI Responses'}
+                              </span>
                               <span aria-hidden="true">·</span>
                               <span className="font-mono text-[11.5px]" title={profile.endpoint}>
                                 {shortEndpointHost(profile.endpoint)}

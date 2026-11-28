@@ -910,6 +910,7 @@ const INBOUND_INTEGRITY_LIST_FIELDS = [
   'output',
   'content',
   'summary',
+  'choices',
 ] as const
 
 function verifyInboundNodeIntegrity(
@@ -1024,6 +1025,40 @@ function createInboundScrubHooks(
   }
 }
 
+function sanitizeChatCompletionDeltaToolCalls(
+  toolCalls: unknown[],
+  hooks: ProviderScrubHooks,
+): unknown[] {
+  let changed = false
+  const mapped = toolCalls.map(entry => {
+    const tc = fields(entry)
+    if (!tc) return entry
+    const tcPatches = new Map<string, unknown>()
+    const fn = fields(ownValue(tc, 'function'))
+    if (fn) {
+      const args = ownValue(fn, 'arguments')
+      if (typeof args === 'string') {
+        const preparedFn = hooks.prepared?.get(fn)
+        const nextArgs = preparedFn?.has('arguments') ? preparedFn.get('arguments')! : hooks.scrubJsonArgs(args)
+        if (nextArgs !== args) tcPatches.set('function', patchRecord(fn, new Map([['arguments', nextArgs]])))
+      }
+    }
+    const custom = fields(ownValue(tc, 'custom'))
+    if (custom) {
+      const input = ownValue(custom, 'input')
+      if (typeof input === 'string') {
+        const preparedCustom = hooks.prepared?.get(custom)
+        const nextInput = preparedCustom?.has('input') ? preparedCustom.get('input')! : hooks.scrubExact(input)
+        if (nextInput !== input) tcPatches.set('custom', patchRecord(custom, new Map([['input', nextInput]])))
+      }
+    }
+    if (tcPatches.size === 0) return entry
+    changed = true
+    return patchRecord(tc, tcPatches)
+  })
+  return changed ? mapped : toolCalls
+}
+
 function sanitizeInboundDelta(
   delta: Fields,
   hooks: ProviderScrubHooks,
@@ -1063,6 +1098,21 @@ function sanitizeInboundDelta(
         ? preparedForDelta.get('partial_json')!
         : hooks.scrubJsonArgs(partial)
       if (next !== partial) patches.set('partial_json', next)
+    }
+    return patchRecord(delta, patches)
+  }
+  if (!deltaType) {
+    for (const fieldName of ['content', 'refusal', 'reasoning_content', 'reasoning', 'reasoning_text'] as const) {
+      const val = ownValue(delta, fieldName)
+      if (typeof val === 'string') {
+        const next = preparedForDelta?.has(fieldName) ? preparedForDelta.get(fieldName)! : hooks.scrubText(val)
+        if (next !== val) patches.set(fieldName, next)
+      }
+    }
+    const toolCalls = ownValue(delta, 'tool_calls')
+    if (Array.isArray(toolCalls)) {
+      const nextToolCalls = sanitizeChatCompletionDeltaToolCalls(toolCalls, hooks)
+      if (nextToolCalls !== toolCalls) patches.set('tool_calls', nextToolCalls)
     }
     return patchRecord(delta, patches)
   }
@@ -1301,9 +1351,33 @@ export function sanitizeProviderValue(
   return patchRecord(record, patches)
 }
 
+function collectChatCompletionChoiceFragments(
+  choices: unknown[],
+  add: (protocol: ProviderSettings['protocol'], index: unknown, channel: string, part: Fragment | undefined) => void,
+): void {
+  for (let ci = 0; ci < choices.length; ci += 1) {
+    const choice = fields(choices[ci])
+    const delta = fields(choice?.delta)
+    if (!delta) continue
+    const choiceIdx = typeof choice?.index === 'number' ? choice.index : ci
+    for (const field of ['content', 'refusal', 'reasoning_content', 'reasoning', 'reasoning_text'] as const) {
+      add('chat-completions', [choiceIdx, field], field, fragment(delta, field))
+    }
+    if (Array.isArray(delta.tool_calls)) {
+      for (let ti = 0; ti < delta.tool_calls.length; ti += 1) {
+        const tc = fields(delta.tool_calls[ti])
+        if (!tc) continue
+        const tcIdx = typeof tc.index === 'number' ? tc.index : ti
+        add('chat-completions', [choiceIdx, 'tool_call', tcIdx], 'arguments', fragment(fields(tc.function), 'arguments'))
+        add('chat-completions', [choiceIdx, 'tool_call_custom', tcIdx], 'input', fragment(fields(tc.custom), 'input'))
+      }
+    }
+  }
+}
+
 function prepareDeltas(frames: Frame[], key: string, secrets: readonly NamedSecret[]): Prepared {
   const groups = new Map<string, { mode: FragmentMode; parts: Fragment[] }>()
-  function add(protocol: 'responses' | 'messages', index: unknown, channel: string, part: Fragment | undefined) {
+  function add(protocol: ProviderSettings['protocol'], index: unknown, channel: string, part: Fragment | undefined) {
     if (!part) return
     const id = JSON.stringify([protocol, index, channel])
     let group = groups.get(id)
@@ -1320,6 +1394,10 @@ function prepareDeltas(frames: Frame[], key: string, secrets: readonly NamedSecr
   }
   for (const { data } of frames) {
     if (!data || data === '[DONE]') continue
+    if (Array.isArray(data.choices)) {
+      collectChatCompletionChoiceFragments(data.choices, add)
+      continue
+    }
     const type = String(data.type)
     const channel = responseChannels.get(type)
     if (channel) add('responses', data.output_index, channel, fragment(data, 'delta'))
@@ -1487,4 +1565,347 @@ export function sanitizeProviderStream(
       emit(controller)
     },
   }))
+}
+
+// ---------------------------------------------------------------------------
+// Chat Completions SSE observers, session affinity headers & Morph burst headers
+// ---------------------------------------------------------------------------
+
+export function collectChatCompletionsDeltaChars(data: Record<string, unknown>): number {
+  if (!Array.isArray(data.choices) || data.choices.length === 0) return 0
+  const choice = fields(data.choices[0])
+  const delta = fields(choice?.delta)
+  if (!delta) return 0
+  let total = 0
+  if (typeof delta.content === 'string') total += delta.content.length
+  for (const rField of ['reasoning_content', 'reasoning', 'reasoning_text'] as const) {
+    const val = delta[rField]
+    if (typeof val === 'string' && val.length > 0) {
+      total += val.length
+      break
+    }
+  }
+  if (Array.isArray(delta.tool_calls)) {
+    for (const rawTc of delta.tool_calls) {
+      const tc = fields(rawTc)
+      const fn = fields(tc?.function)
+      if (typeof fn?.arguments === 'string') total += fn.arguments.length
+      const custom = fields(tc?.custom)
+      if (typeof custom?.input === 'string') total += custom.input.length
+    }
+  }
+  return total
+}
+
+export interface ChatCompletionsToolCallDelta {
+  index?: number
+  callId?: string
+  name?: string
+  argumentsDelta?: string
+}
+
+export function extractChatCompletionsToolCallDeltas(data: Record<string, unknown>): {
+  truncatedByLength: boolean
+  toolCalls: ChatCompletionsToolCallDelta[]
+} {
+  if (!Array.isArray(data.choices) || data.choices.length === 0) {
+    return { truncatedByLength: false, toolCalls: [] }
+  }
+  const choice = fields(data.choices[0])
+  if (!choice) return { truncatedByLength: false, toolCalls: [] }
+  const truncatedByLength = choice.finish_reason === 'length'
+  const delta = fields(choice.delta)
+  const toolCalls: ChatCompletionsToolCallDelta[] = []
+  if (delta && Array.isArray(delta.tool_calls)) {
+    for (const rawTc of delta.tool_calls) {
+      const tc = fields(rawTc)
+      if (!tc) continue
+      const fn = fields(tc.function)
+      const index = typeof tc.index === 'number' ? tc.index : undefined
+      const callId = typeof tc.id === 'string' && tc.id ? tc.id : undefined
+      const name = typeof fn?.name === 'string' && fn.name ? fn.name : undefined
+      const argumentsDelta = typeof fn?.arguments === 'string' ? fn.arguments : undefined
+      toolCalls.push({ index, callId, name, argumentsDelta })
+    }
+  }
+  return { truncatedByLength, toolCalls }
+}
+
+/**
+ * Injects session-affinity headers for prompt cache routing:
+ * - `x-session-id`: set whenever `sessionId` is present and not already set.
+ * - `x-opencode-session`: set when endpoint host matches `opencode.ai` and not already set.
+ */
+export function applySessionAffinityHeaders(
+  headers: Headers,
+  endpointUrl: URL,
+  sessionId: string | undefined,
+): void {
+  const effective = typeof sessionId === 'string' ? sessionId.trim() : ''
+  if (!effective) return
+  if (!headers.has('x-session-id')) {
+    headers.set('x-session-id', effective)
+  }
+  const host = endpointUrl.hostname.toLowerCase()
+  if ((host === 'opencode.ai' || host.endsWith('.opencode.ai')) && !headers.has('x-opencode-session')) {
+    headers.set('x-opencode-session', effective)
+  }
+}
+
+export interface MorphBurstCooldown {
+  retryAfterMs: number
+  reason: string
+}
+
+const morphCooldownDefaultMs = 15_000
+const morphCooldownMinMs = 1_000
+const morphCooldownMaxMs = 300_000
+const profileCooldownHandoffTtlMs = 30_000
+const profileCooldownHandoffMaxEntries = 128
+
+export interface ProfileCooldownHandoff {
+  readonly retryAfterMs: number | null
+  readonly cooldownUntilMs: number | null
+  readonly burstExhausted?: boolean
+  readonly recordedAt: number
+}
+
+// Bounded profile-keyed (never run-keyed) handoff cache carrying retryAfterMs / burst cooldown
+// metadata from `provider.ts` into `model-settings.ts` across legacy 3-arg `onProfileFailure` hooks.
+const latestProfileCooldownHandoffs = new Map<string, ProfileCooldownHandoff>()
+
+export function noteProfileCooldownHandoff(
+  profileId: string,
+  handoff: ProfileCooldownHandoff,
+): void {
+  if (!profileId) return
+  latestProfileCooldownHandoffs.delete(profileId)
+  while (latestProfileCooldownHandoffs.size >= profileCooldownHandoffMaxEntries) {
+    const oldest = latestProfileCooldownHandoffs.keys().next().value
+    if (oldest === undefined) break
+    latestProfileCooldownHandoffs.delete(oldest)
+  }
+  latestProfileCooldownHandoffs.set(profileId, handoff)
+}
+
+export function consumeProfileCooldownHandoff(
+  profileId: string,
+  nowMs = Date.now(),
+): ProfileCooldownHandoff | null {
+  const entry = latestProfileCooldownHandoffs.get(profileId)
+  if (!entry) return null
+  latestProfileCooldownHandoffs.delete(profileId)
+  if (nowMs - entry.recordedAt > profileCooldownHandoffTtlMs) return null
+  return entry
+}
+
+export function clampProviderCooldownMs(retryAfterMs: number | null | undefined): number {
+  const raw = typeof retryAfterMs === 'number' && Number.isFinite(retryAfterMs)
+    ? retryAfterMs
+    : morphCooldownDefaultMs
+  return Math.max(morphCooldownMinMs, Math.min(morphCooldownMaxMs, Math.floor(raw)))
+}
+
+function parseNumericHeader(headers: Headers, name: string): number | null {
+  const raw = headers.get(name)
+  if (!raw) return null
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+  const num = Number(trimmed)
+  return Number.isFinite(num) ? num : null
+}
+
+function parseMorphResetDeltaMs(headers: Headers, names: readonly string[], nowMs: number): number | null {
+  for (const name of names) {
+    const raw = headers.get(name)
+    if (!raw) continue
+    const trimmed = raw.trim()
+    if (!trimmed) continue
+    if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+      const value = Number(trimmed)
+      if (!Number.isFinite(value) || value < 0) continue
+      if (value > 1_000_000_000_000) return Math.max(0, Math.round(value - nowMs))
+      if (value > 1_000_000_000) return Math.max(0, Math.round(value * 1000 - nowMs))
+      return Math.round(value * 1000)
+    }
+    const parsedTs = Date.parse(trimmed)
+    if (Number.isFinite(parsedTs)) return Math.max(0, parsedTs - nowMs)
+  }
+  return null
+}
+
+function isMorphBucketExhausted(steady: number | null, burst: number | null): boolean {
+  if (steady !== null && burst !== null) return steady <= 0 && burst <= 0
+  if (burst !== null) return burst <= 0
+  if (steady !== null) return steady <= 0
+  return false
+}
+
+/**
+ * Inspects Morph Ultra steady + burst rate-limit response headers (`x-morph-ultra-*`).
+ * When both steady and burst remaining headers are present, only triggers when BOTH are `<= 0`
+ * so the burst reserve is fully utilized before failing over.
+ */
+export function inspectMorphBurstCooldown(headers: Headers, nowMs = Date.now()): MorphBurstCooldown | null {
+  const inputSteady = parseNumericHeader(headers, 'x-morph-ultra-uncached-input-remaining')
+  const inputBurst = parseNumericHeader(headers, 'x-morph-ultra-uncached-input-burst-remaining')
+  const outputSteady = parseNumericHeader(headers, 'x-morph-ultra-output-remaining')
+  const outputBurst = parseNumericHeader(headers, 'x-morph-ultra-output-burst-remaining')
+
+  const inputExhausted = isMorphBucketExhausted(inputSteady, inputBurst)
+  const outputExhausted = isMorphBucketExhausted(outputSteady, outputBurst)
+  if (!inputExhausted && !outputExhausted) return null
+
+  const reasons: string[] = []
+  let resetMs = 0
+  if (inputExhausted) {
+    reasons.push('uncached-input')
+    const delta = parseMorphResetDeltaMs(
+      headers,
+      ['x-morph-ultra-uncached-input-burst-reset', 'x-morph-ultra-uncached-input-reset', 'retry-after'],
+      nowMs,
+    )
+    resetMs = Math.max(resetMs, delta ?? morphCooldownDefaultMs)
+  }
+  if (outputExhausted) {
+    reasons.push('output')
+    const delta = parseMorphResetDeltaMs(
+      headers,
+      ['x-morph-ultra-output-burst-reset', 'x-morph-ultra-output-reset', 'retry-after'],
+      nowMs,
+    )
+    resetMs = Math.max(resetMs, delta ?? morphCooldownDefaultMs)
+  }
+  const retryAfterMs = resetMs > 0 ? resetMs : morphCooldownDefaultMs
+  return {
+    retryAfterMs,
+    reason: `Morph Ultra ${reasons.join(' & ')} burst quota exhausted.`,
+  }
+}
+
+const STREAM_DELTA_TEXT_EVENT_TYPES = new Set([
+  'response.output_text.delta',
+  'response.refusal.delta',
+  'response.reasoning_text.delta',
+  'response.reasoning_summary_text.delta',
+  'response.function_call_arguments.delta',
+  'response.custom_tool_call_input.delta',
+])
+
+function readFiniteNonNegativeNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed
+  }
+  return undefined
+}
+
+export class SseUsageAccumulator {
+  private rawInputTokens = 0
+  private cachedInputTokens = 0
+  private outputTokens = 0
+  private anthropicCacheRead = 0
+  private reasoningTokens = 0
+  private providerReportedCostUsd: number | undefined
+  private streamedDeltaChars = 0
+
+  feedData(data: Record<string, unknown> | '[DONE]' | undefined): void {
+    if (!data || data === '[DONE]') return
+    const type = typeof data.type === 'string' ? data.type : ''
+    if (Array.isArray(data.choices)) {
+      this.streamedDeltaChars += collectChatCompletionsDeltaChars(data)
+    } else if (STREAM_DELTA_TEXT_EVENT_TYPES.has(type) && typeof data.delta === 'string') {
+      this.streamedDeltaChars += data.delta.length
+    } else if (type === 'content_block_delta') {
+      const delta = fields(data.delta)
+      if (delta) {
+        if (typeof delta.text === 'string') this.streamedDeltaChars += delta.text.length
+        if (typeof delta.thinking === 'string') this.streamedDeltaChars += delta.thinking.length
+        if (typeof delta.partial_json === 'string') this.streamedDeltaChars += delta.partial_json.length
+      }
+    }
+
+    const responseObj = fields(data.response)
+    const responseUsage = fields(responseObj?.usage)
+    const topUsage = fields(data.usage)
+    const choiceUsage = Array.isArray(data.choices) ? fields(fields(data.choices[0])?.usage) : undefined
+    const msgUsage = fields(fields(data.message)?.usage)
+    const usage = responseUsage ?? topUsage ?? choiceUsage ?? msgUsage
+
+    const reportedCost =
+      readFiniteNonNegativeNumber(usage?.cost) ??
+      readFiniteNonNegativeNumber(usage?.total_cost) ??
+      readFiniteNonNegativeNumber(usage?.cost_usd) ??
+      readFiniteNonNegativeNumber(responseObj?.cost) ??
+      readFiniteNonNegativeNumber(data.cost)
+    if (reportedCost !== undefined) {
+      if (this.providerReportedCostUsd === undefined || reportedCost > this.providerReportedCostUsd) {
+        this.providerReportedCostUsd = reportedCost
+      }
+    }
+
+    if (!usage) return
+    const inp = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0)
+    const out = Number(usage.output_tokens ?? usage.completion_tokens ?? 0)
+    const inputDetails = fields(usage.input_tokens_details)
+    const promptDetails = fields(usage.prompt_tokens_details)
+    const outputDetails = fields(usage.output_tokens_details)
+    const completionDetails = fields(usage.completion_tokens_details)
+    const openaiCached = Number(inputDetails?.cached_tokens ?? promptDetails?.cached_tokens ?? usage.prompt_cache_hit_tokens ?? usage.cached_tokens ?? 0)
+    const msgCached = Number(usage.cache_read_input_tokens ?? 0)
+    const reasoning = Number(
+      outputDetails?.reasoning_tokens
+      ?? completionDetails?.reasoning_tokens
+      ?? usage.reasoning_tokens
+      ?? usage.thinking_tokens
+      ?? 0,
+    )
+    if (Number.isFinite(inp) && inp > this.rawInputTokens) this.rawInputTokens = inp
+    if (Number.isFinite(out) && out > this.outputTokens) this.outputTokens = out
+    if (Number.isFinite(openaiCached) && openaiCached > this.cachedInputTokens) this.cachedInputTokens = openaiCached
+    if (Number.isFinite(msgCached) && msgCached > this.anthropicCacheRead) this.anthropicCacheRead = msgCached
+    if (Number.isFinite(reasoning) && reasoning > this.reasoningTokens) this.reasoningTokens = reasoning
+  }
+
+  feedSseText(sseText: string): void {
+    for (const line of sseText.split('\n')) {
+      if (!line.startsWith('data: ') || line === 'data: [DONE]') continue
+      try {
+        const data = JSON.parse(line.slice(6)) as Record<string, unknown>
+        this.feedData(data)
+      } catch {
+        // Ignore unparseable frames.
+      }
+    }
+  }
+
+  reasoningSnapshot(): number {
+    return this.reasoningTokens
+  }
+
+  reportedCostSnapshot(): number | undefined {
+    return this.providerReportedCostUsd
+  }
+
+  streamedDeltaCharsSnapshot(): number {
+    return this.streamedDeltaChars
+  }
+
+  snapshot(protocol: ProviderSettings['protocol'] = 'responses'): {
+    inputTokens: number
+    cachedInputTokens: number
+    outputTokens: number
+  } {
+    if (protocol === 'messages' && this.anthropicCacheRead > 0) {
+      // Anthropic Messages reports `input_tokens` excluding `cache_read_input_tokens`.
+      return {
+        inputTokens: this.rawInputTokens + this.anthropicCacheRead,
+        cachedInputTokens: this.anthropicCacheRead,
+        outputTokens: this.outputTokens,
+      }
+    }
+    const effectiveCached = Math.min(this.rawInputTokens, Math.max(this.cachedInputTokens, this.anthropicCacheRead))
+    return { inputTokens: this.rawInputTokens, cachedInputTokens: effectiveCached, outputTokens: this.outputTokens }
+  }
 }

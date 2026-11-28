@@ -1322,12 +1322,15 @@ const providerUrl = z.string().trim().min(1).max(300).transform((input, ctx) => 
   }
 })
 
+export const providerProtocols = ['responses', 'messages', 'chat-completions'] as const
+export type ProviderProtocol = typeof providerProtocols[number]
+
 export const providerSettings = z.object({
   id: id.optional(),
   name: shortText.default(DEFAULT_PROVIDER.name),
   endpoint: providerUrl,
   model: z.string().trim().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,127}$/),
-  protocol: z.enum(['responses', 'messages']),
+  protocol: z.enum(providerProtocols),
   key: z.string().trim().max(512).default(''),
   priority: z.number().int().min(0).max(1000).default(100),
   enabled: z.boolean().default(true),
@@ -1357,7 +1360,7 @@ export interface PublicModelProfile {
   name: string
   endpoint: string
   model: string
-  protocol: 'responses' | 'messages'
+  protocol: ProviderProtocol
   priority: number
   enabled: boolean
   contextWindow: number

@@ -15,10 +15,13 @@ export const MAX_TRACKED_RUN_TELEMETRY = 512
 export const MAX_TOOLS_PER_RUN_TELEMETRY = 128
 const MAX_RUN_ID_CHARS = 128
 const MAX_TOOL_NAME_CHARS = 64
+const MAX_PROVIDER_KEY_CHARS = 96
+const MAX_PROVIDERS_PER_RUN_TELEMETRY = 64
 const OVERFLOW_TOOL_BUCKET = '__other__'
 
 const SAFE_TOOL_CHAR_RE = /[^A-Za-z0-9_.:/-]/g
 const CONTROL_OR_SPACE_RE = /[\s\0-\x1f\x7f]+/g
+const CONTROL_CHAR_RE = /[\0-\x1f\x7f]+/g
 
 export type ProviderUsageTelemetryOutcome =
   | 'ok'
@@ -30,6 +33,12 @@ export type ProviderUsageTelemetryOutcome =
 
 export interface ProviderUsageTelemetryInput {
   runId: string
+  /** Optional provider profile ID for per-provider telemetry breakdown. */
+  profileId?: string
+  /** Optional human-readable provider profile name for per-provider telemetry breakdown. */
+  providerName?: string
+  /** Optional model identifier for per-provider telemetry breakdown. */
+  model?: string
   inputTokens?: number
   cachedInputTokens?: number
   uncachedInputTokens?: number
@@ -50,6 +59,28 @@ export interface ProviderUsageTelemetryInput {
   wallClockRotation?: boolean
   /** Set false when attributing a retry/failover marker onto an already-counted stalled attempt. */
   countCall?: boolean
+}
+
+export interface ProviderTelemetryBreakdownEntry {
+  calls: number
+  retries: number
+  stalls: number
+  inputTokens: number
+  cachedInputTokens: number
+  outputTokens: number
+  costUsd: number
+  cacheHitRate: number
+}
+
+interface ProviderBreakdownAccumulator {
+  calls: number
+  retries: number
+  stalls: number
+  inputTokens: number
+  cachedInputTokens: number
+  uncachedInputTokens: number
+  outputTokens: number
+  costUsd: number
 }
 
 export interface ToolResultSizeTelemetryInput {
@@ -91,6 +122,8 @@ export interface RunTokenTelemetrySummary {
   toolResultBytesByTool: Record<string, ToolResultBytesStats>
   /** Top tool-result byte drivers ranked descending by total `bytes`, then `calls`, then `toolName`. */
   topToolResultDrivers: ToolResultByteDriver[]
+  /** Per-provider token, cost, cache, retry, and stall breakdown keyed by provider name / profile ID / model. */
+  providerBreakdown: Record<string, ProviderTelemetryBreakdownEntry>
 }
 
 interface RunTokenTelemetryState {
@@ -109,6 +142,7 @@ interface RunTokenTelemetryState {
   totalToolResultBytes: number
   toolResultSpills: number
   toolResultBytesByTool: Map<string, ToolResultBytesStats>
+  providerBreakdown: Map<string, ProviderBreakdownAccumulator>
 }
 
 const runTelemetryStore = new Map<string, RunTokenTelemetryState>()
@@ -138,6 +172,15 @@ function nonNegFloat(value: unknown): number {
   return value
 }
 
+function sanitizeProviderKey(input: Pick<ProviderUsageTelemetryInput, 'providerName' | 'profileId' | 'model'>): string | null {
+  const candidate = [input.providerName, input.profileId, input.model].find(
+    v => typeof v === 'string' && v.trim().length > 0,
+  )
+  if (!candidate) return null
+  const cleaned = candidate.replace(CONTROL_CHAR_RE, ' ').trim().slice(0, MAX_PROVIDER_KEY_CHARS)
+  return cleaned || null
+}
+
 function createEmptyState(): RunTokenTelemetryState {
   return {
     inputTokens: 0,
@@ -155,6 +198,7 @@ function createEmptyState(): RunTokenTelemetryState {
     totalToolResultBytes: 0,
     toolResultSpills: 0,
     toolResultBytesByTool: new Map(),
+    providerBreakdown: new Map(),
   }
 }
 
@@ -266,6 +310,35 @@ export function recordProviderUsageTelemetry(input: ProviderUsageTelemetryInput)
   if (input.wallClockRotation) {
     state.wallClockRotations += 1
   }
+
+  const rawProviderKey = sanitizeProviderKey(input)
+  if (rawProviderKey) {
+    const providerKey = state.providerBreakdown.has(rawProviderKey) || state.providerBreakdown.size < MAX_PROVIDERS_PER_RUN_TELEMETRY
+      ? rawProviderKey
+      : OVERFLOW_TOOL_BUCKET
+    let entry = state.providerBreakdown.get(providerKey)
+    if (!entry) {
+      entry = {
+        calls: 0,
+        retries: 0,
+        stalls: 0,
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        uncachedInputTokens: 0,
+        outputTokens: 0,
+        costUsd: 0,
+      }
+      state.providerBreakdown.set(providerKey, entry)
+    }
+    if (input.countCall !== false) entry.calls += 1
+    entry.retries += addRetries
+    if (isStalled) entry.stalls += 1
+    entry.inputTokens += addInput
+    entry.cachedInputTokens += addCached
+    entry.uncachedInputTokens += addUncached
+    entry.outputTokens += addOutput
+    entry.costUsd += addCost
+  }
 }
 
 /**
@@ -340,6 +413,7 @@ export function getRunTokenTelemetrySummary(runId: string): RunTokenTelemetrySum
       toolResultSpills: 0,
       toolResultBytesByTool: {},
       topToolResultDrivers: [],
+      providerBreakdown: {},
     }
   }
 
@@ -358,6 +432,21 @@ export function getRunTokenTelemetrySummary(runId: string): RunTokenTelemetrySum
       calls: driver.calls,
       bytes: driver.bytes,
       spilledCount: driver.spilledCount,
+    }
+  }
+
+  const providerBreakdown: Record<string, ProviderTelemetryBreakdownEntry> = {}
+  for (const [providerKey, stats] of state.providerBreakdown.entries()) {
+    const providerCacheDenom = stats.cachedInputTokens + stats.uncachedInputTokens
+    providerBreakdown[providerKey] = {
+      calls: stats.calls,
+      retries: stats.retries,
+      stalls: stats.stalls,
+      inputTokens: stats.inputTokens,
+      cachedInputTokens: stats.cachedInputTokens,
+      outputTokens: stats.outputTokens,
+      costUsd: stats.costUsd,
+      cacheHitRate: providerCacheDenom > 0 ? stats.cachedInputTokens / providerCacheDenom : 0,
     }
   }
 
@@ -383,6 +472,7 @@ export function getRunTokenTelemetrySummary(runId: string): RunTokenTelemetrySum
     toolResultSpills: state.toolResultSpills,
     toolResultBytesByTool,
     topToolResultDrivers,
+    providerBreakdown,
   }
 }
 

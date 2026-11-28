@@ -5,7 +5,7 @@ import type {
   BoardMessageKind, CallerCompatibility, Candidate, CapabilityTier, CheckCoverage,
   CodeLocation, DnsSource, DynamicRetestVerdict, EndpointSource, EvidenceSummary, FailureTaxonomyBucket, Finding, InlineVerifyFeedback, LabConfig,
   OwaspCategory, ParamLocation, PatchProposalStatus, PersonaAuthKind, PersonaLoginConfig, PersonaPrivilege, Phase,
-  PreparedObservation, ReportBody, ReviewPlan, RoleAffinity, RunStatus, SecondOrderCanaryStatus, SpecialistProfile, ThinkingLevel, ThreatModelSummary,
+  PreparedObservation, ProviderProtocol, ReportBody, ReviewPlan, RoleAffinity, RunStatus, SecondOrderCanaryStatus, SpecialistProfile, ThinkingLevel, ThreatModelSummary,
   VerificationTier, WorkerPhase, WorkerStatus,
 } from '../domain.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
@@ -25,7 +25,7 @@ export const modelProfiles = sqliteTable('model_profiles', {
   name: text('name').notNull(),
   endpoint: text('endpoint').notNull(),
   model: text('model').notNull(),
-  protocol: text('protocol').$type<'responses' | 'messages'>().notNull(),
+  protocol: text('protocol').$type<ProviderProtocol>().notNull(),
   credentialId: text('credential_id').notNull(),
   priority: integer('priority').default(100).notNull(),
   enabled: integer('enabled', { mode: 'boolean' }).default(true).notNull(),
