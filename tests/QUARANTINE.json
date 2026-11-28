@@ -1,7 +1,7 @@
 {
   "version": 2,
-  "maxQuarantinedCases": 176,
-  "maxKernelVerdictQuarantinedCases": 27,
+  "maxQuarantinedCases": 175,
+  "maxKernelVerdictQuarantinedCases": 26,
   "entries": [
     {
       "file": "tests/arch-a1-engine.test.ts",
@@ -1029,15 +1029,6 @@
       "ownerStream": "v8-triage",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/v8-oracle-families.test.ts",
-      "testName": "v8 oracle family 4: cryptographic_scope_replay > confirms 3-arm cross-tenant / cross-scope cryptographic replay",
-      "assertionLocation": "tests/v8-oracle-families.test.ts:562:3",
-      "ownerStream": "triage-kernel-v8-oracle-families",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-07",
-      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v8-phasea-fastpath.test.ts",

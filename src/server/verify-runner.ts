@@ -524,20 +524,39 @@ function describeFingerprint(fingerprint: CausalFingerprint): string {
   return `${fingerprint.kind}|${fingerprint.method}|${fingerprint.path}|${fingerprint.status}|${JSON.stringify(fingerprint.expectation)}|${JSON.stringify(fingerprint.observed)}`
 }
 
-function findUnhandledServerError5xx(
-  transcript: TranscriptStore,
+const CITED_EXCHANGE_KEYS = ['exchangeId', 'exchangeIds', 'targetExchangeId', 'probeExchangeId'] as const
+
+/** Exchange IDs an explicit injection-class claim cites as its error-based evidence (never transcript-wide). */
+export function collectInjectionCitedExchangeIds(claims: readonly VerifyScriptResult['claims'][number][]): Set<string> {
+  const cited = new Set<string>()
+  for (const c of claims) {
+    const isInjection = (c.kind === 'impact' && c.impactClass === 'injection')
+      || (c.kind === 'body_contains' && typeof c.vulnClass === 'string' && /sql|inject/i.test(c.vulnClass))
+    if (!isInjection) continue
+    const rec = c as unknown as Record<string, unknown>
+    for (const key of CITED_EXCHANGE_KEYS) {
+      const v = rec[key]
+      for (const id of Array.isArray(v) ? v : [v]) if (typeof id === 'string' && id.trim()) cited.add(id.trim())
+    }
+  }
+  return cited
+}
+
+/**
+ * Fail-closed 5xx scan. Only the exact exchanges an injection-class claim cites are exempt
+ * (error-based injection evidence); every other 5xx in the transcript still rejects.
+ */
+export function findUnhandledServerError5xx(
+  transcript: Pick<TranscriptStore, 'list'>,
   claims: readonly VerifyScriptResult['claims'][number][],
 ) {
-  const hasInjectionErrorClaim = claims.some(c =>
-    (c.kind === 'impact' && c.impactClass === 'injection')
-    || (c.kind === 'body_contains' && typeof c.vulnClass === 'string' && /sql|inject/i.test(c.vulnClass)),
-  )
-  if (hasInjectionErrorClaim) return null
+  const exempt = collectInjectionCitedExchangeIds(claims)
   return transcript.list().find(rec =>
     (rec.op === 'http' || rec.op === 'http2' || rec.op === 'race')
     && typeof rec.response?.status === 'number'
     && rec.response.status >= 500
-    && rec.response.status <= 599,
+    && rec.response.status <= 599
+    && !exempt.has(rec.exchangeId),
   ) ?? null
 }
 

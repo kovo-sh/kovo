@@ -11,16 +11,15 @@ import { analyzeCrossTenantTerminalEvidence, collectCitedReceiptExchanges, deriv
 import { resolveCompositeTerminalExchange } from './composite-terminal.ts'
 import { HostFactLog } from './host-fact-log.ts'
 import { proofReceiptSchema, receiptIdSchema } from './proof-receipt.ts'
-import { extractTenantMarkers, isJobOrHandleStub, type V8OracleFamily } from './v8-oracle-families.ts'
-import { evaluateForgedWebhookProvenanceGuard, evaluateOwnOrgTerminalGuard, findPreMutationDeniedControl, normalizeTerminalVulnClass, resolveCompositeTerminalContract, selectVerifiedPostMutationReadback } from './own-org-terminal-guard.ts'
+import { distinctSurfaceCount, evaluateOwnScopeTerminalGuard, evaluateSignatureProvenanceGuard, extractTenantMarkers, findPreMutationDeniedControl, isJobOrHandleStub, normalizeTerminalVulnClass, resolveCompositeTerminalContract, selectVerifiedPostMutationReadback, type V8OracleFamily } from './v8-oracle-families.ts'
+export { UNIVERSAL_EVIDENCE_PRIMITIVES, resolveUniversalPrimitive, type UniversalEvidencePrimitive } from './v8-oracle-families.ts'
 import { TERMINAL_CLASS_CONTRACT, buildCapOriginIndex, canonicalNonAuthQuery, cleanExactPath, collectUrlParamTokens, diagnoseRejectedTerminalControls, entryCarriesRequestToken, entryMatchesCorrelation, entryMatchesEntity, inferSupplementalHostCausalEdges, isHydratedStub, isPrivilegedActorOrRole, matchesNormalizedDotSegmentPath, normalizeV8OracleInputKeys, partitionNonCausalControlHops, resolveEntryIdentity, resolveTerminalContract, resolveV8OracleFamilyOrDiagnostic, sanitizeEmbeddedProofReceipt, selectStateTransitionPair, type CapOriginIndex, type EconomicAutoHydrateContext, type TerminalContractKind } from './v8-oracle-hydrate.ts'
 export { TERMINAL_CLASS_CONTRACT, type TerminalContractKind }
 import type { ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 
 export const HOP_SURFACES = ['http', 'graphql', 'ws', 'sse', 'browser', 'webhook', 'async_job', 'idp', 'cdn', 'storage'] as const
 export type HopSurface = (typeof HOP_SURFACES)[number]
-const V8_ORACLE_FAMILIES = ['dual_tenant_abac', 'temporal_revocation', 'economic_conservation', 'cryptographic_scope_replay', 'parser_cache_differential', 'cross_surface_pivot'] as const
-const V8_ORACLE_FAMILY_SET: ReadonlySet<string> = new Set(V8_ORACLE_FAMILIES)
+const V8_ORACLE_FAMILIES = ['dual_tenant_abac', 'temporal_revocation', 'economic_conservation', 'cryptographic_scope_replay', 'parser_cache_differential', 'cross_surface_pivot'] as const, V8_ORACLE_FAMILY_SET: ReadonlySet<string> = new Set(V8_ORACLE_FAMILIES)
 export const CAUSAL_EDGE_KINDS = ['value_binding', 'derived_crypto_binding', 'state_transition_binding', 'async_pivot_binding'] as const
 export type CausalEdgeKind = (typeof CAUSAL_EDGE_KINDS)[number]
 export const REPLAY_MODES = ['fresh_clean_replay', 'one_shot_transcript'] as const
@@ -106,6 +105,8 @@ export interface CompositeReceiptVerification {
   terminalOracleFamily?: V8OracleFamily | string | null; terminalEndpoint?: string | null; terminalOrigin?: string | null
   terminalVerification?: ReceiptVerification; evidence?: Record<string, unknown>
 }
+/** Host-stamped replay mode: schema-failed verdicts never parsed a receipt, so they are never stamped Mode A `fresh_clean_replay`. */
+export const resolveTranscriptReplayMode = (v: Pick<CompositeReceiptVerification, 'replayMode' | 'failedStage'> | null | undefined): ReplayMode | undefined => (v && v.failedStage !== 'schema' && (REPLAY_MODES as readonly string[]).includes(v.replayMode) ? v.replayMode : undefined)
 
 // --- Cryptographic, Hashing & Transcript Helpers ----------------------------
 const CONSUMED_STATE_RE = /\b(?:already[_\s-]?(?:consumed|redeemed|used|claimed|applied|settled)|token[_\s-]?(?:consumed|used|redeemed|spent)|one[_\s-]?time|nonce[_\s-]?(?:used|replayed|consumed)|invite[_\s-]?(?:redeemed|consumed|used)|state[_\s-]?(?:consumed|exhausted|finalized))\b/i
@@ -567,10 +568,10 @@ function dispatchDefaultV8Oracle(
   if (family === 'cross_surface_pivot') {
     if (receipt.hops.length < 2) return rejectFam('v8_oracle_failed (cross_surface_pivot): invalid_hop_count — requires >= 2 hops across distinct surfaces.', ['cross_surface_pivot_requires_2_plus_hops'])
     if (!terminalCtrl || !termEx) return rejectFam(`v8_oracle_failed (${family}): missing_pivot_control_or_terminal_record`, ['pre_chain_control_denied', TERMINAL_IMPACT_UNPROVEN_HINT])
-    if (new Set(receipt.hops.map(h => h.surface)).size < 2) return rejectFam('v8_oracle_failed (cross_surface_pivot): single_surface_not_cross_surface_pivot', ['single_surface_not_cross_surface_pivot'])
-    // R3-05 review: hop.surface labels are worker-declared; require >= 2 HOST-evidenced surfaces (bound trace/OOB, verified async pivot, GraphQL endpoint, or distinct signed origin).
+    // causal_dag: cross-surface is `surfaces.size >= 2`; worker-declared labels must ALSO be host-evidenced (bound trace/OOB, verified async pivot, GraphQL endpoint, or distinct signed origin).
+    if (distinctSurfaceCount(receipt.hops.map(h => h.surface)) < 2) return rejectFam('v8_oracle_failed (cross_surface_pivot): single_surface_not_cross_surface_pivot', ['single_surface_not_cross_surface_pivot'])
     const hostSurfaceOf = (h: HopReceipt): string => { const exs = h.exchangeIds.map(id => idx.entriesById.get(id)).filter((e): e is HostTranscriptEntry => Boolean(e)); return h.browserTraceIds.some(id => idx.tracesById.has(id)) ? 'browser' : h.oobEventIds.some(id => idx.oobById.has(id)) ? 'webhook' : ctx.asyncHopIds.has(h.hopId) ? 'async_job' : exs.some(e => /\/graphql(?:[/?#]|$)/i.test(e.step.pathAndQuery ?? e.step.route ?? '')) ? 'graphql' : `http@${normOrigin(exs.map(e => e.origin).find((o): o is string => typeof o === 'string' && o.length > 0) ?? h.target.origin ?? '')}` }
-    if (new Set(receipt.hops.map(hostSurfaceOf)).size < 2) return rejectFam('v8_oracle_failed (cross_surface_pivot): single_host_surface_not_cross_surface_pivot — hop.surface labels lack host-evidenced distinct surfaces.', ['host_evidenced_distinct_surfaces'])
+    if (distinctSurfaceCount(receipt.hops.map(hostSurfaceOf)) < 2) return rejectFam('v8_oracle_failed (cross_surface_pivot): single_host_surface_not_cross_surface_pivot — hop.surface labels lack host-evidenced distinct surfaces.', ['host_evidenced_distinct_surfaces'])
     if (!postMutRb && (ctx.isStub || ctx.ownTenantOnly)) return rejectFam(TERMINAL_IMPACT_UNPROVEN_HINT, [TERMINAL_IMPACT_UNPROVEN_HINT], 'terminal_impact_unproven')
     return ctx.hasVerifiedTermEdge ? { ok: true, family: 'cross_surface_pivot', explicit: false } : rejectFam('v8_oracle_failed (cross_surface_pivot): missing_verified_causal_edge', ['verified_causal_edge'])
   }
@@ -680,7 +681,7 @@ function verifyTerminalImpactGate(
   if (rejectedZeroDelta) return failUnproven('terminal_impact_unproven: zero_delta_post_mutation_readback — post-chain readback state is identical to pre-chain baseline readback on the same route and actor.')
   if (isStub && !hasPostMutation) return failUnproven()
   const crossOrReplay = isCrossTenantCls || contract === 'v8_pivot' || contract === 'v8_crypto', singleHopProofOk = Boolean(ti.proofReceipt && terminalVerification?.confirmed && receipt.hops.length === 1 && !v8Default)
-  const forgedWhErr = evaluateForgedWebhookProvenanceGuard({ normCls, hopCount: receipt.hops.length, verifiedEdgeCount: verifiedEdges.length, singleHopProofOk, termEx, terminalCtrl, preChainControlIds: ti.preChainControlExchangeIds, entriesById: idx.entriesById, hasTermDerivedCrypto, hostVerifiedCryptoOracle: contract === 'v8_crypto' && Boolean(v8Default?.explicit) })
+  const forgedWhErr = evaluateSignatureProvenanceGuard({ normCls, hopCount: receipt.hops.length, verifiedEdgeCount: verifiedEdges.length, singleHopProofOk, termEx, terminalCtrl, preChainControlIds: ti.preChainControlExchangeIds, entriesById: idx.entriesById, hasTermDerivedCrypto, hostVerifiedCryptoOracle: contract === 'v8_crypto' && Boolean(v8Default?.explicit) })
   if (forgedWhErr) return failUnproven(forgedWhErr)
   if (termEx && ownTenantOnly && !hasPostMutation && (crossOrReplay || !hasCleanDeniedCtrl)) return failUnproven()
   if (contract === 'v8_economic') return (v8Default?.explicit && v8Default.family === 'economic_conservation') ? okTerm('economic_conservation') : failUnproven('economic_conservation requires verified host-derived conservation oracle input.')
@@ -688,7 +689,7 @@ function verifyTerminalImpactGate(
   if (!singleHopProofOk) {
     if (!hasCleanDeniedCtrl && !hasDerivedTerminalProof) return failUnproven(`Missing clean denied control (401/403/404) bound to terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['clean_denied_control_401_403_404'])
     if ((!termEx && !hasPostMutation) || !termEndpoint || !termFam) return failUnproven(`Missing concrete terminal exchange or endpoint for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['terminal_exchange_with_endpoint'])
-    const ownOrgErr = evaluateOwnOrgTerminalGuard({ normCls, contract, isPrivEscCls: PRIV_ESC_CLASS_RE.test(normCls), isCrossTenantCls, termEx, terminalCtrl, attackerTenants, personaRoleLabels: options.personaRoleLabels, ownTenantOnly, hasForeignTenantData, reflectedTenantOnly, hasPostMutation, hasV8Oracle: Boolean(v8Default), isReadOnlyDir: isReadOnlyDirectoryOrMetadataImpact(termEx), hasTermDerivedCrypto, hasVerifiedTermStateTransition: verifiedEdges.some(e => e.toHopId === termHop.hopId && e.verified && e.kind === 'state_transition_binding'), hasVerifiedTermValueBinding: verifiedEdges.some(e => e.toHopId === termHop.hopId && e.verified && e.kind === 'value_binding'), hopCount: receipt.hops.length, upstreamEntries, preChainControlIds: ti.preChainControlExchangeIds, entriesById: idx.entriesById })
+    const ownOrgErr = evaluateOwnScopeTerminalGuard({ normCls, contract, isPrivEscCls: PRIV_ESC_CLASS_RE.test(normCls), isCrossTenantCls, termEx, terminalCtrl, attackerTenants, personaRoleLabels: options.personaRoleLabels, ownTenantOnly, hasForeignTenantData, reflectedTenantOnly, hasPostMutation, hasV8Oracle: Boolean(v8Default), isReadOnlyDir: isReadOnlyDirectoryOrMetadataImpact(termEx), hasTermDerivedCrypto, hasVerifiedTermStateTransition: verifiedEdges.some(e => e.toHopId === termHop.hopId && e.verified && e.kind === 'state_transition_binding'), hasVerifiedTermValueBinding: verifiedEdges.some(e => e.toHopId === termHop.hopId && e.verified && e.kind === 'value_binding'), hopCount: receipt.hops.length, upstreamEntries, preChainControlIds: ti.preChainControlExchangeIds, entriesById: idx.entriesById })
     if (ownOrgErr) return failUnproven(ownOrgErr)
     if (!v8Default && isCrossTenantCls && !crossTenantSatisfied) return failUnproven('terminal_impact_unproven: cross-tenant class requires positive non-reflected foreign tenant data (request URL/query tokens stripped) or persisted mutation readback.')
     if (termEx && !hasPostMutation && (!hasBody || isStub || (ownTenantOnly && crossOrReplay))) return failUnproven()

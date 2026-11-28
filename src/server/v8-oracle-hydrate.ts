@@ -10,11 +10,10 @@
  */
 import { createHash } from 'node:crypto'
 import { parseBodyFromCarrierText, type WireCredentialProvenance } from './host-fact-log.ts'
-import { ROLE_RANK, normalizeRole, parseRoleMemberships, resolvePersonaIdentity, stepReadsState, type RoleName } from './oracle-invariants.ts'
+import { ROLE_RANK, normalizeRole, parseRoleMemberships, resolvePersonaIdentity, routeFamily, stepReadsState, type RoleName } from './oracle-invariants.ts'
 import type { ProofReceipt } from './proof-receipt.ts'
-import { deriveRecordAuthzDimension, extractIssuedSignedUrl, extractTenantMarkers, findNonErrorBatchRecord, isJobOrHandleStub, type HostAuthzDimension, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
+import { compareChronoAsc, containsExactTenantToken, deriveRecordAuthzDimension, evaluateJsonPathNumber, extractIssuedSignedUrl, extractTenantMarkers, findNonErrorBatchRecord, hasSignatureCarrier, isJobOrHandleStub, normalizeTerminalVulnClass, resolveEntityLessReadStateTransition, type HostAuthzDimension, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
 import { buildTerminalClassContractMap, resolveTerminalContractKind, type OracleTerminalContractKind } from './oracle-spec.ts'
-import { extractLedgerBalanceMap, hydrateBalanceMintingOperands, isControlDeniedAction, normalizeTerminalVulnClass, resolveEconomicActionRecords, resolveEntityLessReadStateTransition, resolveOpaqueDualCacheBleedTarget, selectAutoEconomicActions } from './own-org-terminal-guard.ts'
 
 export interface HydratableEntry {
   exchangeId: string; op?: string; seq?: number; timestampMs?: number
@@ -48,7 +47,7 @@ const SIG_HEADER_NAMES = new Set(['x-sig', 'x-signature', 'x-hmac-signature', 'x
 const SURFACE_SET = new Set(['http', 'graphql', 'ws', 'sse', 'browser', 'webhook', 'async_job', 'idp', 'cdn', 'storage'])
 const DUAL_MODE_SET = new Set(['cross_org_transfer', 'dual_org_cache_bleed', 'batch_partial_authz'])
 const CRED_KIND_SET = new Set(['token', 'session', 'role', 'invite', 'pat', 'async_job', 'webhook_callback'])
-const ECON_EQ_SET = new Set(['over_refund', 'balance_minting', 'underpaid_fulfillment', 'ineligible_discount'])
+const ECON_EQ_SET = new Set(['over_refund', 'balance_minting', 'underpaid_fulfillment', 'ineligible_discount', 'quantity_conservation'])
 const PARSER_MODE_SET = new Set(['parser_differential', 'cache_primed'])
 const CACHE_PRIMED_MODE_ALIASES = new Set(['cache_poisoning', 'cache_deception', 'cache_bleed', 'cache_priming'])
 const DIFF_KIND_SET = new Set(['duplicate_json_key', 'path_normalization', 'header_normalization', 'hop_by_hop_smuggling', 'content_type_confusion'])
@@ -634,417 +633,431 @@ function resolveEconomicEquation(raw: Record<string, unknown>, baseRec: HostSign
   return hostHits.length === 1 ? hostHits[0] : undefined
 }
 
+interface HydrationCtx { out: Record<string, unknown>; raw: Record<string, unknown>; idx: HydratableTranscriptIndex; fallbackSig: string; econCtx?: EconomicAutoHydrateContext; explicit: Set<string> }
+const roleOf = (h: HydrationCtx, field: string, alias?: string): void => { if (hydrateRoleField(h.out, h.raw, field, h.idx, h.fallbackSig, alias)) h.explicit.add(field) }
+const recOf = (h: HydrationCtx, field: string): HostSignedRecord | undefined => isRecObj(h.out[field]) ? h.out[field] as HostSignedRecord : undefined
+const entryOf = (h: HydrationCtx, field: string): HydratableEntry | undefined => { const r = recOf(h, field); return r ? h.idx.entriesById.get(r.id) : undefined }
+/** Shared host-attested authz dimension (R4-C-5): persona tenant (or capability-emitter tenant) + response tenants/scope. */
+function hostAuthzDim(e: HydratableEntry | undefined, capIdx?: CapOriginIndex, preferredTenant?: string, stripUrlTokens = false): HostAuthzDimension {
+  const caps = e && capIdx ? [...(e.actorPersona?.startsWith('cap:') ? [e.actorPersona] : []), ...(e.consumedCapabilities ?? []), ...(e.emittedCapabilities ?? [])] : []
+  const capT = caps.map(c => capIdx!.emitterActorOf(c)?.tenant).find(Boolean) ?? ''
+  const personaTenant = ((e ? resolveEntryIdentity(e).tenant : null) ?? capT).trim().toLowerCase()
+  return deriveRecordAuthzDimension(e ? { route: e.step.route, pathAndQuery: e.step.pathAndQuery, json: e.step.json, body: e.step.body, tenantId: personaTenant || null } : undefined, { personaTenant, preferredTenant, stripUrlTokens })
+}
+const DUAL_ROLE_FIELDS = [['transferRecord', 'transferExchangeId'], ['postTransferReadback'], ['sourceControlDenied', 'sourceControlExchangeId'], ['baselineDeniedControl', 'baselineControlExchangeId'], ['primeAction'], ['bledAccess'], ['singleForeignControlDenied', 'singleForeignControlExchangeId'], ['batchRequest'], ['postMutationReadback']] as const
+const OWNER_TENANT_KEYS = ['ownertenantid', 'owner_tenant_id', 'ownerorgid', 'owner_org_id', 'destinationtenant', 'destination_tenant', 'desttenantid', 'dest_tenant_id', 'tenantid', 'tenant_id', 'tenant', 'orgid', 'org_id']
+/** dual_tenant_abac (access_differential / wire cache-bleed): host-derived actor, tenants, and impact predicates only. */
+function hydrateDualTenant(h: HydrationCtx): void {
+  const { out, raw, idx } = h
+  for (const [f, a] of DUAL_ROLE_FIELDS) roleOf(h, f, a)
+  const mode = resolveDualAbacMode(raw); if (mode) out.mode = mode
+  const cited = DUAL_ROLE_FIELDS.map(([f]) => entryOf(h, f)), actor = deriveDualActorFromTranscript(idx, cited, raw, h.econCtx)
+  if (actor) out.actor = actor
+  for (const k of ['entityId', 'ownRecordId', 'foreignRecordId'] as const) { const v = pickStr(raw, k, 128); if (v && v.length >= MIN_TOKEN_LEN) out[k] = v }
+  const tenantOf = (e: HydratableEntry | undefined): string | null => hostAuthzDim(e).personaTenant || null
+  const markersOf = (e: HydratableEntry | undefined): Set<string> => hostAuthzDim(e, undefined, undefined, true).responseTenants
+  const known = new Set<string>()
+  for (const e of idx.entriesById.values()) { const t = tenantOf(e); if (t) known.add(t); for (const m of e.actorRoleLabel ? parseRoleMemberships(e.actorRoleLabel) : []) if (m.tenant) known.add(m.tenant.trim().toLowerCase()) }
+  if (mode === 'cross_org_transfer') {
+    const rb = recOf(h, 'postTransferReadback'), xfer = entryOf(h, 'transferRecord'), ctrl = entryOf(h, 'sourceControlDenied'), src = tenantOf(ctrl)
+    const owner = findStringField(parseRecJson(rb), OWNER_TENANT_KEYS)?.trim().toLowerCase(), eid = typeof out.entityId === 'string' ? out.entityId : ''
+    if (src) out.sourceTenantId = src
+    if (owner) { out.destTenantId = owner; out.observedOwnerTenantId = owner }
+    if (!(eid && rb && recordContainsToken(rb, eid) && (entryReferencesToken(xfer, eid) || entryReferencesToken(ctrl, eid) || recordContainsToken(recOf(h, 'transferRecord'), eid)))) delete out.entityId
+  } else if (mode === 'dual_org_cache_bleed') {
+    const bled = recOf(h, 'bledAccess'), prime = tenantOf(entryOf(h, 'primeAction')) ?? tenantOf(entryOf(h, 'baselineDeniedControl')), markers = markersOf(entryOf(h, 'bledAccess'))
+    if (prime) out.primeTenantId = prime
+    const foreign = [...markers].filter(m => m !== prime)
+    const target = foreign.length === 1 ? foreign[0] : resolveOpaqueDualCacheBleedTarget({ bled, primeTenant: prime, bledMarkers: markers, actor, citedUpstreamMarkers: cited.filter(e => e && e.exchangeId !== bled?.id).map(markersOf), hostKnownTenants: known })
+    if (target) out.targetTenantId = target
+    if (bled) {
+      if (target && markers.has(target.trim().toLowerCase())) out.observedTenantId = target; else if (markers.size > 0) out.observedTenantId = [...markers][0]
+      const rawTarget = pickStr(raw, 'targetRecordId', 128); if (rawTarget && rawTarget.length >= MIN_TOKEN_LEN && recordContainsToken(bled, rawTarget)) out.targetRecordId = rawTarget
+    }
+  } else if (mode === 'batch_partial_authz') hydrateBatchPartialAuthz(h, tenantOf, markersOf, known)
+}
+function hydrateBatchPartialAuthz(h: HydrationCtx, tenantOf: (e: HydratableEntry | undefined) => string | null, markersOf: (e: HydratableEntry | undefined) => Set<string>, known: ReadonlySet<string>): void {
+  const { out, raw } = h, batchRec = recOf(h, 'batchRequest'), batchEntry = entryOf(h, 'batchRequest'), ctrl = entryOf(h, 'singleForeignControlDenied'), mutRb = recOf(h, 'postMutationReadback')
+  const own = tenantOf(batchEntry) ?? tenantOf(ctrl); if (own) out.ownTenantId = own
+  if (Array.isArray(raw.requestedIds) && batchEntry) out.requestedIds = raw.requestedIds.filter((x): x is string => typeof x === 'string' && x.trim().length >= MIN_TOKEN_LEN && x.length <= 128).map(x => x.trim()).slice(0, 32).filter(id => entryReferencesToken(batchEntry, id))
+  const fid0 = typeof out.foreignRecordId === 'string' ? out.foreignRecordId : ''
+  if (ctrl && fid0 && (ctrl.step.pathAndQuery || ctrl.step.requestJson !== undefined) && !entryReferencesToken(ctrl, fid0)) delete out.foreignRecordId
+  const fid = typeof out.foreignRecordId === 'string' ? out.foreignRecordId : ''
+  const matched = batchRec && fid && !isHydratedStub(batchRec) ? findNonErrorBatchRecord(batchRec.json, batchRec.body, fid) : null
+  out.returnedForeignIds = matched ? [fid] : []; out.foreignDataObserved = Boolean(matched)
+  if (mutRb) { const isJson = mutRb.json !== undefined || (typeof mutRb.body === 'string' && /^[\[{]/.test(mutRb.body.trim())); out.foreignMutationPersisted = Boolean(is2xx(mutRb.status) && !isHydratedStub(mutRb) && fid && (isJson ? findNonErrorBatchRecord(mutRb.json, mutRb.body, fid) !== null : recordContainsToken(mutRb, fid))) }
+  const respForeign = new Set<string>([...(matched ? extractTenantMarkers(matched, undefined, true) : []), ...markersOf(batchEntry), ...markersOf(entryOf(h, 'postMutationReadback'))]); if (own) respForeign.delete(own)
+  const rawForeign = pickStr(raw, 'foreignTenantId', 128)?.toLowerCase() ?? ''
+  if (respForeign.size === 1) out.foreignTenantId = [...respForeign][0]
+  else if (rawForeign && ((respForeign.size > 1 && respForeign.has(rawForeign)) || (rawForeign !== own && known.has(rawForeign)))) out.foreignTenantId = rawForeign
+}
+/** temporal_revocation (access_differential time boundary): surfaces/handles/actors strictly from host records. */
+function hydrateTemporal(h: HydrationCtx): void {
+  const { out, raw, idx } = h
+  for (const f of ['preRevocationBaseline', 'revocationEvent', 'primaryDeniedCheck', 'secondarySuccess'] as const) roleOf(h, f)
+  const credKind = pickEnum(raw, 'credentialKind', CRED_KIND_SET); if (credKind) out.credentialKind = credKind
+  const p = recOf(h, 'primaryDeniedCheck'), sRec = recOf(h, 'secondarySuccess')
+  if (p) out.primarySurface = deriveHostSurface(idx.entriesById.get(p.id), p)
+  if (sRec) out.secondarySurface = deriveHostSurface(idx.entriesById.get(sRec.id), sRec)
+  for (const [field, a, b, rawVal] of [['credentialHandle', p?.capabilityHandle, sRec?.capabilityHandle, pickStr(raw, 'credentialHandle', 200)], ['actorId', p?.actorId, sRec?.actorId, pickStr(raw, 'actorId', 128)]] as const) {
+    const pa = a?.trim() || '', sa = b?.trim() || ''
+    if (pa && sa && pa === sa) out[field] = pa; else if (rawVal && (rawVal === pa || rawVal === sa)) out[field] = rawVal
+  }
+}
+/** cryptographic_scope_replay (access_differential): symmetric host tenant/scope + request-signature digests (never response hashes). */
+function hydrateCryptoScope(h: HydrationCtx): void {
+  const { out, raw, idx } = h
+  roleOf(h, 'tamperedSignatureControl', 'tamperedControlExchangeId'); roleOf(h, 'sourceValidIssuance', 'sourceIssuanceExchangeId'); roleOf(h, 'replayedAcceptance', 'replayedExchangeId')
+  const tRec = recOf(h, 'tamperedSignatureControl'), sRec = recOf(h, 'sourceValidIssuance'), rRec = recOf(h, 'replayedAcceptance')
+  const tE = entryOf(h, 'tamperedSignatureControl'), sE = entryOf(h, 'sourceValidIssuance'), rE = entryOf(h, 'replayedAcceptance'), capIdx = buildCapOriginIndex(idx.entriesById.values(), ANON_HANDLE_RE)
+  const sDim = hostAuthzDim(sE, capIdx, pickStr(raw, 'sourceTenant', 128)?.toLowerCase()), rDim = hostAuthzDim(rE, capIdx, pickStr(raw, 'targetTenant', 128)?.toLowerCase())
+  const sSigned = sDim.issuedSignedResource || (extractRequestSigDigest(sRec, sE) ? sDim.requestSignedResource : ''), rSigned = rDim.requestSignedResource
+  const srcT = sDim.tenant, dstT = rDim.responseTenants.size > 0 ? rDim.tenant : (srcT || rDim.tenant)
+  if (srcT) out.sourceTenant = srcT; if (dstT) out.targetTenant = dstT; if (sSigned) out.sourceSignedResource = sSigned; if (rSigned) out.targetSignedResource = rSigned
+  const [srcS, dstS] = sSigned && rSigned && sSigned !== rSigned ? [`resource:${sSigned}`, `resource:${rSigned}`] : sDim.responseScope && rDim.responseScope ? [sDim.responseScope, rDim.responseScope] : sSigned && rSigned ? [`resource:${sSigned}`, `resource:${rSigned}`] : [srcT ? `tenant:${srcT}` : '', dstT ? `tenant:${dstT}` : '']
+  if (srcS) out.sourceScope = srcS; if (dstS) out.targetScope = dstS
+  const same = Boolean(sRec && rRec && sRec.id === rRec.id), emitted = new Set(sE?.emittedCapabilities ?? []), linked = same ? undefined : rE?.cryptoAttestations?.find(a => emitted.has(a.derivedFromCapabilityId))
+  out.tamperedSignatureDigest = tE?.cryptoAttestations?.[0]?.artifactDigest ?? extractRequestSigDigest(tRec, tE) ?? ''
+  out.signatureDigest = same ? '' : (linked?.artifactDigest ?? sE?.cryptoAttestations?.[0]?.artifactDigest ?? extractRequestSigDigest(sRec, sE) ?? extractIssuedSigDigest(sE) ?? '')
+  out.replayedSignatureDigest = same ? '' : (linked?.artifactDigest ?? rE?.cryptoAttestations?.[0]?.artifactDigest ?? extractRequestSigDigest(rRec, rE) ?? '')
+}
+/** parser_cache_differential (wire_framing_and_cache_differential): wire values read from host requests, never worker-supplied. */
+function hydrateParserCache(h: HydrationCtx): void {
+  const { out, raw } = h
+  for (const [f, a] of [['cleanControl'], ['differentialProbe'], ['postMutationReadback'], ['victimOrPrimeRequest', 'victimPrimeExchangeId'], ['attackerProbe']] as const) roleOf(h, f, a)
+  const { mode, inferredDifferentialKind } = resolveParserCacheMode(raw); if (mode) out.mode = mode
+  if (mode === 'cache_primed') { const ck = pickStr(raw, 'cacheKey', 256); if (ck) out.cacheKey = ck; const prime = recOf(h, 'victimOrPrimeRequest'); if (prime?.artifactDigest) out.victimArtifactDigest = prime.artifactDigest; return }
+  if (mode !== 'parser_differential') return
+  const dk = raw.differentialKind !== undefined ? pickEnum(raw, 'differentialKind', DIFF_KIND_SET) : inferredDifferentialKind, df = pickStr(raw, 'differentialFeature', 128), ik = pickEnum(raw, 'impactKind', IMPACT_KIND_SET)
+  if (dk) out.differentialKind = dk; if (df) out.differentialFeature = df; if (ik) out.impactKind = ik
+  const ctrl = recOf(h, 'cleanControl'), c = entryOf(h, 'cleanControl'), p = entryOf(h, 'differentialProbe')
+  const wire = (e: HydratableEntry): string => dk === 'path_normalization' ? (e.step.pathAndQuery ?? e.step.route ?? '') : dk === 'content_type_confusion' ? headerLookupCI(e.step.requestHeaders, 'content-type') : dk === 'duplicate_json_key' ? rawRequestBodyText(e) : canonicalDiffHeaders(e.step.requestHeaders)
+  if (dk && c && p) {
+    const cv = wire(c), pv = wire(p)
+    out.canonicalValue = cv
+    out.variantValue = dk === 'content_type_confusion' ? (pv || cv) : dk === 'duplicate_json_key' ? (pv.length > 0 && hasDuplicateJsonKeyInRaw(pv) ? pv : cv) : pv
+  } else { out.canonicalValue = ''; out.variantValue = '' }
+  const rb = recOf(h, 'postMutationReadback')
+  if (ik === 'mutation' && rb) out.mutationPersisted = Boolean(is2xx(rb.status) && !isHydratedStub(rb) && (rb.json !== undefined || (typeof rb.body === 'string' && rb.body.trim().length > 0)) && (!ctrl?.artifactDigest || rb.artifactDigest !== ctrl.artifactDigest))
+}
+/** economic_conservation (state_delta_and_conservation): host-selected window, host-bound actions, host-derived operands. */
+function hydrateEconomic(h: HydrationCtx): void {
+  const { out, raw, idx, fallbackSig, econCtx } = h
+  roleOf(h, 'baselineReadback', 'baselineExchangeId'); roleOf(h, 'finalReadback', 'finalExchangeId')
+  const tol = pickFiniteNonNeg(raw.tolerance); if (tol !== undefined && tol <= 1) out.tolerance = tol
+  const explicitActions = hydrateRecordArrayField(out, raw, 'actions', ['actionExchangeIds', 'actionsExchangeIds', 'actionExchangeId'], idx, fallbackSig)
+  if (econCtx) {
+    if (!explicitActions) { const auto = selectAutoEconomicActions({ econCtx, entriesById: idx.entriesById, toRecord: e => toOracleRecord(e, fallbackSig) }); if (auto.length > 0) out.actions = auto }
+    const acts = Array.isArray(out.actions) ? (out.actions as unknown[]).filter((a): a is HostSignedRecord => Boolean(a && typeof a === 'object' && isPosTs((a as HostSignedRecord).timestampMs))) : []
+    const actIds = new Set(acts.map(a => a.id)), minTs = acts.length > 0 ? Math.min(...acts.map(a => a.timestampMs)) : null, maxTs = acts.length > 0 ? Math.max(...acts.map(a => a.timestampMs)) : null
+    const readOk = (e: HydratableEntry | undefined): e is HydratableEntry => Boolean(e && !actIds.has(e.exchangeId) && is2xx(e.step.status) && isPosTs(e.timestampMs) && stepReadsState(e.step))
+    if (!h.explicit.has('baselineReadback')) { const base = [...econCtx.preChainControlExchangeIds, ...(econCtx.citedExchangeIds ?? [])].map(id => idx.entriesById.get(id)).find(e => readOk(e) && (minTs === null || e.timestampMs! <= minTs)); if (base) out.baselineReadback = toOracleRecord(base, fallbackSig) }
+    if (!h.explicit.has('finalReadback')) {
+      const baseId = recOf(h, 'baselineReadback')?.id
+      const fin = [...econCtx.postChainReadbackExchangeIds, ...[...econCtx.termHopExchangeIds].reverse()].map(id => idx.entriesById.get(id)).find(e => readOk(e) && e.exchangeId !== baseId && (maxTs === null || e.timestampMs! >= maxTs) && hasEntryBody(e) && !isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method, e.step.route ?? e.step.pathAndQuery))
+      if (fin) out.finalReadback = toOracleRecord(fin, fallbackSig)
+    }
+  }
+  const baseRec = recOf(h, 'baselineReadback'), finRec = recOf(h, 'finalReadback')
+  // Dedupe + host-bind actions to probe-arm mutations (R2-C-8), retaining DAG/window-bound `race` sub-exchanges.
+  const actRecs = resolveEconomicActionRecords({ rawActRecs: Array.isArray(out.actions) ? (out.actions as unknown[]).filter(isRecObj) : [], entriesById: idx.entriesById, citedExchangeIds: econCtx?.citedExchangeIds, baseRec, finRec })
+  if (Array.isArray(out.actions)) out.actions = actRecs
+  const eq = resolveEconomicEquation(raw, baseRec, finRec); if (eq) out.equation = eq
+  hydrateEconomicOperands(out, raw, eq, { baseRec, finRec, actRecs, idx, fallbackSig, econCtx })
+}
 /**
- * Hydrate all `HostSignedRecord` fields inside a raw `oracleInput` from `HostSignedTranscript`.
- * Allowlists ONLY safe structural reference IDs/selectors from `rawInput` (never spreading raw
- * model booleans or fabricated numeric operands) and derives all verification operands strictly
- * from host-recorded transcript exchanges.
+ * Hydrate all `HostSignedRecord` fields inside a raw legacy `oracleInput` from the `HostSignedTranscript` and
+ * normalize it onto its universal primitive's operands. Allowlists ONLY safe structural reference IDs/selectors
+ * from `rawInput` (never raw model booleans or fabricated numeric operands); every operand is host-derived.
  */
-export function hydrateV8OracleInput(
-  family: V8OracleFamily,
-  rawInput: Record<string, unknown>,
-  idx: HydratableTranscriptIndex,
-  fallbackSig: string,
-  econCtx?: EconomicAutoHydrateContext,
-): Record<string, unknown> {
-  const out: Record<string, unknown> = {}; if (findConflictingOracleInputKeys(rawInput).length > 0) return out; rawInput = normalizeV8OracleInputKeys(rawInput)
-  const explicit = new Set<string>()
-  const hydrateRole = (field: string, extraAlias?: string): void => {
-    if (hydrateRoleField(out, rawInput, field, idx, fallbackSig, extraAlias)) explicit.add(field)
-  }
-
-  const hostAuthzDim = (e: HydratableEntry | undefined, capIdx?: CapOriginIndex, preferredTenant?: string, stripUrlTokens = false): HostAuthzDimension => {
-    let capT = ''
-    if (e && capIdx) {
-      for (const c of [...(e.actorPersona?.startsWith('cap:') ? [e.actorPersona] : []), ...(e.consumedCapabilities ?? []), ...(e.emittedCapabilities ?? [])]) { const t = capIdx.emitterActorOf(c)?.tenant; if (t) { capT = t; break } }
-    }
-    const personaTenant = ((e ? resolveEntryIdentity(e).tenant : null) ?? capT).trim().toLowerCase()
-    return deriveRecordAuthzDimension(e ? { route: e.step.route, pathAndQuery: e.step.pathAndQuery, json: e.step.json, body: e.step.body, tenantId: personaTenant || null } : undefined, { personaTenant, preferredTenant, stripUrlTokens })
-  }
-
-  if (family === 'dual_tenant_abac') {
-    for (const [f, a] of [
-      ['transferRecord', 'transferExchangeId'], ['postTransferReadback'], ['sourceControlDenied', 'sourceControlExchangeId'],
-      ['baselineDeniedControl', 'baselineControlExchangeId'], ['primeAction'], ['bledAccess'],
-      ['singleForeignControlDenied', 'singleForeignControlExchangeId'], ['batchRequest'], ['postMutationReadback'],
-    ] as const) hydrateRole(f, a)
-    const mode = resolveDualAbacMode(rawInput)
-    if (mode) out.mode = mode
-    const citedEntry = (field: string): HydratableEntry | undefined => isRecObj(out[field]) ? idx.entriesById.get((out[field] as HostSignedRecord).id) : undefined
-    const cited = ['transferRecord', 'postTransferReadback', 'sourceControlDenied', 'baselineDeniedControl', 'primeAction', 'bledAccess', 'singleForeignControlDenied', 'batchRequest', 'postMutationReadback'].map(citedEntry)
-    const actor = deriveDualActorFromTranscript(idx, cited, rawInput, econCtx)
-    if (actor) out.actor = actor
-    // Allowlist ONLY record selector IDs (with minimum length); tenant scope and role requirements are host-derived.
-    for (const k of ['entityId', 'ownRecordId', 'foreignRecordId'] as const) {
-      const v = pickStr(rawInput, k, 128)
-      if (v && v.length >= MIN_TOKEN_LEN) out[k] = v
-    }
-    const tenantOf = (e: HydratableEntry | undefined): string | null => hostAuthzDim(e).personaTenant || null
-    // R3-C-5 + Move-1 + R4-C-5: shared host-attested authz-dimension primitive, stripping attacker-supplied URL path/query tokens.
-    const markersOf = (e: HydratableEntry | undefined): Set<string> => hostAuthzDim(e, undefined, undefined, true).responseTenants
-    const hostKnownTenants = new Set<string>()
-    for (const e of idx.entriesById.values()) { const t = tenantOf(e); if (t) hostKnownTenants.add(t); if (e.actorRoleLabel) for (const m of parseRoleMemberships(e.actorRoleLabel)) if (m.tenant) hostKnownTenants.add(m.tenant.trim().toLowerCase()) }
-    if (mode === 'cross_org_transfer') {
-      const rb = isRecObj(out.postTransferReadback) ? out.postTransferReadback : undefined
-      const xferEntry = citedEntry('transferRecord'), ctrlEntry = citedEntry('sourceControlDenied')
-      const sourceTenant = tenantOf(ctrlEntry)
-      const ownerTenant = findStringField(parseRecJson(rb), ['ownertenantid', 'owner_tenant_id', 'ownerorgid', 'owner_org_id', 'destinationtenant', 'destination_tenant', 'desttenantid', 'dest_tenant_id', 'tenantid', 'tenant_id', 'tenant', 'orgid', 'org_id'])?.trim().toLowerCase()
-      if (sourceTenant) out.sourceTenantId = sourceTenant
-      if (ownerTenant) { out.destTenantId = ownerTenant; out.observedOwnerTenantId = ownerTenant }
-      const eid = typeof out.entityId === 'string' ? out.entityId : ''
-      if (!(eid && rb && recordContainsToken(rb, eid) && (entryReferencesToken(xferEntry, eid) || entryReferencesToken(ctrlEntry, eid) || recordContainsToken(isRecObj(out.transferRecord) ? out.transferRecord : undefined, eid)))) delete out.entityId
-    } else if (mode === 'dual_org_cache_bleed') {
-      const bled = isRecObj(out.bledAccess) ? out.bledAccess : undefined
-      const primeTenant = tenantOf(citedEntry('primeAction')) ?? tenantOf(citedEntry('baselineDeniedControl'))
-      const markers = markersOf(citedEntry('bledAccess'))
-      if (primeTenant) out.primeTenantId = primeTenant
-      const foreignMarkers = new Set(markers); if (primeTenant) foreignMarkers.delete(primeTenant)
-      if (foreignMarkers.size === 1) out.targetTenantId = [...foreignMarkers][0]; else { const fb = resolveOpaqueDualCacheBleedTarget({ bled, primeTenant, bledMarkers: markers, actor, citedUpstreamMarkers: cited.filter(e => e && e.exchangeId !== bled?.id).map(markersOf), hostKnownTenants }); if (fb) out.targetTenantId = fb }
-      if (bled) {
-        const target = typeof out.targetTenantId === 'string' ? out.targetTenantId.trim().toLowerCase() : ''
-        if (target && markers.has(target)) out.observedTenantId = out.targetTenantId
-        else if (markers.size > 0) out.observedTenantId = [...markers][0]
-        const rawTargetRec = pickStr(rawInput, 'targetRecordId', 128)
-        if (rawTargetRec && rawTargetRec.length >= MIN_TOKEN_LEN && recordContainsToken(bled, rawTargetRec)) out.targetRecordId = rawTargetRec
-      }
-    } else if (mode === 'batch_partial_authz') {
-      const batchRec = isRecObj(out.batchRequest) ? out.batchRequest : undefined
-      const batchEntry = batchRec ? idx.entriesById.get(batchRec.id) : undefined
-      const ctrlEntry = citedEntry('singleForeignControlDenied'), mutRb = isRecObj(out.postMutationReadback) ? out.postMutationReadback : undefined
-      const ownTenant = tenantOf(batchEntry) ?? tenantOf(ctrlEntry)
-      if (ownTenant) out.ownTenantId = ownTenant
-      if (Array.isArray(rawInput.requestedIds) && batchEntry) {
-        out.requestedIds = rawInput.requestedIds.filter((x): x is string => typeof x === 'string' && x.trim().length >= MIN_TOKEN_LEN && x.length <= 128).map(x => x.trim()).slice(0, 32).filter(id => entryReferencesToken(batchEntry, id))
-      }
-      const foreignId = typeof out.foreignRecordId === 'string' ? out.foreignRecordId : ''
-      if (ctrlEntry && foreignId && (ctrlEntry.step.pathAndQuery || ctrlEntry.step.requestJson !== undefined) && !entryReferencesToken(ctrlEntry, foreignId)) delete out.foreignRecordId
-      const vFid = typeof out.foreignRecordId === 'string' ? out.foreignRecordId : ''
-      const matchedItem = batchRec && vFid && !isHydratedStub(batchRec) ? findNonErrorBatchRecord(batchRec.json, batchRec.body, vFid) : null
-      out.returnedForeignIds = matchedItem ? [vFid] : []; out.foreignDataObserved = Boolean(matchedItem)
-      if (mutRb) {
-        const mutIsJson = mutRb.json !== undefined || (typeof mutRb.body === 'string' && /^[\[{]/.test(mutRb.body.trim()))
-        out.foreignMutationPersisted = Boolean(is2xx(mutRb.status) && !isHydratedStub(mutRb) && vFid && (mutIsJson ? findNonErrorBatchRecord(mutRb.json, mutRb.body, vFid) !== null : recordContainsToken(mutRb, vFid)))
-      }
-      const respForeign = new Set<string>([...(matchedItem ? extractTenantMarkers(matchedItem, undefined, true) : []), ...markersOf(batchEntry), ...markersOf(citedEntry('postMutationReadback'))])
-      if (ownTenant) respForeign.delete(ownTenant)
-      const rawForeign = pickStr(rawInput, 'foreignTenantId', 128)?.toLowerCase() ?? ''
-      if (respForeign.size === 1) out.foreignTenantId = [...respForeign][0]
-      else if (respForeign.size > 1 && rawForeign && respForeign.has(rawForeign)) out.foreignTenantId = rawForeign
-      else if (rawForeign && rawForeign !== ownTenant && hostKnownTenants.has(rawForeign)) out.foreignTenantId = rawForeign
-    }
-    return out
-  }
-
-  if (family === 'temporal_revocation') {
-    for (const f of ['preRevocationBaseline', 'revocationEvent', 'primaryDeniedCheck', 'secondarySuccess'] as const) hydrateRole(f)
-    const credKind = pickEnum(rawInput, 'credentialKind', CRED_KIND_SET)
-    if (credKind) out.credentialKind = credKind
-    const pRec = isRecObj(out.primaryDeniedCheck) ? out.primaryDeniedCheck : undefined
-    const sRec = isRecObj(out.secondarySuccess) ? out.secondarySuccess : undefined
-    const pEntry = pRec ? idx.entriesById.get(pRec.id) : undefined
-    const sEntry = sRec ? idx.entriesById.get(sRec.id) : undefined
-    // R2-C-8: derive surfaces strictly from host records, never from model-supplied enum labels.
-    if (pRec) out.primarySurface = deriveHostSurface(pEntry, pRec)
-    if (sRec) out.secondarySurface = deriveHostSurface(sEntry, sRec)
-    const pHandle = pRec?.capabilityHandle?.trim() || '', sHandle = sRec?.capabilityHandle?.trim() || ''
-    const rawHandle = pickStr(rawInput, 'credentialHandle', 200)
-    if (pHandle && sHandle && pHandle === sHandle) out.credentialHandle = pHandle
-    else if (rawHandle && (rawHandle === pHandle || rawHandle === sHandle)) out.credentialHandle = rawHandle
-    const pActor = pRec?.actorId?.trim() || '', sActor = sRec?.actorId?.trim() || ''
-    const rawActor = pickStr(rawInput, 'actorId', 128)
-    if (pActor && sActor && pActor === sActor) out.actorId = pActor
-    else if (rawActor && (rawActor === pActor || rawActor === sActor)) out.actorId = rawActor
-    return out
-  }
-
-  if (family === 'cryptographic_scope_replay') {
-    hydrateRole('tamperedSignatureControl', 'tamperedControlExchangeId')
-    hydrateRole('sourceValidIssuance', 'sourceIssuanceExchangeId')
-    hydrateRole('replayedAcceptance', 'replayedExchangeId')
-    const tRec = isRecObj(out.tamperedSignatureControl) ? out.tamperedSignatureControl : undefined
-    const sRec = isRecObj(out.sourceValidIssuance) ? out.sourceValidIssuance : undefined
-    const rRec = isRecObj(out.replayedAcceptance) ? out.replayedAcceptance : undefined
-    const tEntry = tRec ? idx.entriesById.get(tRec.id) : undefined
-    const sEntry = sRec ? idx.entriesById.get(sRec.id) : undefined
-    const rEntry = rRec ? idx.entriesById.get(rRec.id) : undefined
-    // R4-C-5: shared host-attested authz-dimension primitive; symmetric tenant derivation; signed-resource scope only (no route fallback or caller persona).
-    const capIdx = buildCapOriginIndex(idx.entriesById.values(), ANON_HANDLE_RE)
-    const sDim = hostAuthzDim(sEntry, capIdx, pickStr(rawInput, 'sourceTenant', 128)?.toLowerCase())
-    const rDim = hostAuthzDim(rEntry, capIdx, pickStr(rawInput, 'targetTenant', 128)?.toLowerCase())
-    const sCarriesSig = Boolean(extractRequestSigDigest(sRec, sEntry))
-    const sSignedRes = sDim.issuedSignedResource || (sCarriesSig ? sDim.requestSignedResource : '')
-    const rSignedRes = rDim.requestSignedResource
-    const hostSrcTenant = sDim.tenant
-    const hostDstTenant = rDim.responseTenants.size > 0 ? rDim.tenant : (hostSrcTenant || rDim.tenant)
-    if (hostSrcTenant) out.sourceTenant = hostSrcTenant; if (hostDstTenant) out.targetTenant = hostDstTenant
-    if (sSignedRes) out.sourceSignedResource = sSignedRes; if (rSignedRes) out.targetSignedResource = rSignedRes
-    const [hostSrcScope, hostDstScope] = (sSignedRes && rSignedRes && sSignedRes !== rSignedRes)
-      ? [`resource:${sSignedRes}`, `resource:${rSignedRes}`]
-      : (sDim.responseScope && rDim.responseScope)
-        ? [sDim.responseScope, rDim.responseScope]
-        : (sSignedRes && rSignedRes)
-          ? [`resource:${sSignedRes}`, `resource:${rSignedRes}`]
-          : [hostSrcTenant ? `tenant:${hostSrcTenant}` : '', hostDstTenant ? `tenant:${hostDstTenant}` : '']
-    if (hostSrcScope) out.sourceScope = hostSrcScope; if (hostDstScope) out.targetScope = hostDstScope
-    // Bind cryptographic digests STRICTLY to cryptoAttestations or request signature/token headers/query —
-    // NEVER response-body hashes (`observedResponseDigests` / `rec.artifactDigest`), and NEVER same exchange.
-    const sameIssReplay = Boolean(sRec && rRec && sRec.id === rRec.id)
-    const emittedSet = new Set(sEntry?.emittedCapabilities ?? [])
-    const linkedAtt = !sameIssReplay ? rEntry?.cryptoAttestations?.find(a => emittedSet.has(a.derivedFromCapabilityId)) : undefined
-    const replayedDigest = sameIssReplay ? '' : (
-      linkedAtt?.artifactDigest
-      ?? rEntry?.cryptoAttestations?.[0]?.artifactDigest
-      ?? extractRequestSigDigest(rRec, rEntry)
-    )
-    const sourceDigest = sameIssReplay ? '' : (
-      linkedAtt?.artifactDigest
-      ?? sEntry?.cryptoAttestations?.[0]?.artifactDigest
-      ?? extractRequestSigDigest(sRec, sEntry)
-      ?? extractIssuedSigDigest(sEntry)
-    )
-    const tamperedDigest = tEntry?.cryptoAttestations?.[0]?.artifactDigest
-      ?? extractRequestSigDigest(tRec, tEntry)
-    out.tamperedSignatureDigest = tamperedDigest ?? ''
-    out.signatureDigest = sourceDigest ?? ''
-    out.replayedSignatureDigest = replayedDigest ?? ''
-    return out
-  }
-
-  if (family === 'parser_cache_differential') {
-    hydrateRole('cleanControl')
-    hydrateRole('differentialProbe')
-    hydrateRole('postMutationReadback')
-    hydrateRole('victimOrPrimeRequest', 'victimPrimeExchangeId')
-    hydrateRole('attackerProbe')
-    const { mode, inferredDifferentialKind } = resolveParserCacheMode(rawInput)
-    if (mode) out.mode = mode
-    if (mode === 'parser_differential') {
-      const dk = rawInput.differentialKind !== undefined ? pickEnum(rawInput, 'differentialKind', DIFF_KIND_SET) : inferredDifferentialKind
-      const df = pickStr(rawInput, 'differentialFeature', 128)
-      const ik = pickEnum(rawInput, 'impactKind', IMPACT_KIND_SET)
-      if (dk) out.differentialKind = dk
-      if (df) out.differentialFeature = df
-      if (ik) out.impactKind = ik
-      const ctrl = isRecObj(out.cleanControl) ? out.cleanControl : undefined
-      const probe = isRecObj(out.differentialProbe) ? out.differentialProbe : undefined
-      const ctlEntry = ctrl ? idx.entriesById.get(ctrl.id) : undefined
-      const prbEntry = probe ? idx.entriesById.get(probe.id) : undefined
-      // Inspect actual HostFactLog request headers/paths/bodies to verify a real differential occurred;
-      // NEVER trust worker-supplied canonicalValue/variantValue verbatim.
-      if (dk && ctlEntry && prbEntry) {
-        if (dk === 'path_normalization') {
-          out.canonicalValue = ctlEntry.step.pathAndQuery ?? ctlEntry.step.route ?? ''
-          out.variantValue = prbEntry.step.pathAndQuery ?? prbEntry.step.route ?? ''
-        } else if (dk === 'content_type_confusion') {
-          const cCt = headerLookupCI(ctlEntry.step.requestHeaders, 'content-type')
-          const pCt = headerLookupCI(prbEntry.step.requestHeaders, 'content-type')
-          out.canonicalValue = cCt
-          out.variantValue = pCt || cCt
-        } else if (dk === 'header_normalization' || dk === 'hop_by_hop_smuggling') {
-          out.canonicalValue = canonicalDiffHeaders(ctlEntry.step.requestHeaders)
-          out.variantValue = canonicalDiffHeaders(prbEntry.step.requestHeaders)
-        } else if (dk === 'duplicate_json_key') {
-          const cBody = rawRequestBodyText(ctlEntry)
-          const pBody = rawRequestBodyText(prbEntry)
-          const hasDup = pBody.length > 0 && hasDuplicateJsonKeyInRaw(pBody)
-          out.canonicalValue = cBody
-          out.variantValue = hasDup ? pBody : cBody
-        }
-      } else {
-        out.canonicalValue = ''
-        out.variantValue = ''
-      }
-      const rb = isRecObj(out.postMutationReadback) ? out.postMutationReadback : undefined
-      if (ik === 'mutation' && rb) {
-        const rbHasData = rb.json !== undefined || (typeof rb.body === 'string' && rb.body.trim().length > 0)
-        out.mutationPersisted = Boolean(
-          is2xx(rb.status) && !isHydratedStub(rb) && rbHasData && (!ctrl?.artifactDigest || rb.artifactDigest !== ctrl.artifactDigest),
-        )
-      }
-    } else if (mode === 'cache_primed') {
-      const ck = pickStr(rawInput, 'cacheKey', 256)
-      if (ck) out.cacheKey = ck
-      const prime = isRecObj(out.victimOrPrimeRequest) ? out.victimOrPrimeRequest : undefined
-      if (prime?.artifactDigest) out.victimArtifactDigest = prime.artifactDigest
-    }
-    return out
-  }
-
-  if (family === 'cross_surface_pivot') {
-    // Retired parallel pivot hydrator: cross-surface pivot is verified directly on the CompositeProofReceipt DAG (`surfaces.size >= 2`).
-    return out
-  }
-
-  if (family === 'economic_conservation') {
-    hydrateRole('baselineReadback', 'baselineExchangeId')
-    hydrateRole('finalReadback', 'finalExchangeId')
-    const tol = pickFiniteNonNeg(rawInput.tolerance)
-    if (tol !== undefined && tol <= 1) out.tolerance = tol
-
-    const hasExplicitActions = hydrateRecordArrayField(
-      out, rawInput, 'actions', ['actionExchangeIds', 'actionsExchangeIds', 'actionExchangeId'], idx, fallbackSig,
-    )
-    if (econCtx) {
-      if (!hasExplicitActions) {
-        const autoActs = selectAutoEconomicActions({
-          econCtx,
-          entriesById: idx.entriesById,
-          toRecord: e => toOracleRecord(e, fallbackSig),
-        })
-        if (autoActs.length > 0) {
-          out.actions = autoActs
-        }
-        // Preserves race sub-exchanges and rejects zero-mutating-action pseudo-ops.
-      }
-      const validActs = Array.isArray(out.actions)
-        ? (out.actions as unknown[]).filter((a): a is HostSignedRecord => Boolean(a && typeof a === 'object' && isPosTs((a as HostSignedRecord).timestampMs)))
-        : []
-      const actionIdSet = new Set(validActs.map(a => a.id))
-      const minActTs = validActs.length > 0 ? Math.min(...validActs.map(a => a.timestampMs)) : null
-      const maxActTs = validActs.length > 0 ? Math.max(...validActs.map(a => a.timestampMs)) : null
-
-      if (!explicit.has('baselineReadback')) {
-        const isBase = (e: HydratableEntry | undefined): e is HydratableEntry =>
-          Boolean(e && !actionIdSet.has(e.exchangeId) && is2xx(e.step.status) && isPosTs(e.timestampMs) && (minActTs === null || e.timestampMs <= minActTs) && stepReadsState(e.step))
-        const base = [...econCtx.preChainControlExchangeIds, ...(econCtx.citedExchangeIds ?? [])].map(id => idx.entriesById.get(id)).find(isBase)
-        if (base) out.baselineReadback = toOracleRecord(base, fallbackSig)
-      }
-      if (!explicit.has('finalReadback')) {
-        const baseId = out.baselineReadback && typeof out.baselineReadback === 'object' ? (out.baselineReadback as HostSignedRecord).id : null
-        const isFin = (e: HydratableEntry | undefined): e is HydratableEntry =>
-          Boolean(e && !actionIdSet.has(e.exchangeId) && (!baseId || e.exchangeId !== baseId) && is2xx(e.step.status) && isPosTs(e.timestampMs) && (maxActTs === null || e.timestampMs >= maxActTs) && stepReadsState(e.step) && hasEntryBody(e) && !isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method, e.step.route ?? e.step.pathAndQuery))
-        const fin = [...econCtx.postChainReadbackExchangeIds, ...[...econCtx.termHopExchangeIds].reverse()].map(id => idx.entriesById.get(id)).find(isFin)
-        if (fin) out.finalReadback = toOracleRecord(fin, fallbackSig)
-      }
-    }
-
-    const baseRec = isRecObj(out.baselineReadback) ? out.baselineReadback : undefined
-    const finRec = isRecObj(out.finalReadback) ? out.finalReadback : undefined
-    // Deduplicate action exchange IDs, bind strictly to probe-arm mutating actions (R2-C-8),
-    // and retain DAG/window-bound `race` op sub-exchanges cited in `oracleInput.actionExchangeIds`.
-    const rawActRecs = Array.isArray(out.actions) ? (out.actions as unknown[]).filter(isRecObj) : []
-    const actRecs = resolveEconomicActionRecords({
-      rawActRecs,
-      entriesById: idx.entriesById,
-      citedExchangeIds: econCtx?.citedExchangeIds,
-      baseRec,
-      finRec,
-    })
-    // Reject zero-mutating-action economic_conservation receipts cleanly via filtered actions.
-    if (Array.isArray(out.actions)) {
-      out.actions = actRecs
-    }
-    const baseJson = parseRecJson(baseRec), finJson = parseRecJson(finRec)
-    const eq = resolveEconomicEquation(rawInput, baseRec, finRec)
-    if (eq) out.equation = eq
-
-    if (eq === 'over_refund') {
-      const paidKeys = ['paidamount', 'paid_amount', 'paid', 'paidcents', 'paid_cents', 'orderamount', 'order_amount', 'amountpaid', 'amount_paid', 'totalpaid', 'total_paid']
-      const refTotKeys = ['refundedtotal', 'refunded_total', 'baselinerefunded', 'baseline_refunded', 'refundedamount', 'refunded_amount', 'refunded', 'totalrefunded', 'total_refunded']
-      const actRefKeys = ['refunded', 'refundamount', 'refund_amount', 'refundedamount', 'refunded_amount', 'refundedcents', 'credited', 'amount']
-      const hostPaid = findNumericField(baseJson, paidKeys) ?? findNumericField(finJson, paidKeys)
-      const hostBaseRef = findNumericField(baseJson, refTotKeys) ?? (hostPaid !== undefined ? 0 : undefined)
-      const hostFinRef = findNumericField(finJson, refTotKeys)
-      const hostActRefs = actRecs
-        .filter(a => is2xx(a.status) && !(a.method && /^(?:GET|HEAD|OPTIONS)$/i.test(a.method)))
-        .map(a => findNumericField(parseRecJson(a), actRefKeys))
-        .filter((n): n is number => n !== undefined && n >= 0)
-      const sumNums = (xs: readonly number[]) => xs.reduce((a, b) => a + b, 0)
-      let derivedRefs: number[] | undefined
-      if (hostActRefs.length > 0) {
-        derivedRefs = hostFinRef !== undefined && hostFinRef < sumNums(hostActRefs)
-          ? [Math.max(0, hostFinRef)]
-          : hostActRefs
-      } else if (hostFinRef !== undefined && hostFinRef >= 0) {
-        derivedRefs = [hostFinRef]
-      }
-      if (hostPaid !== undefined) {
-        const rawPaid = pickFiniteNonNeg(rawInput.paidAmount)
-        out.paidAmount = rawPaid !== undefined && rawPaid > hostPaid ? rawPaid : hostPaid
-      }
-      if (hostBaseRef !== undefined) {
-        const rawBase = pickFiniteNonNeg(rawInput.baselineRefunded)
-        out.baselineRefunded = rawBase !== undefined && rawBase > hostBaseRef ? rawBase : hostBaseRef
-      }
-      if (derivedRefs && derivedRefs.length > 0) {
-        const rawRefs = Array.isArray(rawInput.refundedAmounts) && rawInput.refundedAmounts.length > 0
-          && rawInput.refundedAmounts.every(n => typeof n === 'number' && Number.isFinite(n) && n >= 0)
-          ? (rawInput.refundedAmounts as number[])
-          : undefined
-        out.refundedAmounts = rawRefs && sumNums(rawRefs) < sumNums(derivedRefs) ? rawRefs : derivedRefs
-      }
-    } else if (eq === 'balance_minting') {
-      const hostBefore = extractBalanceMap(baseRec)
-      const hostAfter = extractBalanceMap(finRec)
-      if (hostBefore && hostAfter) {
-        out.balancesBefore = hostBefore
-        out.balancesAfter = hostAfter
-        // R9: Deduplicate authorizedDeposits per distinct server-identified entity/order ID across
-        // mutating responses in [baseline, final] union cited actions, and fail closed unless an
-        // attacker-induced economic conservation break is host-evidenced:
-        //  (i)  concurrent raceBatchId multiplicity (>= 2 same-route race actions with >= 1 2xx)
-        //       or duplicate credits (>= 2 2xx probe actions on the terminal route + same entity),
-        //  (ii) zero-sum internal transfer minting, negative-amount tampering, bypassed control /
-        //       derived_crypto_binding forged credit, or a same-actor conserving benign control.
-        const mintRes = hydrateBalanceMintingOperands({
-          baseRec,
-          finRec,
-          actRecs,
-          entriesById: idx.entriesById,
-          preChainControlExchangeIds: econCtx?.preChainControlExchangeIds,
-          tolerance: typeof out.tolerance === 'number' ? out.tolerance : 1e-6,
-          findNumericField,
-          extractBalanceMap,
-          isInternalTransferRequest,
-          toRecord: e => toOracleRecord(e, fallbackSig),
-        })
-        if (mintRes.ok) {
-          out.authorizedDeposits = mintRes.authorizedDeposits
-          out.authorizedWithdrawals = 0
-        } else {
-          // Leave authorizedDeposits unset so evaluateEconomicConservation fails closed on bare
-          // single benign captures that lack race/duplicate multiplicity or conserving control.
-          out.conservationBreakRejectedReason = mintRes.reason
-        }
-        // Maintain stable hydration operands without leaking untrusted worker deposit scalars
-        // (strictly host-derived balancesBefore/balancesAfter and per-entity deduplicated deposits).
-        //
-        // Note:
-        //  - distinct order/entity IDs and entity-less deposits continue to sum legitimately;
-        //  - echoed order amounts across lifecycle mutations (create/rebind/capture) deduplicate;
-        //  - internal transfers and control-denied forged credits remain excluded from deposits;
-        //  - bare single benign captures without multiplicity or conserving control fail closed.
-      }
-    } else if (eq === 'underpaid_fulfillment') {
-      const hostPaid = findNumericField(finJson, ['paidamount', 'paid_amount', 'paid', 'amountpaid', 'amount_paid', 'chargedamount', 'charged'])
-        ?? findNumericField(baseJson, ['paidamount', 'paid_amount', 'paid', 'amountpaid', 'amount_paid', 'chargedamount', 'charged'])
-      const hostVal = findNumericField(finJson, ['fulfilledvalue', 'fulfilled_value', 'ordertotal', 'order_total', 'totalamount', 'total_amount', 'itemvalue', 'subtotal', 'price', 'value'])
-        ?? findNumericField(baseJson, ['fulfilledvalue', 'fulfilled_value', 'ordertotal', 'order_total', 'totalamount', 'total_amount', 'itemvalue', 'subtotal', 'price', 'value'])
-      const hostState = findStringField(finJson, ['fulfillmentstate', 'fulfillment_state', 'orderstatus', 'order_status', 'status', 'state'])
-      if (hostPaid !== undefined) {
-        const rawPaid = pickFiniteNonNeg(rawInput.paidAmount)
-        out.paidAmount = rawPaid !== undefined && rawPaid > hostPaid ? rawPaid : hostPaid
-      }
-      if (hostVal !== undefined) {
-        const rawVal = pickFiniteNonNeg(rawInput.fulfilledValue)
-        out.fulfilledValue = rawVal !== undefined && rawVal < hostVal ? rawVal : hostVal
-      }
-      if (hostState) out.fulfillmentState = hostState
-    } else if (eq === 'ineligible_discount') {
-      const hostSub = findNumericField(finJson, ['subtotalamount', 'subtotal_amount', 'subtotal', 'cartsubtotal', 'prediscounttotal'])
-        ?? findNumericField(baseJson, ['subtotalamount', 'subtotal_amount', 'subtotal', 'cartsubtotal', 'prediscounttotal'])
-      const hostThr = findNumericField(finJson, ['requiredthreshold', 'required_threshold', 'minorderamount', 'min_order_amount', 'minimumsubtotal', 'threshold', 'minspend'])
-        ?? findNumericField(baseJson, ['requiredthreshold', 'required_threshold', 'minorderamount', 'min_order_amount', 'minimumsubtotal', 'threshold', 'minspend'])
-      const hostDisc = findNumericField(finJson, ['discountapplied', 'discount_applied', 'discountamount', 'discount_amount', 'discount'])
-      const hostTotal = findNumericField(finJson, ['finaltotalpaid', 'final_total_paid', 'totalpaid', 'total_paid', 'finaltotal', 'total'])
-      if (hostSub !== undefined) out.subtotalAmount = hostSub
-      if (hostThr !== undefined) out.requiredThreshold = hostThr
-      if (hostDisc !== undefined) out.discountApplied = hostDisc
-      if (hostTotal !== undefined) out.finalTotalPaid = hostTotal
-    }
-  }
-
+export function hydrateV8OracleInput(family: V8OracleFamily, rawInput: Record<string, unknown>, idx: HydratableTranscriptIndex, fallbackSig: string, econCtx?: EconomicAutoHydrateContext): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  if (findConflictingOracleInputKeys(rawInput).length > 0) return out
+  const h: HydrationCtx = { out, raw: normalizeV8OracleInputKeys(rawInput), idx, fallbackSig, econCtx, explicit: new Set<string>() }
+  if (family === 'dual_tenant_abac') hydrateDualTenant(h)
+  else if (family === 'temporal_revocation') hydrateTemporal(h)
+  else if (family === 'cryptographic_scope_replay') hydrateCryptoScope(h)
+  else if (family === 'parser_cache_differential') hydrateParserCache(h)
+  else if (family === 'economic_conservation') hydrateEconomic(h)
+  // cross_surface_pivot: owned by the CompositeProofReceipt causal_dag (`surfaces.size >= 2`); no parallel hydrator.
   return out
+}
+
+const ECON_KEYS = {
+  paid: ['paidamount', 'paid_amount', 'paid', 'paidcents', 'paid_cents', 'orderamount', 'order_amount', 'amountpaid', 'amount_paid', 'totalpaid', 'total_paid'],
+  refTotal: ['refundedtotal', 'refunded_total', 'baselinerefunded', 'baseline_refunded', 'refundedamount', 'refunded_amount', 'refunded', 'totalrefunded', 'total_refunded'],
+  actRefund: ['refunded', 'refundamount', 'refund_amount', 'refundedamount', 'refunded_amount', 'refundedcents', 'credited', 'amount'],
+  charged: ['paidamount', 'paid_amount', 'paid', 'amountpaid', 'amount_paid', 'chargedamount', 'charged'],
+  fulfilled: ['fulfilledvalue', 'fulfilled_value', 'ordertotal', 'order_total', 'totalamount', 'total_amount', 'itemvalue', 'subtotal', 'price', 'value'],
+  state: ['fulfillmentstate', 'fulfillment_state', 'orderstatus', 'order_status', 'status', 'state'],
+  subtotal: ['subtotalamount', 'subtotal_amount', 'subtotal', 'cartsubtotal', 'prediscounttotal'],
+  threshold: ['requiredthreshold', 'required_threshold', 'minorderamount', 'min_order_amount', 'minimumsubtotal', 'threshold', 'minspend'],
+  discount: ['discountapplied', 'discount_applied', 'discountamount', 'discount_amount', 'discount'],
+  total: ['finaltotalpaid', 'final_total_paid', 'totalpaid', 'total_paid', 'finaltotal', 'total'],
+} as const
+/** Host-derived economic operands per equation; worker scalars may only make the invariant HARDER to violate. */
+function hydrateEconomicOperands(out: Record<string, unknown>, rawInput: Record<string, unknown>, eq: string | undefined, c: { baseRec?: HostSignedRecord; finRec?: HostSignedRecord; actRecs: readonly HostSignedRecord[]; idx: HydratableTranscriptIndex; fallbackSig: string; econCtx?: EconomicAutoHydrateContext }): void {
+  const baseJson = parseRecJson(c.baseRec), finJson = parseRecJson(c.finRec), K = ECON_KEYS
+  const either = (keys: readonly string[], first = finJson, second = baseJson) => findNumericField(first, keys) ?? findNumericField(second, keys)
+  const harder = (raw: unknown, host: number, preferLower: boolean): number => { const r = pickFiniteNonNeg(raw); return r !== undefined && (preferLower ? r < host : r > host) ? r : host }
+  if (eq === 'over_refund') {
+    const hostPaid = either(K.paid, baseJson, finJson), hostBaseRef = findNumericField(baseJson, K.refTotal) ?? (hostPaid !== undefined ? 0 : undefined), hostFinRef = findNumericField(finJson, K.refTotal)
+    const actRefs = c.actRecs.filter(a => is2xx(a.status) && !(a.method && /^(?:GET|HEAD|OPTIONS)$/i.test(a.method))).map(a => findNumericField(parseRecJson(a), K.actRefund)).filter((n): n is number => n !== undefined && n >= 0)
+    const sum = (xs: readonly number[]) => xs.reduce((a, b) => a + b, 0)
+    const derived = actRefs.length > 0 ? (hostFinRef !== undefined && hostFinRef < sum(actRefs) ? [Math.max(0, hostFinRef)] : actRefs) : (hostFinRef !== undefined && hostFinRef >= 0 ? [hostFinRef] : undefined)
+    if (hostPaid !== undefined) out.paidAmount = harder(rawInput.paidAmount, hostPaid, false)
+    if (hostBaseRef !== undefined) out.baselineRefunded = harder(rawInput.baselineRefunded, hostBaseRef, false)
+    const rawRefs = Array.isArray(rawInput.refundedAmounts) && rawInput.refundedAmounts.length > 0 && rawInput.refundedAmounts.every(n => typeof n === 'number' && Number.isFinite(n) && n >= 0) ? rawInput.refundedAmounts as number[] : undefined
+    if (derived?.length) out.refundedAmounts = rawRefs && sum(rawRefs) < sum(derived) ? rawRefs : derived
+  } else if (eq === 'balance_minting') {
+    const hostBefore = extractBalanceMap(c.baseRec), hostAfter = extractBalanceMap(c.finRec)
+    if (!hostBefore || !hostAfter) return
+    out.balancesBefore = hostBefore; out.balancesAfter = hostAfter
+    // Distinct-action accounting + host-evidenced attacker-induced break; never worker deposit scalars.
+    const res = deriveBalanceConservationOperands({ baseRec: c.baseRec, finRec: c.finRec, actRecs: c.actRecs, entriesById: c.idx.entriesById, preChainControlExchangeIds: c.econCtx?.preChainControlExchangeIds, tolerance: typeof out.tolerance === 'number' ? out.tolerance : 1e-6, toRecord: e => toOracleRecord(e, c.fallbackSig) })
+    if (res.ok) { out.authorizedDeposits = res.authorizedDeposits; out.authorizedWithdrawals = 0 } else out.conservationBreakRejectedReason = res.reason
+  } else if (eq === 'underpaid_fulfillment') {
+    const hostPaid = either(K.charged), hostVal = either(K.fulfilled), hostState = findStringField(finJson, K.state)
+    if (hostPaid !== undefined) out.paidAmount = harder(rawInput.paidAmount, hostPaid, false)
+    if (hostVal !== undefined) out.fulfilledValue = harder(rawInput.fulfilledValue, hostVal, true)
+    if (hostState) out.fulfillmentState = hostState
+  } else if (eq === 'ineligible_discount') {
+    for (const [field, v] of [['subtotalAmount', either(K.subtotal)], ['requiredThreshold', either(K.threshold)], ['discountApplied', findNumericField(finJson, K.discount)], ['finalTotalPaid', findNumericField(finJson, K.total)]] as const) if (v !== undefined) out[field] = v
+  } else if (eq === 'quantity_conservation') hydrateQuantityConservation(out, rawInput, c)
+}
+/**
+ * Domain-free `$Q` conservation: an explicit JSONPath selector is evaluated host-side on signed readbacks;
+ * the benign ceiling comes ONLY from a host-signed control readback pair bracketing a serial replay of at
+ * least as many same-route mutating attempts (never from a worker-supplied authorized delta).
+ */
+const SERIAL_CTRL_DENY_STATUSES = new Set([403, 409, 412, 429])
+function hydrateQuantityConservation(out: Record<string, unknown>, rawInput: Record<string, unknown>, c: { baseRec?: HostSignedRecord; finRec?: HostSignedRecord; actRecs: readonly HostSignedRecord[]; idx: HydratableTranscriptIndex; fallbackSig: string }): void {
+  const sel = pickStr(rawInput, 'quantitySelector', 256); if (!sel || !c.baseRec || !c.finRec) return
+  out.quantitySelector = sel
+  const cb = hydrateRecordValue(rawInput.controlBaselineReadbackExchangeId ?? rawInput.controlBaselineReadback, c.idx, c.fallbackSig), cf = hydrateRecordValue(rawInput.controlFinalReadbackExchangeId ?? rawInput.controlFinalReadback, c.idx, c.fallbackSig)
+  if (!isRecObj(cb) || !isRecObj(cf) || cb.id === cf.id || cb.timestampMs >= cf.timestampMs || cb.id === c.baseRec.id || cf.id === c.finRec.id || cf.timestampMs > c.baseRec.timestampMs) return
+  const cbE = c.idx.entriesById.get(cb.id), cfE = c.idx.entriesById.get(cf.id), basePath = cleanExactPath(c.baseRec.route ?? c.baseRec.pathAndQuery), baseAct = (c.baseRec.actorId ?? '').trim().toLowerCase()
+  if (!cbE || !cfE || cbE.step.arm !== 'control' || cfE.step.arm !== 'control' || !is2xx(cb.status) || !is2xx(cf.status) || !stepReadsState(cbE.step) || !stepReadsState(cfE.step)) return
+  if (!basePath || cleanExactPath(cb.route ?? cb.pathAndQuery) !== basePath || cleanExactPath(cf.route ?? cf.pathAndQuery) !== basePath) return
+  if (baseAct && ((cb.actorId ?? '').trim().toLowerCase() !== baseAct || (cf.actorId ?? '').trim().toLowerCase() !== baseAct)) return
+  const keyOf = (m: string | undefined, p: string | undefined, a: string | null | undefined) => `${(m ?? '').toUpperCase()}|${cleanExactPath(p)}|${(a ?? '').trim().toLowerCase()}`
+  const actKeys = c.actRecs.map(a => keyOf(a.method, a.route ?? a.pathAndQuery, a.actorId)), actKeySet = new Set(actKeys)
+  const inWinMut = [...c.idx.entriesById.values()].filter(e => !stepReadsState(e.step) && !isHostPseudoOpEntry(e) && isPosTs(e.timestampMs) && e.timestampMs > cb.timestampMs && e.timestampMs < cf.timestampMs)
+  const okSerial = (e: HydratableEntry): boolean => e.step.arm === 'control' && !isRaceOpEntry(e) && (is2xx(e.step.status) || SERIAL_CTRL_DENY_STATUSES.has(e.step.status ?? 0)) && actKeySet.has(keyOf(e.step.method, e.step.route ?? e.step.pathAndQuery, actorOfEntry(e)))
+  if (actKeys.length === 0 || inWinMut.length === 0 || !inWinMut.every(okSerial)) return
+  const serial = inWinMut.map(e => keyOf(e.step.method, e.step.route ?? e.step.pathAndQuery, actorOfEntry(e)))
+  if (actKeys.some(k => serial.filter(x => x === k).length < actKeys.filter(x => x === k).length)) return
+  const qb = evaluateJsonPathNumber(parseRecJson(cb), sel), qf = evaluateJsonPathNumber(parseRecJson(cf), sel)
+  if (qb !== undefined && qf !== undefined) out.controlDelta = qf - qb
+}
+/* ─────── state_delta_and_conservation economic normalization (actions, ledgers, distinct-action accounting) ─────── */
+const LEDGER_ARRAY_KEYS = ['entries', 'transactions', 'ledger'] as const
+const LEDGER_AMOUNT_KEYS = new Set(['amount', 'amountcents', 'amount_cents', 'delta']), LEDGER_GROUP_KEYS = new Set(['tenantid', 'tenant_id', 'tenant', 'orgid', 'org_id', 'accountid', 'account_id', 'walletid', 'wallet_id'])
+const LEDGER_DIR_KEYS = new Set(['type', 'direction', 'entrytype', 'entry_type', 'kind']), LEDGER_STATUS_KEYS = new Set(['status', 'state']), LEDGER_CURRENCY_KEYS = new Set(['currency', 'currencycode', 'currency_code', 'asset', 'unit', 'denom'])
+const LEDGER_CREDIT_RE = /^(?:credit|deposit|inflow|topup|top_up|settlement|settlement_credit|payout_credit|adjustment_credit|income|mint)$/i
+const LEDGER_DEBIT_RE = /^(?:debit|withdrawal|outflow|charge|purchase|payment|spend|fee|payout|transfer_out|refund|chargeback|debit_adjustment|expense)$/i
+const LEDGER_NON_FINAL_STATUS_RE = /^(?:failed|fail|pending|processing|queued|reversed|void|voided|declined|cancelled|canceled|rejected|expired|draft|unconfirmed)$/i
+/**
+ * Sum signed `amount`/`amountCents`/`delta` across append-only ledger arrays grouped by tenant/account
+ * (`'default'` otherwise); abstains (`undefined`) on unknown directions, non-final statuses, mixed units, or non-finite amounts.
+ */
+export function extractLedgerBalanceMap(json: unknown): Record<string, number> | undefined {
+  if (!json || typeof json !== 'object') return undefined
+  const items = Array.isArray(json) ? json : LEDGER_ARRAY_KEYS.map(k => (json as Record<string, unknown>)[k]).find(Array.isArray)
+  if (!items || items.length === 0) return undefined
+  const totals = new Map<string, number>(), currencies = new Set<string>()
+  for (const item of items.slice(0, 4096)) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    let amt: number | undefined, dir = '', group = ''
+    for (const [ek, ev] of Object.entries(item as Record<string, unknown>)) {
+      const lk = ek.toLowerCase(), sv = typeof ev === 'string' ? ev.trim() : ''
+      if (LEDGER_AMOUNT_KEYS.has(lk)) { if (typeof ev !== 'number' || !Number.isFinite(ev)) return undefined; amt ??= ev }
+      else if (!dir && LEDGER_DIR_KEYS.has(lk) && sv) dir = sv
+      else if (!group && LEDGER_GROUP_KEYS.has(lk) && sv) group = sv
+      else if (LEDGER_STATUS_KEYS.has(lk) && LEDGER_NON_FINAL_STATUS_RE.test(sv)) return undefined
+      else if (LEDGER_CURRENCY_KEYS.has(lk) && sv && currencies.add(sv.toLowerCase()).size > 1) return undefined
+    }
+    if (amt === undefined) continue
+    if (dir && !LEDGER_DEBIT_RE.test(dir) && !LEDGER_CREDIT_RE.test(dir)) return undefined
+    const key = group && !FORBIDDEN_KEYS.has(group) ? group : 'default'
+    totals.set(key, (totals.get(key) ?? 0) + (dir && LEDGER_DEBIT_RE.test(dir) && amt > 0 ? -amt : amt))
+  }
+  return totals.size > 0 ? Object.assign(Object.create(null) as Record<string, number>, Object.fromEntries(totals)) : undefined
+}
+const isHostPseudoOpEntry = (e: HydratableEntry | undefined): boolean => Boolean(e && (e.evidenceRole === 'host_capability_op' || e.evidenceRole === 'host_crypto_op' || e.step.evidenceRole === 'host_capability_op' || e.step.evidenceRole === 'host_crypto_op' || e.op === 'capability' || e.op === 'crypto' || /^(?:SEAL|SIGN|DERIVE)$/i.test(e.step.method)))
+const isRaceOpEntry = (e: HydratableEntry | undefined): boolean => Boolean(e && (e.op === 'race' || Boolean(e.raceBatchId?.trim())))
+const isOkMutation = (e: HydratableEntry): boolean => is2xx(e.step.status) && !stepReadsState(e.step) && !isHostPseudoOpEntry(e)
+/** Keep only real mutating actions (host pseudo-ops dropped) whenever at least one mutating action exists. */
+export function filterEconomicActionRecords(actRecs: readonly HostSignedRecord[], entriesById: ReadonlyMap<string, HydratableEntry>): HostSignedRecord[] {
+  const real = actRecs.filter(a => !isHostPseudoOpEntry(entriesById.get(a.id)))
+  const mutating = real.filter(a => { const e = entriesById.get(a.id); return e ? !stepReadsState(e.step) : !(a.method && /^(?:GET|HEAD|OPTIONS)$/i.test(a.method)) })
+  return mutating.length > 0 ? mutating : real
+}
+const actorRouteKey = (e: HydratableEntry): string => { const act = (actorOfEntry(e) ?? '').trim().toLowerCase(), fam = routeFamily(e.step.route ?? e.step.pathAndQuery); return act && fam ? `${act}|${e.step.method.toUpperCase()}|${fam}` : '' }
+/** A `race` sub-exchange is causally bound to the cited chain by raceBatchId, consumed capability, entity, or same actor+route inside the readback window. */
+function isRaceActionCausallyBound(entry: HydratableEntry, cited: readonly HydratableEntry[], baseTs: number | null, finTs: number | null): boolean {
+  const batch = entry.raceBatchId?.trim() ?? ''
+  if (cited.length === 0) return false
+  if (batch && cited.some(c => c.raceBatchId?.trim() === batch)) return true
+  const caps = new Set(cited.flatMap(c => [...(c.emittedCapabilities ?? [])])), ents = new Set(cited.map(c => c.entityId?.trim().toLowerCase()).filter(Boolean)), keys = new Set(cited.map(actorRouteKey).filter(Boolean))
+  if ((entry.consumedCapabilities ?? []).some(c => caps.has(c)) || (entry.entityId?.trim() && ents.has(entry.entityId.trim().toLowerCase()))) return true
+  const k = actorRouteKey(entry), ts = isFiniteTs(entry.timestampMs) ? entry.timestampMs : null
+  return Boolean(k && keys.has(k) && baseTs !== null && finTs !== null && ts !== null && ts >= baseTs && ts <= finTs)
+}
+/** Auto-select succeeding mutating probe actions (terminal hop first), expanding raceBatchId bursts and causally bound race ops. */
+export function selectAutoEconomicActions(params: { econCtx: EconomicAutoHydrateContext; entriesById: ReadonlyMap<string, HydratableEntry>; toRecord: (e: HydratableEntry) => HostSignedRecord }): HostSignedRecord[] {
+  const { econCtx, entriesById, toRecord } = params
+  const isMutProbe = (e: HydratableEntry | undefined): e is HydratableEntry => Boolean(e && e.step.arm === 'probe' && !isHostPseudoOpEntry(e) && !stepReadsState(e.step) && isPosTs(e.timestampMs))
+  const isOkMutProbe = (e: HydratableEntry | undefined): e is HydratableEntry => isMutProbe(e) && is2xx(e.step.status)
+  const cited = (econCtx.citedExchangeIds ?? []).map(id => entriesById.get(id)).filter((e): e is HydratableEntry => Boolean(e))
+  let acts = econCtx.termHopExchangeIds.map(id => entriesById.get(id)).filter(isOkMutProbe)
+  if (acts.length === 0 && cited.length > 0) { const allMut = cited.filter(isOkMutProbe), raced = allMut.filter(isRaceOpEntry); acts = raced.length > 0 ? raced : allMut }
+  const batchIds = new Set(acts.map(e => e.raceBatchId?.trim()).filter((b): b is string => Boolean(b)))
+  if (batchIds.size > 0) {
+    const expanded = new Map(acts.map(e => [e.exchangeId, e]))
+    for (const e of entriesById.values()) if (batchIds.has(e.raceBatchId?.trim() ?? '') && isMutProbe(e)) expanded.set(e.exchangeId, e)
+    acts = [...expanded.values()].sort(compareChronoAsc)
+  } else if (acts.length === 0 && cited.length > 0) {
+    const bound = [...entriesById.values()].filter(e => isRaceOpEntry(e) && isMutProbe(e) && isRaceActionCausallyBound(e, cited, null, null)).sort(compareChronoAsc)
+    if (bound.some(isOkMutProbe)) acts = bound
+  }
+  return acts.map(toRecord)
+}
+/** Deduplicate + host-bind actions: probe-arm only, no pseudo-ops, cited (or causally bound race) exchanges only. */
+export function resolveEconomicActionRecords(params: { rawActRecs: readonly HostSignedRecord[]; entriesById: ReadonlyMap<string, HydratableEntry>; citedExchangeIds?: readonly string[]; baseRec?: HostSignedRecord; finRec?: HostSignedRecord }): HostSignedRecord[] {
+  const { entriesById } = params, citedSet = params.citedExchangeIds?.length ? new Set(params.citedExchangeIds) : null
+  const cited = citedSet ? [...citedSet].map(id => entriesById.get(id)).filter((e): e is HydratableEntry => Boolean(e)) : []
+  const baseTs = isFiniteTs(params.baseRec?.timestampMs) ? params.baseRec!.timestampMs : null, finTs = isFiniteTs(params.finRec?.timestampMs) ? params.finRec!.timestampMs : null
+  const seen = new Set<string>(), out: HostSignedRecord[] = []
+  for (const a of params.rawActRecs) {
+    if (seen.has(a.id)) continue
+    seen.add(a.id)
+    const e = entriesById.get(a.id)
+    if (e && (e.step.arm !== 'probe' || isHostPseudoOpEntry(e))) continue
+    if (citedSet && !citedSet.has(a.id) && !(e && isRaceOpEntry(e) && !stepReadsState(e.step) && isRaceActionCausallyBound(e, cited, baseTs, finTs))) continue
+    out.push(a)
+  }
+  return filterEconomicActionRecords(out, entriesById)
+}
+/** A mutating probe denied on the same method+route family by a same-actor pre-chain control (403, or 401 on a signature-carrier endpoint). */
+export function isControlDeniedAction(entry: HydratableEntry, preChainControlIds: readonly string[] | undefined, entriesById: ReadonlyMap<string, HydratableEntry>): boolean {
+  if (entry.step.arm !== 'probe' || stepReadsState(entry.step) || !preChainControlIds?.length) return false
+  const fam = routeFamily(entry.step.route ?? entry.step.pathAndQuery), actor = (actorOfEntry(entry) ?? '').trim().toLowerCase(), sig = hasSignatureCarrier(entry, true)
+  if (!fam || !actor) return false
+  return preChainControlIds.some(cid => {
+    const c = entriesById.get(cid)
+    return Boolean(c && c.exchangeId !== entry.exchangeId && c.step.arm === 'control' && (c.step.status === 403 || (c.step.status === 401 && sig)) && c.step.method.toUpperCase() === entry.step.method.toUpperCase() && routeFamily(c.step.route ?? c.step.pathAndQuery) === fam && (actorOfEntry(c) ?? '').trim().toLowerCase() === actor)
+  })
+}
+const CREDIT_KEYS = ['credited', 'deposited', 'depositamount', 'deposit_amount', 'deposit', 'credit', 'amount', 'amountcents', 'amount_cents', 'delta'] as const
+const NEG_AMOUNT_KEYS = new Set(['amount', 'amountcents', 'amount_cents', 'delta', 'credit', 'credited', 'debit', 'deposit', 'deposited', 'depositamount', 'deposit_amount', 'withdraw', 'withdrawal', 'withdrawamount', 'withdraw_amount', 'transferamount', 'transfer_amount', 'quantity', 'qty', 'price', 'total'])
+const ENTITY_SCOPE_KEY_RE = /^(?:tenant|org|organization|workspace|owner|user|actor|merchant|account|wallet|customer|member|session|request|trace|correlation|idempotency)[_-]?id$/i
+function hasNegativeRequestAmount(node: unknown, depth = 0): boolean {
+  if (depth > 3 || !node || typeof node !== 'object') return false
+  if (Array.isArray(node)) return node.slice(0, 32).some(x => hasNegativeRequestAmount(x, depth + 1))
+  return Object.entries(node as Record<string, unknown>).some(([k, v]) => (NEG_AMOUNT_KEYS.has(k.toLowerCase()) && typeof v === 'number' && Number.isFinite(v) && v < 0) || hasNegativeRequestAmount(v, depth + 1))
+}
+/** Server-reported entity identifier (response `id` / `<x>Id` leaf, principal-scope ids excluded) — domain-free, never request-declared. */
+function serverEchoedEntityId(e: HydratableEntry): string | undefined {
+  const walk = (node: unknown, depth: number): string | undefined => {
+    if (depth > 2 || !node || typeof node !== 'object' || Array.isArray(node)) return undefined
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) if ((k === 'id' || /(?:Id|_id)$/.test(k)) && !ENTITY_SCOPE_KEY_RE.test(k) && (typeof v === 'string' || typeof v === 'number') && String(v).trim().length >= 2) return String(v).trim().toLowerCase()
+    for (const v of Object.values(node as Record<string, unknown>)) { const hit = walk(v, depth + 1); if (hit) return hit }
+    return undefined
+  }
+  return walk(e.step.json, 0)
+}
+type CreditItem = { entry: HydratableEntry; amt: number; echoed: boolean }
+/**
+ * Distinct-action accounting (domain-free): every succeeding mutating action contributes its host-observed
+ * credit once. An entity's server-ECHOED amount dedupes to `max` only across a multi-operation lifecycle
+ * (>= 2 method+route families on one entity, linked by host capability lineage or a server-echoed id);
+ * request-declared amounts and same-route repeats always sum (distinct deposits never collapse).
+ */
+function authorizedCreditTotal(entries: readonly HydratableEntry[], all: ReadonlyMap<string, HydratableEntry>, preCtrl?: readonly string[]): { total: number; keyOf: (e: HydratableEntry) => string | null } {
+  // Lineage roots: non-auth capabilities EMITTED by a succeeding in-window mutation (entity created in-window).
+  const authCaps = new Set([...all.values()].map(e => actorOfEntry(e)?.trim() ?? '').filter(a => a.startsWith('cap:')))
+  const parent = new Map<string, string>(), find = (x: string): string => { let r = x; while (parent.get(r) !== undefined && parent.get(r) !== r) r = parent.get(r)!; return r }
+  for (const e of entries) if (isOkMutation(e)) for (const c of e.emittedCapabilities ?? []) if (c && !authCaps.has(c)) parent.set(c, c)
+  for (const e of entries) if (!isHostPseudoOpEntry(e)) { const caps = [...(e.consumedCapabilities ?? []), ...(e.emittedCapabilities ?? [])].filter(c => parent.has(c)); for (const c of caps.slice(1)) parent.set(find(c), find(caps[0]!)) }
+  const keyOf = (e: HydratableEntry): string | null => { const cap = [...(e.emittedCapabilities ?? []), ...(e.consumedCapabilities ?? [])].find(c => parent.has(c)); if (cap) return `cap:${find(cap)}`; const id = serverEchoedEntityId(e); return id ? `ent:${id}` : null }
+  const buckets = new Map<string, CreditItem[]>()
+  for (const e of entries) {
+    if (!isOkMutation(e) || isInternalTransferRequest(e.step.requestJson) || isControlDeniedAction(e, preCtrl, all)) continue
+    const echoedAmt = findNumericField(e.step.json, CREDIT_KEYS), amt = echoedAmt ?? findNumericField(e.step.requestJson, CREDIT_KEYS)
+    if (amt === undefined || amt <= 0) continue
+    const key = keyOf(e) ?? `ex:${e.exchangeId}`
+    buckets.set(key, [...(buckets.get(key) ?? []), { entry: e, amt, echoed: echoedAmt !== undefined }])
+  }
+  let total = 0
+  for (const items of buckets.values()) {
+    const lifecycle = new Set(items.map(it => `${it.entry.step.method.toUpperCase()}|${routeFamily(it.entry.step.route ?? it.entry.step.pathAndQuery)}`)).size >= 2
+    total += lifecycle && items.every(it => it.echoed) ? Math.max(...items.map(it => it.amt)) : items.reduce((s, it) => s + it.amt, 0)
+  }
+  return { total, keyOf }
+}
+const sumBalance = (m: Readonly<Record<string, number>> | undefined): number | null => { const v = m ? Object.values(m) : []; return v.length > 0 && v.every(Number.isFinite) ? v.reduce((a, b) => a + b, 0) : null }
+/**
+ * `balance_minting` operands: authorized deposits by distinct-action accounting over the [baseline, final]
+ * window, gated on host evidence of an attacker-induced break (race multiplicity, duplicate entity credit,
+ * internal-transfer minting, negative-amount tampering, control-denied / crypto-forged credit, or a
+ * same-actor benign control conserving the ledger); already-conserved deltas pass through for rejection.
+ */
+export function deriveBalanceConservationOperands(params: { baseRec?: HostSignedRecord; finRec?: HostSignedRecord; actRecs: readonly HostSignedRecord[]; entriesById: ReadonlyMap<string, HydratableEntry>; preChainControlExchangeIds?: readonly string[]; tolerance: number; toRecord: (e: HydratableEntry) => HostSignedRecord }): { ok: boolean; authorizedDeposits: number; reason: string } {
+  const { baseRec, finRec, entriesById: all, preChainControlExchangeIds: preCtrl, tolerance: tol } = params
+  const bE = baseRec ? all.get(baseRec.id) : undefined, fE = finRec ? all.get(finRec.id) : undefined
+  const inWindow = (e: HydratableEntry): boolean => (typeof bE?.seq !== 'number' || typeof fE?.seq !== 'number' || typeof e.seq !== 'number' || (e.seq >= bE.seq && e.seq <= fE.seq)) && (!isPosTs(e.timestampMs) || (e.timestampMs >= (baseRec?.timestampMs ?? 0) && e.timestampMs <= (finRec?.timestampMs ?? Infinity)))
+  const actions = params.actRecs.map(a => all.get(a.id)).filter((e): e is HydratableEntry => Boolean(e))
+  const window = new Map(actions.map(e => [e.exchangeId, e]))
+  for (const e of all.values()) if (e.exchangeId !== baseRec?.id && e.exchangeId !== finRec?.id && isOkMutation(e) && inWindow(e)) window.set(e.exchangeId, e)
+  const { total: authorizedDeposits, keyOf } = authorizedCreditTotal([...window.values()], all, preCtrl)
+  const probeMut = actions.filter(e => e.step.arm === 'probe' && !stepReadsState(e.step) && !isHostPseudoOpEntry(e)), probeOk = probeMut.filter(e => is2xx(e.step.status)).sort(compareChronoAsc)
+  const done = (reason: string) => ({ ok: true, authorizedDeposits, reason })
+  if (probeOk.length === 0) return { ok: false, authorizedDeposits, reason: 'no_mutating_probe_actions' }
+  const raceGroups = new Map<string, { total: number; ok: number }>()
+  for (const e of probeMut) { const b = e.raceBatchId?.trim(); if (!b) continue; const k = `${b}|${actorRouteKey(e)}`, g = raceGroups.get(k) ?? { total: 0, ok: 0 }; g.total += 1; if (is2xx(e.step.status)) g.ok += 1; raceGroups.set(k, g) }
+  if ([...raceGroups.values()].some(g => g.total >= 2 && g.ok >= 1)) return done('race_batch_multiplicity')
+  const term = probeOk[probeOk.length - 1]!, termKey = keyOf(term), termRoute = `${term.step.method.toUpperCase()}|${routeFamily(term.step.route ?? term.step.pathAndQuery)}`
+  if (termKey && probeOk.filter(e => `${e.step.method.toUpperCase()}|${routeFamily(e.step.route ?? e.step.pathAndQuery)}` === termRoute && keyOf(e) === termKey).length >= 2) return done('duplicate_entity_credit_multiplicity')
+  for (const e of probeOk) {
+    if (isInternalTransferRequest(e.step.requestJson)) return done('internal_transfer_minting')
+    if (hasNegativeRequestAmount(e.step.requestJson)) return done('negative_amount_tampering')
+    if (isControlDeniedAction(e, preCtrl, all)) return done('control_denied_forged_credit')
+    if ((e.cryptoAttestations?.length ?? 0) > 0) return done('derived_crypto_forged_credit')
+  }
+  if (hasConservingBenignControl(probeOk, new Set(actions.map(e => e.exchangeId)), baseRec, finRec, all, tol, params.toRecord)) return done('conserving_benign_control_verified')
+  const beforeSum = sumBalance(extractBalanceMap(baseRec)), afterSum = sumBalance(extractBalanceMap(finRec))
+  if (beforeSum !== null && afterSum !== null && afterSum <= beforeSum + authorizedDeposits + tol) return done('ledger_conserved_passthrough')
+  return { ok: false, authorizedDeposits, reason: 'unproven_single_capture_without_multiplicity_or_conserving_control' }
+}
+/** Control calibration: a same-actor control-arm action on the probe's method+route, bracketed by probe-free readbacks, conserves the ledger. */
+function hasConservingBenignControl(probeOk: readonly HydratableEntry[], actionIds: ReadonlySet<string>, baseRec: HostSignedRecord | undefined, finRec: HostSignedRecord | undefined, all: ReadonlyMap<string, HydratableEntry>, tol: number, toRecord: (e: HydratableEntry) => HostSignedRecord): boolean {
+  const rbFam = routeFamily(baseRec?.route ?? baseRec?.pathAndQuery ?? finRec?.route ?? finRec?.pathAndQuery), rbActor = (baseRec?.actorId ?? '').trim().toLowerCase()
+  if (!rbFam) return false
+  const probeKeys = new Set(probeOk.map(actorRouteKey).filter(Boolean)), entries = [...all.values()]
+  const readbacks = entries.filter(e => is2xx(e.step.status) && stepReadsState(e.step) && isPosTs(e.timestampMs) && routeFamily(e.step.route ?? e.step.pathAndQuery) === rbFam && (!rbActor || !(actorOfEntry(e) ?? '').trim() || (actorOfEntry(e) ?? '').trim().toLowerCase() === rbActor)).sort(compareChronoAsc)
+  const bal = (e: HydratableEntry): number | null => sumBalance(extractBalanceMap(toRecord(e)))
+  for (const ctrl of entries.filter(e => !actionIds.has(e.exchangeId) && e.step.arm === 'control' && isOkMutation(e) && isPosTs(e.timestampMs) && probeKeys.has(actorRouteKey(e)))) {
+    const before = [...readbacks].reverse().find(r => isChronoBeforeEntry(r, ctrl) && bal(r) !== null), after = readbacks.find(r => r !== before && isChronoBeforeEntry(ctrl, r) && bal(r) !== null)
+    if (!before || !after) continue
+    const inWin = entries.filter(e => e !== before && e !== after && isOkMutation(e) && !isChronoBeforeEntry(e, before) && !isChronoBeforeEntry(after, e))
+    if (inWin.some(e => e.step.arm === 'probe')) continue
+    const delta = bal(after)! - bal(before)!
+    if (delta >= -tol && delta <= authorizedCreditTotal(inWin, all).total + tol) return true
+  }
+  return false
+}
+const isChronoBeforeEntry = (a: HydratableEntry, b: HydratableEntry): boolean => isPosTs(a.timestampMs) && isPosTs(b.timestampMs) && (a.timestampMs < b.timestampMs || (a.timestampMs === b.timestampMs && typeof a.seq === 'number' && typeof b.seq === 'number' && a.seq < b.seq))
+/** R8 opaque plain-text bled access: only a unique foreign upstream marker or a unique host-known tenant token in the body may name the target. */
+export function resolveOpaqueDualCacheBleedTarget(params: { bled: HostSignedRecord | undefined; primeTenant: string | null; bledMarkers: ReadonlySet<string>; actor: { actorId: string; rolesByTenant: Readonly<Record<string, string | null | undefined>> } | undefined; citedUpstreamMarkers: readonly ReadonlySet<string>[]; hostKnownTenants: ReadonlySet<string> }): string | undefined {
+  const { bled, actor } = params, body = typeof bled?.body === 'string' ? bled.body.trim() : ''
+  if (!bled || params.bledMarkers.size > 0 || !actor || bled.json !== undefined || !body || /^[\[{]/.test(body)) return undefined
+  const roles = Object.entries(actor.rolesByTenant ?? {}).map(([t, r]) => [t.trim().toLowerCase(), normalizeRole(r ?? undefined)] as const).filter(([t, r]) => Boolean(t && r))
+  if (new Set(roles.map(([t]) => t)).size < 2 || !roles.some(([, r]) => r !== null && ROLE_RANK[r] >= ROLE_RANK.admin) || !roles.some(([, r]) => r !== null && ROLE_RANK[r] < ROLE_RANK.admin)) return undefined
+  const prime = params.primeTenant?.trim().toLowerCase() ?? '', upstream = new Set([...params.citedUpstreamMarkers].flatMap(ms => [...ms]).filter(m => m && m !== prime))
+  if (upstream.size === 1) return [...upstream][0]
+  const inBody = [...params.hostKnownTenants].filter(t => t && t !== prime && containsExactTenantToken(body, t))
+  return inBody.length === 1 ? inBody[0] : undefined
 }
 
 export function extractCanonicalEntityTokens(entityId: string): string[] {

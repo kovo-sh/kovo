@@ -8,8 +8,8 @@
     "files": [
       "src/server/composite-receipt.ts",
       "src/server/exec-verify.ts",
-      "src/server/own-org-terminal-guard.ts",
-      "src/server/v8-oracle-hydrate.ts"
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/v8-oracle-families.ts"
     ],
     "classes": [
       "cross_tenant_export",

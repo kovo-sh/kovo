@@ -8,7 +8,7 @@
     "files": [
       "src/server/v8-oracle-hydrate.ts",
       "src/server/composite-receipt.ts",
-      "src/server/own-org-terminal-guard.ts"
+      "src/server/v8-oracle-families.ts"
     ],
     "classes": [
       "business_logic",

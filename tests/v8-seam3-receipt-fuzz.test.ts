@@ -1641,14 +1641,18 @@ test('M15–M16: V8 oracle family invariant mutations & single-hop ProofReceipt 
     t.entries![0]!.step.status = 200
     assert.equal(verifyCompositeReceipt(b.receipt, signTranscript(t), b.options).confirmed, false)
   }
-  // Parser/cache differential: missing cache hit evidence & attacker digest mismatch
+  // Parser/cache differential (A2 wire_framing_and_cache_differential): the victim-matched digest + control ablation is
+  // the proof; a brittle `X-Cache: HIT` header is NOT required, but an attacker digest mismatch always fails closed.
   {
     const b = buildParserCacheBaseline()
     const r = deepClone(b.receipt)
     ;(r.terminalImpact.oracleInput as { cacheHitObserved: boolean }).cacheHitObserved = false
-    const t = deepClone(b.transcript)
-    t.entries![2]!.step.responseHeaders = {}
-    assert.equal(verifyCompositeReceipt(r, signTranscript(t), b.options).confirmed, false)
+    const noHit = deepClone(b.transcript)
+    noHit.entries![2]!.step.responseHeaders = {}
+    assert.equal(verifyCompositeReceipt(r, signTranscript(noHit), b.options).confirmed, true)
+    const mismatch = deepClone(noHit)
+    mismatch.entries![2]!.observedResponseDigests = [sha256Hex('attacker-own-statement-row-01')]
+    assert.equal(verifyCompositeReceipt(r, signTranscript(mismatch), b.options).confirmed, false)
   }
   // Cross-surface pivot: collapsing both hops onto single surface fails closed
   {

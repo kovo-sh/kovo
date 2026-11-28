@@ -48,7 +48,7 @@ import type {
   AsyncPollProfile, CapabilityConsumptionAttestation, CapabilitySourceProvenance,
   HostHmacAlg, HostHmacEncoding, HostJwtAlg, InjectCapabilityTarget,
 } from './derived-custody.ts'
-import { signHostRecord, verifyHostRecordSignature } from './composite-receipt.ts'
+import { resolveTranscriptReplayMode, signHostRecord, verifyHostRecordSignature } from './composite-receipt.ts'
 import type {
   CompositeReceiptVerification, CompositeVerifyOptions, HostAsyncPollRecord, HostBrowserTrace,
   HostCryptoAttestation, HostOobEvent, HostSignableRecord, HostSignedTranscript, HostTranscriptEntry,
@@ -2229,13 +2229,13 @@ export class VerifyRpcServer {
     const chainId = this.scrub(verdict.chainId || (typeof rawObj?.chainId === 'string' ? rawObj.chainId : 'invalid'))
     const terminalVulnClass = this.scrub(verdict.terminalVulnClass || (typeof rawObj?.terminalVulnClass === 'string' ? rawObj.terminalVulnClass : 'unknown'))
     const scrubbedRoute = route ? this.scrub(route) : null
-    const transcriptReplayMode: 'fresh_clean_replay' | 'one_shot_transcript' = verdict.replayMode === 'one_shot_transcript' ? 'one_shot_transcript' : 'fresh_clean_replay'
+    const transcriptReplayMode = resolveTranscriptReplayMode(verdict) // A2(b): propagate the verdict's own mode; never default missing/schema-failed to Mode A.
     const recorded = this.transcript.recordCompositeVerification({
-      chainId, terminalVulnClass, replayMode: transcriptReplayMode, hopCount: verdict.hopCount, confirmed: verdict.confirmed,
+      chainId, terminalVulnClass, ...(transcriptReplayMode ? { replayMode: transcriptReplayMode } : {}), hopCount: verdict.hopCount, confirmed: verdict.confirmed,
       verifiedEdgeCount: verdict.verifiedEdges.filter(e => e.verified).length, reason: this.scrub(verdict.reason),
       ...(verdict.failedStage ? { failedStage: verdict.failedStage } : {}),
       rejectedBy: hostRejectedBy, missingEvidence: this.scrubRecord(hostMissingEvidence), exchangeIds, terminalExchangeId, route: scrubbedRoute,
-    })
+    } as Parameters<TranscriptStore['recordCompositeVerification']>[0])
     const cwe = /\bCWE-\d{1,4}\b/i.exec(`${String(rawObj?.cwe ?? '')} ${String(ti?.cwe ?? '')} ${String(rawObj?.terminalVulnClass ?? '')} ${String(ti?.summary ?? ti?.claimedImpact ?? '')}`)?.[0]?.toUpperCase()
     const hopCount = typeof verdict.hopCount === 'number' ? verdict.hopCount : hops.length
     // R2-C-3: Return coarse confirmed/rejected diagnostics to the worker (NEVER raw leaf/stage/edge oracle feedback).
@@ -2245,13 +2245,13 @@ export class VerifyRpcServer {
     const claim: Extract<VerifyClaim, { kind: 'composite_receipt' }> = {
       kind: 'composite_receipt', verificationId: recorded.verificationId, chainId, terminalVulnClass,
       ...(cwe ? { cwe } : {}), ...(scrubbedRoute ? { route: scrubbedRoute } : {}), exchangeIds,
-      ...(terminalExchangeId ? { terminalExchangeId } : {}), replayMode: transcriptReplayMode,
+      ...(terminalExchangeId ? { terminalExchangeId } : {}), ...(transcriptReplayMode ? { replayMode: transcriptReplayMode } : {}),
       hopCount, ...(rawObj ? { compositeReceipt: rawObj } : {}),
       ...(!verdict.confirmed ? { rejectedBy: workerRejectedBy, missingEvidence: workerMissing, reason: workerReason } : {}),
     }
     return this.scrubRecord({
       confirmed: verdict.confirmed, ok: verdict.confirmed, verified: verdict.confirmed, status: verdict.confirmed ? 'confirmed' : 'rejected',
-      chainId, terminalVulnClass, replayMode: verdict.replayMode, hopCount,
+      chainId, terminalVulnClass, ...(transcriptReplayMode ? { replayMode: transcriptReplayMode } : {}), hopCount,
       ...(verdict.confirmed ? { modeBVerified: verdict.modeBVerified, verifiedEdgeCount: verdict.verifiedEdges.filter(e => e.verified).length } : {}),
       ...(scrubbedRoute ? { terminalEndpoint: scrubbedRoute } : {}),
       verificationId: recorded.verificationId, reason: workerReason, rejectedBy: workerRejectedBy, missingEvidence: workerMissing, claim,

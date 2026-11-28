@@ -7,8 +7,8 @@
   "covers": {
     "files": [
       "src/server/composite-receipt.ts",
-      "src/server/own-org-terminal-guard.ts",
-      "src/server/v8-oracle-hydrate.ts"
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/v8-oracle-families.ts"
     ],
     "classes": [
       "authorization_bypass",
@@ -58,7 +58,9 @@
       "persona": "member_a",
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"forbidden\"}"
     },
     {
@@ -70,7 +72,9 @@
       "persona": "member_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"data\":{\"payouts\":[{\"id\":\"po_1\",\"tenant\":\"org_a\",\"amountCents\":2500}]},\"next_page_token\":\"pg2\"}"
     }
   ],
@@ -80,8 +84,12 @@
     "oracleFamily": "",
     "singleHop": true,
     "terminalExchangeId": "ex_list_200",
-    "preChainControlIds": ["ex_ctrl_403"],
-    "attackerPersonas": ["member_a"],
+    "preChainControlIds": [
+      "ex_ctrl_403"
+    ],
+    "attackerPersonas": [
+      "member_a"
+    ],
     "expectedFailedStage": "terminal_impact",
     "claimedDelta": "Own-org paginated collection listing under an alias class must fail closed; dot-segment, nested-wrapper and pagination-key variants must not bypass the guard."
   }

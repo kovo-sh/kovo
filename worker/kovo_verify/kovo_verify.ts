@@ -102,6 +102,47 @@ interface HopRecorder { hopId: string; target?: HopTargetObject; exchangeIds: st
 interface ExSealDiag { status: number; mediaType: string; isJson: boolean; parsedJson: unknown; topKeys: string[]; headerNames: string[]; hasLocation: boolean; locationParamNames: string[]; hasSetCookie: boolean; origin: string; method: string; path: string; secrets: string[] }
 interface RpcTransport { socketPath: string; token: string; nonce: string }
 export const KOVO_VERIFY_SDK_VERSION = 'kovo_verify/v8'
+/* ── Universal Tier-1 evidence primitives: explicit role-named slots (NO positional hop guessing). ── */
+export const UNIVERSAL_EVIDENCE_PRIMITIVES = ['causal_dag', 'access_differential', 'state_delta_and_conservation', 'wire_framing_and_cache_differential', 'oob_and_execution_witness'] as const
+export type UniversalEvidencePrimitive = (typeof UNIVERSAL_EVIDENCE_PRIMITIVES)[number]
+const PRIMITIVE_LABELS: Record<UniversalEvidencePrimitive, RegExp> = {
+  causal_dag: /^(?:causal_dag|cross_surface_pivot|webhook_forgery|webhook|forged_signature.*)$/,
+  access_differential: /^(?:access_differential|dual_tenant_abac|cross_org_transfer|batch_partial_authz|temporal_revocation|cryptographic_scope_replay|bola|idor|bfla|broken_access_control|access_control|authorization|privilege_escalation|cross_tenant.*|.*signed_url.*|csrf|auth_bypass|authentication_bypass|broken_auth|jwt.*|token_forgery|oauth|sso|session_fixation|stale_privilege_use|.*disclosure|.*data_exposure)$/,
+  state_delta_and_conservation: /^(?:state_delta_and_conservation|economic_conservation|over_refund|balance_minting|underpaid_fulfillment|ineligible_discount|quantity_conservation|mass_assignment|business_logic|invariant_violation|workflow_(?:skip|bypass)|price_tampering|race.*|double_spend|.*oversell|conserved_balance|toctou|ledger_overcredit|maker_checker_bypass)$/,
+  wire_framing_and_cache_differential: /^(?:wire_framing_and_cache_differential|parser_cache_differential|parser_differential|cache_.*|.*cache_(?:poisoning|deception)|dual_org_cache_bleed|.*request_smuggling|duplicate_json_key|path_normalization|header_normalization|hop_by_hop_smuggling|content_type_confusion|timing|boolean_differential)$/,
+  oob_and_execution_witness: /^(?:oob_and_execution_witness|ssrf|blind_ssrf|xss.*|.*_xss|markup|html_injection|postmessage|xxe|blind_xxe|oob|ssti|template_injection|.*sqli.*|sql_.*|nosql.*|injection.*|rce|cmdi|command_injection|path_traversal|directory_traversal|lfi|.*redirect)$/,
+}
+/** SDK mirror of the host `resolveUniversalPrimitive` (zero dependencies); unknown labels fall back to `causal_dag`. */
+export function resolveUniversalPrimitive(vulnClassOrFamily: string): UniversalEvidencePrimitive {
+  const n = typeof vulnClassOrFamily === 'string' ? vulnClassOrFamily.trim().toLowerCase().replace(/[\s-]+/g, '_') : ''
+  return UNIVERSAL_EVIDENCE_PRIMITIVES.find(p => PRIMITIVE_LABELS[p].test(n)) ?? 'causal_dag'
+}
+export interface PrimitiveOracleSpec { primitive: UniversalEvidencePrimitive; oracleFamily?: OracleFamily; oracleInput: Record<string, unknown> }
+const xId = (r: ExchangeRef | undefined): string | undefined => (typeof r === 'string' ? r : r?.exchangeId)?.trim() || undefined
+const slots = (o: Record<string, unknown>): Record<string, unknown> => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && !(Array.isArray(v) && v.length === 0)))
+/** access_differential: denied clean `control` vs. succeeding `variant` (+ optional readback / issuance / revocation evidence). */
+export function accessDifferential(o: { control: ExchangeRef; variant: ExchangeRef; readback?: ExchangeRef; issuance?: ExchangeRef; revocation?: ExchangeRef; baseline?: ExchangeRef; entityId?: string; ownRecordId?: string; foreignRecordId?: string; requestedIds?: string[]; credentialKind?: string }): PrimitiveOracleSpec {
+  const p = 'access_differential' as const
+  if (o.issuance) return { primitive: p, oracleFamily: 'cryptographic_scope_replay', oracleInput: slots({ tamperedSignatureControlExchangeId: xId(o.control), sourceValidIssuanceExchangeId: xId(o.issuance), replayedAcceptanceExchangeId: xId(o.variant) }) }
+  if (o.revocation) return { primitive: p, oracleFamily: 'temporal_revocation', oracleInput: slots({ preRevocationBaselineExchangeId: xId(o.baseline), revocationEventExchangeId: xId(o.revocation), primaryDeniedCheckExchangeId: xId(o.control), secondarySuccessExchangeId: xId(o.variant), credentialKind: o.credentialKind }) }
+  if (o.foreignRecordId || o.requestedIds) return { primitive: p, oracleFamily: 'dual_tenant_abac', oracleInput: slots({ mode: 'batch_partial_authz', singleForeignControlDeniedExchangeId: xId(o.control), batchRequestExchangeId: xId(o.variant), postMutationReadbackExchangeId: xId(o.readback), ownRecordId: o.ownRecordId, foreignRecordId: o.foreignRecordId, requestedIds: o.requestedIds }) }
+  return { primitive: p, oracleFamily: 'dual_tenant_abac', oracleInput: slots({ mode: 'cross_org_transfer', sourceControlDeniedExchangeId: xId(o.control), transferRecordExchangeId: xId(o.variant), postTransferReadbackExchangeId: xId(o.readback), entityId: o.entityId }) }
+}
+/** state_delta_and_conservation: signed baseline/final readbacks around mutating actions; `$Q` selector + benign serial control optional. */
+export function stateDeltaAndConservation(o: { baseline?: ExchangeRef; final?: ExchangeRef; actions?: ExchangeRef[]; equation?: string; quantitySelector?: string; controlBaseline?: ExchangeRef; controlFinal?: ExchangeRef }): PrimitiveOracleSpec {
+  return { primitive: 'state_delta_and_conservation', oracleFamily: 'economic_conservation', oracleInput: slots({ equation: o.equation ?? (o.quantitySelector ? 'quantity_conservation' : undefined), baselineReadbackExchangeId: xId(o.baseline), finalReadbackExchangeId: xId(o.final), actionExchangeIds: (o.actions ?? []).map(xId).filter(Boolean), quantitySelector: o.quantitySelector, controlBaselineReadbackExchangeId: xId(o.controlBaseline), controlFinalReadbackExchangeId: xId(o.controlFinal) }) }
+}
+/** wire_framing_and_cache_differential: same resource differing strictly in a wire property (or prior victim cache priming). */
+export function wireFramingAndCacheDifferential(o: { control: ExchangeRef; variant: ExchangeRef; property?: 'cache_priming' | 'duplicate_json_key' | 'path_normalization' | 'header_normalization' | 'hop_by_hop_smuggling' | 'content_type_confusion'; prime?: ExchangeRef; readback?: ExchangeRef; cacheKey?: string; differentialFeature?: string; impactKind?: 'read' | 'mutation'; dualTenant?: boolean }): PrimitiveOracleSpec {
+  const p = 'wire_framing_and_cache_differential' as const
+  if (o.dualTenant) return { primitive: p, oracleFamily: 'dual_tenant_abac', oracleInput: slots({ mode: 'dual_org_cache_bleed', baselineDeniedControlExchangeId: xId(o.control), primeActionExchangeId: xId(o.prime), bledAccessExchangeId: xId(o.variant) }) }
+  if ((o.property ?? 'cache_priming') === 'cache_priming') return { primitive: p, oracleFamily: 'parser_cache_differential', oracleInput: slots({ mode: 'cache_primed', cacheKey: o.cacheKey, cleanControlExchangeId: xId(o.control), victimOrPrimeRequestExchangeId: xId(o.prime), attackerProbeExchangeId: xId(o.variant) }) }
+  return { primitive: p, oracleFamily: 'parser_cache_differential', oracleInput: slots({ mode: 'parser_differential', differentialKind: o.property, differentialFeature: o.differentialFeature, impactKind: o.impactKind ?? (o.readback ? 'mutation' : 'read'), cleanControlExchangeId: xId(o.control), differentialProbeExchangeId: xId(o.variant), postMutationReadbackExchangeId: xId(o.readback) }) }
+}
+/** causal_dag / oob_and_execution_witness are host-owned: the chain DAG and host-minted canaries ARE the evidence (no oracleInput). */
+export const causalDag = (): PrimitiveOracleSpec => ({ primitive: 'causal_dag', oracleInput: {} })
+export const oobAndExecutionWitness = (): PrimitiveOracleSpec => ({ primitive: 'oob_and_execution_witness', oracleInput: {} })
+export const primitives = { causal_dag: causalDag, access_differential: accessDifferential, state_delta_and_conservation: stateDeltaAndConservation, wire_framing_and_cache_differential: wireFramingAndCacheDifferential, oob_and_execution_witness: oobAndExecutionWitness, resolveUniversalPrimitive } as const
 function readContext(): RpcContext {
   const raw = JSON.parse(readFileSync(process.env.KOVO_RPC_CONTEXT_FILE ?? '/kovo-rpc/context.json', 'utf8')) as Record<string, unknown>
   return { nonce: typeof raw.nonce === 'string' ? raw.nonce : '', runId: typeof raw.runId === 'string' ? raw.runId : 'unknown-run', targetOrigins: Array.isArray(raw.targetOrigins) ? raw.targetOrigins.filter((v): v is string => typeof v === 'string') : [], sdkVersion: typeof raw.sdkVersion === 'string' ? raw.sdkVersion : KOVO_VERIFY_SDK_VERSION }
@@ -414,51 +455,12 @@ export class ChainBuilder {
     if (!opts.readback && readRoute) { post = await this.ctx._httpSendDetached(readRoute, { method: readMethod ?? 'GET', ...(readPersona ? { as: readPersona } : {}), role: 'control', arm: 'control', ...(session ? { session: `${session}-post` } : {}) }); pushUnique(this.readbackIds, post.exchangeId); this.exStatus.set(post.exchangeId, post.status) }
     return { ...burst, ...(baseline ? { baseline } : {}), ...(post ? { post } : {}) }
   }
-  private synthOracleInput(family: OracleFamily, raw: Record<string, unknown> | undefined, activeHops: RecordedHop[], edges: CausalEdgeInput[], preControl: string[], postReadback: string[], termEx: string | undefined): Record<string, unknown> | undefined {
-    const oi: Record<string, unknown> = raw ? { ...raw } : {}
-    const fill = (k: string, aliases: readonly string[], v: unknown): void => { if (v !== undefined && aliases.every(a => oi[a] === undefined)) oi[k] = v }
-    const stOf = (id: string) => this.exStatus.get(id) ?? this.ctx._exStatusOf(id)
-    const pickOk = (ids: string[]) => { const r = [...ids].reverse(); return r.find(id => { const s = stOf(id); return s !== undefined && s >= 200 && s < 300 }) ?? r.find(id => stOf(id) === undefined) }
-    const deniedCtrl = preControl.find(id => { const s = stOf(id); return s === 401 || s === 403 || s === 404 })
-    const firstEx = activeHops[0]?.receipt.exchangeIds?.[0], prevEx = activeHops[activeHops.length - 2]?.receipt.exchangeIds?.[0] ?? firstEx, ctrl = deniedCtrl ?? preControl[0], rb = postReadback[0]
-    if (family === 'economic_conservation') {
-      fill('baselineReadbackExchangeId', ['baselineReadback', 'baselineReadbackExchangeId', 'baselineExchangeId'], pickOk(this.baselineReadbackIds) ?? pickOk(preControl))
-      fill('finalReadbackExchangeId', ['finalReadback', 'finalReadbackExchangeId', 'finalExchangeId'], pickOk(postReadback))
-      const acts = this.raceActionIds.length > 0 ? [...this.raceActionIds] : activeHops.flatMap(h => h.receipt.exchangeIds ?? []).filter(id => !preControl.includes(id) && !postReadback.includes(id))
-      if (acts.length > 0) fill('actionExchangeIds', ['actions', 'actionExchangeIds', 'actionsExchangeIds'], acts)
-    } else if (family === 'cryptographic_scope_replay') {
-      fill('tamperedSignatureControlExchangeId', ['tamperedSignatureControl', 'tamperedSignatureControlExchangeId', 'tamperedControlExchangeId'], ctrl)
-      if (activeHops.length >= 2 && firstEx && firstEx !== termEx) fill('sourceValidIssuanceExchangeId', ['sourceValidIssuance', 'sourceValidIssuanceExchangeId', 'sourceIssuanceExchangeId'], firstEx)
-      fill('replayedAcceptanceExchangeId', ['replayedAcceptance', 'replayedAcceptanceExchangeId', 'replayedExchangeId'], termEx)
-    } else if (family === 'temporal_revocation' && (activeHops.length >= 4 || (activeHops.length >= 3 && ctrl))) {
-      fill('preRevocationBaselineExchangeId', ['preRevocationBaseline', 'preRevocationBaselineExchangeId'], firstEx)
-      fill('revocationEventExchangeId', ['revocationEvent', 'revocationEventExchangeId'], activeHops[1]?.receipt.exchangeIds?.[0])
-      fill('primaryDeniedCheckExchangeId', ['primaryDeniedCheck', 'primaryDeniedCheckExchangeId'], ctrl ?? activeHops[2]?.receipt.exchangeIds?.[0])
-      fill('secondarySuccessExchangeId', ['secondarySuccess', 'secondarySuccessExchangeId'], termEx)
-    } else if (family === 'parser_cache_differential') {
-      fill('cleanControlExchangeId', ['cleanControl', 'cleanControlExchangeId'], ctrl)
-      const isCache = oi.mode === 'cache_primed' || ['cacheKey', 'victimOrPrimeRequest', 'victimOrPrimeRequestExchangeId', 'victimPrimeExchangeId', 'attackerProbe', 'attackerProbeExchangeId'].some(k => oi[k] !== undefined)
-      if (isCache) { if (activeHops.length >= 2 && firstEx && firstEx !== termEx) fill('victimOrPrimeRequestExchangeId', ['victimOrPrimeRequest', 'victimOrPrimeRequestExchangeId', 'victimPrimeExchangeId'], firstEx); fill('attackerProbeExchangeId', ['attackerProbe', 'attackerProbeExchangeId'], termEx) }
-      else { fill('differentialProbeExchangeId', ['differentialProbe', 'differentialProbeExchangeId'], termEx); fill('postMutationReadbackExchangeId', ['postMutationReadback', 'postMutationReadbackExchangeId'], rb) }
-    } else if (family === 'dual_tenant_abac') {
-      if (!raw) return undefined
-      const hasAny = (...ks: string[]) => ks.some(k => oi[k] !== undefined), rbOk = postReadback.find(id => { const s = stOf(id); return s !== undefined && s >= 200 && s < 300 })
-      const eid = (typeof oi.entityId === 'string' && oi.entityId.trim()) || activeHops.map(h => h.receipt.entityId?.trim()).find(Boolean)
-      const xferHop = [...activeHops].reverse().find(h => { const m = typeof h.receipt.target === 'object' ? h.receipt.target.method : ''; return Boolean(m && !/^(?:GET|HEAD|OPTIONS)$/i.test(m)) })
-      if (oi.mode === undefined) {
-        if (hasAny('transferRecord', 'transferRecordExchangeId', 'transferExchangeId', 'postTransferReadback', 'postTransferReadbackExchangeId', 'sourceControlDenied', 'sourceControlDeniedExchangeId', 'sourceControlExchangeId', 'sourceTenant', 'sourceTenantId', 'destTenant', 'destTenantId', 'destinationTenant', 'observedOwnerTenantId', 'entityId')) oi.mode = 'cross_org_transfer'
-        else if (hasAny('singleForeignControlDenied', 'singleForeignControlDeniedExchangeId', 'singleForeignControlExchangeId', 'batchRequest', 'batchRequestExchangeId', 'ownRecordId', 'foreignRecordId', 'requestedIds')) oi.mode = 'batch_partial_authz'
-        else if (hasAny('baselineDeniedControl', 'baselineDeniedControlExchangeId', 'baselineControlExchangeId', 'primeAction', 'primeActionExchangeId', 'bledAccess', 'bledAccessExchangeId', 'primeTenant', 'primeTenantId', 'targetTenant', 'targetTenantId', 'observedTenantId', 'isolatedControl')) oi.mode = 'dual_org_cache_bleed'
-      }
-      if (oi.mode === 'dual_org_cache_bleed') { fill('baselineDeniedControlExchangeId', ['baselineDeniedControl', 'baselineDeniedControlExchangeId', 'baselineControlExchangeId'], ctrl); if (activeHops.length >= 2 && prevEx && prevEx !== termEx) fill('primeActionExchangeId', ['primeAction', 'primeActionExchangeId'], prevEx); fill('bledAccessExchangeId', ['bledAccess', 'bledAccessExchangeId'], termEx) }
-      else if (oi.mode === 'cross_org_transfer') { fill('sourceControlDeniedExchangeId', ['sourceControlDenied', 'sourceControlDeniedExchangeId', 'sourceControlExchangeId'], ctrl); fill('transferRecordExchangeId', ['transferRecord', 'transferRecordExchangeId', 'transferExchangeId'], xferHop?.receipt.exchangeIds?.[0] ?? termEx); fill('postTransferReadbackExchangeId', ['postTransferReadback', 'postTransferReadbackExchangeId'], rbOk ?? rb); if (eid) fill('entityId', ['entityId'], eid) }
-      else if (oi.mode === 'batch_partial_authz') { fill('singleForeignControlDeniedExchangeId', ['singleForeignControlDenied', 'singleForeignControlDeniedExchangeId', 'singleForeignControlExchangeId'], ctrl); fill('batchRequestExchangeId', ['batchRequest', 'batchRequestExchangeId'], termEx); fill('postMutationReadbackExchangeId', ['postMutationReadback', 'postMutationReadbackExchangeId'], rbOk ?? rb) }
-    } else if (family === 'cross_surface_pivot') {
-      fill('preChainControlDenied', ['preChainControlDenied', 'preChainControlDeniedExchangeId', 'preChainControlExchangeId'], ctrl)
-      if (oi.hops === undefined && activeHops.length >= 2) oi.hops = activeHops.map((h, i) => { const inE = edges.find(e => e.toHopId === h.receipt.hopId); return { surface: h.receipt.surface ?? 'http', role: i === activeHops.length - 1 ? 'terminal_impact' : h.receipt.surface === 'browser' ? 'browser_dom_trace' : h.receipt.surface === 'webhook' ? 'oob_callback' : 'trigger_write', record: i === activeHops.length - 1 ? (termEx ?? h.receipt.exchangeIds?.[0]) : h.receipt.exchangeIds?.[0], ...(inE ? { bindingKind: inE.kind } : {}) } })
-      fill('terminalImpact', ['terminalImpact'], { kind: rb ? 'privileged_mutation' : 'privileged_read', ...(rb ? { postImpactReadback: rb } : {}) })
-    }
-    return Object.keys(oi).length > 0 ? oi : undefined
+  /** Role-tagged (NEVER positional) state_delta_and_conservation slots: explicit baseline/control, readback, and race-burst roles. */
+  private roleTaggedStateDelta(raw: Record<string, unknown> | undefined, activeHops: RecordedHop[], preControl: string[], postReadback: string[]): Record<string, unknown> {
+    const stOf = (id: string) => this.exStatus.get(id) ?? this.ctx._exStatusOf(id), pickOk = (ids: string[]) => { const r = [...ids].reverse(); return r.find(id => { const st = stOf(id); return st !== undefined && st >= 200 && st < 300 }) ?? r.find(id => stOf(id) === undefined) }
+    const actions = this.raceActionIds.length > 0 ? [...this.raceActionIds] : activeHops.flatMap(h => h.receipt.exchangeIds ?? []).filter(id => !preControl.includes(id) && !postReadback.includes(id))
+    const slots = stateDeltaAndConservation({ baseline: pickOk(this.baselineReadbackIds) ?? pickOk(preControl), final: pickOk(postReadback), actions }).oracleInput
+    return { ...Object.fromEntries(Object.entries(slots).filter(([k]) => !(raw && (raw[k] !== undefined || (k === 'baselineReadbackExchangeId' && (raw.baselineReadback !== undefined || raw.baselineExchangeId !== undefined)) || (k === 'finalReadbackExchangeId' && (raw.finalReadback !== undefined || raw.finalExchangeId !== undefined)) || (k === 'actionExchangeIds' && (raw.actions !== undefined || raw.actionsExchangeIds !== undefined)))))), ...(raw ?? {}) }
   }
   build(opts: ChainProveOptions = {}, pruneDangling = Boolean(opts.terminalHopId)): CompositeProofReceiptInput {
     if (this.hops.length === 0) throw new Error(`ChainBuilder "${this.chainId}" has no recorded hops.`)
@@ -504,9 +506,11 @@ export class ChainBuilder {
     this.recordRefs(preControl, opts.control); this.recordRefs(preControl, opts.controlExchanges); for (const id of opts.preChainControlExchangeIds ?? []) pushUnique(preControl, id)
     for (const id of this.readbackIds) pushUnique(postReadback, id); this.recordRefs(postReadback, opts.readback); for (const id of opts.postChainReadbackExchangeIds ?? []) pushUnique(postReadback, id)
     const terminalExchangeId = opts.terminalExchangeId ?? extractExchangeIds(opts.terminalExchange)[0], modeAFailureExchangeId = opts.modeAFailureExchangeId ?? extractExchangeIds(opts.modeAFailureExchange)[0]
-    const lastExIds = termHop.exchangeIds ?? [], resolvedTermEx = terminalExchangeId ?? lastExIds[lastExIds.length - 1], normCls = this.terminalVulnClass
-    const effFamily: OracleFamily | undefined = opts.oracleFamily ?? (/^(?:economic_conservation|conserved_balance|ledger_overcredit|over_refund|double_spend|race_condition)$/.test(normCls) ? 'economic_conservation' : normCls === 'dual_tenant_abac' || (opts.oracleInput && /^(?:dual_org_cache_bleed|cross_org_transfer|batch_partial_authz)$/.test(String(opts.oracleInput.mode ?? ''))) ? 'dual_tenant_abac' : /^(?:parser_cache_differential|cache_bleed|cache_poisoning|cache_deception|web_cache_deception|web_cache_poisoning|path_confusion|request_smuggling)$/.test(normCls) ? 'parser_cache_differential' : undefined)
-    const oracleInput = effFamily ? this.synthOracleInput(effFamily, opts.oracleInput, activeHops, finalEdges, preControl, postReadback, resolvedTermEx) : (opts.oracleInput ? { ...opts.oracleInput } : undefined)
+    const normCls = this.terminalVulnClass.trim().toLowerCase()
+    // Explicit oracleInput pass-through; the only auto-fill is the role-tagged state_delta_and_conservation primitive.
+    const sd = this.roleTaggedStateDelta(opts.oracleInput, activeHops, preControl, postReadback)
+    const wantsStateDelta = (opts.oracleFamily ?? normCls) === 'economic_conservation' || (!opts.oracleFamily && this.raceActionIds.length > 0 && Boolean(sd.baselineReadbackExchangeId && sd.finalReadbackExchangeId) && resolveUniversalPrimitive(normCls) === 'state_delta_and_conservation')
+    const oracleInput = wantsStateDelta ? sd : (opts.oracleInput ? { ...opts.oracleInput } : undefined)
     return {
       chainId: this.chainId, terminalVulnClass: this.terminalVulnClass, replayMode: opts.replayMode ?? this.replayMode,
       ...(opts.benchmarkMode ?? this.benchmarkMode !== undefined ? { benchmarkMode: opts.benchmarkMode ?? this.benchmarkMode } : {}),
