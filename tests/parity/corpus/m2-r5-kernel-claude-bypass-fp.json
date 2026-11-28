@@ -9,7 +9,6 @@
       "src/server/composite-receipt.ts",
       "src/server/exec-verify.ts",
       "src/server/oracle-spec.ts",
-      "src/server/own-org-terminal-guard.ts",
       "src/server/v8-oracle-families.ts",
       "src/server/v8-oracle-hydrate.ts"
     ],

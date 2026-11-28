@@ -6,11 +6,11 @@
   "description": "R3-05 independent-review FP (r9-kernel-econ-guard, reviewer claude-opus-5-5-high): two legitimate, sequential, same-amount deposits to the attacker's own wallet resource (`POST /v1/wallets/<walletId>/deposit`), each response echoing the wallet object's top-level `id`, bracketed by own-tenant balance readbacks whose delta exactly equals the sum of both deposits. The wallet/account resource id is NOT an economic entity (order/payment/invoice) id, so the deposits must not be collapsed into one entity (max-per-entity dedup would under-count authorizedDeposits by half) and must not satisfy duplicate-entity credit multiplicity. Balance is fully conserved; balance_minting must fail closed. The authored branch keyed both deposits by the wallet id (top-level response `id` / dynamic path segment) and confirmed it. Coverage note: the verdict runs through own-org-terminal-guard/v8-oracle-hydrate (hydrateBalanceMintingOperands) and exec-verify's composite host-origin inspection; the verify-rpc cap:* persona auto-lift path is exercised live by tests/r9-kernel-econ-guard.test.ts test 2 (no RPC transport in the static corpus runner).",
   "covers": {
     "files": [
-      "src/server/own-org-terminal-guard.ts",
       "src/server/v8-oracle-hydrate.ts",
       "src/server/composite-receipt.ts",
       "src/server/exec-verify.ts",
-      "src/server/verify-rpc.ts"
+      "src/server/verify-rpc.ts",
+      "src/server/v8-oracle-families.ts"
     ],
     "classes": [
       "business_logic"

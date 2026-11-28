@@ -7,7 +7,6 @@
   "covers": {
     "files": [
       "src/server/composite-receipt.ts",
-      "src/server/own-org-terminal-guard.ts",
       "src/server/v8-oracle-families.ts",
       "src/server/v8-oracle-hydrate.ts",
       "src/server/verify-rpc.ts"
