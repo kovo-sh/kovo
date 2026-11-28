@@ -1,0 +1,92 @@
+{
+  "id": "a3-policy-judge-no-repo-neon-fp",
+  "side": "fp",
+  "archetype": "a3-policy-judge-no-repo-and-method-mismatch-refusal-control-fp",
+  "description": "R3-05 independent-review FP (Track A3, gemini-4-neon-high): a write refusal (DELETE 403) on a resource is paired with a permitted public read (GET 200) on the same route for the same principal, with no confined repo slices. Tier-1 composite/claims verification and Tier-2 policy judge must both reject confirmation (method-mismatched refusal control cannot bypass the hard no-repo rule, and a non-confirmed / needs_review outcome must never compile a Verify Fix predicate or inflate confirmed counts).",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/exec-verify.ts",
+      "src/server/policy-judge.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/verify-fix-predicate.ts",
+      "src/server/verify-rpc.ts"
+    ],
+    "classes": [
+      "bola",
+      "idor",
+      "authorization"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Public report GET paired with denied DELETE on same route",
+    "impact": "Permitted GET read of a same-tenant public report contrasted against a denied DELETE; no unauthorized access.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Allowed GET read paired with 403 DELETE refusal on report route"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_delete",
+      "arm": "control",
+      "role": "control",
+      "method": "DELETE",
+      "pathAndQuery": "/v1/reports/rep_7001",
+      "persona": "member_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "prb_get",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/v1/reports/rep_7001",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"reportId\":\"rep_7001\",\"tenant\":\"tenant-a\",\"visibility\":\"public\",\"title\":\"Quarterly public status digest\"}"
+    }
+  ],
+  "composite": {
+    "chainId": "a3-policy-judge-no-repo-neon-fp",
+    "singleHop": true,
+    "terminalVulnClass": "bola",
+    "oracleFamily": "dual_tenant_abac",
+    "claimedDelta": "Permitted GET read paired with a denied DELETE on the same route without unauthorized disclosure."
+  },
+  "source": "independent_review"
+}

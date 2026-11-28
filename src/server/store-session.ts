@@ -399,7 +399,7 @@ export type ReplaySpecRow = typeof tables.replaySpecs.$inferSelect
 export interface AgentScriptProofRecord {
   replaySpecId: string
   findingId: string
-  verdict: 'confirmed' | 'dismissed' | 'inconclusive'
+  verdict: 'confirmed' | 'dismissed' | 'inconclusive' | 'needs_review'
   runtime: 'ts' | 'python'
   scriptSha256: string
   artifactId?: string | null

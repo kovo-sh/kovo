@@ -11,6 +11,7 @@ import type {
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
 import type { SecretMatch } from './redact.ts'
 import type { EnvironmentMode } from './scope-policy.ts'
+import type { CompiledVerifyFixPredicate } from './verify-fix-predicate.ts'
 
 export const workspaces = sqliteTable('workspaces', {
   id: text('id').primaryKey().notNull(),
@@ -370,6 +371,8 @@ export interface ReplayProofReceiptRow {
     observed: string
     expected: string
   }
+  /** A3: 0-LLM Verify Fix predicate compiled at confirmation (stored in the `proof_receipt` JSON; no migration). */
+  compiledPredicate?: CompiledVerifyFixPredicate | null
 }
 
 export const replaySpecs = sqliteTable('replay_specs', {
@@ -392,7 +395,7 @@ export const replaySpecs = sqliteTable('replay_specs', {
    * receipt-first (`verifyReceipt()` over the cited exchanges), never a DSL re-interpretation.
    */
   proofKind: text('proof_kind').$type<'agent_script' | null>(),
-  proofVerdict: text('proof_verdict').$type<'confirmed' | 'dismissed' | 'inconclusive' | null>(),
+  proofVerdict: text('proof_verdict').$type<'confirmed' | 'dismissed' | 'inconclusive' | 'needs_review' | null>(),
   proofRuntime: text('proof_runtime').$type<'ts' | 'python' | null>(),
   proofScriptSha256: text('proof_script_sha256'),
   proofArtifactId: text('proof_artifact_id'),
