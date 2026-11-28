@@ -202,12 +202,8 @@ const GENERIC_ACTOR_LABELS = new Set(['', 'worker', 'unknown', 'anonymous', 'sys
 const SIGNING_SECRET_RE = /(?:^|[^a-z0-9])(?:signing[_-]?(?:secret|key|salt|material)|hmac[_-]?(?:secret|key|salt)?|webhook[_-]?(?:secret|key|signing|salt)|(?:sig|signature|mac|digest|verify)[_-]?(?:secret|key|salt)|private[_-]?key|shared[_-]?secret|jwt[_-]?(?:secret|key)|client[_-]?secret|master[_-]?key|secret[_-]?key|signing|salt)(?:[^a-z0-9]|$)/i
 const SPARSE_SECRET_IDENT_RE = /(?:^|[^a-z0-9])(?:secret|salt|hmac|signing|sig)(?:[^a-z0-9]|$)/i
 const SIGNED_URL_FIELD_RE = /(?:^|[^a-z0-9])(?:signed[_-]?url|presigned[_-]?url|download[_-]?url|export[_-]?url|artifact[_-]?url|result[_-]?url|file[_-]?url|upload[_-]?url|callback[_-]?url|location[_-]?url|download[_-]?link)(?:[^a-z0-9]|$)/i
-const SIGNED_URL_VALUE_RE = /(?:https?:\/\/|\/)[^\s]*(?:[?&](?:sig|signature|expires|exp|x-amz-signature|token|download)=|\/(?:download|export|result|artifact|presign|signed)\b)/i
+const SIGNED_URL_VALUE_RE = /(?:https?:\/\/|\/)[^\s]*(?:[?&](?:sig|signature|expires|exp|x-amz-signature|token|download)=)/i
 const CREDENTIAL_TOKEN_RE = /(?:^|[^a-z0-9])(?:jwt|bearer|access[_-]?token|id[_-]?token|refresh[_-]?token|session[_-]?(?:token|id|cookie)|api[_-]?key|apikey|pat|invite[_-]?(?:token|code)|scim(?:[_-]?(?:token|key|secret))?|service[_-]?token|auth[_-]?token|exchange[_-]?token|delegation(?:[_-]?(?:token|key|grant|assertion))?|assertion|oauth[_-]?token|credential|token|cookie)(?:[^a-z0-9]|$)/i
-const SIGNING_PRODUCER_ROUTE_RE = /\/(?:webhooks?|hooks?|signing|hmac|crypto)(?:\/|$)/i
-const CRED_PRODUCER_ROUTE_RE = /\/(?:oauth|oauth2|oidc|sso|auth|login|tokens?|sessions?|scim|delegat\w*|invites?)(?:\/|$)/i
-const DUAL_TENANT_FRONTIER_SIGNAL_RE = /(?:^|[^a-z0-9])(?:cache|cached|cache[_-]?bleed|cache[_-]?key|shared[_-]?(?:edge[_-]?)?cache|edge[_-]?cache|prime|primed[_-]?cache|warm|cdn|cross[_-]?tenant|dual[_-]?tenant|multi[_-]?tenant|abac|switch[_-]?(?:tenant|org|workspace)|(?:tenant|org|workspace)[_-]?switch)(?:[^a-z0-9]|$)/i
-const ORG_SWITCH_ROUTE_RE = /\/(?:orgs?|tenants?|organizations?|workspaces?)(?:\/[^/]+)?\/switch(?:\/|$)/i
 const CAP_HANDLE_PREFIX_RE = /^cap:/i
 const SYNTHETIC_PRECONDITION_CAP_RE = /^(?:surface|branch):/i
 const KNOWN_NEGATIVE_RULE_KINDS: ReadonlySet<string> = new Set<string>([
@@ -217,14 +213,11 @@ const KNOWN_NEGATIVE_RULE_KINDS: ReadonlySet<string> = new Set<string>([
 ])
 const CAP_NOISE_NOUNS = new Set(['hop', 'cap', 'val', 'value', 'raw', 'slot', 'data', 'item', 'secret', 'token', 'key', 'salt', 'url'])
 const JWT_SHAPE_RE = /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}/
-const UUID_OR_PREFIX_ID_RE = /\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-z]{2,8}_[a-z0-9]{4,})\b/i
+const UUID_SHAPE_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i
 
-const SIG_REJECTION_RE = /(?:sig(?:nature)?|hmac|digest|mac\b|webhook|x-signature|x-hub-signature|timestamp|invalid[_ -]?(?:sig|hmac|auth|token|jwt)|missing[_ -]?sig|bad[_ -]?sig|verify|signed|unauthorized)/i
-const SIG_CONSUMER_ROUTE_RE = /\/(?:webhooks?|hooks?|ingest|callback|callbacks|events?|notify|deliver|delivery|dispatch|verify|sign|signed|receive|receiver|inbound|push|sync)(?:\/|$)/i
+const SIG_REJECTION_RE = /(?:sig(?:nature)?|hmac|digest|mac\b|x-signature|x-hub-signature|stripe-signature|svix-signature|invalid[_ -]?(?:sig|hmac)|missing[_ -]?sig|bad[_ -]?sig)/i
 const SIG_SINK_RE = /(?:hmac|webhook|sig|jwt|crypto)/i
-const PRIVILEGED_ROUTE_RE = /\/(?:admin|internal|vault|secrets?|keys?|approve|approval|patch|sync|config|settings?|roles?|permissions?|users?|members?|scim|tenants?|orgs?|organizations?|workspaces?|payouts?|transfers?|settle|release|finalize|revoke|impersonate|delegate|assume|exports?|audit|billing)(?:\/|$)/i
-const SIBLING_VERB_ROUTE_RE = /\/(?:rebind|approve|trace|result|results|deliveries|delivery|archive|content|settle|release|finalize|revoke|cancel|dispatch|execute|run|download|export|url|status|logs|artifacts?|members?|secrets?|tokens?|keys?|sync|verify|trigger|complete|confirm|transfer|patch|update)(?:\/|$)/i
-const DOWNLOAD_ROUTE_RE = /\/(?:download|downloads|export|exports|file|files|artifact|artifacts|result|results|content|storage|media|presign|signed|fetch|proxy|redirect|archive|snapshot|report|reports)(?:\/|$)/i
+const PARAMETERIZED_SUBACTION_RE = /\/:id\/[a-z0-9_-]+(?:\/|$)/i
 
 const AFFORDANCE_TIEBREAK: Record<FrontierAffordanceKind, number> = {
   derive_signature: 0,
@@ -512,16 +505,10 @@ export function classifyCapabilityShape(cap: FrontierCapabilityInput): Capabilit
   }
   const primarySlot = (cap.fieldName ?? cap.slot ?? capParts.slot ?? '').trim()
   const looksLikeEntityId = /(?:^|_)id$/i.test(primarySlot)
-  if (!looksLikeEntityId) {
-    const prodPath = cap.producerEndpoint ? normalizeRouteTemplate(cap.producerEndpoint, { preserveCase: false }) : ''
-    if (prodPath && SIGNING_PRODUCER_ROUTE_RE.test(prodPath)) return 'signing_secret'
-    if (prodPath && DOWNLOAD_ROUTE_RE.test(prodPath) && /(?:^|[^a-z0-9])(?:url|link|href|download|location)(?:[^a-z0-9]|$)/i.test(identText)) {
-      return 'signed_or_download_url'
-    }
-    if (prodPath && CRED_PRODUCER_ROUTE_RE.test(prodPath)) return 'credential_token'
-    if (SPARSE_SECRET_IDENT_RE.test(identText)) return 'signing_secret'
+  if (!looksLikeEntityId && SPARSE_SECRET_IDENT_RE.test(identText)) {
+    return 'signing_secret'
   }
-  if (typeof cap.valueHint === 'string' && UUID_OR_PREFIX_ID_RE.test(cap.valueHint)) return 'entity_or_job_id'
+  if (typeof cap.valueHint === 'string' && UUID_SHAPE_RE.test(cap.valueHint)) return 'entity_or_job_id'
   return 'entity_or_job_id'
 }
 
@@ -529,12 +516,11 @@ interface PersonaContext {
   roleByHandle: Map<string, string | null | undefined>
   nonElevatedHandles: Set<string>
   basePersona: string | null
-  multiTenantPersona: string | null
 }
 
 function buildPersonaContext(personas: readonly FrontierPersonaInput[] = []): PersonaContext {
   const roleByHandle = new Map<string, string | null | undefined>()
-  const ranked: Array<{ handle: string; rank: number; idx: number; elevated: boolean; revoked: boolean; multiTenant: boolean }> = []
+  const ranked: Array<{ handle: string; rank: number; idx: number; elevated: boolean; revoked: boolean }> = []
   personas.forEach((p, idx) => {
     const h = p.handle.trim()
     if (!h || isInvalidActorHandle(h)) return
@@ -546,60 +532,29 @@ function buildPersonaContext(personas: readonly FrontierPersonaInput[] = []): Pe
       idx: typeof p.configIndex === 'number' && Number.isFinite(p.configIndex) ? p.configIndex : idx,
       elevated: priv.elevated,
       revoked: priv.revokedStale,
-      multiTenant: priv.multiTenant,
     })
   })
   ranked.sort((a, b) => a.rank - b.rank || a.idx - b.idx)
   const nonElevatedHandles = new Set(ranked.filter(r => !r.elevated).map(r => r.handle))
-  const basePersona = ranked.find(r => !r.elevated && !r.revoked && !r.multiTenant)?.handle
-    ?? ranked.find(r => !r.elevated && !r.multiTenant)?.handle
+  const basePersona = ranked.find(r => !r.elevated && !r.revoked)?.handle
+    ?? ranked.find(r => !r.elevated)?.handle
     ?? null
-  const multiTenantPersona = ranked.find(r => !r.elevated && r.multiTenant)?.handle ?? null
-  return { roleByHandle, nonElevatedHandles, basePersona, multiTenantPersona }
-}
-
-function isDualTenantFrontierPair(
-  cap: FrontierCapabilityInput,
-  consumer?: Pick<IndexedConsumer, 'normPath' | 'paramNames'>,
-): boolean {
-  if (cap.temporalState === 'primed_cache' || cap.ledgerKind === 'parser_or_cache_primitive') return true
-  if (cap.producerEndpoint && ORG_SWITCH_ROUTE_RE.test(normalizeRouteTemplate(cap.producerEndpoint, { preserveCase: false }))) return true
-  if (consumer && ORG_SWITCH_ROUTE_RE.test(consumer.normPath)) return true
-  const corpus = [
-    cap.fieldName,
-    cap.label,
-    cap.slot,
-    cap.sourceHopId,
-    cap.summary,
-    cap.producerEndpoint,
-    cap.targetPath,
-    consumer?.normPath,
-    ...(consumer ? [...consumer.paramNames] : []),
-  ].filter(Boolean).join(' ')
-  return DUAL_TENANT_FRONTIER_SIGNAL_RE.test(corpus)
+  return { roleByHandle, nonElevatedHandles, basePersona }
 }
 
 /**
- * Resolve the owning `actingPersona` for a capability without ever emitting a `cap:*` handle,
- * an unapproved/elevated persona, or a `multi_tenant` persona on non-dual-tenant steps.
+ * Resolve the owning `actingPersona` for a capability without ever emitting a `cap:*` handle
+ * or substituting an elevated persona. Preserves the owning non-elevated persona verbatim.
  */
 function resolveSafeActingPersona(
   cap: FrontierCapabilityInput,
   ctx: PersonaContext,
-  options?: { allowMultiTenant?: boolean },
 ): string | null {
-  const allowMultiTenant = Boolean(options?.allowMultiTenant)
   const hasConfigured = ctx.roleByHandle.size > 0
-  const isApprovedNonElevated = (handle: string): boolean => {
-    if (isInvalidActorHandle(handle)) return false
-    if (hasConfigured) return ctx.nonElevatedHandles.has(handle)
-    return !classifyPersonaPrivilege(handle, ctx.roleByHandle.get(handle)).elevated
-  }
   const acceptCandidate = (handle: string): string | null => {
-    if (!isApprovedNonElevated(handle)) return null
-    const priv = classifyPersonaPrivilege(handle, ctx.roleByHandle.get(handle))
-    if (priv.multiTenant && !allowMultiTenant) return ctx.basePersona
-    return handle
+    if (isInvalidActorHandle(handle)) return null
+    if (hasConfigured) return ctx.nonElevatedHandles.has(handle) ? handle : null
+    return !classifyPersonaPrivilege(handle, ctx.roleByHandle.get(handle)).elevated ? handle : null
   }
 
   const raw = (cap.actingPersona ?? '').trim()
@@ -610,7 +565,6 @@ function resolveSafeActingPersona(
   const derivedAccepted = acceptCandidate(derived)
   if (derivedAccepted) return derivedAccepted
 
-  if (allowMultiTenant && ctx.multiTenantPersona) return ctx.multiTenantPersona
   return ctx.basePersona ?? (hasConfigured ? null : 'attacker')
 }
 
@@ -812,7 +766,7 @@ function indexConsumers(
       const persona = (ex.personaHandle ?? '').trim()
       if (persona) node.deniedPersonas.add(persona)
       const diag = `${ex.bodyPreview ?? ''} ${parseHeadersText(ex.respHeaders)}`
-      if (SIG_REJECTION_RE.test(diag) || (node.isMutating && SIG_CONSUMER_ROUTE_RE.test(node.normPath))) {
+      if (SIG_REJECTION_RE.test(diag)) {
         node.hasSignatureRejection = true
       }
     }
@@ -860,6 +814,8 @@ function scoreCapabilityConsumerMatch(
 ): ScoreOutcome | null {
   const crossOrigin = cap.origin !== consumer.origin
   const nounOverlap = [...capNouns].filter(n => consumer.nouns.has(n))
+  const capFieldSnake = toSnake(cap.fieldName ?? cap.slot ?? '')
+  const exactFieldParam = Boolean(capFieldSnake && consumer.paramNames.has(capFieldSnake))
   const hasDenied = consumer.observedDeniedStatuses.size > 0
   const basePersonaDenied = consumer.deniedPersonas.has(actingPersona)
     || (personaCtx.basePersona !== null && consumer.deniedPersonas.has(personaCtx.basePersona))
@@ -867,29 +823,29 @@ function scoreCapabilityConsumerMatch(
   const reasons: string[] = []
 
   if (shapeKind === 'signing_secret') {
-    const isSigRoute = SIG_CONSUMER_ROUTE_RE.test(consumer.normPath)
     const hasSigSink = consumer.sinkKinds.some(sk => SIG_SINK_RE.test(sk))
-    if (!consumer.hasSignatureRejection && !hasDenied && !(consumer.isMutating && isSigRoute) && !hasSigSink) return null
+    const hasSigParam = [...consumer.paramNames].some(p => /sig|hmac/.test(p))
+    if (!consumer.hasSignatureRejection && !hasDenied && !hasSigSink && !hasSigParam) return null
     let score = 82
     if (consumer.hasSignatureRejection) { score += 40; reasons.push('observed_401_403_signature_rejection') }
     else if (hasDenied) { score += 18; reasons.push('observed_401_403') }
-    if (consumer.isMutating && isSigRoute) { score += 22; reasons.push('mutating_webhook_or_ingest_route') }
-    else if (isSigRoute) { score += 12; reasons.push('webhook_or_ingest_route') }
-    if (hasSigSink) { score += 18; reasons.push('signature_sink_hint') }
-    if (consumer.isMutating) { score += 8; reasons.push('mutating_method') }
+    if (hasSigSink) { score += 20; reasons.push('signature_sink_hint') }
+    if (hasSigParam) { score += 18; reasons.push('signature_param_schema') }
+    if (consumer.isMutating) { score += 10; reasons.push('mutating_method') }
     if (nounOverlap.length) { score += 14; reasons.push(`noun_overlap:${nounOverlap[0]}`) }
     if (crossOrigin) { score += 12; reasons.push('cross_origin') }
     return { affordance: 'derive_signature', score, reasons }
   }
 
   if (shapeKind === 'credential_token') {
-    const isPrivRoute = PRIVILEGED_ROUTE_RE.test(consumer.normPath)
     const requiresAuth = Boolean(consumer.authRequirement && consumer.authRequirement !== 'none')
-    if (!hasDenied && !isPrivRoute && !(requiresAuth && consumer.isMutating)) return null
+    const hasCredParam = [...consumer.paramNames].some(p => /token|auth|session|key|credential/.test(p))
+    if (!hasDenied && !hasCredParam && !(requiresAuth && consumer.isMutating)) return null
     let score = 74
     if (hasDenied && basePersonaDenied) { score += 34; reasons.push('base_persona_401_403') }
     else if (hasDenied) { score += 24; reasons.push('observed_401_403') }
-    if (isPrivRoute) { score += 20; reasons.push('privileged_or_admin_route') }
+    if (hasCredParam) { score += 18; reasons.push('credential_param_schema') }
+    if (requiresAuth) { score += 14; reasons.push('openapi_auth_requirement') }
     if (consumer.isMutating) { score += 10; reasons.push('mutating_method') }
     if (crossOrigin) { score += 16; reasons.push('cross_origin') }
     if (nounOverlap.length) { score += 10; reasons.push(`noun_overlap:${nounOverlap[0]}`) }
@@ -903,25 +859,26 @@ function scoreCapabilityConsumerMatch(
       && (!cap.targetOrigin || cap.targetOrigin === consumer.origin)
       && (consumer.normPath === normTarget || consumer.normPath.startsWith(normTarget)),
     )
-    const isDownloadRoute = DOWNLOAD_ROUTE_RE.test(consumer.normPath)
-    if (!exactTarget && !isDownloadRoute) return null
+    const hasUrlParam = [...consumer.paramNames].some(p => /url|file|path|artifact|download|token|location/.test(p))
+    if (!exactTarget && !hasUrlParam && !(nounOverlap.length > 0 && (consumer.hasIdParam || hasDenied))) return null
     let score = 76
     if (exactTarget) { score += 36; reasons.push('exact_signed_url_target') }
-    if (isDownloadRoute) { score += 16; reasons.push('download_or_export_route') }
-    if (nounOverlap.length) { score += 12; reasons.push(`noun_overlap:${nounOverlap[0]}`) }
+    if (hasUrlParam) { score += 18; reasons.push('url_or_file_param_schema') }
+    if (nounOverlap.length) { score += 14; reasons.push(`noun_overlap:${nounOverlap[0]}`) }
     if (crossOrigin) { score += 14; reasons.push('cross_origin') }
     if (hasDenied) { score += 10; reasons.push('observed_401_403') }
     return { affordance: 'redeem_signed_url', score, reasons }
   }
 
   // shapeKind === 'entity_or_job_id'
-  const isSiblingVerb = SIBLING_VERB_ROUTE_RE.test(consumer.normPath)
   const acceptsId = consumer.hasIdParam || [...consumer.paramNames].some(p => p === 'id' || p.endsWith('_id'))
   if (!acceptsId) return null
-  if (!nounOverlap.length && !isSiblingVerb) return null
+  const hasSubAction = PARAMETERIZED_SUBACTION_RE.test(consumer.normPath)
+  if (!nounOverlap.length && !exactFieldParam && !(hasSubAction && (consumer.isMutating || hasDenied))) return null
   let score = 68
+  if (exactFieldParam) { score += 30; reasons.push(`exact_param:${capFieldSnake}`) }
   if (nounOverlap.length) { score += 28; reasons.push(`noun_overlap:${nounOverlap[0]}`) }
-  if (isSiblingVerb) { score += 24; reasons.push('sibling_verb_route') }
+  if (hasSubAction) { score += 18; reasons.push('parameterized_subaction_route') }
   if (consumer.isMutating) { score += 10; reasons.push('mutating_method') }
   if (hasDenied) { score += 12; reasons.push('observed_401_403') }
   if (crossOrigin) { score += 14; reasons.push('cross_origin') }
@@ -963,9 +920,7 @@ export function rankCapabilityConsumerPairs(input: RankCapabilityConsumerPairsIn
       if (prodNorm && cap.origin === consumer.origin && prodNorm === consumer.normPath && (!prodMethod || prodMethod === consumer.method)) {
         continue
       }
-      const actingPersona = resolveSafeActingPersona(cap, personaCtx, {
-        allowMultiTenant: isDualTenantFrontierPair(cap, consumer),
-      })
+      const actingPersona = resolveSafeActingPersona(cap, personaCtx)
       if (!actingPersona) continue
       const match = scoreCapabilityConsumerMatch(cap, shapeKind, capNouns, actingPersona, consumer, personaCtx)
       if (!match) continue

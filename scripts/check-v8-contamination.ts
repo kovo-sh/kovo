@@ -22,6 +22,7 @@ export type ContaminationCategory =
   | 'chain_or_twin_id'
   | 'internal_hostname'
   | 'synthetic_canary'
+  | 'structural_lab_artifact'
 
 export interface ContaminationRule {
   id: string
@@ -96,7 +97,83 @@ export const V8_CONTAMINATION_RULES: readonly ContaminationRule[] = [
     pattern: /mh_fake_/gi,
     description: 'v8 multihop-saas synthetic canary prefix',
   },
+  {
+    id: 'lab-fast-lab-profile',
+    category: 'structural_lab_artifact',
+    pattern: /\bfast_lab\b/gi,
+    description: 'lab-tuned async polling profile literal',
+  },
+  {
+    id: 'lab-dual-org-cache-bleed',
+    category: 'structural_lab_artifact',
+    pattern: /\bdual_org_cache_bleed\b/gi,
+    description: 'bespoke multihop-saas sub-oracle mode name',
+  },
+  {
+    id: 'lab-nfkc-collision',
+    category: 'structural_lab_artifact',
+    pattern: /nfkc-collision/gi,
+    description: 'benchmark-specific NFKC collision fixture label',
+  },
+  {
+    id: 'lab-split-refund-ledger-break',
+    category: 'structural_lab_artifact',
+    pattern: /\bsplit_refund_ledger_break\b/gi,
+    description: 'multihop-saas chain name literal',
+  },
+  {
+    id: 'lab-billingz-token',
+    category: 'structural_lab_artifact',
+    pattern: /\bbillingz\b/gi,
+    description: 'target-specific service slug literal',
+  },
+  {
+    id: 'lab-whsec-prefix',
+    category: 'structural_lab_artifact',
+    pattern: /whsec_/gi,
+    description: 'hardcoded webhook secret prefix literal',
+  },
+  {
+    id: 'lab-xfer-prefix',
+    category: 'structural_lab_artifact',
+    pattern: /xfer_/gi,
+    description: 'hardcoded transfer ID prefix literal',
+  },
+  {
+    id: 'lab-hardened-twin',
+    category: 'structural_lab_artifact',
+    pattern: /hardened_twin/gi,
+    description: 'benchmark hardened-twin coaching literal',
+  },
+  {
+    id: 'lab-rbs-prefix',
+    category: 'structural_lab_artifact',
+    pattern: /\brbs_/gi,
+    description: 'realistic-bench secret token prefix literal',
+  },
 ] as const
+
+/**
+ * Narrow per-file, per-rule allowlist for structural lab-artifact tokens pending Phase 0/1-2 cleanup.
+ * Every entry MUST be tightened to zero as its owning phase lands (except Stripe secret redaction in redact.ts).
+ */
+export const TEMPORARY_STRUCTURAL_ALLOWLIST: Readonly<Record<string, ReadonlySet<string>>> = {
+  // Legitimate outbound Stripe webhook secret redactor (not overfitting):
+  'src/server/redact.ts': new Set(['lab-whsec-prefix']),
+  // TODO(Phase 0): retired by sibling Phase 0 non-kernel cleanup streams:
+  'src/server/assignment-brief.ts': new Set(['lab-fast-lab-profile', 'lab-hardened-twin']),
+  'src/server/exploiter-tools.ts': new Set(['lab-dual-org-cache-bleed']),
+  'src/server/probes/xxe.ts': new Set(['lab-rbs-prefix']),
+  // TODO(Phase 1-2): confirmation-kernel & compiler files retired in Phases 1–2 (Opus R3-05 reviewed):
+  'src/server/evidence-provenance.ts': new Set(['lab-rbs-prefix']),
+  'src/server/oracle-spec.ts': new Set(['lab-split-refund-ledger-break']),
+  'src/server/v8-oracle-families.ts': new Set(['lab-dual-org-cache-bleed']),
+  'src/server/v8-oracle-hydrate.ts': new Set(['lab-dual-org-cache-bleed']),
+  'src/server/causal-proof-compiler.ts': new Set(['lab-dual-org-cache-bleed']),
+  'src/server/trace-proof-compiler.ts': new Set(['lab-split-refund-ledger-break']),
+  'src/server/derived-custody.ts': new Set(['lab-fast-lab-profile']),
+  'src/server/verify-rpc.ts': new Set(['lab-fast-lab-profile']),
+}
 
 function toPosixRelative(rootDir: string, absPath: string): string {
   const rel = relative(rootDir, absPath)
@@ -127,10 +204,12 @@ export function scanTextForContamination(
   rules: readonly ContaminationRule[] = V8_CONTAMINATION_RULES,
 ): ContaminationHit[] {
   const hits: ContaminationHit[] = []
+  const allowedRuleIds = TEMPORARY_STRUCTURAL_ALLOWLIST[file]
   const lines = content.split(/\r?\n/)
   for (let lineIdx = 0; lineIdx < lines.length; lineIdx += 1) {
     const lineText = lines[lineIdx]!
     for (const rule of rules) {
+      if (allowedRuleIds?.has(rule.id)) continue
       const flags = rule.pattern.flags.includes('g') ? rule.pattern.flags : `${rule.pattern.flags}g`
       const re = new RegExp(rule.pattern.source, flags)
       let match: RegExpExecArray | null

@@ -852,7 +852,7 @@ export type RepoOriginAffinityConfidence =
   | 'unmapped'
 
 export interface RepoAffinityDescriptor {
-  /** Mounted repo identifier or slug (e.g. `dmail`, `owner/dyad-billingz`, `/repos/dyad-llm-engine`). */
+  /** Mounted repo identifier or slug (e.g. `mail-svc`, `owner/payments-api`, `/repos/worker-engine`). */
   repo: string
   /** Optional relative root prefix inside workspace/source files. */
   root?: string
@@ -923,22 +923,9 @@ function repoBasenameSlug(raw: string): string {
 function stemAffinityToken(raw: string): string {
   const tok = raw.toLowerCase().replace(/[^a-z0-9]/g, '')
   if (!tok) return ''
-  if (tok === 'uploader' || tok === 'uploaders' || tok === 'uploading' || tok === 'uploads') return 'upload'
-  if (tok === 'downloader' || tok === 'downloaders' || tok === 'downloads') return 'download'
-  if (tok === 'mailer' || tok === 'mailers' || tok === 'mails') return 'mail'
-  if (tok === 'logger' || tok === 'loggers' || tok === 'logging' || tok === 'logs') return 'log'
-  if (tok === 'images' || tok === 'img' || tok === 'imgs') return 'image'
-  if (tok === 'workers' || tok === 'worker') return 'worker'
-  if (tok === 'engines') return 'engine'
-  if (tok === 'chats') return 'chat'
-  if (tok === 'files') return 'file'
-  if (tok === 'docs') return 'doc'
-  if (tok.length > 4 && tok.endsWith('ers')) return tok.slice(0, -3)
-  if (tok.length > 4 && tok.endsWith('er') && /(?:upload|download|mail|log|scan|build|sync|parse|route)er$/.test(tok)) {
-    return tok.slice(0, -2)
-  }
   if (tok.length > 4 && tok.endsWith('ies')) return `${tok.slice(0, -3)}y`
-  if (tok.length > 3 && tok.endsWith('s') && !/(?:ss|us|is|status|access|billingz)$/.test(tok)) {
+  if (tok.length > 4 && /(?:ches|shes|xes|zes|ses)$/.test(tok)) return tok.slice(0, -2)
+  if (tok.length > 3 && tok.endsWith('s') && !/(?:ss|us|is|status|access)$/.test(tok)) {
     return tok.slice(0, -1)
   }
   return tok
@@ -1272,7 +1259,7 @@ export function resolveRepoOriginAffinity(input: RepoOriginAffinityInput): RepoO
     for (const rawName of candidates) {
       const allTokens = tokenizeAffinitySlug(rawName)
       if (!allTokens.length) continue
-      // Strip leading/trailing apex brand tokens (e.g. `dyad-billingz` -> `billingz`) when non-brand tokens remain.
+      // Strip leading/trailing apex brand tokens (e.g. `acme-payments` -> `payments`) when non-brand tokens remain.
       const withoutBrand = allTokens.filter(t => !brandTokens.has(t))
       const baseTokens = withoutBrand.length > 0 ? withoutBrand : allTokens
       const distinctiveTokens = baseTokens.filter(t => !AFFINITY_GENERIC_STOPWORDS.has(t))
@@ -1621,7 +1608,7 @@ function hopKindToCapabilityKind(kind: ChainHop['artifactKind']): CapabilityKind
 export const CHECKPOINT_CAP_SKILL_PREFIX = 'checkpoint_cap:'
 export const MAX_WORKSPACE_DIGEST_BYTES = 8 * 1024
 export const HOP_CONTINUATION_DIRECTIVE =
-  'Continue from verified Hop 1–2 checkpoint — DO NOT re-read source or repeat Hops 1–2; execute Hops 3–5 using the sealed handles + ctx.hmac_sign/ctx.jwt_sign/ctx.await_async and confirm end-to-end via ctx.prove_composite!'
+  'Continue from the verified hop checkpoint — do not repeat already-verified discovery hops; advance the next unverified boundary using sealed capability handles and confirm end-to-end via ctx.prove_composite.'
 
 export function extractCheckpointCapIdFromStep(step: { skills?: readonly string[] }): string | null {
   for (const skill of step.skills ?? []) {

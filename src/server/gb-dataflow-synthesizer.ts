@@ -35,7 +35,7 @@ export interface GbDataflowSynthesizeResult { steps: GbDataflowStepDraft[]; chai
 interface ProducedCap { field: string; kind: ProducerTokenKind; noun: string; fromLive: boolean; targetOrigin?: string; targetNormPath?: string; valueDigest?: string; exchangeId?: string; factId?: string; observedAtMs?: number; persona?: string }
 interface PersonaDiff { allowed: string[]; denied: string[]; hasAsymmetry: boolean; has202: boolean; summary: string }
 interface EndpointNode {
-  key: string; id: string; origin: string; host: string; role: 'auth' | 'api' | 'edge' | 'general'
+  key: string; id: string; origin: string; host: string
   method: string; normPath: string; nouns: string[]; primaryNoun: string; isMutating: boolean; isHighValue: boolean
   paramNames: Set<string>; consumedNouns: Set<string>; sinkKinds: string[]; acceptsSigning: boolean; acceptsCredential: boolean; acceptsInvite: boolean
   acceptsSignedUrl: boolean; acceptsAsyncJob: boolean; hasSignatureRejection: boolean; produces: ProducedCap[]
@@ -46,6 +46,8 @@ interface DataflowEdge { from: EndpointNode; to: EndpointNode; field: string; ki
 const DEFAULT_MAX_STEPS = 6
 const MAX_OUTGOING = 8
 const MAX_JSON_KEYS = 60
+export const MAX_VALUEFLOW_EDGES_PER_RUN = 48
+const MAX_VALUEFLOW_EDGES_PER_TICK = 12
 const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 const NOISE_KEYS = new Set([
   'ok', 'success', 'error', 'errors', 'message', 'msg', 'status', 'status_code', 'timestamp', 'created_at',
@@ -53,14 +55,6 @@ const NOISE_KEYS = new Set([
   'type', 'name', 'description', 'title', 'email', 'data', 'result', 'results', 'items', 'meta', 'headers', 'detail', 'reason',
 ])
 const SKIP_SEGS = new Set(['api', 'v1', 'v2', 'v3', 'v4', 'rest', 'public', 'internal', 'service', 'services', 'app', 'oauth', 'oauth2', 'oidc', 'auth', 'graphql', 'gql'])
-const ACTION_VERBS = new Set([
-  'approve', 'rebind', 'settle', 'release', 'finalize', 'commit', 'publish', 'capture', 'revoke', 'redeem',
-  'exchange', 'verify', 'callback', 'resolve', 'sync', 'download', 'content', 'url', 'status', 'result',
-  'cancel', 'accept', 'claim', 'dispatch', 'trigger', 'execute', 'run', 'impersonate', 'assume', 'delegate',
-  'mint', 'sign', 'rotate', 'reset', 'batch', 'list', 'create', 'update', 'delete', 'get', 'search', 'query',
-  'export', 'import', 'transfer', 'grant', 'issue', 'complete', 'confirm', 'fetch', 'proxy', 'redirect', 'render', 'join', 'onboard',
-  'promote', 'rollback', 'deliver', 'deliveries', 'trace', 'archive', 'logs', 'redeploy', 'retry', 'resume', 'pause', 'abort', 'ship', 'refund', 'dispute', 'replay',
-])
 const ASYNC_NOUNS = new Set(['job', 'export', 'render', 'task', 'run', 'build', 'batch', 'report', 'archive', 'snapshot', 'pipeline', 'workflow', 'deployment', 'release'])
 const CRED_NOUNS = new Set(['token', 'session', 'key', 'secret', 'credential', 'pat', 'jwt', 'assertion', 'delegation'])
 const INVITE_NOUNS = new Set(['invite', 'invitation', 'grant', 'ticket', 'otp', 'challenge'])
@@ -71,73 +65,31 @@ const CRED_KEY_RE = /(?:^|_)(?:token|jwt|bearer|session|access_token|id_token|re
 const URL_KEY_RE = /(?:^|_)(?:signed_url|presigned_url|download_url|upload_url|export_url|artifact_url|file_url|callback_url|redirect_uri|redirect_url|redirect|location|href|url|download_link|result_url)(?:$|_)/
 const ASYNC_KEY_RE = /(?:^|_)(?:job_id|export_id|render_id|task_id|run_id|build_id|batch_id|pipeline_id|report_id|archive_id|snapshot_id|workflow_id|operation_id|deployment_id|release_id)(?:$|_)/
 const JWT_VAL_RE = /^eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}/
-const PREFIXED_ID_VAL_RE = /^([a-z]{2,12})_[A-Za-z0-9_-]{4,48}$/i
-const PREFIX_NOUN_MAP: Record<string, { noun: string; kind: ProducerTokenKind }> = {
-  job: { noun: 'job', kind: 'async_job_or_export' },
-  exp: { noun: 'export', kind: 'async_job_or_export' },
-  export: { noun: 'export', kind: 'async_job_or_export' },
-  dep: { noun: 'deployment', kind: 'async_job_or_export' },
-  deploy: { noun: 'deployment', kind: 'async_job_or_export' },
-  rel: { noun: 'release', kind: 'async_job_or_export' },
-  bld: { noun: 'build', kind: 'async_job_or_export' },
-  run: { noun: 'run', kind: 'async_job_or_export' },
-  ord: { noun: 'order', kind: 'entity_id' },
-  order: { noun: 'order', kind: 'entity_id' },
-  pay: { noun: 'payout', kind: 'entity_id' },
-  payout: { noun: 'payout', kind: 'entity_id' },
-  xfer: { noun: 'transfer', kind: 'entity_id' },
-  inv: { noun: 'invite', kind: 'invite_or_grant' },
-  invite: { noun: 'invite', kind: 'invite_or_grant' },
-  wh: { noun: 'webhook', kind: 'entity_id' },
-  hook: { noun: 'webhook', kind: 'entity_id' },
-  whsec: { noun: 'webhook', kind: 'signing_secret' },
-  tok: { noun: 'token', kind: 'credential_token' },
-  key: { noun: 'key', kind: 'credential_token' },
-}
 const LOW_PRIV_RE = /\b(?:member|viewer|guest|basic|user|demoted|revoked|suspended|external|readonly|read_only|limited|standard)\b/i
-const AUTH_HOST_RE = /(?:^|[.-])(?:idp|auth|sso|login|oauth|oidc|iam|identity|accounts?)(?:[.-]|$)/i
-const EDGE_HOST_RE = /(?:^|[.-])(?:edge|vault|storage|files?|cdn|media|runner|worker|jobs?|webhooks?|hooks?|proxy|gateway|sandbox|exec|render|export)(?:[.-]|$)/i
-const API_HOST_RE = /(?:^|[.-])(?:api|core|backend|app|portal|console|admin|graphql|ledger|orders?|payments?)(?:[.-]|$)/i
-const ACTION_RE = /\/(?:approve|rebind|settle|release|finalize|url|content|revoke|resolve|redeem|exchange|sync|download|webhook|hooks?|graphql|admin|secrets?|vault|export|dispatch|transfer|assume|impersonate|delegate|callback|verify|accept|claim|rollback|promote|deliver|deliveries|trace|result|results|archive|logs)(?:\/|$)/i
-const SIG_CONSUMER_ROUTE_RE = /\/(?:webhooks?|hooks?|ingest|callback|callbacks|events?|notify|deliver|delivery|dispatch|verify|sign|signed|receive|receiver|inbound|push|sync)(?:\/|$)/i
-const SIG_REJECTION_BODY_RE = /(?:sig(?:nature)?|hmac|digest|mac\b|webhook|x-signature|x-hub-signature|invalid[_ -]?(?:sig|hmac)|missing[_ -]?sig|bad[_ -]?sig)/i
-const INVITE_ROUTE_RE = /\/(?:redeem|accept|claim|exchange|callback|verify|reset|join|onboard|register|invite|invites|grant|grants|token)(?:\/|$)/i
-const URL_ROUTE_RE = /\/(?:download|content|files?|artifacts?|fetch|proxy|redirect|resolve|render|import|webhooks?|callback|signed|presign|url|export|exports)(?:\/|$)/i
-const CRED_ROUTE_RE = /\/(?:exchange|verify|assume|delegate|impersonate|admin|internal|vault|secrets?|keys?|graphql|webhooks?|payouts?|transfers?|orders?|exports?|users?|roles?|permissions?|settings?|scim|sync)(?:\/|$)/i
+const SIG_REJECTION_BODY_RE = /(?:sig(?:nature)?|hmac|digest|mac\b|x-signature|x-hub-signature|stripe-signature|svix-signature|invalid[_ -]?(?:sig|hmac)|missing[_ -]?sig|bad[_ -]?sig)/i
 const KIND_BONUS: Record<ProducerTokenKind, number> = { signing_secret: 26, credential_token: 22, invite_or_grant: 20, signed_url_or_location: 18, async_job_or_export: 18, entity_id: 12 }
 
 const toSnake = (raw: string) => raw.trim().replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '').toLowerCase()
 const singularize = (w: string) => w.length <= 2 ? w : w.endsWith('ies') && w.length > 4 ? `${w.slice(0, -3)}y` : /(?:ses|xes|zes|ches|shes)$/.test(w) && w.length > 4 ? w.slice(0, -2) : w.endsWith('s') && !/(?:ss|us|is)$/.test(w) ? w.slice(0, -1) : w
 const hostOf = (o: string) => URL.canParse(o) ? new URL(o).host.toLowerCase() : o.replace(/^https?:\/\//i, '').replace(/\/.*$/, '').toLowerCase()
 
-function classifyOriginRole(origin: string, paths: readonly string[]): 'auth' | 'api' | 'edge' | 'general' {
-  const host = URL.canParse(origin) ? new URL(origin).hostname.toLowerCase() : hostOf(origin)
-  if (AUTH_HOST_RE.test(host)) return 'auth'
-  if (EDGE_HOST_RE.test(host)) return 'edge'
-  if (API_HOST_RE.test(host)) return 'api'
-  const joined = paths.join(' ').toLowerCase()
-  return /\/(?:oauth|oidc|sso|saml|login|token|authorize)\b/.test(joined) ? 'auth'
-    : /\/(?:download|artifacts?|vault|secrets?|webhooks?|runner|signed)\b/.test(joined) ? 'edge'
-      : /\/(?:api|v1|v2|graphql)\b/.test(joined) ? 'api' : 'general'
-}
-
 function extractRouteNouns(normPath: string): string[] {
   const out: string[] = []
   for (const raw of normPath.split('/')) {
     const seg = raw.trim().toLowerCase()
-    if (!seg || seg.startsWith(':') || SKIP_SEGS.has(seg) || ACTION_VERBS.has(seg)) continue
+    if (!seg || seg.startsWith(':') || SKIP_SEGS.has(seg)) continue
     const noun = singularize(toSnake(seg.replace(/[^a-z0-9_-]/g, '')).split('_').pop() ?? '')
-    if (noun.length >= 2 && !SKIP_SEGS.has(noun) && !ACTION_VERBS.has(noun)) out.push(noun)
+    if (noun.length >= 2 && !SKIP_SEGS.has(noun)) out.push(noun)
   }
   return [...new Set(out)]
 }
 
-function classifyField(rawKey: string, routeNouns: readonly string[], status: number, normPath: string): { kind: ProducerTokenKind; noun: string } | null {
+function classifyField(rawKey: string, routeNouns: readonly string[], status: number): { kind: ProducerTokenKind; noun: string } | null {
   const snake = toSnake(rawKey)
   if (!snake || snake.length < 2 || NOISE_KEYS.has(snake)) return null
   const primary = routeNouns[routeNouns.length - 1] ?? ''
-  if (SIGNING_KEY_RE.test(snake)) return { kind: 'signing_secret', noun: primary || 'webhook' }
-  if (INVITE_KEY_RE.test(snake) || (snake === 'code' && (INVITE_ROUTE_RE.test(normPath) || AUTH_HOST_RE.test(normPath)))) return { kind: 'invite_or_grant', noun: primary || 'invite' }
+  if (SIGNING_KEY_RE.test(snake)) return { kind: 'signing_secret', noun: primary || 'signing' }
+  if (INVITE_KEY_RE.test(snake)) return { kind: 'invite_or_grant', noun: primary || 'invite' }
   if (URL_KEY_RE.test(snake)) return { kind: 'signed_url_or_location', noun: primary || 'url' }
   if (CRED_KEY_RE.test(snake)) return { kind: 'credential_token', noun: primary || 'token' }
   if (ASYNC_KEY_RE.test(snake)) return { kind: 'async_job_or_export', noun: singularize(snake.replace(/_id$/, '')) || primary || 'job' }
@@ -161,7 +113,7 @@ function classifyConcreteStringValue(
 ): { kind: ProducerTokenKind; noun: string; targetOrigin?: string; targetNormPath?: string } | null {
   const v = rawVal.trim()
   if (v.length < 4 || v.length > 1024) return null
-  if (v.startsWith('http://') || v.startsWith('https://') || (v.startsWith('/') && /\/(?:download|export|file|artifact|result|content|signed|presign|callback|webhook|invite|accept|redeem|verify)/i.test(v))) {
+  if (v.startsWith('http://') || v.startsWith('https://') || (v.startsWith('/') && v.includes('/', 1))) {
     const target = resolveApprovedUrl(v, baseOrigin, approved)
     if (target) {
       const targetNouns = extractRouteNouns(target.normPath)
@@ -170,11 +122,6 @@ function classifyConcreteStringValue(
   }
   if (JWT_VAL_RE.test(v) || /^Bearer\s+\S{8,}/i.test(v)) {
     return { kind: 'credential_token', noun: routeNouns[routeNouns.length - 1] || 'token' }
-  }
-  const pm = PREFIXED_ID_VAL_RE.exec(v)
-  if (pm?.[1]) {
-    const hit = PREFIX_NOUN_MAP[pm[1].toLowerCase()]
-    if (hit) return { kind: hit.kind, noun: hit.noun }
   }
   const snake = toSnake(rawKey)
   if (snake && !NOISE_KEYS.has(snake) && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)) {
@@ -222,7 +169,7 @@ function extractExchangeCaps(ex: GbDataflowExchangeInput, nouns: readonly string
   }
   for (const [hk, hv] of Object.entries(hdrs)) {
     if (!hk.startsWith('x-') || !hv.trim()) continue
-    const hCls = classifyField(hk.slice(2), nouns, ex.status, normPath)
+    const hCls = classifyField(hk.slice(2), nouns, ex.status)
     if (hCls) {
       const urlTarget = hCls.kind === 'signed_url_or_location' ? resolveApprovedUrl(hv, ex.origin, approved) : undefined
       push({ field: hk, kind: hCls.kind, noun: hCls.noun, fromLive: true, valueDigest: digestOf(hk, hv), ...(urlTarget ? { targetOrigin: urlTarget.origin, targetNormPath: urlTarget.normPath } : {}) })
@@ -239,7 +186,7 @@ function extractExchangeCaps(ex: GbDataflowExchangeInput, nouns: readonly string
         if (Array.isArray(val)) { for (const item of val.slice(0, 4)) walk(item, depth + 1); return }
         for (const [key, child] of Object.entries(val as Record<string, unknown>)) {
           if (++visited > MAX_JSON_KEYS) break
-          const cls = classifyField(key, nouns, ex.status, normPath)
+          const cls = classifyField(key, nouns, ex.status)
           if (cls) {
             const urlTarget = cls.kind === 'signed_url_or_location' && typeof child === 'string' ? resolveApprovedUrl(child, ex.origin, approved) : undefined
             push({ field: key, kind: cls.kind, noun: cls.noun, fromLive: true, valueDigest: digestOf(key, child), ...(urlTarget ? { targetOrigin: urlTarget.origin, targetNormPath: urlTarget.normPath } : {}) })
@@ -257,7 +204,7 @@ function extractExchangeCaps(ex: GbDataflowExchangeInput, nouns: readonly string
     let count = 0
     for (const m of body.matchAll(/"([A-Za-z_][A-Za-z0-9_-]{0,48})"\s*:\s*("([^"]{1,256})")?/g)) {
       if (++count > MAX_JSON_KEYS) break
-      const cls = classifyField(m[1]!, nouns, ex.status, normPath)
+      const cls = classifyField(m[1]!, nouns, ex.status)
       if (cls) {
         const urlTarget = cls.kind === 'signed_url_or_location' && m[3] ? resolveApprovedUrl(m[3], ex.origin, approved) : undefined
         push({ field: m[1]!, kind: cls.kind, noun: cls.noun, fromLive: true, valueDigest: digestOf(m[1]!, m[3] ?? ''), ...(urlTarget ? { targetOrigin: urlTarget.origin, targetNormPath: urlTarget.normPath } : {}) })
@@ -274,21 +221,6 @@ function enrichNodes(nodes: readonly EndpointNode[], personas: readonly GbDatafl
   const lowPriv = new Set(personas.filter(p => LOW_PRIV_RE.test(`${p.handle} ${p.roleLabel ?? ''}`)).map(p => p.handle))
   const deniedByOriginNoun = new Map<string, Set<string>>()
   for (const node of nodes) {
-    if (!node.produces.some(p => p.fromLive)) {
-      const addSpec = (field: string, kind: ProducerTokenKind, noun: string) => {
-        if (!node.produces.some(p => p.kind === kind && toSnake(p.field) === toSnake(field))) node.produces.push({ field, kind, noun, fromLive: false })
-      }
-      if (/\/(?:signed[-_]?url|presign|download[-_]?url|upload[-_]?url|url)(?:\/|$)/i.test(node.normPath)) addSpec('signed_url', 'signed_url_or_location', node.primaryNoun || 'url')
-      if (node.method === 'POST') {
-        if (/\/(?:token|tokens|session|sessions|login|exchange|delegate|impersonate|keys|api[-_]?keys|pat|secrets|mint|sign|oauth)(?:\/|$)/i.test(node.normPath)) addSpec('access_token', 'credential_token', node.primaryNoun || 'token')
-        else if (/\/(?:invite|invites|invitations|grant|grants|tickets|otp|reset|authorize)(?:\/|$)/i.test(node.normPath)) addSpec('invite_code', 'invite_or_grant', node.primaryNoun || 'invite')
-        else if (ASYNC_NOUNS.has(node.primaryNoun) && !ACTION_RE.test(node.normPath)) addSpec(`${node.primaryNoun}_id`, 'async_job_or_export', node.primaryNoun)
-        else if (node.primaryNoun && !node.normPath.endsWith('/:id') && !ACTION_RE.test(node.normPath)) addSpec(`${node.primaryNoun}_id`, 'entity_id', node.primaryNoun)
-      } else if (node.method === 'GET' && node.primaryNoun && !node.normPath.includes('/:id') && !ACTION_RE.test(node.normPath)) {
-        const k: ProducerTokenKind = CRED_NOUNS.has(node.primaryNoun) ? 'credential_token' : ASYNC_NOUNS.has(node.primaryNoun) ? 'async_job_or_export' : 'entity_id'
-        addSpec(`${node.primaryNoun}_${k === 'credential_token' ? 'token' : 'id'}`, k, node.primaryNoun)
-      }
-    }
     const allowed: string[] = []; const denied: string[] = []; let has202 = false
     for (const [persona, statuses] of node.personaStatuses.entries()) {
       if (statuses.has(202)) has202 = true
@@ -296,7 +228,7 @@ function enrichNodes(nodes: readonly EndpointNode[], personas: readonly GbDatafl
       if ([...statuses].some(s => s === 401 || s === 403)) denied.push(persona)
     }
     const lowPrivOk = allowed.some(p => lowPriv.has(p) || LOW_PRIV_RE.test(p))
-    const hasAsymmetry = (allowed.length > 0 && denied.length > 0) || (lowPrivOk && (node.isMutating || /\/(?:admin|internal|export|approve|rebind|settle|revoke|secrets?|vault)/i.test(node.normPath)))
+    const hasAsymmetry = (allowed.length > 0 && denied.length > 0) || (lowPrivOk && node.isMutating)
     const summary = allowed.length && denied.length ? `${node.method} ${node.normPath} 2xx=[${allowed.join(',')}] vs 401/403=[${denied.join(',')}]`
       : has202 ? `${node.method} ${node.normPath} async 202 (${allowed.join(',')})`
         : hasAsymmetry ? `${node.method} ${node.normPath} 2xx for low-priv [${allowed.join(',')}]` : ''
@@ -317,9 +249,6 @@ function enrichNodes(nodes: readonly EndpointNode[], personas: readonly GbDatafl
 function buildNodes(input: GbDataflowSynthesizeInput, approved: ReadonlySet<string>) {
   const paramsByEp = new Map<string, GbDataflowParamInput[]>()
   for (const p of input.endpointParams ?? []) (paramsByEp.get(p.endpointId) ?? paramsByEp.set(p.endpointId, []).get(p.endpointId)!).push(p)
-  const pathsByOrigin = new Map<string, string[]>()
-  for (const ep of input.endpoints) if (approved.has(ep.origin)) (pathsByOrigin.get(ep.origin) ?? pathsByOrigin.set(ep.origin, []).get(ep.origin)!).push(ep.pathTemplate)
-  for (const ex of input.brokerExchanges ?? []) if (approved.has(ex.origin)) (pathsByOrigin.get(ex.origin) ?? pathsByOrigin.set(ex.origin, []).get(ex.origin)!).push(ex.pathAndQuery.split(/[?#]/, 1)[0] ?? '/')
   const byId = new Map<string, EndpointNode>(); const byKey = new Map<string, EndpointNode>()
   const makeNode = (id: string, origin: string, method: string, rawPath: string, authReq = '', risk = 55, params: readonly GbDataflowParamInput[] = [], sinkKinds: readonly string[] = []): EndpointNode | null => {
     if (!approved.has(origin)) return null
@@ -347,16 +276,16 @@ function buildNodes(input: GbDataflowSynthesizeInput, approved: ReadonlySet<stri
       if (pn.endsWith('_id') && pn.length > 3) consumedNouns.add(singularize(pn.slice(0, -3).split('_').pop() ?? ''))
       else if (pn !== 'id') consumedNouns.add(singularize(pn))
     }
-    if (hasObjId || ACTION_RE.test(normPath)) for (const n of nouns) consumedNouns.add(n)
-    const isMutating = MUTATING.has(cleanMethod); const isHighValue = isMutating || ACTION_RE.test(normPath) || risk >= 75
+    if (hasObjId) for (const n of nouns) consumedNouns.add(n)
+    const isMutating = MUTATING.has(cleanMethod); const isHighValue = isMutating || risk >= 75
     const node: EndpointNode = {
-      key, id: id || key, origin, host: hostOf(origin), role: classifyOriginRole(origin, pathsByOrigin.get(origin) ?? []),
+      key, id: id || key, origin, host: hostOf(origin),
       method: cleanMethod, normPath, nouns, primaryNoun, isMutating, isHighValue, paramNames, consumedNouns, sinkKinds: [...sinkKinds],
-      acceptsSigning: SIG_CONSUMER_ROUTE_RE.test(normPath) || sinkKinds.some(sk => /(?:hmac|webhook|sig|jwt|crypto)/i.test(sk)) || [...paramNames].some(p => SIGNING_KEY_RE.test(p) || /signature|hmac/.test(p)),
-      acceptsCredential: CRED_ROUTE_RE.test(normPath) || [...paramNames].some(p => CRED_KEY_RE.test(p)) || (Boolean(authReq && authReq !== 'none') && isHighValue),
-      acceptsInvite: INVITE_ROUTE_RE.test(normPath) || [...paramNames].some(p => INVITE_KEY_RE.test(p)),
-      acceptsSignedUrl: URL_ROUTE_RE.test(normPath) || [...paramNames].some(p => URL_KEY_RE.test(p) || p === 'file' || p === 'path'),
-      acceptsAsyncJob: [...paramNames].some(p => ASYNC_KEY_RE.test(p)) || (nouns.some(n => ASYNC_NOUNS.has(n)) && (hasObjId || /\/(?:status|result|url|download|content|artifact|cancel|logs|rollback|promote|redeploy|retry|deliver|archive)(?:\/|$)/i.test(normPath))),
+      acceptsSigning: sinkKinds.some(sk => /(?:hmac|webhook|sig|jwt|crypto)/i.test(sk)) || [...paramNames].some(p => SIGNING_KEY_RE.test(p) || /signature|hmac/.test(p)),
+      acceptsCredential: [...paramNames].some(p => CRED_KEY_RE.test(p)) || Boolean(authReq && authReq !== 'none'),
+      acceptsInvite: [...paramNames].some(p => INVITE_KEY_RE.test(p)),
+      acceptsSignedUrl: [...paramNames].some(p => URL_KEY_RE.test(p) || p === 'file' || p === 'path'),
+      acceptsAsyncJob: [...paramNames].some(p => ASYNC_KEY_RE.test(p)) || (hasObjId && nouns.some(n => ASYNC_NOUNS.has(n))),
       hasSignatureRejection: false,
       produces: [], personaStatuses: new Map(), personaDiff: { allowed: [], denied: [], hasAsymmetry: false, has202: false, summary: '' },
     }
@@ -391,7 +320,7 @@ function buildEdges(nodes: readonly EndpointNode[], byId: ReadonlyMap<string, En
     seen.add(`${from.key}->${to.key}`)
     const crossOrigin = from.origin !== to.origin
     let score = KIND_BONUS[kind] + (fromDep ? 28 : redirect ? 32 : fromLive ? 20 : 8) + (to.isHighValue ? 14 : 0) + (from.personaDiff.has202 ? 14 : 0)
-    if (crossOrigin) score += 26 + ((from.role === 'auth' && to.role !== 'auth') || (from.role === 'api' && to.role === 'edge') ? 10 : 0)
+    if (crossOrigin) score += 26
     if (from.personaDiff.hasAsymmetry || to.personaDiff.hasAsymmetry) score += 18
     ;(outgoing.get(from.key) ?? outgoing.set(from.key, []).get(from.key)!).push({ from, to, field, kind, crossOrigin, fromLive, score })
   }
@@ -405,20 +334,25 @@ function buildEdges(nodes: readonly EndpointNode[], byId: ReadonlyMap<string, En
   for (const dep of apiDeps) {
     const prod = resolveRef(dep.producerEndpointId, dep.producer, dep.producerOrigin)
     const cons = resolveRef(dep.consumerEndpointId, dep.consumer, dep.consumerOrigin)
-    if (prod && cons) addEdge(prod, cons, dep.resourceKey, classifyField(dep.resourceKey, prod.nouns, 200, prod.normPath)?.kind ?? 'entity_id', true, true, false)
+    if (prod && cons) addEdge(prod, cons, dep.resourceKey, classifyField(dep.resourceKey, prod.nouns, 200)?.kind ?? 'entity_id', true, true, false)
   }
   for (const prod of nodes) {
     for (const cap of prod.produces) {
+      if (!cap.fromLive) continue
+      const fieldSnake = toSnake(cap.field)
       for (const cons of nodes) {
         if (prod.key === cons.key || (prod.origin === cons.origin && prod.normPath === cons.normPath)) continue
         const redirect = Boolean(cap.targetOrigin === cons.origin && cap.targetNormPath && (cons.normPath === cap.targetNormPath || cons.normPath.startsWith(cap.targetNormPath)))
+        const exactParam = Boolean(fieldSnake && cons.paramNames.has(fieldSnake))
+        const nounOverlap = Boolean(cap.noun && (cons.consumedNouns.has(cap.noun) || cons.primaryNoun === cap.noun))
+        const hasDenied = cons.personaDiff.denied.length > 0
         const matched = redirect
-          || (cap.kind === 'signing_secret' && (cons.hasSignatureRejection || cons.acceptsSigning || (cons.isMutating && cons.personaDiff.denied.length > 0)))
-          || (cap.kind === 'invite_or_grant' && cons.acceptsInvite && (cons.origin !== prod.origin || cons.isMutating || INVITE_ROUTE_RE.test(cons.normPath)))
-          || (cap.kind === 'credential_token' && cons.acceptsCredential && (cons.origin !== prod.origin || cons.isHighValue))
-          || (cap.kind === 'signed_url_or_location' && cons.acceptsSignedUrl && (cons.origin !== prod.origin || !cap.noun || cons.consumedNouns.has(cap.noun) || URL_ROUTE_RE.test(cons.normPath)))
-          || (cap.kind === 'async_job_or_export' && ((cons.acceptsAsyncJob && (!cap.noun || cons.consumedNouns.has(cap.noun) || cons.primaryNoun === cap.noun || [...cons.paramNames].some(p => ASYNC_KEY_RE.test(p)))) || (cons.acceptsSignedUrl && cons.origin !== prod.origin)))
-          || (cap.kind === 'entity_id' && Boolean(cap.noun) && (cons.consumedNouns.has(cap.noun) || cons.paramNames.has(toSnake(cap.field))) && (cons.isHighValue || cons.origin !== prod.origin || cons.normPath.includes('/:id')))
+          || (cap.kind === 'signing_secret' && (cons.hasSignatureRejection || cons.acceptsSigning))
+          || (cap.kind === 'invite_or_grant' && (exactParam || cons.acceptsInvite))
+          || (cap.kind === 'credential_token' && (exactParam || ((cons.acceptsCredential || hasDenied) && (cons.origin !== prod.origin || cons.isMutating || hasDenied))))
+          || (cap.kind === 'signed_url_or_location' && cons.acceptsSignedUrl && (exactParam || nounOverlap || cons.origin !== prod.origin))
+          || (cap.kind === 'async_job_or_export' && (exactParam || (cons.acceptsAsyncJob && (nounOverlap || cons.origin !== prod.origin)) || (prod.personaDiff.has202 && nounOverlap && cons.normPath.includes('/:id'))))
+          || (cap.kind === 'entity_id' && (exactParam || nounOverlap) && (cons.normPath.includes('/:id') || exactParam || hasDenied))
         if (matched) addEdge(prod, cons, cap.field, cap.kind, cap.fromLive, false, redirect)
       }
     }
@@ -430,28 +364,9 @@ function buildEdges(nodes: readonly EndpointNode[], byId: ReadonlyMap<string, En
   return outgoing
 }
 
-const CACHE_OR_DUAL_TENANT_SIGNAL_RE = /(?:^|[^a-z0-9])(?:cache|cached|cache[_-]?bleed|cache[_-]?key|shared[_-]?(?:edge[_-]?)?cache|edge[_-]?cache|prime|primed[_-]?cache|warm|cdn|cross[_-]?tenant|dual[_-]?tenant|multi[_-]?tenant|abac|switch[_-]?(?:tenant|org|workspace)|(?:tenant|org|workspace)[_-]?switch)(?:[^a-z0-9]|$)/i
-const ORG_SWITCH_PATH_RE = /\/(?:orgs?|tenants?|organizations?|workspaces?)(?:\/[^/]+)?\/switch(?:\/|$)/i
-
-function isMultiTenantChainHypothesis(
-  pNodes: readonly EndpointNode[],
-  pEdges: readonly DataflowEdge[],
-  diffs: readonly string[],
-): boolean {
-  if (pNodes.some(n => ORG_SWITCH_PATH_RE.test(n.normPath))) return true
-  const signalCorpus = [
-    ...pNodes.map(n => n.normPath),
-    ...pNodes.flatMap(n => [...n.paramNames]),
-    ...pEdges.map(e => e.field),
-    ...diffs,
-  ].join(' ')
-  return CACHE_OR_DUAL_TENANT_SIGNAL_RE.test(signalCorpus)
-}
-
 function orderPersonasLowPrivFirst(
   observed: readonly string[],
   personas: readonly GbDataflowPersonaInput[],
-  options?: { preferMultiTenant?: boolean },
 ): { ordered: string[]; basePersona?: string } {
   const roleByHandle = new Map<string, string | null | undefined>()
   const configIndexByHandle = new Map<string, number>()
@@ -468,22 +383,13 @@ function orderPersonasLowPrivFirst(
     if (!configIndexByHandle.has(handle)) configIndexByHandle.set(handle, baseObservedOffset + idx)
   })
   const handles = [...new Set([...personas.map(p => p.handle).filter(Boolean), ...observedClean])]
-  const effectiveRank = (handle: string): number => {
-    const priv = classifyPersonaPrivilege(handle, roleByHandle.get(handle))
-    if (options?.preferMultiTenant && priv.multiTenant) return -1
-    return priv.rank
-  }
   handles.sort((a, b) =>
-    effectiveRank(a) - effectiveRank(b)
+    classifyPersonaPrivilege(a, roleByHandle.get(a)).rank - classifyPersonaPrivilege(b, roleByHandle.get(b)).rank
     || (configIndexByHandle.get(a) ?? Number.MAX_SAFE_INTEGER) - (configIndexByHandle.get(b) ?? Number.MAX_SAFE_INTEGER),
   )
-  const basePersona = (
-    options?.preferMultiTenant
-      ? handles.find(h => classifyPersonaPrivilege(h, roleByHandle.get(h)).multiTenant)
-      : undefined
-  ) ?? handles.find(h => {
+  const basePersona = handles.find(h => {
     const priv = classifyPersonaPrivilege(h, roleByHandle.get(h))
-    return !priv.elevated && !priv.revokedStale && !priv.multiTenant
+    return !priv.elevated && !priv.revokedStale
   })
   return { ordered: handles.slice(0, 5), ...(basePersona ? { basePersona } : {}) }
 }
@@ -497,14 +403,12 @@ function buildChainDraft(pNodes: readonly EndpointNode[], pEdges: readonly Dataf
   const hopTrace = pNodes.map((n, i) => `Hop ${i + 1}: ${n.method} ${n.origin}${n.normPath}${pEdges[i] ? ` (yields ${pEdges[i]!.field} [${pEdges[i]!.kind}])` : ''}`).join(' -> ')
   const diffs = pNodes.map(n => n.personaDiff.summary).filter(Boolean)
   const tags = [`[chain_hops=${pNodes.length}]`, '[lane=chain]', `[dataflow_source=${fromLive ? 'live' : 'spec'}]`, `[api_dependency:${fields.join(',')}]`, ...(crossOrigin ? [`[cross_origin_edge:${origins[0]}->${origins[origins.length - 1]}]`] : []), ...(diffs.length ? [`[persona_diff:${diffs[0]}]`] : [])]
-  const preferMultiTenant = isMultiTenantChainHypothesis(pNodes, pEdges, diffs)
   const { ordered: obsPersonas, basePersona } = orderPersonasLowPrivFirst(
     pNodes.flatMap(n => [...n.personaDiff.allowed, ...n.personaDiff.denied]),
     personas,
-    { preferMultiTenant },
   )
   const hypothesis = `${tags.join(' ')} Producer->consumer multi-hop dataflow chain: ${hopTrace}.${diffs.length ? ` Observed differentials: ${diffs.slice(0, 2).join('; ')}.` : ''}${basePersona ? ` Base persona: ${basePersona}.` : ''}${obsPersonas.length ? ` Relevant personas: ${obsPersonas.join(', ')}.` : ''} Verify control vs variant boundaries end-to-end with kovo_verify, sealing intermediate tokens/handles with capability.seal.`.slice(0, 1400)
-  const category = kinds.includes('signed_url_or_location') && pNodes[pNodes.length - 1]!.acceptsSignedUrl ? 'upload-storage'
+  const category = kinds.includes('signed_url_or_location') ? 'upload-storage'
     : kinds.includes('signing_secret') || kinds.includes('credential_token') || kinds.includes('invite_or_grant') ? 'auth-identity' : 'broken-access-control'
   const skills = [...new Set(['multihop-chains', 'chain-primitives', 'api-dependency', 'dataflow-graph', ...(crossOrigin ? ['cross-origin-chain'] : []), ...(hasPersonaAsymmetry ? ['authz-differential'] : [])])]
   const priority = fromLive ? Math.max(88, Math.min(98, 98 - idx)) : Math.max(76, Math.min(84, 84 - idx))
@@ -531,10 +435,9 @@ export function synthesizeGreyBoxDataflowGraph(input: GbDataflowSynthesizeInput)
   const candidates: Array<{ nodes: EndpointNode[]; edges: DataflowEdge[]; score: number; fromLive: boolean }> = []
   const scorePath = (pNodes: readonly EndpointNode[], pEdges: readonly DataflowEdge[]): number => {
     const origins = new Set(pNodes.map(n => n.origin))
-    const roles = new Set(pNodes.map(n => n.role).filter(r => r !== 'general'))
     const kinds = new Set(pEdges.map(e => e.kind))
     let s = (pEdges.reduce((a, e) => a + e.score, 0) / pEdges.length) + pEdges.length * 14
-      + (origins.size >= 3 ? 42 : origins.size === 2 ? 24 : 0) + Math.max(0, roles.size - 1) * 12 + Math.max(0, kinds.size - 1) * 10
+      + (origins.size >= 3 ? 42 : origins.size === 2 ? 24 : 0) + Math.max(0, kinds.size - 1) * 10
       + pEdges.filter(e => e.fromLive).length * 10 + (pNodes[pNodes.length - 1]!.isHighValue ? 16 : 0)
     if (pNodes.some(n => n.personaDiff.hasAsymmetry)) s += 20
     if (pNodes.some(n => n.personaDiff.has202)) s += 12
@@ -720,7 +623,7 @@ function kindToLedgerCapabilityKind(kind: ProducerTokenKind): CapabilityKind {
 
 function classifyValueFlowSurface(normPath: string): CapabilitySurface {
   if (/\/(?:graphql|gql)\b/i.test(normPath)) return 'graphql'
-  if (SIG_CONSUMER_ROUTE_RE.test(normPath)) return 'webhook'
+  if (/\/(?:webhooks?|callbacks?|hooks?)\b/i.test(normPath)) return 'webhook'
   if (/\/(?:jobs?|exports?|tasks?|builds?|deployments?|releases?|pipelines?|runs?|async)\b/i.test(normPath)) return 'async_job'
   if (/\/(?:storage|files?|artifacts?|downloads?|uploads?|media)\b/i.test(normPath)) return 'storage'
   return 'http'
@@ -790,7 +693,7 @@ function extractRuntimeFactCaps(
     let matchedAny = false
     for (const [k, v] of Object.entries(data)) {
       if (k === 'subkind' || k === 'source' || k === 'endpoint' || k === 'path' || k === 'route' || k === 'method' || k === 'persona' || k === 'personaHandle' || k === 'ownerPersona') continue
-      const cls = classifyField(k, nouns, 200, normPath)
+      const cls = classifyField(k, nouns, 200)
       if (cls && (typeof v === 'string' || typeof v === 'number')) {
         const sVal = String(v)
         const target = cls.kind === 'signed_url_or_location' ? resolveApprovedUrl(sVal, fact.origin, approved) : undefined
@@ -808,10 +711,10 @@ function extractRuntimeFactCaps(
       const summary = `${fact.summary} ${typeof data.fieldName === 'string' ? data.fieldName : ''} ${typeof data.secretKind === 'string' ? data.secretKind : ''}`
       if (fact.kind === 'secret') {
         const isSig = SIGNING_KEY_RE.test(toSnake(summary)) || /(?:hmac|signing|webhook[_ -]?secret|signing[_ -]?salt)/i.test(summary)
-        pushCap(typeof data.fieldName === 'string' ? data.fieldName : (isSig ? 'signing_secret' : 'access_token'), isSig ? 'signing_secret' : 'credential_token', nouns[nouns.length - 1] || (isSig ? 'webhook' : 'token'), fact.id)
+        pushCap(typeof data.fieldName === 'string' ? data.fieldName : (isSig ? 'signing_secret' : 'access_token'), isSig ? 'signing_secret' : 'credential_token', nouns[nouns.length - 1] || (isSig ? 'signing' : 'token'), fact.id)
       } else if (fact.kind === 'object_ref' && (typeof data.resourceId === 'string' || typeof data.id === 'string')) {
         const rawId = String(data.resourceId ?? data.id)
-        const noun = nouns[nouns.length - 1] || (PREFIXED_ID_VAL_RE.exec(rawId)?.[1] ? PREFIX_NOUN_MAP[PREFIXED_ID_VAL_RE.exec(rawId)![1]!.toLowerCase()]?.noun : undefined) || 'resource'
+        const noun = nouns[nouns.length - 1] || 'resource'
         pushCap(`${noun}_id`, ASYNC_NOUNS.has(noun) ? 'async_job_or_export' : 'entity_id', noun, rawId)
       } else if (fact.kind === 'redirect' && typeof data.redirectTarget === 'string') {
         const target = resolveApprovedUrl(data.redirectTarget, fact.origin, approved)
@@ -830,7 +733,6 @@ function scoreRuntimeValueFlow(
   cons: EndpointNode,
   isNew: boolean,
 ): number | null {
-  if (prod.origin === cons.origin && prod.normPath === cons.normPath && prod.method === cons.method) return null
   if (prod.origin === cons.origin && prod.normPath === cons.normPath) return null
   const redirect = Boolean(cap.targetOrigin === cons.origin && cap.targetNormPath && (cons.normPath === cap.targetNormPath || cons.normPath.startsWith(cap.targetNormPath)))
   const fieldSnake = toSnake(cap.field)
@@ -841,12 +743,12 @@ function scoreRuntimeValueFlow(
 
   let matched = redirect
   if (!matched) {
-    if (cap.kind === 'signing_secret') matched = cons.hasSignatureRejection || cons.acceptsSigning || (cons.isMutating && hasDenied)
-    else if (cap.kind === 'invite_or_grant') matched = cons.acceptsInvite || exactParam
-    else if (cap.kind === 'credential_token') matched = cons.acceptsCredential && (hasDenied || crossOrigin || cons.isHighValue)
-    else if (cap.kind === 'signed_url_or_location') matched = cons.acceptsSignedUrl && (crossOrigin || nounOverlap || URL_ROUTE_RE.test(cons.normPath))
-    else if (cap.kind === 'async_job_or_export') matched = ((cons.acceptsAsyncJob || cons.normPath.includes('/:id')) && (nounOverlap || exactParam || [...cons.paramNames].some(p => ASYNC_KEY_RE.test(p)))) || (cons.acceptsSignedUrl && (nounOverlap || crossOrigin))
-    else matched = (exactParam || nounOverlap) && (cons.normPath.includes('/:id') || cons.isHighValue || crossOrigin || hasDenied)
+    if (cap.kind === 'signing_secret') matched = cons.hasSignatureRejection || cons.acceptsSigning
+    else if (cap.kind === 'invite_or_grant') matched = exactParam || cons.acceptsInvite
+    else if (cap.kind === 'credential_token') matched = exactParam || ((cons.acceptsCredential || hasDenied) && (hasDenied || (crossOrigin && cons.isMutating)))
+    else if (cap.kind === 'signed_url_or_location') matched = cons.acceptsSignedUrl && (exactParam || nounOverlap)
+    else if (cap.kind === 'async_job_or_export') matched = exactParam || ((cons.acceptsAsyncJob || cons.normPath.includes('/:id')) && nounOverlap)
+    else matched = (exactParam || nounOverlap) && (cons.normPath.includes('/:id') || exactParam)
   }
   if (!matched) return null
 
@@ -900,7 +802,7 @@ function collectRuntimeValueFlowCandidates(
     if (!prod) {
       const nouns = extractRouteNouns(fc.normPath)
       prod = {
-        key, id: key, origin: fc.origin, host: hostOf(fc.origin), role: classifyOriginRole(fc.origin, [fc.normPath]),
+        key, id: key, origin: fc.origin, host: hostOf(fc.origin),
         method: fc.method, normPath: fc.normPath, nouns, primaryNoun: nouns[nouns.length - 1] ?? '',
         isMutating: MUTATING.has(fc.method), isHighValue: true, paramNames: new Set(), consumedNouns: new Set(nouns),
         sinkKinds: [], acceptsSigning: false, acceptsCredential: false, acceptsInvite: false, acceptsSignedUrl: false,
@@ -965,17 +867,34 @@ function persistValueFlowCausalEdges(
   storage: Store,
   run: Run,
   candidates: readonly RuntimeValueFlowCandidate[],
+  slotBudget: number,
 ): { edgesPersisted: number; producerCapsPersisted: number; prodCapBySig: Map<string, string> } {
-  const ledger = storage.capabilityLedger(run.id)
   const prodCapBySig = new Map<string, string>()
+  if (slotBudget <= 0 || candidates.length === 0) {
+    return { edgesPersisted: 0, producerCapsPersisted: 0, prodCapBySig }
+  }
+  const ledger = storage.capabilityLedger(run.id)
+  const existingRunEdges = ledger.listCausalEdges().filter(
+    e => e.edgeId.startsWith('edge_vf_') || e.metadata?.source === 'gb_valueflow',
+  ).length
+  const remainingRunCap = Math.max(0, MAX_VALUEFLOW_EDGES_PER_RUN - existingRunEdges)
+  const tickCap = Math.min(remainingRunCap, Math.max(1, slotBudget * 2), MAX_VALUEFLOW_EDGES_PER_TICK)
+  if (tickCap <= 0) {
+    return { edgesPersisted: 0, producerCapsPersisted: 0, prodCapBySig }
+  }
+
   let edgesPersisted = 0
   let producerCapsPersisted = 0
 
-  for (const cand of candidates.slice(0, 24)) {
+  for (const cand of candidates.slice(0, Math.min(candidates.length, tickCap * 3))) {
+    if (edgesPersisted >= tickCap) break
     const slot = sanitizeCapSlot(cand.field)
     const prodCapId = formatDerivedCapabilityHandle(`vf_${shortHash(`${cand.producerOrigin}|${cand.producerMethod}|${cand.producerNormPath}`, 12)}`, slot)
     const consCapId = formatDerivedCapabilityHandle(`vfc_${shortHash(`${cand.consumerOrigin}|${cand.consumerMethod}|${cand.consumerNormPath}`, 12)}`, slot)
     prodCapBySig.set(cand.flowSig, prodCapId)
+
+    const edgeId = `edge_vf_${shortHash(`${run.id}|${prodCapId}|${consCapId}|${slot}`, 20)}`
+    if (ledger.getCausalEdge(edgeId)) continue
 
     const ts = Math.max(1, Math.floor(cand.observedAtMs || Date.now()))
     if (!ledger.getCapability(prodCapId)) {
@@ -1032,8 +951,6 @@ function persistValueFlowCausalEdges(
       } catch { /* ignore duplicate */ }
     }
     if (!ledger.getCapability(prodCapId) || !ledger.getCapability(consCapId)) continue
-    const edgeId = `edge_vf_${shortHash(`${run.id}|${prodCapId}|${consCapId}|${slot}`, 20)}`
-    if (ledger.getCausalEdge(edgeId)) continue
     try {
       ledger.addCausalEdge({
         edgeId,
@@ -1065,7 +982,8 @@ function persistValueFlowCausalEdges(
  * Continuous Round-2+ Grey-Box value-flow synthesizer & `value_binding` causal-edge persister.
  * Runs strictly in agentic mode (`llmMode === 'agentic'`), tracks a per-run 2xx exchange + fact
  * watermark so newly observed Round-2+ artifacts trigger bounded, deduplicated follow-on steps
- * and `CapabilityLedger.addCausalEdge` persistence without affecting `--no-llm` runs.
+ * and `CapabilityLedger.addCausalEdge` persistence (capped per-run and gated on `slotBudget > 0`)
+ * without affecting `--no-llm` runs.
  */
 export function refreshGreyBoxValueFlowSteps(
   storage: Store,
@@ -1096,23 +1014,28 @@ export function refreshGreyBoxValueFlowSteps(
     return { steps: [], edgesPersisted: 0, producerCapsPersisted: 0, watermarkChanged: false }
   }
 
-  const { candidates, liveFactIds } = collectRuntimeValueFlowCandidates(storage, run, options.activeOrigins, prevWm)
-  if (valueFlowWatermarks.size > 256) {
-    const oldest = valueFlowWatermarks.keys().next().value
-    if (oldest) valueFlowWatermarks.delete(oldest)
-  }
-  valueFlowWatermarks.set(wmKey, currWm)
-  if (!candidates.length) {
-    return { steps: [], edgesPersisted: 0, producerCapsPersisted: 0, watermarkChanged: true }
-  }
-
-  const { edgesPersisted, producerCapsPersisted, prodCapBySig } = persistValueFlowCausalEdges(storage, run, candidates)
   const existingSteps = options.existingSteps ?? storage.listChainSteps(run.id, run.goalRevision)
   const maxPerRound = Math.max(0, Math.min(8, Math.floor(options.maxPerRound ?? 4)))
   const maxTotal = Math.max(0, Math.min(32, Math.floor(options.maxTotalSteps ?? 18)))
   const existingVfSteps = existingSteps.filter(s => s.title.startsWith('GB value-flow (') || s.hypothesis.includes('[gb_valueflow='))
   const activeVfCount = existingVfSteps.filter(s => s.status === 'pending' || s.status === 'ready' || s.status === 'running').length
   const slotBudget = Math.max(0, Math.min(maxPerRound, maxTotal - existingVfSteps.length, 6 - activeVfCount))
+
+  if (valueFlowWatermarks.size > 256) {
+    const oldest = valueFlowWatermarks.keys().next().value
+    if (oldest) valueFlowWatermarks.delete(oldest)
+  }
+  valueFlowWatermarks.set(wmKey, currWm)
+  if (slotBudget <= 0) {
+    return { steps: [], edgesPersisted: 0, producerCapsPersisted: 0, watermarkChanged: true }
+  }
+
+  const { candidates, liveFactIds } = collectRuntimeValueFlowCandidates(storage, run, options.activeOrigins, prevWm)
+  if (!candidates.length) {
+    return { steps: [], edgesPersisted: 0, producerCapsPersisted: 0, watermarkChanged: true }
+  }
+
+  const { edgesPersisted, producerCapsPersisted, prodCapBySig } = persistValueFlowCausalEdges(storage, run, candidates, slotBudget)
 
   const existingTitles = new Set(existingSteps.map(s => s.title.trim().toLowerCase()))
   const existingSigs = new Set<string>()

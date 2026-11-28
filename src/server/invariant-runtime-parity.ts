@@ -18,7 +18,7 @@ import type {
   RuntimeSpaRoute,
 } from './invariant-synthesizer.ts'
 
-const WRAPPER_SEG_RE = /^(?:v\d+(?:\.\d+)?|api|rest|rpc|internal|private|public|external|edge|app|portal|admin|batch|bulk|stream|events|sse|ws|socket|graphql|gql|async|jobs|workers|exports|webhooks|callbacks|hooks|files|storage|download|upload|search|facets)$/i
+const WRAPPER_SEG_RE = /^(?:v\d+(?:\.\d+)?|api|rest|rpc|internal|private|public|external|edge|app|portal|admin|batch|bulk|stream|events|sse|ws|socket|graphql|gql|async|jobs|workers|exports|webhooks|callbacks|hooks|files|storage|download|upload|search)$/i
 const PUBLIC_EXEMPT_RE = /\/(?:login|signin|sign-in|register|signup|sign-up|logout|health|healthz|ready|readyz|livez|metrics|status|ping|jwks|\.well-known|openid-configuration|favicon)(?:\/|[?#]|$)/i
 const STATIC_ASSET_EXT_RE = /\.(?:png|svg|jpe?g|webp|gif|ico|css|m?js|map|woff2?|ttf|eot|avif|mp4|webm|pdf|txt|xml)(?:[?#]|$)/i
 const STATIC_ASSET_PREFIX_RE = /^\/(?:_next\/static\/|_next\/image(?:\/|[?#]|$)|static\/|assets\/|images\/|fonts\/|favicon(?:[./?#]|$))/i
@@ -26,11 +26,11 @@ const ANONYMOUS_PERSONA_RE = /^(?:|anonymous|anon|unauthenticated|public)$/i
 const WCD_SENSITIVE_PATH_RE = /\/(?:profile|account|users?|me|settings|billing|orders?|invoices?|secrets?)\//i
 export const BATCH_HINT_RE = /(?:\/(?:batch|bulk|multi)(?:\/|$)|batch[A-Z_]|bulk[A-Z_]|arrayOfIds|\bids\b)/i
 export const MUTATING_METHOD_RE = /^(?:POST|PUT|PATCH|DELETE|MUTATION)$/i
-const STATE_TRANSITION_RE = /\b(?:status|state|phase|stage|lifecycle|transition|reopen|dispute|approve|reject|cancel|revoke|demote|promote|publish|release|archive|activate|suspend|schedule|autoRelease|pending|draft|completed|settled)\b/i
-const CREATOR_APPROVER_RE = /\b(?:createdBy|creatorId|authorId|ownerId|approverId|approvedBy|reviewerId|invitedBy|assignedTo|maker|checker|selfApprov|transfer(?:Owner|Project|Org)?|delegate|delegation|invite|membership|roleUpdate|impersonat)\b/i
-const NUMERIC_BALANCE_RE = /\b(?:balance|amount|credit|debit|refund|payout|rebate|discount|subtotal|total|price|ledger|settlement|capture|escrow|quota|threshold|cap|limit|fee|wallet|treasury|mint)\b|(?:[+\-*]=\s*(?:amount|delta|value|price|credit|debit|fee))/i
+const STRUCTURAL_STATE_FIELD_RE = /\b(?:status|state)\b\s*(?:===?|!==?|=|:)/i
+const STRUCTURAL_OWNER_ACTOR_RE = /\b(?:createdBy|ownerId|authorId|approverId|approvedBy|userId|actorId)\b/i
+const STRUCTURAL_ARITHMETIC_MUTATION_RE = /(?:[+\-*]=\s*[a-zA-Z_][a-zA-Z0-9_]*|\b(?:amount|balance|quantity|quota|limit)\b\s*(?:[+\-*]=|[<>]=?))/i
 const SECRET_SCRUB_RE = /(?:eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{6,})?|\b(?:sk|pk|rk|pat|tok|sec|key)_(?:live|test|prod|dev|secret)_[A-Za-z0-9_-]{8,}\b|Bearer\s+[A-Za-z0-9._-]{16,}|\b[0-9a-f]{40,}\b)/g
-const ENTITY_ACTION_VERB_RE = /^(?:create|update|delete|remove|list|get|fetch|approve|reject|cancel|reopen|promote|demote|transfer|export|sync|trigger|download|preview|verify|redeem|revoke|capture|refund|settle|dispatch|run|start|stop|stream|subscribe|watch|listen|notify|emit|read|write|grant|impersonate|invite|batch|bulk|multi|process|handle|resolve|query|mutate|submit|publish|archive|activate|suspend|release|schedule)$/i
+const ENTITY_ACTION_VERB_RE = /^(?:create|update|delete|remove|list|get|fetch|approve|reject|cancel|promote|demote|transfer|export|sync|trigger|download|preview|verify|redeem|revoke|dispatch|run|start|stop|stream|subscribe|watch|listen|notify|emit|read|write|grant|invite|batch|bulk|multi|process|handle|resolve|query|mutate|submit|publish|archive|activate|suspend|release|schedule)$/i
 
 /** True when a persona label represents a real authenticated actor rather than anonymous traffic. */
 function isAuthenticatedPersona(persona?: string | null): boolean {
@@ -118,9 +118,9 @@ export function classifySurface(path: string, method = 'GET', handler = '', body
 
 export function detectLifecyclePatterns(text: string): LifecyclePatternKind[] {
   const out: LifecyclePatternKind[] = []
-  if (STATE_TRANSITION_RE.test(text)) out.push('state_transition')
-  if (CREATOR_APPROVER_RE.test(text)) out.push('creator_approver_mutation')
-  if (NUMERIC_BALANCE_RE.test(text)) out.push('numeric_balance_billing')
+  if (STRUCTURAL_STATE_FIELD_RE.test(text)) out.push('state_transition')
+  if (STRUCTURAL_OWNER_ACTOR_RE.test(text)) out.push('creator_approver_mutation')
+  if (STRUCTURAL_ARITHMETIC_MUTATION_RE.test(text)) out.push('numeric_balance_billing')
   return out
 }
 
@@ -145,8 +145,7 @@ export function toCapabilityLedgerSeeds(hypotheses: readonly InvariantHypothesis
 const isAllowedStatus = (status: number): boolean => (status >= 200 && status < 300) || status === 101
 const isDeniedStatus = (status: number): boolean => status === 401 || status === 403
 const MISSING_AUTH_REQ_RE = /^(?:|none|public|unknown|anonymous|unauthenticated)$/i
-const PRIVILEGED_HINT_RE = /\b(?:admin|owner|role|rbac|superuser|staff|privileged|approver|finance|internal|manage|console|backoffice)\b/i
-const PRIVILEGED_ROUTE_RE = /\/(?:admin|internal|manage|management|backoffice|staff|console|roles?|permissions?|webhooks?|billing|exports?|audit|settings|transfer|approve|refund|impersonate|invite)(?:\/|$)/i
+const PRIVILEGED_HINT_RE = /\b(?:admin|owner|role|rbac|superuser|staff|privileged)\b/i
 const parseMethodAndPath = (raw: string): { method: string; path: string } => {
   const m = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|QUERY|MUTATION|SUBSCRIPTION)\s+(.+)$/i.exec(raw.trim())
   return m ? { method: m[1]!.toUpperCase(), path: m[2]!.trim() } : { method: 'GET', path: raw.trim() }
@@ -156,14 +155,12 @@ const hasOpenApiAuth = (op: RuntimeOpenApiOperation): boolean =>
   Array.isArray(op.security) ? op.security.some(s => Object.keys(s).length > 0) : Boolean(op.authRequirement && !MISSING_AUTH_REQ_RE.test(op.authRequirement.trim()))
 const hasOpenApiRoleRestriction = (op: RuntimeOpenApiOperation): boolean =>
   Boolean(op.authRequirement && PRIVILEGED_HINT_RE.test(op.authRequirement))
-  || Boolean(op.security?.some(req => Object.entries(req).some(([s, sc]) => PRIVILEGED_HINT_RE.test(s) || (Array.isArray(sc) && sc.some(v => PRIVILEGED_HINT_RE.test(v) || /(?:write|admin|delete|manage|approve|grant)/i.test(v))))))
+  || Boolean(op.security?.some(req => Object.entries(req).some(([s, sc]) => PRIVILEGED_HINT_RE.test(s) || (Array.isArray(sc) && sc.some(v => PRIVILEGED_HINT_RE.test(v) || /(?:write|admin|delete|manage|grant)/i.test(v))))))
 
 export type RuntimeDependencyEdgeKind = 'await_async' | 'hmac_sign' | 'lifecycle_chain' | 'signed_url' | 'generic'
-const REBIND_STAGE_RE = /\/(?:rebind|update|assign|delegate|transfer|approve|reassign|edit|modify|attach|link|role|owner|member)(?:\/|$)/i
-const FINALIZE_STAGE_RE = /\/(?:finalize|settle|release|complete|commit|publish|capture|execute|export|dispatch|confirm|submit|payout|withdraw|close)(?:\/|$)/i
-const ASYNC_ROUTE_RE = /\/(?:jobs?|tasks?|exports?|reports?|status|poll|results?|progress|queues?|workers?|async|batches?)(?:\/|$)/i
-const WEBHOOK_ROUTE_RE = /\/(?:webhooks?|callbacks?|hooks?|events?\/ingest|notify)(?:\/|$)/i
-const STORAGE_ROUTE_RE = /\/(?:downloads?|files?|artifacts?|storage|buckets?|signed-url|presign|blobs?)(?:\/|$)/i
+const ASYNC_ROUTE_RE = /\/(?:jobs?|tasks?|exports?|status|poll|queues?|workers?|async)(?:\/|$)/i
+const WEBHOOK_ROUTE_RE = /\/(?:webhooks?|callbacks?|hooks?)(?:\/|$)/i
+const STORAGE_ROUTE_RE = /\/(?:downloads?|files?|artifacts?|storage|signed-url|presign)(?:\/|$)/i
 const PARAM_CANON_RE = /[^a-z0-9]/g
 const canonicalParamToken = (name: string): string => name.toLowerCase().replace(/^x-/, '').replace(PARAM_CANON_RE, '')
 
@@ -214,35 +211,27 @@ export function filterGhostSurfaceProbeEndpoints<T extends { origin: string; met
   })
 }
 
-/** Classify a producer -> consumer runtime dependency into a prioritized grey-box workflow edge family. */
+/** Classify a producer -> consumer runtime dependency using structural field, header, and HTTP method signals. */
 export function classifyRuntimeDependencyEdgeKind(
   dep: Pick<RuntimeApiDependency, 'producer' | 'consumer' | 'resourceKey' | 'observedTransitions'>,
 ): RuntimeDependencyEdgeKind {
   const transitions = (dep.observedTransitions ?? []).join(' ').toLowerCase()
   if (transitions.includes('hmac_sign')) return 'hmac_sign'
   if (transitions.includes('await_async') || transitions.includes('status:202')) return 'await_async'
-  if (transitions.includes('lifecycle_chain') || transitions.includes('create->rebind') || transitions.includes('rebind->finalize')) return 'lifecycle_chain'
+  if (transitions.includes('lifecycle_chain')) return 'lifecycle_chain'
   if (transitions.includes('signed_url')) return 'signed_url'
   const prod = parseMethodAndPath(dep.producer), cons = parseMethodAndPath(dep.consumer)
   const key = dep.resourceKey.trim()
   const keyKind = classifyStructuralFieldEdgeKind(key, key.includes('-') ? 'header' : 'json')
     ?? classifyStructuralFieldEdgeKind(key, 'json')
-  if (keyKind === 'hmac_sign' || ((WEBHOOK_ROUTE_RE.test(prod.path) || WEBHOOK_ROUTE_RE.test(cons.path)) && /(?:secret|sign|hmac|key|token|signature)/i.test(`${key} ${prod.path} ${cons.path}`))) return 'hmac_sign'
-  if (keyKind === 'await_async' || key === 'status:202' || (ASYNC_ROUTE_RE.test(cons.path) && /(?:job|task|export|status|poll|async|batch|operation|location)/i.test(`${key} ${prod.path} ${cons.path}`))) return 'await_async'
-  if (keyKind === 'signed_url' || (STORAGE_ROUTE_RE.test(cons.path) && /(?:url|token|link|download|signed|presign|artifact)/i.test(`${key} ${prod.path}`))) return 'signed_url'
-  const isMutProd = MUTATING_METHOD_RE.test(prod.method), isMutCons = MUTATING_METHOD_RE.test(cons.method)
-  if ((isMutProd && (cons.method === 'PATCH' || cons.method === 'PUT' || REBIND_STAGE_RE.test(cons.path) || FINALIZE_STAGE_RE.test(cons.path)))
-    || (isMutCons && (REBIND_STAGE_RE.test(prod.path) || FINALIZE_STAGE_RE.test(cons.path)))
-    || ((isMutProd || isMutCons) && detectLifecyclePatterns(`${prod.path} ${cons.path} ${key}`).length > 0)) {
+  if (keyKind === 'hmac_sign' || ((WEBHOOK_ROUTE_RE.test(prod.path) || WEBHOOK_ROUTE_RE.test(cons.path)) && /(?:secret|sign|hmac|key|signature)/i.test(key))) return 'hmac_sign'
+  if (keyKind === 'await_async' || key === 'status:202' || (ASYNC_ROUTE_RE.test(cons.path) && /(?:job|task|export|status|poll|async|operation|location)/i.test(key))) return 'await_async'
+  if (keyKind === 'signed_url' || (STORAGE_ROUTE_RE.test(cons.path) && /(?:url|link|download|signed|presign|location)/i.test(key))) return 'signed_url'
+  if (MUTATING_METHOD_RE.test(prod.method) && MUTATING_METHOD_RE.test(cons.method)) {
     return 'lifecycle_chain'
   }
   return 'generic'
 }
-
-const isCreateRebindFinalizeChain = (p: { pm: string; pp: string; cm: string; cp: string }, n: { cm: string; cp: string }): boolean =>
-  p.pm === 'POST'
-  && (p.cm === 'PATCH' || p.cm === 'PUT' || REBIND_STAGE_RE.test(p.cp))
-  && (MUTATING_METHOD_RE.test(n.cm) || FINALIZE_STAGE_RE.test(n.cp))
 
 /** Resolve OpenAPI schema `$ref`s (local `#/components/schemas/...` / `#/definitions/...`) safely with cycle protection. */
 function collectOpenApiSchemaProperties(
@@ -406,22 +395,22 @@ export function inferRuntimeInvariantHypotheses(input: RuntimeDiscoveryInput): R
     const calls = spa.apiCalls ?? [], actionText = `${spa.path} ${(spa.stateActions ?? []).join(' ')} ${calls.map(c => c.path).join(' ')}`
     const patterns = detectLifecyclePatterns(actionText), hasClientRoles = Boolean(spa.requiredRoles?.length && calls.length)
     const crossOriginCall = spa.serviceOrigin ? calls.find(c => c.serviceOrigin && c.serviceOrigin !== spa.serviceOrigin) : undefined
-    const isPrivSpa = PRIVILEGED_ROUTE_RE.test(spa.path) && calls.length > 0
-    if (!patterns.length && !hasClientRoles && !crossOriginCall && !isPrivSpa) continue
+    const hasMutatingCall = calls.some(c => MUTATING_METHOD_RE.test(c.method))
+    if (!patterns.length && !hasClientRoles && !crossOriginCall && !hasMutatingCall) continue
     const target = crossOriginCall ?? calls[0], entity = inferEntityName(target?.path ?? spa.path, '', actionText)
     const surface: CapabilitySurface = target?.surface ?? (target ? classifySurface(target.path, target.method) : 'browser')
-    const kind: InvariantHypothesisKind = crossOriginCall ? 'trust_boundary_mismatch' : (hasClientRoles || isPrivSpa) ? 'runtime_surface_asymmetry' : 'lifecycle_invariant'
-    const capabilityKind: CapabilityKind = crossOriginCall ? 'identity_session' : (hasClientRoles || isPrivSpa) ? 'policy_asymmetry' : 'state_handle'
+    const kind: InvariantHypothesisKind = crossOriginCall ? 'trust_boundary_mismatch' : hasClientRoles ? 'runtime_surface_asymmetry' : 'lifecycle_invariant'
+    const capabilityKind: CapabilityKind = crossOriginCall ? 'identity_session' : hasClientRoles ? 'policy_asymmetry' : 'state_handle'
     const targetOrigin = target?.serviceOrigin ?? spa.serviceOrigin
     hypotheses.push(makeHypothesis({
       id: stableId('hyp_spa', `${spa.path}|${target?.path ?? 'ui'}|${patterns.join(',')}|${crossOriginCall?.serviceOrigin ?? ''}`), kind, capabilityKind,
       mode: input.mode, entity, surface, ...(targetOrigin ? { serviceOrigin: targetOrigin } : {}),
       targetRoute: target ? `${target.method.toUpperCase()} ${target.path}` : `SPA ${spa.path}`,
-      score: 0.56 + patterns.length * 0.09 + (hasClientRoles ? 0.12 : 0) + (crossOriginCall ? 0.14 : 0) + (isPrivSpa && !hasClientRoles ? 0.06 : 0),
+      score: 0.56 + patterns.length * 0.09 + (hasClientRoles ? 0.12 : 0) + (crossOriginCall ? 0.14 : 0) + (hasMutatingCall && !hasClientRoles ? 0.06 : 0),
       summary: crossOriginCall
         ? `SPA route "${spa.path}" (${spa.serviceOrigin}) invokes cross-origin call ${crossOriginCall.method.toUpperCase()} ${crossOriginCall.path} (${crossOriginCall.serviceOrigin}); verify cross-origin authz.`
         : hasClientRoles ? `SPA route "${spa.path}" enforces client-side roles [${spa.requiredRoles!.join(', ')}] in front of API calls (${calls.map(c => `${c.method} ${c.path}`).join(', ')}); verify server-side authorization.`
-          : `SPA route "${spa.path}" drives entity "${entity}" lifecycle actions [${patterns.join(', ') || 'privileged_access'}].`,
+          : `SPA route "${spa.path}" drives entity "${entity}" mutating actions [${patterns.join(', ') || 'mutating_api'}].`,
       preconditions: [`spa_route:${spa.path}`, ...(crossOriginCall ? [`cross_origin_edge:${spa.serviceOrigin}->${crossOriginCall.serviceOrigin}`] : [])],
       verificationHint: hasClientRoles ? `Call backend endpoint ${target ? `${target.method} ${target.path}` : spa.path} directly as a non-[${spa.requiredRoles!.join(',')}] actor.`
         : `Replay the SPA workflow sequence directly against backend endpoints with out-of-order or dual-actor mutations.`,
@@ -447,7 +436,7 @@ export function inferRuntimeInvariantHypotheses(input: RuntimeDiscoveryInput): R
   const edgeMeta = (ek: RuntimeDependencyEdgeKind, fallbackSurface: CapabilitySurface, pRef: string, cRef: string, rk: string, nRef?: string) => {
     if (ek === 'hmac_sign') return { cap: 'signing_material' as CapabilityKind, surf: 'webhook' as CapabilitySurface, boost: 0.16, tags: ['edge_kind:hmac_sign', 'workflow:webhook_signing'], hint: `Seal signing material "${rk}" from ${pRef} via ctx.seal_capability, compute callback signature with ctx.hmac_sign, and verify authorization on ${nRef ?? cRef}.` }
     if (ek === 'await_async') return { cap: 'state_handle' as CapabilityKind, surf: 'async_job' as CapabilitySurface, boost: 0.15, tags: ['edge_kind:await_async', 'workflow:async_poll'], hint: `Trigger ${pRef} (202/async), seal "${rk}" via ctx.seal_capability, poll via ctx.await_async against ${nRef ?? cRef}, and verify cross-tenant isolation.` }
-    if (ek === 'lifecycle_chain') return { cap: 'state_handle' as CapabilityKind, surf: fallbackSurface, boost: 0.12, tags: ['edge_kind:lifecycle_chain', ...(nRef ? ['workflow:create_rebind_finalize'] : [])], hint: `Sequence create -> rebind -> finalize (${pRef} -> ${cRef}${nRef ? ` -> ${nRef}` : ''}) with denied control and ctx.prove_composite to test ownership/state invariants.` }
+    if (ek === 'lifecycle_chain') return { cap: 'state_handle' as CapabilityKind, surf: fallbackSurface, boost: 0.12, tags: ['edge_kind:lifecycle_chain'], hint: `Sequence multi-step mutations (${pRef} -> ${cRef}${nRef ? ` -> ${nRef}` : ''}) with denied control and ctx.prove_composite to test ownership/state invariants.` }
     if (ek === 'signed_url') return { cap: 'signed_artifact_or_url' as CapabilityKind, surf: fallbackSurface === 'http' ? 'storage' as CapabilitySurface : fallbackSurface, boost: 0.10, tags: ['edge_kind:signed_url'], hint: `Harvest signed handle "${rk}" from ${pRef}, seal via ctx.seal_capability, and replay against ${nRef ?? cRef} as a distinct tenant/persona.` }
     return { cap: 'opaque_object_ref' as CapabilityKind, surf: fallbackSurface, boost: 0, tags: [] as string[], hint: `Harvest "${rk}" from ${pRef}, establish a denied control, then replay against ${nRef ?? cRef} as a distinct persona.` }
   }
@@ -456,9 +445,10 @@ export function inferRuntimeInvariantHypotheses(input: RuntimeDiscoveryInput): R
     const next = (depsByProd.get(d.cp) ?? []).find(n => n.cp !== d.pp && n.cp !== d.cp)
     if (next) {
       const nRef = `${next.cm} ${next.cp}`, xChain = d.xOrigin || next.xOrigin || Boolean(d.raw.producerOrigin && next.raw.consumerOrigin && d.raw.producerOrigin !== next.raw.consumerOrigin)
+      const isMultiMutChain = MUTATING_METHOD_RE.test(d.pm) && d.mut && next.mut
       const chainKind: RuntimeDependencyEdgeKind = d.edgeKind === 'hmac_sign' || next.edgeKind === 'hmac_sign' ? 'hmac_sign'
         : d.edgeKind === 'await_async' || next.edgeKind === 'await_async' ? 'await_async'
-          : isCreateRebindFinalizeChain(d, next) || d.edgeKind === 'lifecycle_chain' || next.edgeKind === 'lifecycle_chain' ? 'lifecycle_chain'
+          : isMultiMutChain || d.edgeKind === 'lifecycle_chain' || next.edgeKind === 'lifecycle_chain' ? 'lifecycle_chain'
             : d.edgeKind !== 'generic' ? d.edgeKind : next.edgeKind
       const m = edgeMeta(chainKind, classifySurface(next.cp, next.cm), pRef, cRef, d.raw.resourceKey, nRef)
       hypotheses.push(makeHypothesis({
@@ -472,15 +462,14 @@ export function inferRuntimeInvariantHypotheses(input: RuntimeDiscoveryInput): R
       }))
       continue
     }
-    const isPriv = PRIVILEGED_ROUTE_RE.test(d.cp)
-    if (!d.xOrigin && !d.mut && !d.life.length && !isPriv && d.edgeKind === 'generic' && d.raw.testedBola) continue
+    if (!d.xOrigin && !d.mut && !d.life.length && d.edgeKind === 'generic' && d.raw.testedBola) continue
     const m = edgeMeta(d.edgeKind, classifySurface(d.cp, d.cm), pRef, cRef, d.raw.resourceKey)
     hypotheses.push(makeHypothesis({
       id: stableId('hyp_dep', `${pRef}|${cRef}|${d.raw.resourceKey}|${d.raw.consumerOrigin ?? ''}`),
       kind: d.xOrigin ? 'trust_boundary_mismatch' : (d.life.length || d.edgeKind === 'lifecycle_chain' || d.edgeKind === 'await_async') ? 'lifecycle_invariant' : d.edgeKind === 'hmac_sign' ? 'trust_boundary_mismatch' : 'runtime_surface_asymmetry',
       capabilityKind: d.edgeKind !== 'generic' ? m.cap : d.life.length ? 'state_handle' : 'opaque_object_ref', mode: input.mode, entity: d.entity, surface: m.surf,
       ...(targetOrigin ? { serviceOrigin: targetOrigin } : {}), targetRoute: cRef,
-      score: (d.xOrigin ? 0.76 : d.life.length ? 0.64 + Math.min(0.14, d.life.length * 0.06) : 0.60) + (d.mut ? 0.08 : 0) + (isPriv ? 0.06 : 0) + m.boost,
+      score: (d.xOrigin ? 0.76 : d.life.length ? 0.64 + Math.min(0.14, d.life.length * 0.06) : 0.60) + (d.mut ? 0.08 : 0) + m.boost,
       summary: d.xOrigin ? `Cross-origin API dependency${d.edgeKind !== 'generic' ? ` [${d.edgeKind}]` : ''} flows "${d.raw.resourceKey}" from ${pRef} (${d.raw.producerOrigin}) -> ${cRef} (${d.raw.consumerOrigin}).`
         : `Producer ${pRef} -> Consumer ${cRef}${d.edgeKind !== 'generic' ? ` [${d.edgeKind}]` : ''} propagates "${d.raw.resourceKey}"${d.life.length ? ` [${d.life.join(', ')}]` : ''}; verify ownership/workflow invariants.`,
       preconditions: [`api_dependency:${d.raw.resourceKey}`, ...m.tags, ...(d.xOrigin ? [`cross_origin_edge:${d.raw.producerOrigin}->${d.raw.consumerOrigin}`] : []), ...(d.raw.personaHandle ? [`persona:${d.raw.personaHandle}`] : [])],

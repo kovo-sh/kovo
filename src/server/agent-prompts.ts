@@ -763,7 +763,7 @@ export const KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN = [
   '- Builder: `const ch = ctx.chain({ chainId, terminalVulnClass }); ch.control(ctl); await ch.hop("hop_1", { claimedDelta }, async () => ...); ch.readback(fin); await ch.prove({ claimedImpact }); return ctx.result({ title })` (`state_transition_binding`: `ch.stateTransition({ fromHopId, toHopId, entityId, ablationExchange })`).',
   '- Seal/control: assert 2xx before `ctx.seal_capability` (`jsonPath`/`header`/`cookie`/`value`, NEVER `regex`; `kind: "hmac_key"`); negative controls pass `{ as: actor, arm: "control" }` on `ctx.http`/`ctx.http_send`; minted bearer: `kind: "bearer_token"`, `{ capability: { handle, target: "bearer" } }` (or `Authorization: "Bearer " + handle`), OMIT `as`/`persona`; `ctx.hmac_sign`/`ctx.jwt_sign`/`ctx.await_async`/`ctx.prove_race_burst`.',
   '- Connected DAG (`dag_topology`): with ANY prerequisite setup hops, ALWAYS use `ctx.prove_composite` (NEVER standalone `prove_race_burst`/`prove_access_boundary`/`prove_persisted_mutation`), declare EVERY executed causal hop (Hop 1->terminal) in `hops[]`+`causalEdges[]` reaching `terminalImpact.terminalHopId` (omitting Hop 1 or intermediate hops yields an incomplete receipt; no orphan exploratory hops; `state_transition_binding`: `entityId`+`ablationExchangeIds` from pre-Stage-1 `{ arm: "control" }`).',
-  '- Terminal/provenance: NEVER prove own-tenant reads or intermediate invite/job/export-handle mints — confirm cross-tenant/victim impact on `terminalHopId`; low-priv/multi-tenant attacker only (no single-tenant victim/owner/admin); dual-tenant->dual_tenant_abac. `economic_conservation`/mutating/logic: `baselineReadbackExchangeId`, `finalReadbackExchangeId`, `actionExchangeIds` in `terminalImpact.oracleInput`; after shallow sequential confirmation, ALSO probe numeric boundary/cap fields and concurrent `race` (`N >= 5` parallel calls) before `complete_intent`.',
+  '- Terminal/provenance: confirm real unauthorized or persisted terminal impact on `terminalHopId` rather than stopping at intermediate handles or own-scope reads; start from a low-privilege attacker persona (reserve privileged personas strictly for `{ arm: "control" }` baselines) and include pre-chain baseline + post-chain readback exchange IDs for state-mutating claims.',
 ].join('\n')
 
 const KOVO_VERIFY_TOOL_DESCRIPTION_BASE = [
@@ -2245,24 +2245,17 @@ export function workerInvestigationPrompt(input: {
     ...(specialistConfig ? { specialistProfile: specialistConfig.id, specialistFocus: specialistConfig.focusPrompt } : {}),
     explorationGuardrails: {
       lowPrivFirst: 'Start as lowest-privilege persona first (attacker ONLY; never victim/owner/admin shortcuts — negative control only with { arm: "control" }).',
-      ...(!isMultiHopStep ? { pushToTerminalImpact: 'Never prove own-tenant reads or stop at invite/token/metadata/job/export-handle mints; confirm cross-tenant/victim impact on terminalHopId. Dual-tenant->dual_tenant_abac.' } : {}),
+      ...(!isMultiHopStep ? { pushToTerminalImpact: 'Confirm real unauthorized or persisted terminal impact on terminalHopId rather than stopping at intermediate handles or own-scope reads.' } : {}),
       closureEvidence: 'For authz/workflow/business-logic/chain/race (>=2 personas or multi-step), never mark "ruled_out"/"no_issue_found" from a single 403/404 probe without /repos file:line or >=2 personas/steps; else run the missing check or record "needs_follow_up".',
     },
     ...(isMultiHopStep && !input.decoupledProofPipeline
       ? {
           multiHopDirectives: {
             scopeAnchor: 'Stay strictly anchored to your assigned chain/suspect endpoints and pivot across hops of THAT hypothesis.\nDo not spend turns re-confirming an unrelated endpoint already covered by another finding or step (see alreadyConfirmed).',
-            requiredCompositeProof: 'MUST prove end-to-end with ctx.seal_capability + ctx.prove_composite (or ctx.chain().prove()); with prerequisite setup hops (parser differential, state rebind, async job polling), ALWAYS use ctx.prove_composite — NEVER standalone prove_race_burst / prove_access_boundary / prove_persisted_mutation.',
-            declareAllExecutedHops: 'Declare EVERY causal hop (Hop 1 -> terminal) in prove_composite.hops[] connected via causalEdges[]; omitting Hop 1 or intermediate hops yields an incomplete receipt.',
             compositeCallSignature: 'Prefer const ch = ctx.chain({ chainId, terminalVulnClass }); ch.control(ctl); await ch.hop("hop_1", { claimedDelta }, ...); ch.readback(fin); await ch.prove({ claimedImpact }).',
-            noPrematureSingleHop: 'Never prove own-tenant reads or stop at invite/token/metadata/role-write/job/export-handle mints — seal via ctx.seal_capability and chain in ONE script to victim impact on terminalHopId.',
-            singleOriginProbeArm: 'Run probe-arm hops as one low-priv attacker persona (or derived credential); never victim/owner/admin shortcuts; dual-tenant->dual_tenant_abac.',
-            cryptoAndAsyncHelpers: 'Run ctx.hmac_sign / ctx.jwt_sign / ctx.await_async / ctx.prove_race_burst inside ONE script, then ctx.prove_composite (replayMode: "fresh_clean_replay").',
-            singleScriptConsolidation: 'Write ONE cohesive N-hop kovo_verify script using ctx.chain(...) (Hop 1 -> terminal -> ch.prove) so hops[], exchangeIds, and causalEdges[] stay aligned.',
-            stateTransitionControlOrder: 'Always pass { arm: "control" } on negative-control ctx.http calls; for state_transition_binding, run clean denied control BEFORE Stage 1 with entityId + ablationExchangeIds.',
-            economicConservationReadback: 'For terminalVulnClass: "economic_conservation", read baseline BEFORE the chain (preChainControlExchangeIds / oracleInput.baselineReadbackExchangeId), run mutating/race hops, read final AFTER (postChainReadbackExchangeIds / oracleInput.finalReadbackExchangeId), and pass { equation, balancesBefore/paidAmount, baselineReadbackExchangeId, finalReadbackExchangeId, actionExchangeIds } in terminalImpact.oracleInput (host hydrates host-signed records).',
-            connectedDagTopology: 'dag_topology: every hop in hops[] must be connected by causalEdges[] reaching terminalImpact.terminalHopId; pass { arm: "control" } on negative controls and never include unused or orphan exploratory hops in hops[].',
-            derivedSessionTokenInjection: 'Derived bearer/session token: seal with kind: "bearer_token", inject with { capability: { handle, target: "bearer" } } (or Authorization: "Bearer " + handle), and OMIT as / persona.',
+            singleScriptConsolidation: 'Chain prerequisite setup hops and terminal impact in ONE kovo_verify script using ctx.chain(...) / ctx.prove_composite (never standalone helpers after setup hops) with every executed causal hop connected via causalEdges[] to terminalHopId.',
+            attackerProvenance: 'Run probe-arm hops from a low-privilege attacker persona or a capability handle sealed inside the DAG; reserve privileged personas strictly for { arm: "control" } baselines.',
+            controlsAndReadback: 'Confirm real unauthorized or persisted terminal impact rather than intermediate handles or own-scope reads; capture clean { arm: "control" } baselines before mutating shared state and include post-chain readback exchange IDs.',
           },
         }
       : {}),

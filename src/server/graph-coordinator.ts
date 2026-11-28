@@ -237,35 +237,52 @@ export const NON_FLOOR_SEMANTIC_CLASSES: readonly NonFloorSemanticClass[] = [
 ]
 
 const SEMANTIC_MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
-const WORKFLOW_PATH_RE = /\/(?:checkout|confirm|approve|reject|submit|publish|cancel|refunds?|transitions?|verify|activate|complete|close|escalate|impersonate|invites?)(?:\/|$)/i
-const BUSINESS_LOGIC_PATH_RE = /\/(?:carts?|orders?|invoices?|billing|plans?|subscriptions?|prices?|discounts?|coupons?|vouchers?|credits?|quotas?|seats?|limits?|tiers?|payments?)(?:\/|$)/i
-const RACE_PATH_RE = /\/(?:redeem|apply|transfers?|withdraw|debit|claims?|reserve|allocate|stock|inventory|balances?|wallets?|gifts?|cards?|coupons?|checkout|pay)(?:\/|$)/i
-const AUTH_PROTOCOL_PATH_RE = /\/(?:auth|login|tokens?|jwt|oauth|oidc|saml|sso|sessions?|refresh|mfa|2fa|otp|magic|reset|verify|keys?|webhooks?|reports?|exports?|integrations?)(?:\/|$)/i
+const HEALTH_OR_STATIC_ENDPOINT_RE = /\/(?:health|healthz|ready|readyz|livez|metrics|ping|favicon\.ico|robots\.txt)(?:\/|$)/i
+const PARAMETERIZED_ACTION_RE = /\/(?::[a-zA-Z0-9_]+|\{[^}]+\})\/[a-zA-Z0-9_-]+(?:\/|$)/
+const AUTH_PROTOCOL_RE = /\/(?:auth|login|oauth2?|oidc|saml|sso|jwks|tokens?|jwt|sessions?|mfa|2fa|otp)(?:\/|$)/i
 
 /**
  * Pure structural classifier for non-floor semantic classes (`workflow`, `business_logic`, `race`,
- * `auth_protocol`, `chain`) that are under-covered on an endpoint. Returns classes relevant to the
- * endpoint that have not yet been tested, without any benchmark/app literals.
+ * `auth_protocol`, `chain`) that are under-covered on an endpoint. Uses HTTP method, structural
+ * parameterization, sink metadata, and standard auth-protocol paths without domain noun lists.
  */
 export function classifySemanticEndpointClasses(endpoint: CoordinatorEndpoint): NonFloorSemanticClass[] {
   const method = (endpoint.method || 'GET').toUpperCase()
   const path = endpoint.pathTemplate || ''
+  const sinks = new Set((endpoint.sinkKinds ?? []).map(s => s.toLowerCase()))
+  if (HEALTH_OR_STATIC_ENDPOINT_RE.test(path) && sinks.size === 0) return []
   const tested = new Set((endpoint.testedClasses ?? []).map(c => c.toLowerCase()))
   const mutating = SEMANTIC_MUTATING_METHODS.has(method)
+  const hasParameterizedAction = PARAMETERIZED_ACTION_RE.test(path)
   const out: NonFloorSemanticClass[] = []
-  if (mutating && WORKFLOW_PATH_RE.test(path) && !tested.has('workflow') && !tested.has('workflow_bypass')) {
+  if (
+    mutating
+    && (hasParameterizedAction || Boolean(endpoint.ownershipGuard) || sinks.has('workflow') || sinks.has('state_mutation'))
+    && !tested.has('workflow') && !tested.has('workflow_bypass')
+  ) {
     out.push('workflow')
   }
-  if (mutating && BUSINESS_LOGIC_PATH_RE.test(path) && !tested.has('business_logic') && !tested.has('price_tampering')) {
+  if (
+    mutating
+    && (hasParameterizedAction || sinks.has('business_logic') || sinks.has('numeric_invariant') || (endpoint.riskScore ?? 0) >= 80)
+    && !tested.has('business_logic') && !tested.has('price_tampering')
+  ) {
     out.push('business_logic')
   }
-  if (mutating && RACE_PATH_RE.test(path) && !tested.has('race') && !tested.has('race_burst') && !tested.has('race_condition')) {
+  if (
+    mutating
+    && (hasParameterizedAction || sinks.has('race') || sinks.has('concurrency'))
+    && !tested.has('race') && !tested.has('race_burst') && !tested.has('race_condition')
+  ) {
     out.push('race')
   }
-  if ((AUTH_PROTOCOL_PATH_RE.test(path) || isRoleExclusive(endpoint)) && !tested.has('auth_protocol') && !tested.has('jwt') && !tested.has('jwt_forgery')) {
+  if (
+    (AUTH_PROTOCOL_RE.test(path) || isRoleExclusive(endpoint) || sinks.has('auth') || sinks.has('jwt') || sinks.has('oauth') || sinks.has('session'))
+    && !tested.has('auth_protocol') && !tested.has('jwt') && !tested.has('jwt_forgery')
+  ) {
     out.push('auth_protocol')
   }
-  if ((endpoint.sinkKinds?.length ?? 0) > 0 && (endpoint.coveragePct ?? 0) < 100 && !tested.has('chain')) {
+  if (sinks.size > 0 && (endpoint.coveragePct ?? 0) < 100 && !tested.has('chain')) {
     out.push('chain')
   }
   return out
@@ -1639,7 +1656,7 @@ function inferRuntimeRoutePrimitiveKind(
   }
   if (
     SEMANTIC_MUTATING_METHODS.has(method.toUpperCase())
-    && (WORKFLOW_PATH_RE.test(endpoint) || BUSINESS_LOGIC_PATH_RE.test(endpoint) || RACE_PATH_RE.test(endpoint) || /\/(?:exports?|jobs?|async|batch|bulk)(?:\/|$)/.test(lower))
+    && (PARAMETERIZED_ACTION_RE.test(endpoint) || /\/(?:jobs?|async|batch|bulk)(?:\/|$)/.test(lower))
   ) {
     return 'workflow_state_handle'
   }
@@ -1775,19 +1792,6 @@ export interface PlannedCompositeWorkflow<T extends CompositeWorkflowNode = Comp
   priority: number
 }
 
-interface CompositeWorkflowRule<T extends CompositeWorkflowNode> {
-  key: string
-  entry: (c: T) => boolean
-  entryFallback?: (c: T) => boolean
-  pivot: (c: T) => boolean
-  pivotFallback?: (c: T) => boolean
-  terminal?: (c: T, pivot: T) => boolean
-  terminalFallback?: (c: T, pivot: T) => boolean
-  label: (hasTerminal: boolean) => string
-  category: (hasTerminal: boolean) => string
-  requireDiversity?: boolean
-}
-
 function compositeRoleToCapabilityKind(roles: ReadonlySet<CompositeWorkflowRole>): CapabilityKind {
   if (roles.has('outbound_fetch')) return 'internal_reach_handle'
   if (roles.has('signing_webhook')) return 'signing_material'
@@ -1873,8 +1877,9 @@ export function seedCompositeNodesToLedger(
 }
 
 /**
- * Unified table-driven causal composite planner shared by white-box code-audit suspect promotion
- * and grey-box runtime composite promotion (replaces duplicated 5-pattern matchers).
+ * Generic causal graph composite planner shared by white-box code-audit suspect promotion and
+ * grey-box runtime composite promotion. Chains nodes strictly over actual observed/AST dependency
+ * edges, ledger causal edges, and cross-boundary graph diversity (zero hardcoded recipe templates).
  */
 export function planCompositeWorkflows<T extends CompositeWorkflowNode>(
   candidates: readonly T[],
@@ -1892,31 +1897,6 @@ export function planCompositeWorkflows<T extends CompositeWorkflowNode>(
   const composites: PlannedCompositeWorkflow<T>[] = []
   const usedInPrior = new Set<string>()
   const emittedIdSets: ReadonlySet<string>[] = []
-
-  const pick = (
-    predicate: (c: T) => boolean,
-    excludeIds: ReadonlySet<string>,
-    anchor?: T,
-  ): T | undefined => {
-    let best: { c: T; score: number; idx: number } | undefined
-    for (let idx = 0; idx < candidates.length; idx += 1) {
-      const c = candidates[idx]!
-      if (excludeIds.has(c.id) || !predicate(c)) continue
-      let score = options.mode === 'runtime' ? (c.priorityScore ?? 50) : 0
-      if (!usedInPrior.has(c.id)) score += options.mode === 'runtime' ? 20 : 4
-      if (anchor) {
-        if (options.mode === 'runtime' && c.origin !== anchor.origin) score += 28
-        if (c.serviceScope !== anchor.serviceScope) score += options.mode === 'runtime' ? 10 : 3
-        if (c.fileLoc && anchor.fileLoc && c.fileLoc !== anchor.fileLoc) score += 2
-        if (c.sinkKind !== anchor.sinkKind) score += options.mode === 'runtime' ? 8 : 2
-      }
-      if (c.explicitSuspect) score += 1
-      if (!best || score > best.score || (score === best.score && idx < best.idx)) {
-        best = { c, score, idx }
-      }
-    }
-    return best?.c
-  }
 
   const record = (
     key: string,
@@ -1940,153 +1920,160 @@ export function planCompositeWorkflows<T extends CompositeWorkflowNode>(
     })
   }
 
-  const rules: CompositeWorkflowRule<T>[] = [
-    {
-      key: 'outbound_signing_webhook',
-      entry: c => c.roles.has('outbound_fetch'),
-      pivot: c => c.roles.has('signing_webhook'),
-      terminal: c => c.roles.has('privileged_mutation'),
-      terminalFallback: c => c.roles.has('auth_session'),
-      label: t => t ? 'Outbound/SSRF -> Signing/Webhook -> Terminal Impact' : 'Outbound/SSRF -> Signing/Webhook Pivot',
-      category: t => t ? 'broken-access-control' : 'auth-identity',
-    },
-    {
-      key: 'disclosure_auth_mutation',
-      entry: c => c.roles.has('info_disclosure') && c.sinkKind !== 'auth_config',
-      entryFallback: c => c.roles.has('info_disclosure') || (options.mode === 'runtime' && Boolean(c.isApiDep)),
-      pivot: c => c.roles.has('auth_session') && (options.mode === 'whitebox' ? c.sinkKind === 'auth_config' : true),
-      pivotFallback: c => c.roles.has('auth_session'),
-      terminal: c => c.roles.has('privileged_mutation') || (options.mode === 'runtime' && c.roles.has('async_worker')),
-      label: t => t ? 'Disclosure -> Auth/Session -> Privileged Mutation' : 'Disclosure -> Auth/Session Pivot',
-      category: () => 'broken-access-control',
-    },
-    ...(options.mode === 'whitebox'
-      ? [
-          {
-            key: 'cache_permission_async_export',
-            entry: (c: T) => c.roles.has('cache_permission'),
-            pivot: (c: T) => c.roles.has('async_worker'),
-            terminal: (c: T, p: T) => (c.roles.has('privileged_mutation') || c.roles.has('info_disclosure')) && c.id !== p.id,
-            label: (t: boolean) => t
-              ? 'Cache/Permission -> Async Export/Download -> Terminal Readback'
-              : 'Cache/Permission -> Async Export/Download Pivot',
-            category: () => 'broken-access-control',
-          },
-          {
-            key: 'request_parsing_concurrent_settlement',
-            entry: (c: T) => c.roles.has('request_parsing'),
-            pivot: (c: T) => c.roles.has('concurrent_settlement'),
-            terminal: (c: T, p: T) => (c.roles.has('privileged_mutation') || c.roles.has('async_worker')) && c.id !== p.id,
-            label: (t: boolean) => t
-              ? 'Request-Parsing -> Concurrent Settlement -> Terminal Conservation'
-              : 'Request-Parsing -> Concurrent Settlement Pivot',
-            category: () => 'business-logic',
-          },
-        ]
-      : []),
-  ]
-
-  for (const rule of rules) {
-    if (composites.length >= maxComposites) break
-    const used = new Set<string>()
-    const entry = pick(rule.entry, used) ?? (rule.entryFallback ? pick(rule.entryFallback, used) : undefined)
-    if (!entry) continue
-    used.add(entry.id)
-    const pivot = pick(rule.pivot, used, entry) ?? (rule.pivotFallback ? pick(rule.pivotFallback, used, entry) : undefined)
-    if (!pivot) continue
-    used.add(pivot.id)
-    const terminal = rule.terminal
-      ? (pick(c => rule.terminal!(c, pivot), used, pivot)
-        ?? (rule.terminalFallback ? pick(c => rule.terminalFallback!(c, pivot), used, pivot) : undefined))
-      : undefined
-    const hops = terminal ? [entry, pivot, terminal] : [entry, pivot]
-    record(rule.key, rule.label(Boolean(terminal)), rule.category(Boolean(terminal)), hops)
+  const inferCategory = (hops: readonly T[]): string => {
+    const tail = hops[hops.length - 1]!
+    if (tail.roles.has('auth_session') || tail.roles.has('signing_webhook')) return 'auth-identity'
+    if (tail.roles.has('concurrent_settlement') || tail.roles.has('request_parsing')) return 'business-logic'
+    return 'broken-access-control'
   }
 
-  // Runtime producer -> consumer API dependency composite
-  if (options.mode === 'runtime' && composites.length < maxComposites && (options.depPairs?.length ?? 0) > 0) {
-    const rankedDep = [...options.depPairs!].sort((a, b) =>
-      Number(b.prod.origin !== b.cons.origin) - Number(a.prod.origin !== a.cons.origin)
-      || ((b.prod.priorityScore ?? 50) + (b.cons.priorityScore ?? 50))
-        - ((a.prod.priorityScore ?? 50) + (a.cons.priorityScore ?? 50)),
-    )[0]!
-    const used = new Set<string>([rankedDep.prod.id, rankedDep.cons.id])
-    const terminal = pick(
-      c => c.origin !== rankedDep.cons.origin || c.roles.has('privileged_mutation') || c.roles.has('async_worker'),
-      used,
-      rankedDep.cons,
-    )
-    const hops = terminal ? [rankedDep.prod, rankedDep.cons, terminal] : [rankedDep.prod, rankedDep.cons]
-    record(
-      'runtime_api_dependency',
-      `Producer -> Consumer (${rankedDep.resourceKey})${terminal ? ' -> Cross-Boundary Pivot' : ''}`,
-      'broken-access-control',
-      hops,
-      rankedDep.resourceKey,
-    )
+  // 1. Build directed adjacency graph from observed/AST depPairs, ledger causal edges, and shared resourceKeys.
+  interface GraphEdge { from: T; to: T; resourceKey?: string; weight: number }
+  const outById = new Map<string, GraphEdge[]>()
+  const seenEdge = new Set<string>()
+  const addEdge = (from: T, to: T, resourceKey: string | undefined, weight: number): void => {
+    if (from.id === to.id) return
+    const ek = `${from.id}->${to.id}`
+    if (seenEdge.has(ek)) return
+    seenEdge.add(ek)
+    const crossBoost = (from.origin !== to.origin ? 24 : 0)
+      + (from.serviceScope !== to.serviceScope ? 10 : 0)
+      + (from.sinkKind !== to.sinkKind ? 6 : 0)
+    const list = outById.get(from.id) ?? []
+    list.push({ from, to, ...(resourceKey ? { resourceKey } : {}), weight: weight + crossBoost })
+    outById.set(from.id, list)
   }
 
-  // White-box 2-hop Disclosure/Auth -> Privileged Mutation fallback
-  if (options.mode === 'whitebox' && composites.length < maxComposites) {
-    const used = new Set<string>()
-    const leak = pick(c => c.roles.has('info_disclosure') && c.sinkKind !== 'auth_config', used)
-      ?? pick(c => c.roles.has('info_disclosure'), used)
-    if (leak) used.add(leak.id)
-    const authPivot = !leak
-      ? (pick(c => c.roles.has('auth_session') && c.sinkKind === 'auth_config', used)
-        ?? pick(c => c.roles.has('auth_session'), used))
-      : undefined
-    if (authPivot) used.add(authPivot.id)
-    const terminal = pick(c => c.roles.has('privileged_mutation'), used, authPivot ?? leak)
-    const hops = [leak, authPivot, terminal].filter((h): h is T => Boolean(h))
-    const hasCrossBoundaryDiversity = Boolean(leak && terminal)
-      || new Set(hops.map(h => h.serviceScope)).size >= 2
-      || new Set(hops.map(h => h.sinkKind)).size >= 2
-    if (hops.length >= 2 && hasCrossBoundaryDiversity) {
-      record(
-        'disclosure_or_auth_mutation',
-        leak && terminal ? 'Disclosure -> Privileged Cross-Tenant Pivot' : 'Auth/Session -> Privileged Mutation Pivot',
-        'broken-access-control',
-        hops,
-      )
+  for (const pair of options.depPairs ?? []) {
+    addEdge(pair.prod, pair.cons, pair.resourceKey, 40)
+  }
+
+  const byCapId = new Map<string, T>()
+  for (const c of candidates) {
+    const capKind = compositeRoleToCapabilityKind(c.roles)
+    byCapId.set(`cap:hop_comp_${sanitizeUnitToken(c.id)}:${sanitizeUnitToken(capKind)}`, c)
+  }
+  for (const edge of options.ledger?.listCausalEdges() ?? []) {
+    const to = edge.postconditionCapId ? byCapId.get(edge.postconditionCapId) : undefined
+    if (!to) continue
+    const rk = typeof edge.metadata?.resourceKey === 'string' ? edge.metadata.resourceKey : undefined
+    for (const preId of edge.preconditionCapIds) {
+      const from = byCapId.get(preId)
+      if (from) addEdge(from, to, rk, 35)
     }
   }
 
-  // General cross-service (whitebox) or cross-origin (runtime) multi-sink fallback
-  if (composites.length < maxComposites) {
-    const crossReady = options.mode === 'runtime'
-      ? new Set(candidates.map(c => c.origin)).size >= 2
-      : new Set(candidates.map(c => c.serviceScope)).size >= 2 && new Set(candidates.map(c => c.sinkKind)).size >= 2
-    if (crossReady) {
-      const used = new Set<string>()
-      const first = pick(
-        c => c.roles.has('outbound_fetch') || c.roles.has('info_disclosure') || c.roles.has('auth_session') || c.roles.has('async_worker') || c.roles.size > 0,
-        used,
-      ) ?? pick(() => true, used)
-      if (first) {
-        used.add(first.id)
-        const second = options.mode === 'runtime'
-          ? (pick(c => c.origin !== first.origin && (c.roles.size > 0 || c.sinkKind !== first.sinkKind), used, first)
-            ?? pick(c => c.origin !== first.origin, used, first))
-          : pick(c => c.serviceScope !== first.serviceScope && c.sinkKind !== first.sinkKind, used, first)
-        if (second) {
-          used.add(second.id)
-          const third = options.mode === 'runtime'
-            ? (pick(c => c.origin !== first.origin && c.origin !== second.origin, used, second)
-              ?? pick(c => c.roles.has('privileged_mutation') || c.roles.has('async_worker'), used, second))
-            : pick(c => c.roles.has('privileged_mutation') && c.serviceScope !== second.serviceScope, used, second)
-          const hops = third ? [first, second, third] : [first, second]
-          const prefix = options.mode === 'runtime' ? 'Cross-Origin' : 'Cross-Service'
-          const suffix = options.mode === 'runtime' ? 'Workflow' : 'Pivot'
-          record(
-            options.mode === 'runtime' ? 'cross_origin_runtime_workflow' : 'cross_service_multi_sink',
-            `${prefix} ${first.sinkKind} -> ${second.sinkKind}${third ? ` -> ${third.sinkKind}` : ''} ${suffix}`,
-            'broken-access-control',
-            hops,
-          )
+  const byResourceKey = new Map<string, T[]>()
+  for (const c of candidates) {
+    const rk = c.resourceKey?.trim().toLowerCase()
+    if (!rk) continue
+    const group = byResourceKey.get(rk) ?? []
+    group.push(c)
+    byResourceKey.set(rk, group)
+  }
+  for (const [rk, group] of byResourceKey) {
+    if (group.length < 2) continue
+    for (let i = 0; i < group.length; i += 1) {
+      for (let j = 0; j < group.length; j += 1) {
+        if (i === j) continue
+        const a = group[i]!, b = group[j]!
+        if (a.origin !== b.origin || a.serviceScope !== b.serviceScope || a.endpoint !== b.endpoint) {
+          addEdge(a, b, rk, 25)
         }
       }
     }
+  }
+
+  for (const list of outById.values()) {
+    list.sort((a, b) => b.weight - a.weight || (b.to.priorityScore ?? 50) - (a.to.priorityScore ?? 50) || a.to.id.localeCompare(b.to.id))
+  }
+
+  // 2. Enumerate ranked 2-to-3 hop chains strictly along directed dataflow/dependency edges.
+  interface ScoredPath { hops: T[]; resourceKey?: string; score: number }
+  const edgePaths: ScoredPath[] = []
+  for (const start of candidates) {
+    const firstEdges = outById.get(start.id)
+    if (!firstEdges?.length) continue
+    for (const e1 of firstEdges.slice(0, 4)) {
+      const baseScore = e1.weight + ((start.priorityScore ?? 50) + (e1.to.priorityScore ?? 50)) / 4
+      const nextEdges = (outById.get(e1.to.id) ?? []).filter(e2 => e2.to.id !== start.id)
+      if (nextEdges.length > 0) {
+        for (const e2 of nextEdges.slice(0, 3)) {
+          edgePaths.push({
+            hops: [start, e1.to, e2.to],
+            resourceKey: e1.resourceKey ?? e2.resourceKey,
+            score: baseScore + e2.weight + 18 + (e2.to.origin !== start.origin ? 14 : 0),
+          })
+        }
+      } else {
+        edgePaths.push({ hops: [start, e1.to], resourceKey: e1.resourceKey, score: baseScore })
+      }
+    }
+  }
+  edgePaths.sort((a, b) =>
+    b.score - a.score
+    || b.hops.length - a.hops.length
+    || a.hops.map(h => h.id).join('>').localeCompare(b.hops.map(h => h.id).join('>')),
+  )
+  for (const path of edgePaths) {
+    if (composites.length >= maxComposites) break
+    const labelSuffix = path.resourceKey ? ` (${path.resourceKey})` : ''
+    const hopKinds = path.hops.map(h => h.sinkKind || 'node').join(' -> ')
+    record(
+      options.mode === 'runtime' ? 'runtime_dataflow_chain' : 'ast_dataflow_chain',
+      `Dataflow Chain: ${hopKinds}${labelSuffix}`,
+      inferCategory(path.hops),
+      path.hops,
+      path.resourceKey,
+    )
+  }
+
+  // 3. Generic cross-boundary multi-node chaining fallback when graph edges don't fill maxComposites.
+  const pickNext = (excludeIds: ReadonlySet<string>, anchor?: T): T | undefined => {
+    let best: { c: T; score: number; idx: number } | undefined
+    for (let idx = 0; idx < candidates.length; idx += 1) {
+      const c = candidates[idx]!
+      if (excludeIds.has(c.id)) continue
+      if (anchor) {
+        const distinctBoundary = options.mode === 'runtime'
+          ? c.origin !== anchor.origin
+          : c.serviceScope !== anchor.serviceScope && c.sinkKind !== anchor.sinkKind
+        if (!distinctBoundary) continue
+      }
+      let score = (options.mode === 'runtime' ? (c.priorityScore ?? 50) : 0) + (!usedInPrior.has(c.id) ? 20 : 0)
+      if (anchor) {
+        if (c.origin !== anchor.origin) score += 28
+        if (c.serviceScope !== anchor.serviceScope) score += 10
+        if (c.sinkKind !== anchor.sinkKind) score += 8
+      }
+      if (c.explicitSuspect) score += 2
+      if (!best || score > best.score || (score === best.score && idx < best.idx)) best = { c, score, idx }
+    }
+    return best?.c
+  }
+
+  const crossReady = options.mode === 'runtime'
+    ? new Set(candidates.map(c => c.origin)).size >= 2
+    : new Set(candidates.map(c => c.serviceScope)).size >= 2 && new Set(candidates.map(c => c.sinkKind)).size >= 2
+  while (crossReady && composites.length < maxComposites) {
+    const used = new Set<string>()
+    const first = pickNext(used)
+    if (!first) break
+    used.add(first.id)
+    const second = pickNext(used, first)
+    if (!second) break
+    used.add(second.id)
+    const third = pickNext(used, second)
+    const hops = third ? [first, second, third] : [first, second]
+    const prevCount = composites.length
+    const prefix = options.mode === 'runtime' ? 'Cross-Origin' : 'Cross-Service'
+    record(
+      options.mode === 'runtime' ? 'cross_origin_runtime_workflow' : 'cross_service_multi_sink',
+      `${prefix} ${hops.map(h => h.sinkKind).join(' -> ')} Chain`,
+      inferCategory(hops),
+      hops,
+    )
+    if (composites.length === prevCount) break
   }
 
   return composites
