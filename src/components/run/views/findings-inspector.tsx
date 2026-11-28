@@ -33,6 +33,11 @@ export function canGeneratePatch(f: Pick<FindingRow, 'status' | 'codeLocations'>
   return (f.status === 'confirmed' || f.status === 'static_verified') && (f.codeLocations?.length ?? 0) > 0
 }
 
+/** SHA-256 of the 0-LLM Verify Fix predicate compiled at confirmation (persisted inside `proof_receipt` JSON), if any. */
+function compiledPredicateShaOf(proofReceipt: unknown): string | null {
+  const compiled = proofReceipt && typeof proofReceipt === 'object' ? (proofReceipt as { compiledPredicate?: { predicateSha256?: unknown } | null }).compiledPredicate : null
+  return typeof compiled?.predicateSha256 === 'string' && compiled.predicateSha256 ? compiled.predicateSha256 : null
+}
 const TIER_L: Record<string, string> = { runtime_confirmed: 'Runtime confirmed', static_verified: 'Static advisory', baseline_confirmed: 'Baseline confirmed' }
 const RETEST_L: Record<string, string> = { reproduced: 'Still reproducible', fixed: 'Verified fixed', inconclusive: 'Inconclusive' }
 const RETEST_ST: Record<string, string> = { reproduced: 'failed', fixed: 'fixed', inconclusive: 'inconclusive' }
@@ -255,7 +260,7 @@ export function extractCompositeProofSummary(
     ? verification.confirmed
     : replaySpec?.proofVerdict === 'confirmed' || diffVerdict === 'confirmed'
       ? true
-      : replaySpec?.proofVerdict === 'dismissed' || replaySpec?.proofVerdict === 'inconclusive'
+      : replaySpec?.proofVerdict === 'dismissed' || replaySpec?.proofVerdict === 'inconclusive' || replaySpec?.proofVerdict === 'needs_review'
         ? false
         : null
   const terminalOracleFamily = typeof verification?.terminalOracleFamily === 'string' && verification.terminalOracleFamily
@@ -676,6 +681,7 @@ function FixVerifyActions({ f, primaryExchangeId }: { f: FindingRow; primaryExch
   const patches = (detail.patchProposals ?? []).filter(p => p.findingId === f.id)
   const active = detail.assignments.some(a => a.phase === 'retest' && (a.status === 'queued' || a.status === 'running') && (a.stepId === f.id || a.objective.includes(f.id) || (replay && a.objective.includes(replay.id))))
   const canRetest = canVerifyFix(f)
+  const compiledPredicateSha = compiledPredicateShaOf(replay?.proofReceipt)
   const canPatch = canGeneratePatch(f)
   if (!primaryExchangeId && !canRetest && !canPatch && !retests.length && !patches.length) return null
 
@@ -710,6 +716,7 @@ function FixVerifyActions({ f, primaryExchangeId }: { f: FindingRow; primaryExch
     {(primaryExchangeId || canRetest || canPatch) && <div className="mb-2.5 mt-2 flex flex-wrap items-center gap-2">
       <CopyCurlButton exchangeId={primaryExchangeId} />
       {canRetest && <VerifyFixButton busy={active || verifying} disabled={active || verifying || pending > 0} onClick={() => void runVerifyFix()} />}
+      {canRetest && compiledPredicateSha && <Tag mono title={`Verify Fix replays a compiled, deterministic predicate (no model calls) · sha256 ${compiledPredicateSha.slice(0, 12)}`}>0-LLM predicate</Tag>}
       {canPatch && <button type="button" className={runBtn()} disabled={patching} onClick={() => void runGeneratePatch()} title="Generate and verify a code patch for this finding">
         <Icon name="edit" />{patching ? 'Generating patch…' : 'Generate verified patch'}
       </button>}
@@ -821,11 +828,15 @@ export function FindingInspector({ sel }: InspectorProps) {
           <button type="button" className={cn(runBtn({ variant: 'ghost' }), 'ml-auto')} onClick={() => links.finding(superseded.id)}>Open<Icon name="arrowR" /></button></div>}
         <div className="mb-2.5 flex flex-wrap gap-1.5">
           <Tag><SevGlyph sev={f.severity} />{f.severity ? (SEV_LABEL[f.severity] ?? f.severity) : 'Unrated'}</Tag>
-          <Tag tone={st === 'confirmed' ? 'accent' : st === 'static_verified' ? 'solid' : undefined}><StatusGlyph status={st} />{stLabel(st)}</Tag>
+          <Tag tone={st === 'confirmed' ? 'accent' : st === 'static_verified' ? 'solid' : st === 'needs_review' ? 'warn' : undefined}><StatusGlyph status={st} />{stLabel(st)}</Tag>
           {st === 'confirmed' && !replay && !evs.length && !exIds.length && <Tag tone="warn">No receipt attached</Tag>}
           {triage && triage.status !== 'open' && triageMeta && <Tag tone={triageMeta.tone}>Triage: {triageMeta.short}</Tag>}
           {triage?.severityOverride && <Tag>Override: {SEV_LABEL[triage.severityOverride] ?? triage.severityOverride}</Tag>}
         </div>
+        {st === 'needs_review' && <div data-slot="needs-review-banner" className="mb-3 flex items-start gap-2 rounded-[7px] bg-warn-soft px-2.5 py-2 text-[12px] leading-[17px] text-fg-muted shadow-[inset_0_0_0_1px_var(--warn-line)]">
+          <Icon name="alert" className="mt-0.5 flex-none text-warn" />
+          <span><b className="font-medium text-fg">Needs review</b> — the policy judge found supporting evidence but could not confirm it by replay. Review the evidence before reporting this finding.</span>
+        </div>}
         <h2 className="m-0 mb-3 break-words text-[15px] font-semibold leading-[22px] tracking-[-0.012em] text-fg"><FindingTitle title={f.title} /></h2>
         <Props rows={findingPropRows(f, spans, {
           origin: () => links.host(f.origin),

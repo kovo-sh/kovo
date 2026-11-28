@@ -6,7 +6,7 @@ import { cn } from '../../lib/cn.ts'
 import { isRunDeleteBlocked, isRunInProgress } from '../../server/run-status.ts'
 import { Icon } from '../run/icons.tsx'
 import { runStatusLabel } from '../run/meta.ts'
-import { capabilityTierMeta, formatUsd, phaseNames } from '../run-state.ts'
+import { capabilityTierMeta, formatCount, formatUsd, phaseNames } from '../run-state.ts'
 import { formatFullDateTime, formatRelativeTime, useNow } from '../shell/AppShell.tsx'
 import { Badge } from '../ui/badge.tsx'
 import { Button } from '../ui/button.tsx'
@@ -26,6 +26,56 @@ import { formatGithubPatBadge } from './types.ts'
 interface Props {
   data: ProjectLoaderData
   onSelectTab: (tab: ProjectTabId) => void
+  onNewRun?: () => void
+}
+
+type ProjectRun = ProjectLoaderData['runs'][number]
+
+/**
+ * Posture title built from lifecycle buckets so "in progress" never hides that
+ * runs are actually paused or awaiting approval. `needsAttention` drives the
+ * amber dot (only when a human has to act).
+ */
+function describeRunLifecycle(runs: readonly Pick<ProjectRun, 'status'>[]): {
+  title: string
+  needsAttention: boolean
+} {
+  let running = 0
+  let paused = 0
+  let awaiting = 0
+  for (const run of runs) {
+    // Canonical RunStatus only: `waiting` is the approval/consent wait; anything else in progress is running.
+    if (run.status === 'paused' || run.status === 'budget_paused') paused += 1
+    else if (run.status === 'waiting') awaiting += 1
+    else running += 1
+  }
+  const title = [
+    running > 0 ? `${formatCount(running)} running` : '',
+    paused > 0 ? `${formatCount(paused)} paused` : '',
+    awaiting > 0 ? `${formatCount(awaiting)} awaiting approval` : '',
+  ].filter(Boolean).join(' · ')
+  return { title, needsAttention: paused > 0 || awaiting > 0 }
+}
+
+/** Posture headline that reads as a sentence. */
+function describePosture(input: {
+  runs: readonly Pick<ProjectRun, 'status'>[]
+  inProgress: readonly Pick<ProjectRun, 'status'>[]
+  hostCount: number
+}): { title: string; dot: string | undefined } {
+  const { runs, inProgress, hostCount } = input
+  if (runs.length === 0) {
+    return {
+      title: hostCount > 0 ? `Ready to assess ${plural(hostCount, 'host')}` : 'Add a host to start assessing',
+      dot: undefined,
+    }
+  }
+  if (inProgress.length > 0) {
+    const lifecycle = describeRunLifecycle(inProgress)
+    return { title: lifecycle.title, dot: lifecycle.needsAttention ? 'paused' : 'running' }
+  }
+  const latestStatus = runs[0]!.status
+  return { title: `Latest run ${runStatusLabel(latestStatus).toLowerCase()}`, dot: latestStatus }
 }
 
 const SETUP_GRID_COLS: Record<number, string> = {
@@ -35,7 +85,7 @@ const SETUP_GRID_COLS: Record<number, string> = {
 }
 
 function plural(count: number, singular: string, pluralWord = `${singular}s`): string {
-  return `${count} ${count === 1 ? singular : pluralWord}`
+  return `${formatCount(count)} ${count === 1 ? singular : pluralWord}`
 }
 
 function statusDotClass(status: string | undefined): string {
@@ -189,7 +239,7 @@ function GithubSetupSvg({ ready }: { ready: boolean }) {
   )
 }
 
-export function ProjectOverviewTab({ data, onSelectTab }: Props) {
+export function ProjectOverviewTab({ data, onSelectTab, onNewRun }: Props) {
   const { project, assets, personas, specs, runs, githubPatStatus } = data
   const navigate = useNavigate()
   const router = useRouter()
@@ -236,7 +286,7 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
   }
   const latestRun = runs[0]
   const completedRuns = runs.filter(r => r.status === 'complete').length
-  const activeRuns = runs.filter(r => isRunInProgress(r.activity ?? r.status)).length
+  const inProgressRuns = runs.filter(r => isRunInProgress(r.activity ?? r.status))
   const wildcardCount = assets.filter(a => a.includeSubdomains && !a.thirdParty).length
   const thirdPartyCount = assets.filter(a => a.thirdParty).length
   const allowlistCount = (project.sandboxWriteAllowlist ?? []).length
@@ -261,11 +311,7 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
   ]
   const pendingSetup = setupItems.filter(item => !item.done)
   const completedSetup = setupItems.length - pendingSetup.length
-  const postureTitle = runs.length === 0
-    ? `Ready to assess ${plural(assets.length, 'host')}`
-    : activeRuns > 0
-      ? `${plural(activeRuns, 'run')} in progress`
-      : `Latest run ${runStatusLabel(latestRun!.status)}`
+  const posture = describePosture({ runs, inProgress: inProgressRuns, hostCount: assets.length })
   const postureSub = latestRun
     ? [
       capabilityTierMeta[latestRun.capabilityTier]?.name ?? 'Standard',
@@ -308,12 +354,15 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
       >
         <div className="flex min-w-0 flex-[1_1_320px] items-center gap-2.5">
           <span
-            className={cn('inline-block size-2 flex-none rounded-full', statusDotClass(latestRun?.status))}
+            className={cn('inline-block size-2 flex-none rounded-full', statusDotClass(posture.dot))}
             aria-hidden="true"
           />
           <div className="flex min-w-0 flex-col gap-0.5">
-            <div className="flex flex-wrap items-center gap-2 text-[15px] font-semibold leading-[22px] tracking-[-0.012em] text-fg">
-              {postureTitle}
+            <div
+              className="flex flex-wrap items-center gap-2 text-[15px] font-semibold leading-[22px] tracking-[-0.012em] text-fg"
+              data-slot="posture-title"
+            >
+              {posture.title}
               {project.environment === 'local-lab' && <Badge variant="warn">Local Lab</Badge>}
             </div>
             <div className="text-[12px] leading-[18px] text-fg-subtle">{postureSub}</div>
@@ -321,31 +370,31 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
         </div>
         <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1.5 text-[12px] tabular-nums text-fg-subtle">
           <span>
-            <b className="font-semibold text-fg-muted">{assets.length}</b> hosts
-            {wildcardCount > 0 ? ` · ${wildcardCount} *.domain` : ''}
+            <b className="font-semibold text-fg-muted">{formatCount(assets.length)}</b> hosts
+            {wildcardCount > 0 ? ` · ${formatCount(wildcardCount)} *.domain` : ''}
           </span>
           <span>
-            <b className="font-semibold text-fg-muted">{personas.length}</b> accounts
+            <b className="font-semibold text-fg-muted">{formatCount(personas.length)}</b> accounts
           </span>
           <span>
-            <b className="font-semibold text-fg-muted">{specs.length}</b> specs
+            <b className="font-semibold text-fg-muted">{formatCount(specs.length)}</b> specs
           </span>
           {allowlistCount > 0 && (
             <span>
-              <b className="font-semibold text-fg-muted">{allowlistCount}</b> write rules
+              <b className="font-semibold text-fg-muted">{formatCount(allowlistCount)}</b> write rules
             </span>
           )}
           {thirdPartyCount > 0 && (
             <span>
-              <b className="font-semibold text-fg-muted">{thirdPartyCount}</b> third-party
+              <b className="font-semibold text-fg-muted">{formatCount(thirdPartyCount)}</b> third-party
             </span>
           )}
           <span className={githubPatStatus.configured ? 'text-fg-muted' : 'text-fg-subtle'}>
-            {formatGithubPatBadge(githubPatStatus)}
+            {githubPatStatus.configured ? formatGithubPatBadge(githubPatStatus) : 'GitHub not connected'}
           </span>
           {latestRun && latestRun.spentRequests > 0 && (
             <span>
-              <b className="font-semibold text-fg-muted">{latestRun.spentRequests}</b> reqs · {formatUsd(latestRun.spentUsd)}
+              <b className="font-semibold text-fg-muted">{formatCount(latestRun.spentRequests)}</b> reqs · {formatUsd(latestRun.spentUsd)}
             </span>
           )}
         </div>
@@ -432,24 +481,25 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
                 <Link
                   to="/runs/$runId"
                   params={{ runId: run.id }}
-                  className="flex min-h-[42px] min-w-0 flex-1 items-center gap-3 px-1.5 py-[7px] text-inherit no-underline"
+                  className="flex min-h-[42px] min-w-0 flex-1 items-center gap-3 px-1.5 py-[7px] text-inherit no-underline max-[480px]:flex-wrap max-[480px]:gap-y-1"
+                  data-slot="overview-run-row"
                 >
                   <span
                     className={cn('inline-block size-[7px] flex-none rounded-full', statusDotClass(run.status))}
                     aria-hidden="true"
                   />
-                  <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <span className="flex min-w-0 flex-1 flex-col gap-0.5 [overflow-wrap:anywhere]">
                     <span className="flex min-w-0 flex-wrap items-center gap-1.5 font-medium text-fg">
                       <span className="truncate" title={runTitle !== run.goal ? run.goal : undefined}>{runTitle}</span>
                     </span>
-                    <span className="text-[12px] tabular-nums text-fg-subtle">
+                    <span className="text-[12px] tabular-nums text-fg-subtle" data-slot="overview-run-meta">
                       {capabilityTierMeta[run.capabilityTier]?.name ?? 'Standard'} · {phaseNames[run.phase]}
                       {run.findingCount > 0 ? ` · ${plural(run.findingCount, 'finding')}` : ''}
-                      {run.confirmedCount > 0 ? ` (${run.confirmedCount} confirmed)` : ''}
-                      {' '}· {run.turnsUsed} turns · {run.spentRequests} reqs · {formatUsd(run.spentUsd)}
+                      {run.confirmedCount > 0 ? ` (${formatCount(run.confirmedCount)} confirmed)` : ''}
+                      {' '}· {formatCount(run.turnsUsed)} turns · {formatCount(run.spentRequests)} reqs · {formatUsd(run.spentUsd)}
                     </span>
                   </span>
-                  <span className="flex flex-none items-center gap-2.5">
+                  <span className="flex flex-none items-center gap-2.5 max-[480px]:basis-full max-[480px]:flex-wrap max-[480px]:gap-y-1 max-[480px]:pl-[19px]">
                     <Badge variant="neutral" className="bg-sunk">{runStatusLabel(run.status)}</Badge>
                     <time
                       className="text-[12px] tabular-nums text-fg-subtle"
@@ -471,7 +521,7 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
                     onClick={() => void handleRerun(run)}
                   >
                     <Icon name="replay" size={12} />
-                    {rerunningRunId === run.id ? 'Starting…' : 'Re-run'}
+                    <span className="max-[480px]:sr-only">{rerunningRunId === run.id ? 'Starting…' : 'Re-run'}</span>
                   </Button>
                 )}
                 <Button
@@ -497,8 +547,15 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
             <EmptyState
               icon={<RunsEmptySvg />}
               title="No runs yet"
-              description={`Start a ${capabilityTierMeta[1].name} to map your surface, or run ${capabilityTierMeta[2].name} with test accounts to verify access controls across ${project.name}. Use New run in the header to begin.`}
-              className="max-w-[440px] py-9 [&_[data-slot=empty-state-icon]]:size-auto [&_[data-slot=empty-state-icon]>svg]:h-[88px] [&_[data-slot=empty-state-icon]>svg]:w-[180px]"
+              description={`Start a ${capabilityTierMeta[1].name} to map your surface, or run ${capabilityTierMeta[2].name} with test accounts to verify access controls across ${project.name}.`}
+              action={onNewRun ? (
+                // Distinct name from the header's "New run" so the two controls are distinguishable.
+                <Button type="button" variant="default" onClick={onNewRun}>
+                  <Icon name="plus" size={13} />
+                  Start first run
+                </Button>
+              ) : undefined}
+              className="max-w-[440px] py-9 [overflow-wrap:anywhere] [&_[data-slot=empty-state-icon]]:size-auto [&_[data-slot=empty-state-icon]>svg]:h-[88px] [&_[data-slot=empty-state-icon]>svg]:w-[180px]"
             />
           </div>
         )}
@@ -558,10 +615,10 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
                     </Badge>
                     <Badge variant="neutral" className="bg-panel">
                       {plural(runToDelete.findingCount, 'finding')}
-                      {runToDelete.confirmedCount > 0 ? ` (${runToDelete.confirmedCount} confirmed)` : ''}
+                      {runToDelete.confirmedCount > 0 ? ` (${formatCount(runToDelete.confirmedCount)} confirmed)` : ''}
                     </Badge>
                     <Badge variant="neutral" className="bg-panel">
-                      {runToDelete.spentRequests} req · {formatUsd(runToDelete.spentUsd)}
+                      {formatCount(runToDelete.spentRequests)} req · {formatUsd(runToDelete.spentUsd)}
                     </Badge>
                   </div>
                 </div>

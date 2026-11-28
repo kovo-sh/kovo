@@ -21,7 +21,7 @@ export const findingSeverityOrder: Record<Finding['severity'], number> = {
 }
 
 export const findingStatusOrder: Record<Finding['status'], number> = {
-  confirmed: 0, static_verified: 1, pending: 2, inconclusive: 3, dismissed: 4,
+  confirmed: 0, static_verified: 1, needs_review: 2, pending: 3, inconclusive: 4, dismissed: 5,
 }
 
 export const HEADER_HYGIENE_CHECK_IDS = [
@@ -312,6 +312,8 @@ export interface FindingsViewCounts {
   suppressed: number
   excluded: number
   pending: number
+  /** Tier-2 policy-judge findings held for operator review (never runtime-confirmed). */
+  needsReview: number
   inconclusive: number
   dismissed: number
   bySeverity: Record<CanonicalSeverity, number>
@@ -496,6 +498,7 @@ export function projectRunFindings<T extends FindingsViewInputRow>(
   const bySeverity: Record<CanonicalSeverity, number> = { critical: 0, high: 0, medium: 0, low: 0, informational: 0 }
   const byConfirmedSeverity: Record<CanonicalSeverity, number> = { critical: 0, high: 0, medium: 0, low: 0, informational: 0 }
   let pending = 0
+  let needsReview = 0
   let inconclusive = 0
   let dismissed = 0
 
@@ -513,6 +516,7 @@ export function projectRunFindings<T extends FindingsViewInputRow>(
       else {
         bySeverity[item.effectiveSeverity]++
         if (item.finding.status === 'pending' || item.finding.status === 'proposed') pending++
+        else if (item.finding.status === 'needs_review') needsReview++
         else inconclusive++
       }
     }
@@ -538,6 +542,7 @@ export function projectRunFindings<T extends FindingsViewInputRow>(
       suppressed: suppressed.length,
       excluded: excluded.length,
       pending,
+      needsReview,
       inconclusive,
       dismissed,
       bySeverity,

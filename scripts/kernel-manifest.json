@@ -15,6 +15,7 @@
     "src/server/nonce-ledger.ts",
     "src/server/oracle-invariants.ts",
     "src/server/oracle-spec.ts",
+    "src/server/policy-judge.ts",
     "src/server/proof-kernel/boolean-differential.ts",
     "src/server/proof-kernel/control-legitimacy.ts",
     "src/server/proof-kernel/index.ts",
@@ -28,6 +29,7 @@
     "src/server/v8-oracle-families.ts",
     "src/server/v8-oracle-hydrate.ts",
     "src/server/verify-claims.ts",
+    "src/server/verify-fix-predicate.ts",
     "src/server/verify-prove-handlers.ts",
     "src/server/verify-rpc.ts",
     "src/server/verify-support.ts"
@@ -210,6 +212,16 @@
       ]
     },
     {
+      "file": "src/server/policy-judge.ts",
+      "reasons": [
+        "call_graph_reachable"
+      ],
+      "matchedExports": [],
+      "reachableFrom": [
+        "src/server/terminal-oracle-registry.ts::evaluateTerminalOracle"
+      ]
+    },
+    {
       "file": "src/server/proof-kernel/boolean-differential.ts",
       "reasons": [
         "call_graph_reachable",
@@ -381,6 +393,16 @@
         "src/server/verify-prove-handlers.ts::handleProvePersistedMutation",
         "src/server/verify-prove-handlers.ts::handleProveRace",
         "src/server/verify-prove-handlers.ts::handleProveSignedUrlMint"
+      ]
+    },
+    {
+      "file": "src/server/verify-fix-predicate.ts",
+      "reasons": [
+        "call_graph_reachable"
+      ],
+      "matchedExports": [],
+      "reachableFrom": [
+        "src/server/terminal-oracle-registry.ts::evaluateTerminalOracle"
       ]
     },
     {

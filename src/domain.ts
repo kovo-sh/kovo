@@ -491,7 +491,7 @@ export type HttpMethod = typeof httpMethods[number]
 export const verificationTiers = ['runtime_confirmed', 'static_verified', 'baseline_confirmed'] as const
 export type VerificationTier = typeof verificationTiers[number]
 
-export const findingStatuses = ['pending', 'confirmed', 'static_verified', 'dismissed', 'inconclusive'] as const
+export const findingStatuses = ['pending', 'confirmed', 'static_verified', 'needs_review', 'dismissed', 'inconclusive'] as const
 export type FindingStatus = typeof findingStatuses[number]
 
 export const coverageClosureStatuses = ['reported', 'no_issue_found', 'ruled_out', 'not_applicable', 'needs_follow_up'] as const
@@ -507,7 +507,7 @@ export const dynamicRetestVerdicts = ['fixed', 'reproduced', 'skipped'] as const
 export type DynamicRetestVerdict = typeof dynamicRetestVerdicts[number]
 
 export const inlineVerifyFeedbackSchema = z.object({
-  verdict: z.enum(['confirmed', 'static_verified', 'dismissed', 'inconclusive']),
+  verdict: z.enum(['confirmed', 'static_verified', 'needs_review', 'dismissed', 'inconclusive']),
   verificationTier: z.enum(verificationTiers).optional(),
   failedStepId: z.string().optional(),
   controlPassed: z.boolean(),

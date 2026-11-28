@@ -65,8 +65,9 @@ const visibilityBadgeVariants = cva(
   {
     variants: {
       visibility: {
-        private: 'rounded-full border border-line-2 bg-sunk px-1.5 font-medium text-fg-muted',
-        public: 'bg-transparent px-0.5 font-normal text-fg-subtle',
+        // Same pill geometry for both; only the tone differs.
+        private: 'rounded-full border border-line-2 bg-sunk px-1.5 font-medium leading-none text-fg-muted',
+        public: 'rounded-full border border-line bg-transparent px-1.5 font-medium leading-none text-fg-subtle',
       },
     },
   },
@@ -236,7 +237,7 @@ export function GroupedRepoPicker({
       {showToolbar && (
         <div
           className={cn(
-            'flex items-center gap-1.5 border-b border-line bg-panel transition-colors duration-[var(--d1)] focus-within:border-b-accent-line',
+            'flex flex-wrap items-center gap-1.5 border-b border-line bg-panel transition-colors duration-[var(--d1)] focus-within:border-b-accent-line',
             isDetailed ? 'min-h-10 py-[5px] pl-4 pr-3' : 'min-h-9 py-1 pl-3 pr-2',
           )}
         >
@@ -244,7 +245,7 @@ export function GroupedRepoPicker({
             <Icon name="search" size={13} className="flex-none text-fg-subtle" />
             <input
               type="search"
-              className="h-[26px] w-full min-w-0 flex-1 rounded-none border-0 bg-transparent p-0 text-[12.5px] leading-5 text-fg shadow-none outline-none placeholder:text-fg-subtle focus:shadow-none focus:outline-none"
+              className="h-[26px] w-full min-w-0 flex-1 truncate rounded-none border-0 bg-transparent p-0 text-[12.5px] leading-5 text-fg shadow-none outline-none placeholder:text-fg-subtle focus:shadow-none focus:outline-none [&::-webkit-search-cancel-button]:appearance-none [&::-webkit-search-decoration]:appearance-none"
               value={search}
               onChange={e => onSearchChange(e.target.value)}
               placeholder={
@@ -257,7 +258,7 @@ export function GroupedRepoPicker({
               disabled={disabled}
             />
           </div>
-          <div className="flex flex-none items-center gap-0.5">
+          <div className="flex flex-none items-center gap-0.5 max-[480px]:basis-full max-[480px]:justify-end">
             <button
               type="button"
               className="h-6 cursor-pointer rounded-[5px] border-0 bg-transparent px-[7px] text-[11.5px] font-medium text-fg-muted shadow-none transition-colors duration-[var(--d1)] hover:bg-hover hover:text-fg disabled:cursor-default disabled:opacity-45 disabled:hover:bg-transparent"
@@ -305,14 +306,15 @@ export function GroupedRepoPicker({
               <div key={group.owner} className="border-t border-line first:border-t-0">
                 <div
                   className={cn(
-                    'group/org flex items-center justify-between gap-1.5 bg-sunk transition-colors duration-[var(--d1)] hover:bg-[color-mix(in_srgb,var(--hover)_70%,var(--sunk))]',
+                    'group/org flex flex-wrap items-center justify-between gap-x-1.5 bg-sunk transition-colors duration-[var(--d1)] hover:bg-[color-mix(in_srgb,var(--hover)_70%,var(--sunk))]',
                     isDetailed ? 'min-h-[34px] pl-2.5 pr-3' : 'min-h-8 pl-1.5 pr-2',
                   )}
                 >
                   <button
                     type="button"
                     className={cn(
-                      'flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded-none border-0 bg-transparent px-1.5 text-left text-fg shadow-none hover:bg-transparent',
+                      // Never narrower than "@owner… (N)"; when the org actions no longer fit, the row wraps instead of overlapping.
+                      'flex min-w-[min(100%,16ch)] flex-1 cursor-pointer items-center gap-1.5 rounded-none border-0 bg-transparent px-1.5 text-left text-fg shadow-none hover:bg-transparent',
                       isDetailed ? 'h-[34px]' : 'h-8',
                     )}
                     aria-expanded={expanded}
@@ -327,21 +329,21 @@ export function GroupedRepoPicker({
                     >
                       <Icon name="chevR" size={12} />
                     </span>
-                    <span className="min-w-0 truncate text-[12px] font-semibold text-fg" title={group.owner}>
+                    <span className="min-w-[6ch] truncate text-[12px] font-semibold text-fg" title={group.owner}>
                       <span className="mr-px font-normal text-fg-subtle">@</span>
                       {group.owner}
                     </span>
-                    <span className="inline-flex h-[17px] min-w-[18px] flex-none items-center justify-center rounded-full border border-line-2 bg-panel px-[5px] text-[11px] font-medium tabular-nums text-fg-subtle">
+                    <span className="inline-flex h-[17px] min-w-[18px] shrink-0 items-center justify-center rounded-full border border-line-2 bg-panel px-[5px] text-[11px] font-medium leading-none tabular-nums text-fg-subtle" data-slot="owner-count-pill">
                       {isSearching ? `${group.items.length} / ${group.totalCount}` : group.items.length}
                     </span>
                     {selectedInGroup > 0 && (
-                      <span className="inline-flex h-[17px] flex-none items-center whitespace-nowrap rounded-full border border-accent/28 bg-accent-soft px-1.5 text-[10.5px] font-medium tabular-nums text-accent">
+                      <span className="inline-flex h-[17px] shrink-0 items-center whitespace-nowrap rounded-full border border-accent/28 bg-accent-soft px-1.5 text-[10.5px] font-medium leading-none tabular-nums text-accent" data-slot="owner-selected-pill">
                         {selectedInGroup} selected
                       </span>
                     )}
                   </button>
 
-                  <div className="flex flex-none items-center gap-0.5">
+                  <div className="ml-auto flex flex-none items-center gap-0.5" data-slot="org-actions">
                     {canSelectOrg && (
                       <button
                         type="button"
@@ -405,7 +407,10 @@ export function GroupedRepoPicker({
                                 >
                                   {repo.private ? 'private' : 'public'}
                                 </span>
-                                <span className="inline-flex h-[18px] flex-none items-center whitespace-nowrap rounded-full border border-line bg-sunk px-1.5 font-mono text-[10.5px] text-fg-muted">
+                                <span
+                                  className="inline-block h-[18px] min-w-0 max-w-[min(24ch,100%)] truncate whitespace-nowrap rounded-full border border-line bg-sunk px-1.5 font-mono text-[10.5px] leading-4 text-fg-muted"
+                                  title={repo.defaultBranch}
+                                >
                                   {repo.defaultBranch}
                                 </span>
                                 {updated?.label && (

@@ -64,7 +64,7 @@ function GithubMarkIcon() {
 function GithubBannerSvg() {
   return (
     <svg
-      className="block flex-none text-fg-muted"
+      className="block flex-none text-fg-muted max-[520px]:hidden"
       width="54"
       height="40"
       viewBox="0 0 58 44"
@@ -181,10 +181,10 @@ export function CreateProjectGithubBlock({
     return (
       <div className="flex flex-wrap items-center gap-[13px] overflow-hidden rounded-card border border-line-2 bg-sunk px-[15px] py-[13px] dark:bg-raise">
         <GithubBannerSvg />
-        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <div className="flex min-w-0 grow basis-[220px] flex-col gap-0.5">
           <span className="flex flex-wrap items-center gap-2">
             <strong className="text-[13.5px] font-semibold leading-[19px] text-fg">Connect GitHub</strong>
-            <Badge className="h-[19px] bg-panel text-[11px] font-medium tracking-[0.01em] text-fg-muted">
+            <Badge className="h-[19px] shrink-0 bg-panel text-[11px] font-medium tracking-[0.01em] text-fg-muted">
               Recommended
             </Badge>
           </span>
@@ -197,7 +197,7 @@ export function CreateProjectGithubBlock({
           search={{}}
           className={cn(
             buttonVariants({ variant: 'outline' }),
-            'flex-none no-underline',
+            'flex-none no-underline max-[520px]:w-full max-[520px]:justify-center',
             disabled && 'pointer-events-none opacity-50',
           )}
         >

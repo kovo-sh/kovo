@@ -94,6 +94,8 @@ export function StatusGlyph({ status }: { status: string | null | undefined }) {
       return <Ring stroke="var(--ok)" glyph={status}><path d="M4.6 7.1 6.3 8.8 9.5 5.4" fill="none" stroke="var(--ok)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></Ring>
     case 'static_verified':
       return <Ring stroke="var(--fg-3)" dash glyph={status}><path d="M5.4 5.2 3.8 7l1.6 1.8M8.6 5.2 10.2 7 8.6 8.8" fill="none" stroke="var(--fg-2)" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round" /></Ring>
+    case 'needs_review':
+      return <Ring stroke="var(--warn)" glyph={status}><path d="M7 4.2v3.3M7 9.7v.01" stroke="var(--warn)" strokeWidth="1.6" strokeLinecap="round" /></Ring>
     case 'reported':
       return <Ring stroke="var(--fg-3)" glyph={status}><path d="M7 4.25 9.75 7 7 9.75 4.25 7Z" fill="var(--fg-2)" /></Ring>
     case 'no_issue_found':

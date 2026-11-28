@@ -2309,7 +2309,7 @@ export class FindingsRepository {
     })
     if (!matches.length) return undefined
     const order: Record<Finding['status'], number> = {
-      confirmed: 0, static_verified: 1, pending: 2, inconclusive: 3, dismissed: 4,
+      confirmed: 0, static_verified: 1, needs_review: 2, pending: 3, inconclusive: 4, dismissed: 5,
     }
     return sortChainDuplicateRows(matches, order, r => rowCompSigById.get(r.id) ?? extractRowCompositeSignature(r))[0]
   }

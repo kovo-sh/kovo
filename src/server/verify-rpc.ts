@@ -2239,7 +2239,7 @@ export class VerifyRpcServer {
     const cwe = /\bCWE-\d{1,4}\b/i.exec(`${String(rawObj?.cwe ?? '')} ${String(ti?.cwe ?? '')} ${String(rawObj?.terminalVulnClass ?? '')} ${String(ti?.summary ?? ti?.claimedImpact ?? '')}`)?.[0]?.toUpperCase()
     const hopCount = typeof verdict.hopCount === 'number' ? verdict.hopCount : hops.length
     // R2-C-3: Return coarse confirmed/rejected diagnostics to the worker (NEVER raw leaf/stage/edge oracle feedback).
-    const workerReason = verdict.confirmed ? 'composite_verification_confirmed' : 'composite_verification_rejected'
+    const workerReason = verdict.confirmed ? 'composite_verification_confirmed' : verdict.verdict === 'needs_review' ? 'composite_verification_needs_review' : 'composite_verification_rejected'
     const workerRejectedBy = verdict.confirmed ? null : 'composite_receipt'
     const workerMissing = verdict.confirmed ? [] : ['composite_receipt']
     const claim: Extract<VerifyClaim, { kind: 'composite_receipt' }> = {
@@ -2250,7 +2250,7 @@ export class VerifyRpcServer {
       ...(!verdict.confirmed ? { rejectedBy: workerRejectedBy, missingEvidence: workerMissing, reason: workerReason } : {}),
     }
     return this.scrubRecord({
-      confirmed: verdict.confirmed, ok: verdict.confirmed, verified: verdict.confirmed, status: verdict.confirmed ? 'confirmed' : 'rejected',
+      confirmed: verdict.confirmed, ok: verdict.confirmed, verified: verdict.confirmed, status: verdict.confirmed ? 'confirmed' : verdict.verdict === 'needs_review' ? 'needs_review' : 'rejected',
       chainId, terminalVulnClass, ...(transcriptReplayMode ? { replayMode: transcriptReplayMode } : {}), hopCount,
       ...(verdict.confirmed ? { modeBVerified: verdict.modeBVerified, verifiedEdgeCount: verdict.verifiedEdges.filter(e => e.verified).length } : {}),
       ...(scrubbedRoute ? { terminalEndpoint: scrubbedRoute } : {}),

@@ -257,7 +257,7 @@ export function ProjectSourcesTab({ data }: Props) {
             {headerShowDiscoverBtn && (
               <Button
                 type="button"
-                variant={showRepoSheet ? 'outline' : 'default'}
+                variant="outline"
                 disabled={githubAction.pending}
                 onClick={openRepoPicker}
                 aria-expanded={repoPickerOpen}
@@ -308,7 +308,7 @@ export function ProjectSourcesTab({ data }: Props) {
             <Link
               to="/settings"
               search={{}}
-              className={cn(buttonVariants({ variant: 'default' }), 'flex-none no-underline')}
+              className={cn(buttonVariants({ variant: 'outline' }), 'flex-none no-underline')}
             >
               Connect GitHub in Settings
             </Link>
@@ -318,8 +318,8 @@ export function ProjectSourcesTab({ data }: Props) {
 
       {showRepoSheet && (
         <Card className="pw-repo-sheet mb-4 overflow-hidden border-line">
-          <CardHeader className="items-center py-2.5">
-            <span className="text-[13px] font-semibold text-fg">Select repositories to sync</span>
+          <CardHeader className="flex-wrap items-center gap-y-1.5 py-2.5">
+            <span className="min-w-0 text-[13px] font-semibold text-fg">Select repositories to sync</span>
             <div className="flex flex-wrap items-center gap-1.5">
               <Button type="button" variant="ghost" disabled={githubAction.pending} onClick={loadGithubRepos}>
                 {githubAction.pending && !reposLoaded ? 'Loading…' : 'Refresh'}
@@ -439,8 +439,8 @@ export function ProjectSourcesTab({ data }: Props) {
 
       {showLinkedReposCard && (
         <Card className="mb-4 overflow-hidden border-line">
-          <CardHeader className="items-center py-2.5">
-            <div className="flex items-center gap-2">
+          <CardHeader className="flex-wrap items-center gap-y-1.5 py-2.5">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
               <span className="text-[13px] font-semibold text-fg">
                 Linked repositories{' '}
                 <span className="font-normal tabular-nums text-fg-subtle">({linkedRepos.length})</span>
@@ -470,7 +470,8 @@ export function ProjectSourcesTab({ data }: Props) {
             ) : linkedRepos.length === 0 ? (
               <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 text-[12.5px] text-fg-subtle">
                 <span>No repositories synced to this project yet.</span>
-                {liveGithubStatus.configured && (
+                {/* The open picker already offers Refresh; don't stack a third discover/refresh action. */}
+                {liveGithubStatus.configured && !showRepoSheet && (
                   <Button type="button" variant="outline" onClick={openRepoPicker}>
                     Discover repositories
                   </Button>
@@ -599,8 +600,11 @@ export function ProjectSourcesTab({ data }: Props) {
                   <Button
                     type="button"
                     variant="ghost"
-                    className="data-[slot=button]:text-danger data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger"
+                    size="icon"
+                    className="data-[slot=button]:text-fg-subtle data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger data-[slot=button]:focus-visible:text-danger"
                     disabled={specAction.pending}
+                    aria-label={`Delete ${spec.name}`}
+                    title="Delete spec"
                     onClick={() => {
                       void specAction.submit(() => removeProjectSpec({ data: {
                         requestId: crypto.randomUUID(),
@@ -609,7 +613,7 @@ export function ProjectSourcesTab({ data }: Props) {
                       } }), () => setSpecNotice(`Removed spec "${spec.name}".`))
                     }}
                   >
-                    Delete
+                    <Icon name="trash" size={14} />
                   </Button>
                 </div>
               </div>
