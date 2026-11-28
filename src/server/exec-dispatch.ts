@@ -2004,8 +2004,9 @@ export const PHASE_B_AIMD_INCREASE_STEP = 2
 export const PHASE_B_AIMD_CLEAN_WINDOW_MS = 18_000
 export const PHASE_B_AIMD_CLEAN_COMPLETIONS_THRESHOLD = 3
 export const PHASE_B_AIMD_USD_PER_SLOT = 0.15
-export const PHASE_B_AIMD_RAM_GB_PER_SLOT = 0.75
-export const PHASE_B_AIMD_CPU_FRACTION = 0.75
+/** I/O-bound LLM/HTTP workers use ~30 MB RAM and spend ~85% awaiting LLM/HTTPS I/O; Docker verify slots are bounded separately in `worker-backend.ts`. */
+export const PHASE_B_AIMD_RAM_GB_PER_SLOT = 0.35
+export const PHASE_B_AIMD_CPU_FRACTION = 3
 export const PHASE_B_AIMD_SPAWN_LATENCY_WARN_MS = 8_000
 
 export type PhaseBPressureKind =
@@ -2038,7 +2039,7 @@ export function parseEnvPhaseBConcurrencyOverride(env: NodeJS.ProcessEnv = proce
   return Math.max(1, Math.min(maxWorkerConcurrency, Math.floor(parsed)))
 }
 
-/** Auto-compute host Phase-B concurrency ceiling from CPU cores and available RAM (~0.75 GiB/slot). */
+/** Auto-compute host I/O-bound LLM worker concurrency ceiling (`llmWorkerHardwareCap`) from CPU cores & available RAM (Docker verify containers are bounded separately). */
 export function computeHostPhaseBConcurrencyCap(input: {
   cpuCount?: number
   availMemBytes?: number
@@ -2099,6 +2100,7 @@ export interface PhaseBConcurrencySnapshot {
  */
 export class PhaseBConcurrencyController {
   readonly hardwareCap: number
+  get llmWorkerHardwareCap(): number { return this.hardwareCap }
   readonly override: number | null
   private readonly cleanWindowMs: number
   private readonly cleanCompletionsThreshold: number
@@ -4667,11 +4669,6 @@ function classifyCodeAuditChainRoles(input: {
   ) {
     roles.add('request_parsing')
   }
-  if (
-    /\b(?:concurren(?:t|cy)|race(?:\s+condition|\s+burst)?|toctou|parallel\s+(?:burst|request|settlement)|double[- ]?spend|idempoten(?:cy|t)|over[- ]?credit|settlement|balance\s+conservation|quota\s+bypass|withdrawal\s+race|refund\s+race)\b/.test(lower)
-  ) {
-    roles.add('concurrent_settlement')
-  }
   return roles
 }
 
@@ -4740,13 +4737,11 @@ function buildCompositeWorkflowHypothesis(input: {
     `Hop ${idx + 1} / Stage ${idx + 1} (${h.endpoint}, ${h.loc}): ${h.cue}`,
   )
   const compRoles = new Set(input.hops.flatMap(h => [...h.roles]))
-  const helperHint = compRoles.has('concurrent_settlement')
-    ? 'ctx.prove_race_burst + ctx.seal_capability'
-    : compRoles.has('signing_webhook')
-      ? 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign'
-      : compRoles.has('async_worker') || compRoles.has('cache_permission')
-        ? 'ctx.seal_capability + ctx.await_async'
-        : 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign/ctx.await_async'
+  const helperHint = compRoles.has('signing_webhook')
+    ? 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign'
+    : compRoles.has('async_worker') || compRoles.has('cache_permission')
+      ? 'ctx.seal_capability + ctx.await_async'
+      : 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign/ctx.await_async'
   const intermediatePivotStage = input.hops.length === 2 ? [`Stage 3 (pivot via ${helperHint})`] : []
   const terminalStage = 'Terminal Verification (denied control BEFORE Stage 1 -> final readback/state change -> ctx.prove_composite)'
   const hopSequence = [...hopEntries, ...intermediatePivotStage, terminalStage].join(' -> ')
@@ -5249,36 +5244,32 @@ export function synthesizeRuntimeCompositeWave1Steps(
     }
   }
   const endpoints = filterGhostSurfaceProbeEndpoints(rawEndpoints, runExchanges, evidencedKeys)
-  const lifeBuckets = new Map<string, { create?: NormalizedRuntimeHopCandidate; rebind?: NormalizedRuntimeHopCandidate; finalize?: NormalizedRuntimeHopCandidate }>()
+  const collectionMutators = new Map<string, { root?: NormalizedRuntimeHopCandidate; member?: NormalizedRuntimeHopCandidate; subs: NormalizedRuntimeHopCandidate[] }>()
   for (const ep of endpoints) {
-    if (!assetByOrigin.has(ep.origin)) continue
-    if (ep.pathTemplate === '/' || /^\/(?:health|healthz|ready|metrics|favicon)/i.test(ep.pathTemplate)) continue
+    if (!assetByOrigin.has(ep.origin) || ep.pathTemplate === '/' || /^\/(?:health|healthz|ready|metrics|favicon)/i.test(ep.pathTemplate)) continue
     const method = ep.method.toUpperCase(), label = `${method} ${ep.pathTemplate}`
-    const authHint = ep.authRequirement ? `auth=${ep.authRequirement}` : 'auth=unspecified'
-    const before = candidates.length
+    const authHint = ep.authRequirement ? `auth=${ep.authRequirement}` : 'auth=unspecified', before = candidates.length
     pushCandidate({
-      origin: ep.origin,
-      endpoint: label,
-      cue: `Discovered ${label} (${authHint}) on ${hostOfOrigin(ep.origin)}`,
-      sinkKind: ep.sinkKinds?.[0],
-      extraText: `${authHint} ${(ep.sinkKinds ?? []).join(' ')}`,
-      baseScore: ep.riskScore ?? 55,
+      origin: ep.origin, endpoint: label, cue: `Discovered ${label} (${authHint}) on ${hostOfOrigin(ep.origin)}`,
+      sinkKind: ep.sinkKinds?.[0], extraText: `${authHint} ${(ep.sinkKinds ?? []).join(' ')}`, baseScore: ep.riskScore ?? 55,
     })
     const cand = candidates.find(c => c.origin === ep.origin && c.endpoint === label) ?? (candidates.length > before ? candidates[candidates.length - 1] : undefined)
-    if (!cand) continue
+    if (!cand || !/^(?:POST|PUT|PATCH|DELETE)$/.test(method)) continue
     const ent = inferEntityName(ep.pathTemplate)
-    if (ent && ent !== 'resource') {
-      const b = lifeBuckets.get(`${ep.origin}|${ent}`) ?? {}
-      if (!b.create && method === 'POST' && !/\/(?:rebind|update|approve|transfer|finalize|settle|release|export|complete)(?:\/|$)/i.test(ep.pathTemplate)) b.create = cand
-      else if (!b.rebind && (method === 'PATCH' || method === 'PUT' || /\/(?:rebind|update|assign|delegate|transfer|approve)(?:\/|$)/i.test(ep.pathTemplate))) b.rebind = cand
-      if (!b.finalize && /\/(?:finalize|settle|release|complete|commit|publish|capture|export|dispatch|confirm|payout)(?:\/|$)/i.test(ep.pathTemplate) && cand.key !== b.create?.key && cand.key !== b.rebind?.key) b.finalize = cand
-      lifeBuckets.set(`${ep.origin}|${ent}`, b)
-    }
+    if (!ent || ent === 'resource') continue
+    const parts = ep.pathTemplate.split('/').filter(Boolean).filter((s, i) => !(i < 2 && /^(?:api|v\d+)$/i.test(s)))
+    const paramIdx = parts.findIndex(s => /^[:{]/.test(s)), g = collectionMutators.get(`${ep.origin}|${ent}`) ?? { subs: [] }
+    if (paramIdx < 0 && parts.length === 1) { if (!g.root || method === 'POST') g.root = cand }
+    else if (paramIdx === parts.length - 1) { if (!g.member) g.member = cand }
+    else if (!g.subs.some(s => s.key === cand.key)) g.subs.push(cand)
+    collectionMutators.set(`${ep.origin}|${ent}`, g)
   }
-  for (const [ek, b] of lifeBuckets) {
-    const rk = `${ek.split('|')[1] ?? 'entity'}Id`
-    if (b.create && b.rebind && !depPairs.some(p => p.prod.key === b.create!.key && p.cons.key === b.rebind!.key)) depPairs.push({ prod: b.create, cons: b.rebind, resourceKey: rk })
-    if (b.rebind && b.finalize && !depPairs.some(p => p.prod.key === b.rebind!.key && p.cons.key === b.finalize!.key)) depPairs.push({ prod: b.rebind, cons: b.finalize, resourceKey: rk })
+  for (const [ek, g] of collectionMutators) {
+    const rk = `${ek.split('|')[1] ?? 'entity'}Id`, seq = [g.root, g.member, ...g.subs.slice(0, 2)].filter((c): c is NormalizedRuntimeHopCandidate => Boolean(c))
+    for (let i = 0; i + 1 < seq.length; i += 1) {
+      const prod = seq[i]!, cons = seq[i + 1]!
+      if (prod.key !== cons.key && !depPairs.some(p => p.prod.key === prod.key && p.cons.key === cons.key)) depPairs.push({ prod, cons, resourceKey: rk })
+    }
   }
 
   // 4. Collect from JSON OpenAPI specs when endpoints/facts are sparse.

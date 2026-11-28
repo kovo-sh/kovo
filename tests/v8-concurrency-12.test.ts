@@ -214,14 +214,16 @@ async function startFastMockLlm(
 // 1. Hardware Cap & Budget Cap Helpers
 // ============================================================================
 
-test('computeHostPhaseBConcurrencyCap derives ceiling 12 on 16c/11GiB and scales down on smaller hosts', () => {
+test('computeHostPhaseBConcurrencyCap derives ceiling 12 on 16c/11GiB and scales I/O-bound LLM workers generously on small VMs', () => {
   assert.equal(PHASE_B_AIMD_MAX_CEILING, 12)
   assert.equal(PHASE_B_AIMD_WARM_START, 6)
   assert.equal(computeHostPhaseBConcurrencyCap({ cpuCount: 16, availMemBytes: 11 * GiB }), 12)
   assert.equal(computeHostPhaseBConcurrencyCap({ cpuCount: 32, availMemBytes: 64 * GiB }), 12)
-  assert.equal(computeHostPhaseBConcurrencyCap({ cpuCount: 8, availMemBytes: 16 * GiB }), 6)
-  assert.equal(computeHostPhaseBConcurrencyCap({ cpuCount: 16, availMemBytes: 4.5 * GiB }), 6)
-  assert.equal(computeHostPhaseBConcurrencyCap({ cpuCount: 4, availMemBytes: 16 * GiB }), 3)
+  assert.equal(computeHostPhaseBConcurrencyCap({ cpuCount: 8, availMemBytes: 16 * GiB }), 12)
+  assert.equal(computeHostPhaseBConcurrencyCap({ cpuCount: 16, availMemBytes: 4.5 * GiB }), 12)
+  assert.equal(computeHostPhaseBConcurrencyCap({ cpuCount: 4, availMemBytes: 16 * GiB }), 12)
+  assert.equal(computeHostPhaseBConcurrencyCap({ cpuCount: 2, availMemBytes: 3.8 * GiB }), 6)
+  assert.equal(computeHostPhaseBConcurrencyCap({ cpuCount: 2, availMemBytes: 2.8 * GiB }), 6)
   assert.equal(computeHostPhaseBConcurrencyCap({ cpuCount: 2, availMemBytes: 1 * GiB }), 2)
 })
 
