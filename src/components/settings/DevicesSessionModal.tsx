@@ -104,6 +104,34 @@ export function DevicesIcon({ className }: { className?: string }) {
   )
 }
 
+/**
+ * Loopback-only pairing warning. While the auth status is loading the same
+ * box renders as an invisible-content placeholder, so the centred dialog keeps
+ * its loaded geometry instead of jumping ~60px when the fetch resolves.
+ */
+function LoopbackNote({ placeholder = false }: { placeholder?: boolean }) {
+  return (
+    <div
+      role={placeholder ? undefined : 'note'}
+      aria-hidden={placeholder || undefined}
+      data-slot={placeholder ? 'loopback-note-placeholder' : 'loopback-note'}
+      className={cn(
+        'flex flex-col gap-1 rounded-[7px] border px-[11px] py-[9px] text-[12px] leading-[17px] text-fg-muted',
+        placeholder
+          ? 'animate-pulse border-line bg-sunk [&>*]:invisible'
+          : 'border-warn/30 bg-warn-soft',
+      )}
+    >
+      <strong className="font-medium text-warn-text">Loopback-only pairing URL</strong>
+      <span>
+        This server is only reachable on <code className="font-mono text-[11.5px]">127.0.0.1</code> /{' '}
+        <code className="font-mono text-[11.5px]">localhost</code>, so pairing links only work in another browser on this same machine. To pair a phone or remote device, run behind an HTTPS reverse proxy and set{' '}
+        <code className="font-mono text-[11.5px]">KOVO_PUBLIC_ORIGIN</code>.
+      </span>
+    </div>
+  )
+}
+
 export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModalProps) {
   const [sessionState, setSessionState] = useState<SessionState>('loading')
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null)
@@ -177,6 +205,18 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
       }
     }
   }, [])
+
+  // The modal stays mounted (so Base UI can run its exit transition); clear
+  // per-visit state only after the close animation has finished.
+  function resetAfterClose() {
+    setSessionState('loading')
+    setPairingLink(null)
+    setExpiresAtMs(null)
+    setCopyState('idle')
+    setConfirmRotate(false)
+    setStatusMessage('')
+    setErrorMessage('')
+  }
 
   function markCopied() {
     setCopyState('copied')
@@ -299,6 +339,7 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
     <Dialog
       open={open}
       closeOnEscape={!busy}
+      onOpenChangeComplete={nextOpen => { if (!nextOpen) resetAfterClose() }}
       onOpenChange={(nextOpen, details) => {
         if (!nextOpen) {
           if (busy) {
@@ -325,7 +366,8 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
             <Button
               type="button"
               variant="ghost"
-              className="size-[26px] min-w-[26px] p-0 text-fg-subtle"
+              size="icon"
+              className="size-[26px] flex-none p-0 text-fg-subtle"
               onClick={onClose}
               disabled={busy}
               aria-label="Close"
@@ -349,12 +391,18 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
               </div>
             </div>
 
+            {sessionState === 'loading' ? (
+              <LoopbackNote placeholder />
+            ) : pairingLoopbackOnly && sessionState === 'active' ? (
+              <LoopbackNote />
+            ) : null}
+
             {!pairingLink ? (
               <div className="flex items-center gap-2">
                 <Button
                   type="button"
-                  variant="outline"
-                  className="h-7 bg-fg px-2.5 text-panel shadow-none hover:bg-fg hover:brightness-110 active:scale-[0.98]"
+                  variant="default"
+                  className="h-7 px-2.5"
                   disabled={controlsDisabled}
                   onClick={() => void handleMintPairingLink()}
                 >
@@ -393,7 +441,7 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
                     <Button
                       type="button"
                       variant="outline"
-                      className="h-7 border border-ok/35 bg-ok-soft px-2.5 text-ok shadow-none hover:bg-ok-soft"
+                      className="h-7 border border-ok/35 bg-ok-soft px-2.5 text-ok-text shadow-none hover:bg-ok-soft"
                       disabled={isExpired || busy}
                       onClick={() => void handleCopyExisting()}
                     >
@@ -434,24 +482,10 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
               </div>
             )}
 
-            {pairingLoopbackOnly && sessionState === 'active' && (
-              <div
-                role="note"
-                className="flex flex-col gap-1 rounded-[7px] border border-warn/30 bg-warn-soft px-[11px] py-[9px] text-[12px] leading-[17px] text-fg-muted"
-              >
-                <strong className="font-medium text-warn">Loopback-only pairing URL</strong>
-                <span>
-                  This server is only reachable on <code className="font-mono text-[11.5px]">127.0.0.1</code> /{' '}
-                  <code className="font-mono text-[11.5px]">localhost</code>, so pairing links only work in another browser on this same machine. To pair a phone or remote device, run behind an HTTPS reverse proxy and set{' '}
-                  <code className="font-mono text-[11.5px]">KOVO_PUBLIC_ORIGIN</code>.
-                </span>
-              </div>
-            )}
-
             {errorMessage && (
               <div
                 role="alert"
-                className="flex items-start gap-[7px] rounded-[7px] border border-danger/30 bg-danger-soft px-[11px] py-[9px] text-[12px] leading-[17px] text-danger"
+                className="flex min-w-0 items-start gap-[7px] rounded-[7px] border border-danger/30 bg-danger-soft px-[11px] py-[9px] text-[12px] leading-[17px] text-danger [overflow-wrap:anywhere]"
               >
                 {errorMessage}
               </div>
@@ -460,10 +494,10 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
             {statusMessage && !errorMessage && (
               <div
                 role="status"
-                className="flex items-start gap-[7px] rounded-[7px] border border-ok/30 bg-ok-soft px-[11px] py-[9px] text-[12px] leading-[17px] text-ok"
+                className="flex min-w-0 items-start gap-[7px] rounded-[7px] border border-ok/30 bg-ok-soft px-[11px] py-[9px] text-[12px] leading-[17px] text-ok-text [overflow-wrap:anywhere]"
               >
                 <Icon name="check" size={13} className={cn(SVG_ICON_CLASS, 'mt-px size-[13px]')} />
-                <span>{statusMessage}</span>
+                <span className="min-w-0">{statusMessage}</span>
               </div>
             )}
           </section>

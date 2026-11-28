@@ -37,12 +37,10 @@ const DANGER_OUTLINE_BTN =
 function ModelProfilesEmptyIllustration() {
   return (
     <svg
-      width="180"
-      height="88"
       viewBox="0 0 180 88"
       fill="none"
       aria-hidden="true"
-      className="block text-fg"
+      className="block h-auto w-full max-w-[180px] text-fg"
     >
       <rect x="6" y="8" width="168" height="72" rx="10" fill="var(--sunk)" stroke="var(--line-2)" strokeWidth="1.2" />
       <rect x="20" y="29" width="34" height="30" rx="6" fill="var(--panel)" stroke="var(--line-strong)" strokeWidth="1.2" />
@@ -453,12 +451,12 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
         )}
 
         {displayError && (
-          <div role="alert" className="border-t border-line bg-danger-soft px-4 py-[9px] text-[12px] text-danger">
+          <div role="alert" className="min-w-0 border-t border-line bg-danger-soft px-4 py-[9px] text-[12px] text-danger [overflow-wrap:anywhere]">
             {displayError}
           </div>
         )}
         {notice && !error && (
-          <div role="status" className="border-t border-line bg-ok-soft px-4 py-[9px] text-[12px] text-ok">
+          <div role="status" className="min-w-0 border-t border-line bg-ok-soft px-4 py-[9px] text-[12px] text-ok-text [overflow-wrap:anywhere]">
             {notice}
           </div>
         )}
@@ -486,7 +484,8 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
             <Button
               type="button"
               variant="ghost"
-              className="size-6 min-w-6 rounded-[5px] p-0 text-fg-subtle"
+              size="icon"
+              className="size-6 flex-none rounded-[5px] p-0 text-fg-subtle"
               disabled={disconnecting}
               onClick={() => setConfirmDisconnect(false)}
               aria-label="Close"
@@ -546,23 +545,26 @@ function poolSummary(profiles: PublicModelProfile[]): { label: string; tone: 'ok
   const openCount = enabled.filter(p => p.healthState === 'open').length
   const halfCount = enabled.filter(p => p.healthState === 'half_open').length
   if (openCount === enabled.length) return { label: `All models unavailable · ${enabled.length} of ${profiles.length}`, tone: 'danger' }
-  if (openCount > 0 || halfCount > 0) return { label: `Some models unavailable · ${enabled.length} of ${profiles.length} enabled`, tone: 'warn' }
+  if (openCount > 0) return { label: `${openCount} unavailable · ${enabled.length} of ${profiles.length} enabled`, tone: 'warn' }
+  if (halfCount > 0) return { label: `${halfCount} recovering · ${enabled.length} of ${profiles.length} enabled`, tone: 'warn' }
   return { label: `Ready · ${enabled.length} of ${profiles.length} enabled`, tone: 'ok' }
 }
 
+/** Decimal token units: 999_999 -> "1M" (never "1000k"), 1_048_576 -> "1.05M". */
 function formatK(value: number) {
-  if (value >= 1_000_000) {
-    const m = value / 1_048_576
-    return Number.isInteger(m) ? `${m}M` : `${(value / 1_000_000).toFixed(2).replace(/\.?0+$/, '')}M`
-  }
+  if (value >= 999_500) return `${Number((value / 1_000_000).toFixed(2))}M`
   return value >= 1000 ? `${Math.round(value / 1000)}k` : String(value)
 }
 
+/** USD per 1M tokens with grouping ("$1,234.56"); sub-dime rates keep 2 significant digits. */
 function formatRate(value: number) {
   if (value === 0) return '$0'
-  if (value < 0.01) return `$${Number(value.toFixed(4))}`
-  if (value < 0.1) return `$${Number(value.toFixed(3))}`
-  return `$${value.toFixed(2)}`
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: value >= 0.1 ? 2 : 0,
+    maximumSignificantDigits: value < 0.1 ? 2 : undefined,
+  }).format(value)
 }
 
 function shortEndpointHost(endpoint: string): string {
@@ -592,9 +594,9 @@ function toneDotClass(tone: 'ok' | 'warn' | 'bad' | 'danger' | 'off' | 'neutral'
 function statusTextClass(tone: 'ok' | 'warn' | 'bad' | 'off'): string {
   switch (tone) {
     case 'ok':
-      return 'text-ok'
+      return 'text-ok-text'
     case 'warn':
-      return 'text-warn'
+      return 'text-warn-text'
     case 'bad':
       return 'text-danger'
     case 'off':
@@ -606,9 +608,14 @@ function WorkspaceSettingsBand({ workspace }: { workspace: { id: string; name: s
   const [name, setName] = useState(() => workspace.name)
   const [notice, setNotice] = useState('')
   const action = useAction()
+  // Last server value the field was synced to: revalidation only replaces the
+  // input while it is pristine, so an unsaved draft is never clobbered.
+  const syncedRef = useRef(workspace.name)
 
   useEffect(() => {
-    setName(workspace.name)
+    const previous = syncedRef.current
+    syncedRef.current = workspace.name
+    setName(current => (current === previous ? workspace.name : current))
   }, [workspace.name])
 
   const trimmed = name.trim()
@@ -666,18 +673,54 @@ function WorkspaceSettingsBand({ workspace }: { workspace: { id: string; name: s
             </Button>
           </div>
           {action.error && (
-            <div role="alert" className="border-t border-line bg-danger-soft px-4 py-[9px] text-[12px] text-danger">
+            <div role="alert" className="min-w-0 border-t border-line bg-danger-soft px-4 py-[9px] text-[12px] text-danger [overflow-wrap:anywhere]">
               {action.error}
             </div>
           )}
           {notice && !action.error && (
-            <div role="status" className="border-t border-line bg-ok-soft px-4 py-[9px] text-[12px] text-ok">
+            <div role="status" className="min-w-0 border-t border-line bg-ok-soft px-4 py-[9px] text-[12px] text-ok-text [overflow-wrap:anywhere]">
               {notice}
             </div>
           )}
         </form>
       </Card>
     </section>
+  )
+}
+
+function protocolLabel(protocol: PublicModelProfile['protocol']): string {
+  if (protocol === 'messages') return 'Anthropic Messages'
+  if (protocol === 'chat-completions') return 'OpenAI Chat Completions'
+  return 'OpenAI Responses'
+}
+
+// Each item carries its own leading "·" in a fixed 15px box; the row is
+// shifted left by that box inside an overflow-hidden wrapper, so the dot of
+// whichever item starts a line is clipped and no line starts or ends with an
+// orphan separator when the meta line wraps.
+const META_LINE_CLASS = [
+  '-ml-[15px] flex flex-wrap items-center gap-y-0.5 text-[12px] text-fg-subtle',
+  "[&>*]:whitespace-nowrap [&>*]:before:inline-block [&>*]:before:w-[15px] [&>*]:before:text-center [&>*]:before:text-fg-faint [&>*]:before:content-['·']",
+].join(' ')
+
+/** Protocol · endpoint · role · updated, with separators that travel with their items. */
+function ProfileMetaLine({ profile, updated }: {
+  profile: PublicModelProfile
+  updated: { label: string; full: string }
+}) {
+  return (
+    <div className="min-w-0 overflow-hidden" data-slot="profile-meta">
+      <div className={META_LINE_CLASS}>
+        <span>{protocolLabel(profile.protocol)}</span>
+        <span className="min-w-0 max-w-[260px] truncate font-mono text-[11.5px]" title={profile.endpoint}>
+          {shortEndpointHost(profile.endpoint)}
+        </span>
+        <span>Role: {profile.roleAffinity ?? 'any'}</span>
+        {updated.label && (
+          <span className="tabular-nums" title={updated.full}>Updated {updated.label}</span>
+        )}
+      </div>
+    </div>
   )
 }
 
@@ -745,7 +788,7 @@ function SettingsWorkbenchPage() {
   return (
     <main className="flex min-h-0 flex-1 flex-col bg-panel font-sans text-[13px] leading-5 tracking-[-0.003em] text-fg">
       <header className="sticky top-0 z-10 flex-none border-b border-line bg-panel px-4 sm:px-6">
-        <div className="flex h-11 min-w-0 items-center gap-2.5">
+        <div className="flex min-h-11 min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1.5 py-2">
           {runId ? (
             <>
               <Link
@@ -773,7 +816,7 @@ function SettingsWorkbenchPage() {
           </h1>
           <Badge
             variant={pool.tone}
-            className={cn('font-medium tabular-nums', pool.tone === 'neutral' && 'bg-sunk')}
+            className={cn('min-w-0 max-w-full shrink font-medium tabular-nums', pool.tone === 'neutral' && 'bg-sunk')}
           >
             <i className={cn('inline-block size-1.5 flex-none rounded-full', toneDotClass(pool.tone))} aria-hidden="true" />
             {pool.label}
@@ -783,7 +826,7 @@ function SettingsWorkbenchPage() {
             <div className="flex flex-none items-center gap-2">
               <Button type="button" variant="default" onClick={openCreate}>
                 <span aria-hidden="true">+</span>
-                Add model profile
+                <span className="max-[560px]:sr-only">Add model profile</span>
               </Button>
             </div>
           )}
@@ -793,7 +836,7 @@ function SettingsWorkbenchPage() {
       {poolAction.error && (
         <div
           role="alert"
-          className="flex flex-none items-center gap-2.5 border-b border-line bg-danger-soft px-4 py-2 text-[12.5px] text-danger sm:px-6"
+          className="flex min-w-0 flex-none items-center gap-2.5 border-b border-line bg-danger-soft px-4 py-2 text-[12.5px] text-danger [overflow-wrap:anywhere] sm:px-6"
         >
           <span className="min-w-0 flex-1">{poolAction.error}</span>
         </div>
@@ -801,7 +844,7 @@ function SettingsWorkbenchPage() {
       {pageStatus && !poolAction.error && (
         <div
           role="status"
-          className="flex flex-none items-center gap-2.5 border-b border-line bg-ok-soft px-4 py-2 text-[12.5px] text-ok sm:px-6"
+          className="flex min-w-0 flex-none items-center gap-2.5 border-b border-line bg-ok-soft px-4 py-2 text-[12.5px] text-ok-text [overflow-wrap:anywhere] sm:px-6"
         >
           <span className="min-w-0 flex-1">{pageStatus}</span>
           <Button
@@ -838,7 +881,7 @@ function SettingsWorkbenchPage() {
           {profiles.length === 0 ? (
             <Card className="border-line">
               <EmptyState
-                className="max-w-[560px] gap-3.5 px-6 py-10 [&>[data-slot=empty-state-icon]]:h-auto [&>[data-slot=empty-state-icon]]:w-auto [&>[data-slot=empty-state-icon]>svg]:h-auto [&>[data-slot=empty-state-icon]>svg]:w-auto"
+                className="max-w-[560px] gap-3.5 px-6 py-10 [&>[data-slot=empty-state-icon]]:h-auto [&>[data-slot=empty-state-icon]]:w-full [&>[data-slot=empty-state-icon]>svg]:h-auto [&>[data-slot=empty-state-icon]>svg]:w-full [&>[data-slot=empty-state-icon]>svg]:max-w-[180px]"
                 icon={<ModelProfilesEmptyIllustration />}
                 title="No model profiles configured"
                 description="Connect OpenRouter or any OpenAI / Anthropic compatible provider so Kovo can map attack surfaces, investigate security issues, and verify findings."
@@ -854,7 +897,8 @@ function SettingsWorkbenchPage() {
               <table className="w-full border-collapse text-left" aria-label="Configured model profiles">
                 <thead>
                   <tr>
-                    <th className="h-8 whitespace-nowrap border-b border-line bg-sunk px-3.5 text-[11.5px] font-medium text-fg-subtle">
+                    {/* Preferred share for the contained profile column (its content no longer sizes it). */}
+                    <th className="h-8 w-[36%] whitespace-nowrap border-b border-line bg-sunk px-3.5 text-[11.5px] font-medium text-fg-subtle">
                       Profile &amp; model
                     </th>
                     <th className="h-8 whitespace-nowrap border-b border-line bg-sunk px-3.5 text-[11.5px] font-medium text-fg-subtle">
@@ -882,40 +926,25 @@ function SettingsWorkbenchPage() {
                         data-enabled={profile.enabled}
                         className="border-b border-line transition-colors last:border-b-0 hover:bg-hover data-[enabled=false]:opacity-65"
                       >
-                        <td className="px-3.5 py-[11px] align-middle">
-                          <div className="flex min-w-[200px] flex-col gap-[3px]">
-                            <div className="flex flex-wrap items-center gap-[7px]">
-                              <span className="font-medium text-fg">{profile.name}</span>
+                        <td className="max-w-[460px] px-3.5 py-[11px] align-middle">
+                          {/* contain-inline-size: unbroken names, model IDs and URLs never raise the
+                              column's min-content width, so Status and Actions stay on screen. */}
+                          <div className="flex min-w-[200px] max-w-[460px] flex-col gap-[3px] contain-inline-size">
+                            <div className="flex min-w-0 flex-wrap items-center gap-[7px]">
                               <span
-                                className="max-w-full truncate font-mono text-[11.5px] text-fg-muted"
+                                className="line-clamp-2 min-w-0 font-medium text-fg [overflow-wrap:anywhere]"
+                                title={profile.name}
+                              >
+                                {profile.name}
+                              </span>
+                              <span
+                                className="min-w-0 max-w-full truncate font-mono text-[11.5px] text-fg-muted"
                                 title={profile.model}
                               >
                                 {profile.model}
                               </span>
                             </div>
-                            <div className="flex flex-wrap items-center gap-2 text-[12px] text-fg-subtle">
-                              <span>
-                                {profile.protocol === 'messages'
-                                  ? 'Anthropic Messages'
-                                  : profile.protocol === 'chat-completions'
-                                    ? 'OpenAI Chat Completions'
-                                    : 'OpenAI Responses'}
-                              </span>
-                              <span aria-hidden="true">·</span>
-                              <span className="font-mono text-[11.5px]" title={profile.endpoint}>
-                                {shortEndpointHost(profile.endpoint)}
-                              </span>
-                              <span aria-hidden="true">·</span>
-                              <span>Role: {profile.roleAffinity ?? 'any'}</span>
-                              {updated.label && (
-                                <>
-                                  <span aria-hidden="true">·</span>
-                                  <span className="tabular-nums" title={updated.full}>
-                                    Updated {updated.label}
-                                  </span>
-                                </>
-                              )}
-                            </div>
+                            <ProfileMetaLine profile={profile} updated={updated} />
                             {profile.lastError && (
                               <span
                                 className="mt-0.5 max-w-[440px] truncate text-[11.5px] text-danger"
@@ -1060,7 +1089,8 @@ function SettingsWorkbenchPage() {
             <Button
               type="button"
               variant="ghost"
-              className="size-6 min-w-6 rounded-[5px] p-0 text-fg-subtle"
+              size="icon"
+              className="size-6 flex-none rounded-[5px] p-0 text-fg-subtle"
               disabled={poolAction.pending}
               onClick={() => setConfirmDelete(null)}
               aria-label="Close"

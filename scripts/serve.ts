@@ -291,18 +291,23 @@ function bootstrapNotice(options: { bootstrapActive?: boolean; hostHint?: string
     ? 'docker compose exec kovo cat /data/bootstrap'
     : 'docker compose restart kovo'
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in to Kovo</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>
-:root{color-scheme:light dark;font-family:Inter,system-ui,-apple-system,sans-serif}
-body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#fbfbfa;color:#18181b}
-@media(prefers-color-scheme:dark){body{background:#141416;color:#f4f4f5}.card{background:#1c1c20;border-color:#2e2e34}input{background:#121215;border-color:#32323a;color:#f4f4f5}pre{background:#121215;border-color:#2e2e34}}
-.card{width:100%;max-width:460px;background:#fff;border:1px solid #e4e4e7;border-radius:12px;padding:28px;box-shadow:0 8px 30px rgba(0,0,0,.06)}
-h1{margin:0 0 8px;font-size:20px;font-weight:600}
-p{margin:0 0 16px;font-size:14px;line-height:1.5;color:#71717a}
+:root{color-scheme:light dark;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;--bg:#fbfbfa;--card:#fff;--line:#e4e4e7;--field-line:#d4d4d8;--fg:#18181b;--muted:#71717a;--sunk:#f4f4f5;--cta:#18181b;--cta-fg:#fff;--ring:rgba(47,95,223,.35);--ring-soft:rgba(47,95,223,.09);--shadow:0 8px 30px rgba(0,0,0,.06)}
+@media(prefers-color-scheme:dark){:root{--bg:#141416;--card:#1c1c20;--line:#2e2e34;--field-line:#3a3a42;--fg:#f4f4f5;--muted:#a1a1aa;--sunk:#121215;--cta:#f4f4f5;--cta-fg:#141416;--ring:rgba(108,147,255,.45);--ring-soft:rgba(108,147,255,.14);--shadow:0 8px 30px rgba(0,0,0,.4)}}
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;grid-template-columns:minmax(0,460px);justify-content:center;align-content:center;padding:24px 16px;background:var(--bg);color:var(--fg)}
+.card{min-width:0;width:100%;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:28px;box-shadow:var(--shadow)}
+@media(max-width:420px){.card{padding:22px 18px}}
+h1{margin:0 0 8px;font-size:20px;font-weight:600;color:var(--fg)}
+p{margin:0 0 16px;font-size:14px;line-height:1.5;color:var(--muted)}
+code{font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}
 form{display:flex;flex-direction:column;gap:12px;margin:16px 0}
-input{width:100%;box-sizing:border-box;padding:10px 12px;font:14px ui-monospace,SFMono-Regular,Menlo,monospace;border:1px solid #d4d4d8;border-radius:8px}
-button{padding:10px 14px;font-size:14px;font-weight:600;border:0;border-radius:8px;background:#18181b;color:#fff;cursor:pointer}
-@media(prefers-color-scheme:dark){button{background:#f4f4f5;color:#141416}}
+input{width:100%;min-width:0;padding:10px 12px;font:16px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg);background:var(--card);border:1px solid var(--field-line);border-radius:8px}
+input::placeholder{color:var(--muted);font-size:14px}
+input:focus-visible{outline:none;border-color:transparent;box-shadow:0 0 0 1px var(--ring),0 0 0 3px var(--ring-soft)}
+button{padding:10px 14px;font:inherit;font-size:14px;font-weight:600;border:0;border-radius:8px;background:var(--cta);color:var(--cta-fg);cursor:pointer}
+button:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
 .hint{font-size:13px}
-pre{margin:8px 0 0;padding:10px 12px;border-radius:8px;border:1px solid #e4e4e7;background:#f4f4f5;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;overflow-x:auto}
+pre{margin:8px 0 0;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--sunk);color:var(--fg);font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-all}
 </style></head><body><main class="card"><h1>Sign in to Kovo</h1><p>${subtitle}</p>${hostNote}<form method="GET" action="/"><input type="password" name="${bootstrapParam}" placeholder="Paste 64-character one-time token" autocomplete="off" spellcheck="false" autofocus required><button type="submit">Sign in</button></form><p class="hint">Missed the terminal banner? Run:</p><pre>${cmdHint}</pre></main></body></html>`
 }
 

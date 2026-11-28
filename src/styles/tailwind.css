@@ -74,6 +74,7 @@
   --color-accent-fg: var(--accent-fg);
   --color-accent-soft: var(--accent-soft);
   --color-accent-line: var(--accent-line);
+  --color-accent-text: var(--accent-text);
   --color-on-accent: var(--on-accent);
   --color-trace: var(--trace);
   --color-trace-soft: var(--trace-soft);
@@ -81,9 +82,11 @@
   /* Status ----------------------------------------------------------- */
   --color-ok: var(--ok);
   --color-ok-soft: var(--ok-soft);
+  --color-ok-text: var(--ok-text);
   --color-warn: var(--warn);
   --color-warn-soft: var(--warn-soft);
   --color-warn-line: var(--warn-line);
+  --color-warn-text: var(--warn-text);
   --color-danger: var(--danger);
   --color-danger-soft: var(--danger-soft);
   --color-crit: var(--crit);
@@ -130,4 +133,5 @@
   --ease-kovo: var(--ease);
   --ease-spring: var(--spring);
   --default-transition-duration: var(--d1);
+  --default-transition-timing-function: var(--ease);
 }
