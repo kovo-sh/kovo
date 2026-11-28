@@ -2,7 +2,7 @@ import { after, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { PassThrough, Writable } from 'node:stream'
@@ -742,9 +742,9 @@ describe('dispatch-worker: CLI', () => {
     const calls = readCalls(bins)
     assert.deepEqual(calls.map((c) => c.who), ['claude', 'opencode'])
     assert.deepEqual(calls[0].killSwitches, ['1', '1', '1'])
-    assert.equal(calls[0].cwd, wt)
+    assert.equal(realpathSync(calls[0].cwd), realpathSync(wt))
     assert.deepEqual(calls[1].argv, [...OPENCODE_ARGS_PREFIX, 'CLI task.'])
-    assert.equal(calls[1].cwd, wt)
+    assert.equal(realpathSync(calls[1].cwd), realpathSync(wt))
     assert.ok(readHandoff(wt).detectedModels.includes('claude-opus-4-8'))
     assertWorktreePreserved(wt, true)
   })
