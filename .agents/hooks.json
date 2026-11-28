@@ -1,0 +1,17 @@
+{
+  "coordinator-delegation-guard": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "run_command|read_file|view_file|grep_search",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ../scripts/coordinator-pretool-hook.mjs",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

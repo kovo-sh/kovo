@@ -50,6 +50,42 @@ moving — **not** doing hands-on codebase digging or editing yourself.
   them once the verifier finishes.
 - **Never push to a remote** unless the user explicitly asks.
 
+## 1-Call Budget & Subagent Routing Table
+
+Every coordinator turn operates under a **1-call orchestration budget**: the
+coordinator may run **at most 1 trivial orchestration check** directly per turn
+and MUST delegate all codebase, log, VM, Docker, DB, network, and editing work
+according to this table:
+
+| Task Category | Route To | Scope & Output Contract |
+| :------------ | :------- | :---------------------- |
+| Trivial orchestration check (max **1** call/turn: `git status`/`log`, `scripts/certify-v8.ts`, `scripts/benchmark-multihop.ts`, `scripts/merge-stream.sh`, `scripts/parallel-pulse.sh`, `scripts/worker-source-hash.sh`, `npm run worker:build`, `manage_task`, `uptime`, `df`, `ls`) | **Coordinator (direct)** | Scorecard, merge, branch status, build, or host-health check only. Never chain inline digging after an orchestration check. |
+| Local codebase / benchmark / log forensics (`rg`/`grep`, `read_file` on `src/`/`worker/`/`benchmarks/`, `report.json` reject signatures, `.meta.json` details) | `invoke_subagent(typeName: "research")` | Read-only inspection; returns concise structural summary (files, line numbers, mechanism class, recommended lease split; zero raw bodies/probes). |
+| Live VM / SSH / Docker / DB / network debugging (`ssh`, `docker exec`, `sqlite3`, container logs, port/network probes) | `invoke_subagent(typeName: "self")` | Isolated shell/SSH/Docker/DB investigation; returns a **<=10-line** structured summary of findings and next action. |
+| Code edits / fixes / tests / docs | `swarm(action="add", workspace="share")` | Exclusive disjoint file lease in an isolated worktree; commits locally and reports SHA + summary (use OpenCode fallback below on content-safety block). |
+
+### Mechanical Enforcement (`PreToolUse` Hook)
+
+The project hook [`.agents/hooks.json`](../../../.agents/hooks.json) runs
+[`scripts/coordinator-pretool-hook.mjs`](../../../scripts/coordinator-pretool-hook.mjs)
+on `PreToolUse` to enforce this routing mechanically when coordinator mode is
+active:
+
+- **Hard-blocks** coordinator inline `run_command` containing `ssh`,
+  `docker exec`, `sqlite3`, `rg`, `grep` (including `git grep`), and inline
+  `read_file`/`view_file` targeting `src/`, `worker/`, or `benchmarks/`.
+- **Always allows** whitelisted orchestration commands (`git`,
+  `scripts/merge-stream.sh`, `scripts/certify-v8.ts`,
+  `scripts/benchmark-multihop.ts`, `scripts/parallel-pulse.sh`,
+  `scripts/worker-source-hash.sh`, `npm run worker:build`, `uptime`, `df`,
+  `ls`).
+- **Never blocks subagents or swarm workers:** enforces only when the active
+  conversation owns `.system_generated/swarm/swarm.json` (`swarm_id ===
+  conversationId`) or `KOVO_COORDINATOR_MODE=1` is explicitly set outside
+  worker worktrees (`worktrees/*/swarm-*`).
+- **Emergency escape hatch:** set `KOVO_COORDINATOR_HOOK_BYPASS=1` only when
+  explicitly instructed by the operator.
+
 ## Worker Dispatch & Model Routing
 
 When spawning native swarm workers (`swarm(action="add", model=...)`), route by task complexity:
@@ -70,6 +106,7 @@ When spawning native swarm workers (`swarm(action="add", model=...)`), route by 
 1. **Main coordinator thread scorecard-only rule:** After a benchmark run completes, the coordinator may read **ONLY** the compact `certify-v8.ts` pass/fail scorecard and pure numeric counts (e.g., recall `6/12`, twin/unmatched FP counts, shortcut count, spend `$`, duration, funnel hop counts). **NEVER** print or load `topRejectDetails`, finding titles, routes/error signatures, `failureReason` detail strings, corpus entries, or `truth/blueprint.ts` files into the main coordinator context.
 2. **Isolate all detailed benchmark forensics in single-purpose subagents:** Never run forensics in the main coordinator thread. Any inspection of `report.json` reject signatures, `.meta.json` finding details, captured verification corpora, or per-chain failure causes **MUST** run inside a single-purpose subagent (e.g., `research` or a dedicated read-only worker) that returns only structured root-cause summaries (file paths, line numbers, mechanism class, fix lease — zero raw bodies, tokens, or probe strings).
 3. **Never point native workers at `benchmarks/multihop-saas/apps/*/truth/blueprint.ts` (or raw truth/solver files):** Native models (both Gemini and Claude) frequently trip content-safety filters on `truth/blueprint.ts` and raw truth/solver files. Keep native subagents and swarm workers scoped to `src/server/` plus numeric/structured metadata; if a task genuinely requires inspecting `truth/blueprint.ts` or raw truth/solver files and a native worker hits a filter block, immediately route that inspection through the OpenCode fallback below (`opencode run ...`).
+4. **Brief Hygiene Rule:** In coordinator prompts, briefs, and summaries, **NEVER** inline concrete fixture file paths, XML entity snippets, or secret-pattern regexes — always pass `file:line` + symbol/function name only (letting the isolated worker read the lines in its own worktree) to avoid false-positive content-safety filter triggers in the main thread.
 
 ## Content-Block Fallback: Delegate to OpenCode
 
@@ -120,18 +157,25 @@ scoped task to **OpenCode** in an isolated git worktree:
 ## Per-Turn Coordinator Checklist
 
 Before issuing tool calls in any turn, verify:
-1. Am I about to `grep`, `read_file`, or `edit_file` repo code, or print
-   benchmark forensics (`topRejectDetails`, finding titles, routes/error
-   signatures, `failureReason`, corpus entries, `truth/blueprint.ts`)? **Stop —
-   keep the main thread scorecard-only and delegate to a single-purpose
-   subagent/worker instead.**
-2. Do all active writers (native swarm + OpenCode worktrees) have **100%
+1. Am I respecting the **1-Call Budget & Subagent Routing Table**? At most 1
+   trivial orchestration check (`git status`/`log`, `certify-v8.ts`,
+   `manage_task`, `merge-stream.sh`, `uptime`, `df`) in the coordinator thread:
+   - Local codebase / benchmark / log forensics -> `invoke_subagent(typeName: "research")`
+   - Live VM / SSH / Docker / DB / network debugging -> `invoke_subagent(typeName: "self")` (returns <=10-line summary)
+   - Code edits / fixes -> `swarm(action="add", workspace="share")`
+2. Am I about to `grep`/`rg`, `ssh`, `docker exec`, `sqlite3`, `read_file` on
+   `src/`/`worker/`/`benchmarks/`, or print benchmark forensics
+   (`topRejectDetails`, finding titles, routes/error signatures,
+   `failureReason`, corpus entries, `truth/blueprint.ts`)? **Stop — keep the
+   main thread scorecard-only and delegate instead (the `PreToolUse` hook will
+   hard-block violations).**
+3. Do all active writers (native swarm + OpenCode worktrees) have **100%
    disjoint file leases**?
-3. Did any worker hit a content-safety block (or genuinely need to inspect
+4. Did any worker hit a content-safety block (or genuinely need to inspect
    `truth/blueprint.ts` / raw truth/solver files)? **Keep native workers off
    truth/solver files; kill/salvage any blocked worker and delegate that task to
    `opencode run --auto`.**
-4. Is any clean, completed branch ready to merge (and is the main checkout
+5. Is any clean, completed branch ready to merge (and is the main checkout
    free)? **Merge, gate, and kill the worker now.**
-5. Are all active streams running? **Park with `swarm_wait` or report concisely
+6. Are all active streams running? **Park with `swarm_wait` or report concisely
    to the user.**
