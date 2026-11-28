@@ -65,6 +65,7 @@ import {
 } from '../src/server/run-snapshot.ts'
 import type { SnapshotCheckpoint } from '../src/server/run-snapshot.ts'
 import { Store } from '../src/server/store.ts'
+import type { RunTokenTelemetrySummary, ToolResultByteDriver } from '../src/server/token-telemetry.ts'
 import type { WorkerBackend } from '../src/server/worker-backend.ts'
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
 import { VERIFY_RPC_SDK_VERSION } from '../src/server/verify-rpc.ts'
@@ -342,6 +343,9 @@ export async function loadMultihopRuntime(path: string = multihopRuntimePath()):
 
 export const DEFAULT_BUDGET_USD = 5
 export const DEFAULT_MAX_DURATION_MS = 30 * 60_000
+export const SMOKE_BUDGET_USD = 2
+export const SMOKE_DURATION_MIN = 10
+export const SMOKE_MAX_DURATION_MS = SMOKE_DURATION_MIN * 60_000
 export const DEFAULT_CONCURRENCY = 1
 export const DEFAULT_SNAPSHOT_MAX_AGE_MS = 24 * 60 * 60_000
 /** v8 Anti-Heuristic ceiling: Execution --no-llm MUST score <= 5% (target 0/16). */
@@ -352,6 +356,7 @@ export interface MultihopArgs {
   seeds: number[]
   mode: MultihopMode
   heldOut: boolean
+  smoke: boolean
   budgetUsd: number
   maxDurationMs: number
   outDir: string
@@ -395,9 +400,11 @@ Flags:
   --no-llm                  deterministic floor run AND Anti-Heuristic Gate:
                             exits 3 when overall chain recall > ${Math.round(ANTI_HEURISTIC_CEILING * 100)}%
   --verifier <kind>         auto | docker | local-jq (default: auto)
-  --budget-usd <n>          per-cell USD budget (default: ${DEFAULT_BUDGET_USD})
+  --smoke                   fast-iteration preset (defaults to --duration-min ${SMOKE_DURATION_MIN} --budget-usd ${SMOKE_BUDGET_USD}
+                            unless explicitly overridden by --duration-min/--max-duration-ms or --budget-usd)
+  --budget-usd <n>          per-cell USD budget (default: ${DEFAULT_BUDGET_USD}; ${SMOKE_BUDGET_USD} with --smoke)
   --max-duration-ms <n|10m|30m|60m>
-                            wall-clock cap per cell (default: ${Math.round(DEFAULT_MAX_DURATION_MS / 60_000)}m)
+                            wall-clock cap per cell (default: ${Math.round(DEFAULT_MAX_DURATION_MS / 60_000)}m; ${SMOKE_DURATION_MIN}m with --smoke)
   --duration-min <n>        alias for --max-duration-ms <n * 60000> (minutes, 1..360)
   --concurrency <n>         parallel app/seed cells (default: ${DEFAULT_CONCURRENCY})
   --worker-concurrency <n>  override in-run Execution worker slots (1..${maxWorkerConcurrency}; omitted = dynamic AIMD)
@@ -438,6 +445,12 @@ Exit codes:
   2  preflight error / inert agentic run (e.g., model profile + --verifier local-jq) / missing runtime
   3  Anti-Heuristic Gate violation (--no-llm recall > ${Math.round(ANTI_HEURISTIC_CEILING * 100)}%)
   4  Hardened-Twin Decoy FP / precision gate violation (hardenedTwinDecoyFps > 0)
+
+4-Tier Iteration Cadence:
+  Tier 0 ($0 offline):      node --experimental-strip-types scripts/replay-v8-receipts.ts --dir <corpus-dir>
+  Tier 1 (slice smoke):     KOVO_ALLOW_LOCAL_LAB=1 node scripts/benchmark-multihop.ts --app <app> --smoke
+  Tier 2 (dev smoke):       KOVO_ALLOW_LOCAL_LAB=1 node scripts/benchmark-multihop.ts --smoke
+  Tier 3 (full matrix):     KOVO_ALLOW_LOCAL_LAB=1 node scripts/benchmark-multihop.ts --app dev --budget-usd ${DEFAULT_BUDGET_USD} --duration-min ${Math.round(DEFAULT_MAX_DURATION_MS / 60_000)}
 
 Agentic runs require Docker workers:
   model profile + --verifier local-jq  -> FAIL FAST (exit 2) unless --no-llm
@@ -544,7 +557,7 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
   }
 
   const known = new Set([
-    'app', 'seed', 'seeds', 'held-out', 'mode', 'no-llm', 'verifier',
+    'app', 'seed', 'seeds', 'held-out', 'smoke', 'mode', 'no-llm', 'verifier',
     'isolate-data-dir', 'no-isolate-data-dir',
     'concurrency', 'worker-concurrency', 'budget-usd', 'max-duration-ms', 'duration-min',
     'data-dir', 'keep-data-dirs',
@@ -570,6 +583,7 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
       seeds: [1],
       mode: 'grey-box',
       heldOut: false,
+      smoke: false,
       budgetUsd: DEFAULT_BUDGET_USD,
       maxDurationMs: DEFAULT_MAX_DURATION_MS,
       outDir: resolve('.kovo/multihop-saas'),
@@ -611,14 +625,20 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
     }
   }
 
-  const budgetUsd = a['budget-usd'] === undefined ? DEFAULT_BUDGET_USD : Number(stringFlag(a, 'budget-usd'))
+  if (typeof a.smoke === 'string') {
+    fail(`--smoke is a boolean flag and does not take a value (got '${a.smoke}')`)
+  }
+  const smoke = a.smoke === true
+
+  const defaultBudgetUsd = smoke ? SMOKE_BUDGET_USD : DEFAULT_BUDGET_USD
+  const budgetUsd = a['budget-usd'] === undefined ? defaultBudgetUsd : Number(stringFlag(a, 'budget-usd'))
   if (!Number.isFinite(budgetUsd) || budgetUsd < 0.1 || budgetUsd > 500) {
     fail(`--budget-usd must be a number between 0.1 and 500 (got '${String(a['budget-usd'])}')`)
   }
   if (a['max-duration-ms'] !== undefined && a['duration-min'] !== undefined) {
     fail('use either --max-duration-ms or --duration-min, not both')
   }
-  let maxDurationMs = DEFAULT_MAX_DURATION_MS
+  let maxDurationMs = smoke ? SMOKE_MAX_DURATION_MS : DEFAULT_MAX_DURATION_MS
   if (a['max-duration-ms'] !== undefined) {
     maxDurationMs = parseDurationMs(stringFlag(a, 'max-duration-ms') ?? '', '--max-duration-ms')
   } else if (a['duration-min'] !== undefined) {
@@ -689,6 +709,7 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
     seeds,
     mode: modeRaw,
     heldOut,
+    smoke,
     budgetUsd,
     maxDurationMs,
     outDir: isAbsolute(outDirRaw) ? outDirRaw : resolve(outDirRaw),
@@ -997,6 +1018,325 @@ export function computeEfficiencyMetrics(input: {
   const tpPerDollar = input.costUsd > 0 ? input.confirmedChains / input.costUsd : null
   const tpPer10m = input.durationMs > 0 ? input.confirmedChains / (input.durationMs / 600_000) : null
   return { tpPerDollar, tpPer10m }
+}
+
+/** Compute cost per two-side confirmed chain (`null` when 0 chains confirmed). */
+export function computeCostPerConfirmed(costUsd: number, chainsConfirmed: number): number | null {
+  if (!Number.isFinite(chainsConfirmed) || chainsConfirmed <= 0) return null
+  const safeCost = Number.isFinite(costUsd) && costUsd > 0 ? costUsd : 0
+  return Number((safeCost / chainsConfirmed).toFixed(4))
+}
+
+export interface MultihopProviderTelemetry {
+  calls: number
+  retries: number
+  stalls: number
+  inputTokens: number
+  cachedInputTokens: number
+  outputTokens: number
+  costUsd: number
+  cacheHitRate: number
+}
+
+export interface MultihopTokenTelemetry {
+  totalCostUsd: number
+  inputTokens: number
+  cachedInputTokens: number
+  uncachedInputTokens: number
+  outputTokens: number
+  reasoningTokens: number
+  providerCalls: number
+  providerRetries: number
+  providerStalls: number
+  cacheHitRate: number
+  retryStallWasteUsd: number
+  providerBreakdown: Record<string, MultihopProviderTelemetry>
+  topToolResultDrivers: ToolResultByteDriver[]
+}
+
+export type RawRunTokenTelemetry = Omit<RunTokenTelemetrySummary, 'providerBreakdown'> & {
+  providerBreakdown?: Record<string, Partial<MultihopProviderTelemetry> & { uncachedInputTokens?: number }>
+}
+
+const TOP_TOOL_RESULT_DRIVERS_LIMIT = 5
+
+function nonNegIntVal(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
+}
+
+function nonNegFloatVal(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+}
+
+function roundUsd(value: number): number {
+  return Number(nonNegFloatVal(value).toFixed(6))
+}
+
+function clampUnitRate(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 0
+  return value >= 1 ? 1 : value
+}
+
+function normalizeProviderEntry(
+  raw: Partial<MultihopProviderTelemetry> & { uncachedInputTokens?: number },
+): MultihopProviderTelemetry {
+  const inputTokens = nonNegIntVal(raw.inputTokens)
+  const cachedInputTokens = nonNegIntVal(raw.cachedInputTokens)
+  const hasExplicitUncached = raw.uncachedInputTokens !== undefined
+  const uncachedInputTokens = nonNegIntVal(raw.uncachedInputTokens)
+  const denom = hasExplicitUncached && cachedInputTokens + uncachedInputTokens > 0
+    ? cachedInputTokens + uncachedInputTokens
+    : inputTokens
+  const cacheHitRate = denom > 0
+    ? clampUnitRate(cachedInputTokens / denom)
+    : clampUnitRate(raw.cacheHitRate)
+  return {
+    calls: nonNegIntVal(raw.calls),
+    retries: nonNegIntVal(raw.retries),
+    stalls: nonNegIntVal(raw.stalls),
+    inputTokens,
+    cachedInputTokens,
+    outputTokens: nonNegIntVal(raw.outputTokens),
+    costUsd: roundUsd(nonNegFloatVal(raw.costUsd)),
+    cacheHitRate,
+  }
+}
+
+function rankTopToolDrivers(
+  drivers: readonly ToolResultByteDriver[],
+  limit = TOP_TOOL_RESULT_DRIVERS_LIMIT,
+): ToolResultByteDriver[] {
+  const merged = new Map<string, ToolResultByteDriver>()
+  for (const d of drivers) {
+    if (!d || typeof d.toolName !== 'string' || !d.toolName.trim()) continue
+    const toolName = d.toolName.trim()
+    const calls = nonNegIntVal(d.calls)
+    const bytes = nonNegIntVal(d.bytes)
+    const spilledCount = nonNegIntVal(d.spilledCount)
+    const prev = merged.get(toolName)
+    if (prev) {
+      prev.calls += calls
+      prev.bytes += bytes
+      prev.spilledCount += spilledCount
+    } else {
+      merged.set(toolName, { toolName, calls, bytes, spilledCount })
+    }
+  }
+  return [...merged.values()]
+    .sort((a, b) => b.bytes - a.bytes || b.calls - a.calls || a.toolName.localeCompare(b.toolName))
+    .slice(0, limit)
+}
+
+/**
+ * Normalize `engine.getRunTokenTelemetry(runId)` into the compact structured benchmark snapshot.
+ * Reads `providerBreakdown` defensively so it works identically before and after Track E1 merges.
+ */
+export function compactRunTokenTelemetry(
+  raw: RawRunTokenTelemetry | null | undefined,
+): MultihopTokenTelemetry | null {
+  if (!raw) return null
+  const rawBreakdown = (
+    raw as {
+      providerBreakdown?: Record<string, {
+        calls?: number
+        retries?: number
+        stalls?: number
+        inputTokens?: number
+        cachedInputTokens?: number
+        outputTokens?: number
+        costUsd?: number
+        cacheHitRate?: number
+        uncachedInputTokens?: number
+      }>
+    }
+  ).providerBreakdown ?? {}
+
+  const providerBreakdown: Record<string, MultihopProviderTelemetry> = {}
+  for (const key of Object.keys(rawBreakdown).sort()) {
+    const cleanKey = key.trim()
+    if (!cleanKey) continue
+    const entry = rawBreakdown[key]
+    if (!entry || typeof entry !== 'object') continue
+    providerBreakdown[cleanKey] = normalizeProviderEntry(entry)
+  }
+
+  const inputTokens = nonNegIntVal(raw.inputTokens)
+  const cachedInputTokens = nonNegIntVal(raw.cachedInputTokens)
+  const uncachedInputTokens = nonNegIntVal(raw.uncachedInputTokens)
+  const cacheDenominator = cachedInputTokens + uncachedInputTokens
+  const cacheHitRate = cacheDenominator > 0
+    ? clampUnitRate(cachedInputTokens / cacheDenominator)
+    : clampUnitRate(raw.cacheHitRate)
+
+  return {
+    totalCostUsd: roundUsd(nonNegFloatVal(raw.totalCostUsd)),
+    inputTokens,
+    cachedInputTokens,
+    uncachedInputTokens,
+    outputTokens: nonNegIntVal(raw.outputTokens),
+    reasoningTokens: nonNegIntVal(raw.reasoningTokens),
+    providerCalls: nonNegIntVal(raw.providerCalls),
+    providerRetries: nonNegIntVal(raw.providerRetries),
+    providerStalls: nonNegIntVal(raw.providerStalls),
+    cacheHitRate,
+    retryStallWasteUsd: roundUsd(nonNegFloatVal(raw.retryStallWasteUsd)),
+    providerBreakdown,
+    topToolResultDrivers: rankTopToolDrivers(
+      Array.isArray(raw.topToolResultDrivers) ? raw.topToolResultDrivers : [],
+      TOP_TOOL_RESULT_DRIVERS_LIMIT,
+    ),
+  }
+}
+
+/** Merge per-provider telemetry maps across cells with token-weighted `cacheHitRate`. */
+export function mergeProviderBreakdowns(
+  breakdowns: ReadonlyArray<Record<string, MultihopProviderTelemetry> | undefined | null>,
+): Record<string, MultihopProviderTelemetry> {
+  const acc = new Map<string, MultihopProviderTelemetry>()
+  for (const breakdown of breakdowns) {
+    if (!breakdown || typeof breakdown !== 'object') continue
+    for (const [rawKey, entry] of Object.entries(breakdown)) {
+      const key = rawKey.trim()
+      if (!key || !entry || typeof entry !== 'object') continue
+      const norm = normalizeProviderEntry(entry)
+      const prev = acc.get(key)
+      if (prev) {
+        prev.calls += norm.calls
+        prev.retries += norm.retries
+        prev.stalls += norm.stalls
+        prev.inputTokens += norm.inputTokens
+        prev.cachedInputTokens += norm.cachedInputTokens
+        prev.outputTokens += norm.outputTokens
+        prev.costUsd = roundUsd(prev.costUsd + norm.costUsd)
+      } else {
+        acc.set(key, { ...norm })
+      }
+    }
+  }
+  const out: Record<string, MultihopProviderTelemetry> = {}
+  for (const key of [...acc.keys()].sort()) {
+    const entry = acc.get(key)!
+    out[key] = {
+      ...entry,
+      costUsd: roundUsd(entry.costUsd),
+      cacheHitRate: entry.inputTokens > 0
+        ? clampUnitRate(entry.cachedInputTokens / entry.inputTokens)
+        : clampUnitRate(entry.cacheHitRate),
+    }
+  }
+  return out
+}
+
+/**
+ * Aggregate token, prompt-cache, waste, provider-breakdown, and tool-driver telemetry across cells.
+ * Computes token-weighted `cacheHitRate` (never an unweighted mean of per-cell rates).
+ */
+export function aggregateMultihopTokenTelemetry(
+  cells: readonly Pick<
+    MultihopCellMeta,
+    'tokenTelemetry' | 'providerBreakdown' | 'retryStallWasteUsd' | 'topToolResultDrivers' | 'cacheHitRate' | 'costUsd'
+  >[],
+): MultihopTokenTelemetry | null {
+  const hasAny = cells.some(c =>
+    Boolean(c.tokenTelemetry)
+    || (c.providerBreakdown && Object.keys(c.providerBreakdown).length > 0)
+    || nonNegFloatVal(c.retryStallWasteUsd) > 0
+    || (Array.isArray(c.topToolResultDrivers) && c.topToolResultDrivers.length > 0),
+  )
+  if (!hasAny) return null
+
+  let totalCostUsd = 0
+  let inputTokens = 0
+  let cachedInputTokens = 0
+  let uncachedInputTokens = 0
+  let outputTokens = 0
+  let reasoningTokens = 0
+  let providerCalls = 0
+  let providerRetries = 0
+  let providerStalls = 0
+  let retryStallWasteUsd = 0
+  const breakdowns: Array<Record<string, MultihopProviderTelemetry> | undefined | null> = []
+  const allDrivers: ToolResultByteDriver[] = []
+
+  for (const cell of cells) {
+    const t = cell.tokenTelemetry
+    if (t) {
+      totalCostUsd += nonNegFloatVal(t.totalCostUsd)
+      inputTokens += nonNegIntVal(t.inputTokens)
+      cachedInputTokens += nonNegIntVal(t.cachedInputTokens)
+      uncachedInputTokens += nonNegIntVal(t.uncachedInputTokens)
+      outputTokens += nonNegIntVal(t.outputTokens)
+      reasoningTokens += nonNegIntVal(t.reasoningTokens)
+      providerCalls += nonNegIntVal(t.providerCalls)
+      providerRetries += nonNegIntVal(t.providerRetries)
+      providerStalls += nonNegIntVal(t.providerStalls)
+      retryStallWasteUsd += nonNegFloatVal(t.retryStallWasteUsd)
+      breakdowns.push(t.providerBreakdown)
+      if (Array.isArray(t.topToolResultDrivers)) allDrivers.push(...t.topToolResultDrivers)
+    } else {
+      totalCostUsd += nonNegFloatVal(cell.costUsd)
+      retryStallWasteUsd += nonNegFloatVal(cell.retryStallWasteUsd)
+      breakdowns.push(cell.providerBreakdown)
+      if (Array.isArray(cell.topToolResultDrivers)) allDrivers.push(...cell.topToolResultDrivers)
+    }
+  }
+
+  const providerBreakdown = mergeProviderBreakdowns(breakdowns)
+  const cacheDenominator = cachedInputTokens + uncachedInputTokens
+  const cacheHitRate = cacheDenominator > 0
+    ? clampUnitRate(cachedInputTokens / cacheDenominator)
+    : (inputTokens > 0 ? clampUnitRate(cachedInputTokens / inputTokens) : 0)
+
+  return {
+    totalCostUsd: roundUsd(totalCostUsd),
+    inputTokens,
+    cachedInputTokens,
+    uncachedInputTokens,
+    outputTokens,
+    reasoningTokens,
+    providerCalls,
+    providerRetries,
+    providerStalls,
+    cacheHitRate,
+    retryStallWasteUsd: roundUsd(retryStallWasteUsd),
+    providerBreakdown,
+    topToolResultDrivers: rankTopToolDrivers(allDrivers, TOP_TOOL_RESULT_DRIVERS_LIMIT),
+  }
+}
+
+/** Format a clean 1-line cost, prompt-cache, waste & per-provider summary for `multihop-report.md`. */
+export function formatCostCacheProviderSummaryLine(input: {
+  costUsd: number
+  costPerConfirmed: number | null
+  cacheHitRate: number | null
+  retryStallWasteUsd: number
+  providerBreakdown?: Record<string, MultihopProviderTelemetry> | null
+}): string {
+  const breakdown = input.providerBreakdown ?? {}
+  const entries = Object.entries(breakdown).sort((a, b) =>
+    b[1].calls - a[1].calls
+    || (b[1].inputTokens + b[1].outputTokens) - (a[1].inputTokens + a[1].outputTokens)
+    || a[0].localeCompare(b[0]),
+  )
+  const totalCalls = entries.reduce((sum, [, p]) => sum + nonNegIntVal(p.calls), 0)
+  const totalTokens = entries.reduce((sum, [, p]) => sum + nonNegIntVal(p.inputTokens) + nonNegIntVal(p.outputTokens), 0)
+  const providersText = entries.length
+    ? entries.map(([name, p]) => {
+        const callPct = totalCalls > 0 ? `${((nonNegIntVal(p.calls) / totalCalls) * 100).toFixed(1)}%` : '0.0%'
+        const tokCount = nonNegIntVal(p.inputTokens) + nonNegIntVal(p.outputTokens)
+        const tokPct = totalTokens > 0 ? `${((tokCount / totalTokens) * 100).toFixed(1)}%` : '0.0%'
+        return `${name} (${callPct} calls / ${tokPct} tokens)`
+      }).join(', ')
+    : 'none'
+  const cpc = input.costPerConfirmed === null ? 'n/a' : `$${input.costPerConfirmed.toFixed(4)}`
+  const cachePct = input.cacheHitRate === null ? 'n/a' : `${(input.cacheHitRate * 100).toFixed(1)}%`
+  return (
+    `Cost & Cache Summary: cost=$${nonNegFloatVal(input.costUsd).toFixed(4)} · `
+    + `$/confirmed=${cpc} · `
+    + `cacheHit=${cachePct} · `
+    + `retryStallWaste=$${nonNegFloatVal(input.retryStallWasteUsd).toFixed(4)} · `
+    + `providers=${providersText}`
+  )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2664,8 +3004,14 @@ export interface MultihopCellMeta {
   unmatchedFalsePositives: number
   unmatchedFindingsDetail?: MultihopUnmatchedFindingSummary[]
   costUsd: number
+  costPerConfirmed?: number | null
   tpPerDollar: number | null
   tpPer10m: number | null
+  cacheHitRate?: number | null
+  retryStallWasteUsd?: number
+  providerBreakdown?: Record<string, MultihopProviderTelemetry>
+  topToolResultDrivers?: ToolResultByteDriver[]
+  tokenTelemetry?: MultihopTokenTelemetry | null
   hopFunnel: HopDepthFunnel
   depthBreakdown: DepthTierBreakdown
   chains: MultihopChainVerdict[]
@@ -3482,6 +3828,12 @@ export async function runCell(
     try {
       frontierTelemetry = engine.frontierControllerFor(runId).getTelemetry()
     } catch { /* best-effort */ }
+    let rawTokenTelemetry: RawRunTokenTelemetry | null = null
+    try {
+      rawTokenTelemetry = engine.getRunTokenTelemetry(runId)
+    } catch { /* best-effort */ }
+    const tokenTelemetry = compactRunTokenTelemetry(rawTokenTelemetry)
+    const costPerConfirmed = computeCostPerConfirmed(costUsd, chainsConfirmed)
     const runTelemetry = extractMultihopRunTelemetry(storage, runId, {
       runStartedAtMs: startedAt,
       runEndedAtMs: endedAt,
@@ -3548,8 +3900,14 @@ export async function runCell(
       unmatchedFalsePositives,
       unmatchedFindingsDetail,
       costUsd,
+      costPerConfirmed,
       tpPerDollar: efficiency.tpPerDollar,
       tpPer10m: efficiency.tpPer10m,
+      cacheHitRate: tokenTelemetry ? tokenTelemetry.cacheHitRate : null,
+      retryStallWasteUsd: tokenTelemetry ? tokenTelemetry.retryStallWasteUsd : 0,
+      providerBreakdown: tokenTelemetry ? tokenTelemetry.providerBreakdown : {},
+      topToolResultDrivers: tokenTelemetry ? tokenTelemetry.topToolResultDrivers : [],
+      tokenTelemetry,
       hopFunnel,
       depthBreakdown,
       chains: twoSide.verdicts,
@@ -3668,9 +4026,15 @@ export interface MultihopAggregate {
   unmatchedFalsePositives: number
   hardenedTwinGatePassed: boolean
   costUsd: number
+  costPerConfirmed?: number | null
   durationMs: number
   tpPerDollar: number | null
   tpPer10m: number | null
+  cacheHitRate?: number | null
+  retryStallWasteUsd?: number
+  providerBreakdown?: Record<string, MultihopProviderTelemetry>
+  topToolResultDrivers?: ToolResultByteDriver[]
+  tokenTelemetry?: MultihopTokenTelemetry | null
   hopFunnel: HopDepthFunnel
   depthBreakdown: DepthTierBreakdown
   assignmentsCompleted: number
@@ -3736,6 +4100,8 @@ export function aggregateMultihopCells(
   const totalFps = hardenedTwinDecoyFps + unmatchedFalsePositives
   const precision: number | null = chainsConfirmed + totalFps > 0 ? ratio(chainsConfirmed, chainsConfirmed + totalFps) : null
   const eff = computeEfficiencyMetrics({ confirmedChains: chainsConfirmed, costUsd, durationMs })
+  const costPerConfirmed = computeCostPerConfirmed(costUsd, chainsConfirmed)
+  const tokenTelemetry = aggregateMultihopTokenTelemetry(cells)
   return {
     status,
     failedCells: invalidCellCount,
@@ -3760,9 +4126,15 @@ export function aggregateMultihopCells(
       && unmatchedFalsePositives === 0
       && (worstRunPrecision === null || worstRunPrecision >= 1),
     costUsd,
+    costPerConfirmed,
     durationMs,
     tpPerDollar: eff.tpPerDollar,
     tpPer10m: eff.tpPer10m,
+    cacheHitRate: tokenTelemetry ? tokenTelemetry.cacheHitRate : null,
+    retryStallWasteUsd: tokenTelemetry ? tokenTelemetry.retryStallWasteUsd : 0,
+    providerBreakdown: tokenTelemetry ? tokenTelemetry.providerBreakdown : {},
+    topToolResultDrivers: tokenTelemetry ? tokenTelemetry.topToolResultDrivers : [],
+    tokenTelemetry,
     hopFunnel: aggregateHopDepthFunnels(funnels),
     depthBreakdown: computeDepthTierBreakdown(allChains),
     assignmentsCompleted,
@@ -3905,6 +4277,12 @@ export interface MultihopReport {
   curve: MultihopCurveRow[]
   antiHeuristicGate: MultihopAntiHeuristicGate | null
   hardenedTwinGatePassed: boolean
+  costPerConfirmed?: number | null
+  cacheHitRate?: number | null
+  retryStallWasteUsd?: number
+  providerBreakdown?: Record<string, MultihopProviderTelemetry>
+  topToolResultDrivers?: ToolResultByteDriver[]
+  tokenTelemetry?: MultihopTokenTelemetry | null
   telemetry?: MultihopRunTelemetry | null
   notes: string[]
 }
@@ -3941,6 +4319,7 @@ export function buildMultihopReport(
 
   const benchmarkVersion = opts.benchmarkVersion ?? cells.find(c => c.benchmarkVersion)?.benchmarkVersion
   const effectiveConfigHash = opts.effectiveConfigHash ?? cells.find(c => c.effectiveConfigHash)?.effectiveConfigHash
+  const primaryAgg = agenticCells.length ? agentic : allAgg
 
   return {
     schemaVersion: 1,
@@ -3958,6 +4337,12 @@ export function buildMultihopReport(
     curve: budgetDurationCurve(allFloor.concat(agenticCells)),
     antiHeuristicGate: floorRunCells.length ? evaluateAntiHeuristicGate(floorRunCells) : null,
     hardenedTwinGatePassed: allAgg.hardenedTwinGatePassed,
+    costPerConfirmed: primaryAgg.costPerConfirmed,
+    cacheHitRate: primaryAgg.cacheHitRate,
+    retryStallWasteUsd: primaryAgg.retryStallWasteUsd,
+    providerBreakdown: primaryAgg.providerBreakdown,
+    topToolResultDrivers: primaryAgg.topToolResultDrivers,
+    tokenTelemetry: primaryAgg.tokenTelemetry,
     telemetry,
     notes,
   }
@@ -3982,6 +4367,20 @@ export function renderMultihopReport(report: MultihopReport, format: 'json' | 'm
   lines.push('')
   const a = report.agentic
   const f = a.hopFunnel
+  const summaryAgg = a.cells > 0 ? a : (report.floorRun ?? a)
+  const summaryCostPerConfirmed = report.costPerConfirmed !== undefined
+    ? report.costPerConfirmed
+    : (summaryAgg.costPerConfirmed ?? computeCostPerConfirmed(summaryAgg.costUsd, summaryAgg.chainsConfirmed))
+  const summaryCacheHitRate = report.cacheHitRate !== undefined
+    ? report.cacheHitRate
+    : (summaryAgg.cacheHitRate ?? report.tokenTelemetry?.cacheHitRate ?? null)
+  const summaryRetryStallWasteUsd = report.retryStallWasteUsd !== undefined
+    ? report.retryStallWasteUsd
+    : (summaryAgg.retryStallWasteUsd ?? report.tokenTelemetry?.retryStallWasteUsd ?? 0)
+  const summaryProviderBreakdown = report.providerBreakdown
+    ?? summaryAgg.providerBreakdown
+    ?? report.tokenTelemetry?.providerBreakdown
+    ?? {}
   lines.push('## Headline (Two-Side Confirmation)')
   lines.push('')
   lines.push(mdTable(
@@ -3995,11 +4394,20 @@ export function renderMultihopReport(report: MultihopReport, format: 'json' | 'm
       ['3–4 hop recall', `${a.depthBreakdown.hops3to4.confirmed}/${a.depthBreakdown.hops3to4.targets} (${pct(a.depthBreakdown.hops3to4.recall)})`],
       ['5–6 hop recall', `${a.depthBreakdown.hops5to6.confirmed}/${a.depthBreakdown.hops5to6.targets} (${pct(a.depthBreakdown.hops5to6.recall)})`],
       ['TP/$', a.tpPerDollar === null ? 'n/a' : a.tpPerDollar.toFixed(2)],
+      ['$/confirmed', summaryCostPerConfirmed === null ? 'n/a' : `$${summaryCostPerConfirmed.toFixed(4)}`],
       ['TP/10m', a.tpPer10m === null ? 'n/a' : a.tpPer10m.toFixed(2)],
       ['`--no-llm` floor recall', report.lift.floorRecall === null ? 'n/a' : pct(report.lift.floorRecall)],
       ['ΔReasoning (agentic − floor)', report.lift.deltaReasoning === null ? 'n/a' : `${(report.lift.deltaReasoning * 100).toFixed(1)}pp`],
     ],
   ))
+  lines.push('')
+  lines.push(formatCostCacheProviderSummaryLine({
+    costUsd: summaryAgg.costUsd,
+    costPerConfirmed: summaryCostPerConfirmed,
+    cacheHitRate: summaryCacheHitRate,
+    retryStallWasteUsd: summaryRetryStallWasteUsd,
+    providerBreakdown: summaryProviderBreakdown,
+  }))
   lines.push('')
   lines.push('## Hop-Depth Funnel')
   lines.push('')
