@@ -274,7 +274,7 @@ export function ProjectPersonasTab({ data, assets, personaTests, onTestPersona, 
           <div className="flex flex-wrap items-center gap-1.5">
             <Button
               type="button"
-              variant="default"
+              variant="outline"
               onClick={openCreateModal}
             >
               Add test account
@@ -308,11 +308,15 @@ export function ProjectPersonasTab({ data, assets, personaTests, onTestPersona, 
             const isCopied = copiedPersonaId === persona.id
             return (
               <div key={persona.id} className="border-b border-line">
-                <div className="flex min-h-[44px] items-center justify-between gap-3 px-1 py-2 transition-colors hover:bg-hover">
+                <div className="flex min-h-[44px] items-center justify-between gap-3 px-1 py-2 transition-colors hover:bg-hover max-[720px]:flex-wrap max-[720px]:gap-y-1">
                   <div className="flex min-w-0 flex-1 flex-col gap-0.5">
                     <div className="flex min-w-0 flex-wrap items-center gap-1.5 font-medium text-fg">
-                      <strong className="font-mono text-[12px] font-semibold">{persona.handle}</strong>
-                      <Badge variant="accent">{persona.roleLabel}</Badge>
+                      <strong className="min-w-0 max-w-full truncate font-mono text-[12px] font-semibold" title={persona.handle}>
+                        {persona.handle}
+                      </strong>
+                      <Badge variant="accent" className="max-w-[min(40ch,100%)]" title={persona.roleLabel}>
+                        <span className="min-w-0 truncate">{persona.roleLabel}</span>
+                      </Badge>
                       <Badge variant="neutral" className="bg-sunk">{formatPersonaAuthBadge(persona)}</Badge>
                       {test && (
                         <Badge
@@ -324,11 +328,11 @@ export function ProjectPersonasTab({ data, assets, personaTests, onTestPersona, 
                         </Badge>
                       )}
                     </div>
-                    <div className="text-[12px] text-fg-subtle">
+                    <div className="text-[12px] text-fg-subtle [overflow-wrap:anywhere]">
                       Allowlist: {persona.originAllowlist.map(safeHost).join(', ')}
                     </div>
                   </div>
-                  <div className="flex flex-none items-center gap-2">
+                  <div className="flex flex-none items-center gap-2 max-[720px]:basis-full max-[720px]:flex-wrap max-[720px]:gap-1" data-slot="persona-row-actions">
                     <Button
                       type="button"
                       variant="ghost"
@@ -348,11 +352,14 @@ export function ProjectPersonasTab({ data, assets, personaTests, onTestPersona, 
                     <Button
                       type="button"
                       variant="ghost"
-                      className="data-[slot=button]:text-danger data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger"
+                      size="icon"
+                      className="data-[slot=button]:text-fg-subtle data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger data-[slot=button]:focus-visible:text-danger"
                       disabled={personaAction.pending}
+                      aria-label={`Delete ${persona.handle}`}
+                      title="Delete test account"
                       onClick={() => setPersonaToDelete(persona)}
                     >
-                      Delete
+                      <Icon name="trash" size={14} />
                     </Button>
                   </div>
                 </div>

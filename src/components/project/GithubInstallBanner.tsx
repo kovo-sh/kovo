@@ -202,19 +202,22 @@ export function GithubInstallBanner({
               Choose orgs &amp; repos on GitHub ↗
             </a>
           )}
-          <Button
-            type="button"
-            variant="outline"
-            className="px-2.5 text-[12px]"
-            disabled={loading}
-            onClick={() => {
-              cleanupRef.current?.()
-              setAwaitingReturn(false)
-              onRefresh()
-            }}
-          >
-            {loading ? 'Refreshing…' : 'Refresh repos'}
-          </Button>
+          {/* The flush (picker) surface owns a single Refresh in its header. */}
+          {!flush && (
+            <Button
+              type="button"
+              variant="outline"
+              className="px-2.5 text-[12px]"
+              disabled={loading}
+              onClick={() => {
+                cleanupRef.current?.()
+                setAwaitingReturn(false)
+                onRefresh()
+              }}
+            >
+              {loading ? 'Refreshing…' : 'Refresh repos'}
+            </Button>
+          )}
           {awaitingReturn && !loading && (
             <span className="text-[11.5px] text-fg-subtle" role="status">
               Will refresh automatically when you return from GitHub.
@@ -289,19 +292,22 @@ export function GithubInstallBanner({
               Manage orgs &amp; repos on GitHub ↗
             </a>
           )}
-          <Button
-            type="button"
-            variant="ghost"
-            className="h-6 px-[7px] text-[12px]"
-            disabled={loading}
-            onClick={() => {
-              cleanupRef.current?.()
-              setAwaitingReturn(false)
-              onRefresh()
-            }}
-          >
-            {loading ? 'Refreshing…' : 'Refresh'}
-          </Button>
+          {/* The flush (picker) surface owns a single Refresh in its header. */}
+          {!flush && (
+            <Button
+              type="button"
+              variant="ghost"
+              className="h-6 px-[7px] text-[12px]"
+              disabled={loading}
+              onClick={() => {
+                cleanupRef.current?.()
+                setAwaitingReturn(false)
+                onRefresh()
+              }}
+            >
+              {loading ? 'Refreshing…' : 'Refresh'}
+            </Button>
+          )}
         </div>
       </div>
     )
@@ -341,19 +347,22 @@ export function GithubInstallBanner({
               Choose orgs &amp; repos on GitHub ↗
             </a>
           )}
-          <Button
-            type="button"
-            variant="ghost"
-            className="h-6 px-[7px] text-[12px]"
-            disabled={loading}
-            onClick={() => {
-              cleanupRef.current?.()
-              setAwaitingReturn(false)
-              onRefresh()
-            }}
-          >
-            {loading ? 'Refreshing…' : 'Refresh'}
-          </Button>
+          {/* The flush (picker) surface owns a single Refresh in its header. */}
+          {!flush && (
+            <Button
+              type="button"
+              variant="ghost"
+              className="h-6 px-[7px] text-[12px]"
+              disabled={loading}
+              onClick={() => {
+                cleanupRef.current?.()
+                setAwaitingReturn(false)
+                onRefresh()
+              }}
+            >
+              {loading ? 'Refreshing…' : 'Refresh'}
+            </Button>
+          )}
         </div>
       </div>
     )

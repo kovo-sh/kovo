@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import {
   addProjectAsset,
   bulkRemoveProjectAssetsAction,
@@ -54,6 +54,7 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
   const [editSource, setEditSource] = useState('')
   const [editThirdParty, setEditThirdParty] = useState(false)
   const [assetToDelete, setAssetToDelete] = useState<ProjectLoaderData['assets'][number] | null>(null)
+  const addHostInputRef = useRef<HTMLInputElement | null>(null)
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
   const [candidateOrigin, setCandidateOrigin] = useState('')
   const [candidateSource, setCandidateSource] = useState('')
@@ -225,7 +226,7 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
         key={asset.id}
         data-testid={`inventory-row-${asset.id}`}
         className={cn(
-          'flex min-h-[44px] items-center justify-between gap-3 border-b border-line px-1.5 py-2 transition-colors hover:bg-hover',
+          'flex min-h-[44px] items-center justify-between gap-3 border-b border-line px-1.5 py-2 transition-colors hover:bg-hover max-[720px]:flex-wrap max-[720px]:gap-y-1.5',
           isSelected && 'bg-accent-soft/35 hover:bg-accent-soft/50',
         )}
       >
@@ -266,7 +267,8 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
             </div>
           </div>
         </div>
-        <div className="flex flex-none items-center gap-2.5">
+        {/* Narrow widths: scope controls drop beneath the host (aligned past the checkbox) instead of crushing it. */}
+        <div className="flex flex-none items-center gap-2.5 max-[720px]:basis-full max-[720px]:flex-wrap max-[720px]:pl-[26px]">
           {project.environment === 'public' && !asset.thirdParty && (
             <label
               className="inline-flex cursor-pointer select-none items-center gap-[7px] text-[12px] font-normal text-fg-muted"
@@ -343,12 +345,14 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
           <Button
             type="button"
             variant="ghost"
-            className="data-[slot=button]:text-danger data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger"
+            size="icon"
+            className="data-[slot=button]:text-fg-subtle data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger data-[slot=button]:focus-visible:text-danger"
             disabled={inventoryAction.pending}
             aria-label={`Delete host ${hostLabel}`}
+            title="Delete host"
             onClick={() => setAssetToDelete(asset)}
           >
-            Delete
+            <Icon name="trash" size={14} />
           </Button>
         </div>
       </div>
@@ -370,7 +374,7 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
           {assets.length > 0 && (
             <Button
               type="button"
-              variant="default"
+              variant="outline"
               onClick={() => {
                 setAddHostOpen(true)
                 setNotice('')
@@ -556,6 +560,7 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
                   <Button
                     type="button"
                     variant="outline"
+                    className="h-auto min-h-[26px] max-w-full whitespace-normal py-1 text-left"
                     data-testid="approve-all-first-party"
                     disabled={inventoryAction.pending}
                     onClick={handleApproveAllFirstParty}
@@ -630,7 +635,10 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
           }
         }}
       >
-        <DialogContent className="flex max-h-[calc(100vh-56px)] max-w-[560px] flex-col overflow-hidden p-0">
+        <DialogContent
+          initialFocus={addHostInputRef}
+          className="flex max-h-[calc(100vh-56px)] max-w-[560px] flex-col overflow-hidden p-0"
+        >
           <form
             className="flex min-h-0 flex-1 flex-col"
             onSubmit={event => {
@@ -668,6 +676,7 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
                 <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
                   Host
                   <Input
+                    ref={addHostInputRef}
                     className="w-full"
                     name="origin"
                     value={candidateOrigin}

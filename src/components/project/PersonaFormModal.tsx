@@ -7,7 +7,7 @@ import {
 import type { PersonaAuthKind, PersonaLoginAdapter, PersonaPrivilege, PublicPersona } from '../../domain.ts'
 import { cn } from '../../lib/cn.ts'
 import { parseCurlOrHeaderInput } from '../../server/curl-parse.ts'
-import { FormError, useAction } from '../common.tsx'
+import { useAction } from '../common.tsx'
 import { Icon } from '../run/icons.tsx'
 import { Badge } from '../ui/badge.tsx'
 import { Button } from '../ui/button.tsx'
@@ -214,6 +214,7 @@ export function PersonaFormModal({
   const [headerName, setHeaderName] = useState('')
   const [origins, setOrigins] = useState(() => defaultProjectOrigins.join('\n'))
   const [secret, setSecret] = useState('')
+  const [secretError, setSecretError] = useState('')
   const [curlPaste, setCurlPaste] = useState('')
   const [curlNote, setCurlNote] = useState('')
   const [advancedOpen, setAdvancedOpen] = useState(false)
@@ -235,6 +236,8 @@ export function PersonaFormModal({
   const [importNote, setImportNote] = useState('')
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const roleLabelRef = useRef<HTMLInputElement | null>(null)
+  const submitErrorRef = useRef<HTMLParagraphElement | null>(null)
   const addressInputRef = useRef<HTMLInputElement | null>(null)
   const eventSourceRef = useRef<EventSource | null>(null)
   const lastMoveSentRef = useRef(0)
@@ -245,6 +248,15 @@ export function PersonaFormModal({
   const navHistoryIndexRef = useRef(-1)
   const pendingHistoryIndexRef = useRef<number | null>(null)
   const personaAction = useAction()
+  useEffect(() => {
+    // A pasted/parsed secret or a different auth method makes the inline secret error stale.
+    setSecretError('')
+  }, [authMode, staticKind, loginAdapter, secret])
+  useEffect(() => {
+    if (!personaAction.error) return
+    submitErrorRef.current?.scrollIntoView({ block: 'nearest' })
+    submitErrorRef.current?.focus()
+  }, [personaAction.error])
 
   const isBrowserSessionMode = authMode === 'browser_session'
   const isClerkClient = authMode === 'automated_login' && loginAdapter === 'clerk_client'
@@ -533,6 +545,7 @@ export function PersonaFormModal({
     setOrigins(defaultProjectOrigins.join('\n'))
     setSelectedStartOrigin(defaultProjectOrigins[0] ?? '')
     setSecret('')
+    setSecretError('')
     setCurlPaste('')
     setCurlNote('')
     setCapturedToken('')
@@ -1037,6 +1050,15 @@ export function PersonaFormModal({
     }
 
     // Mode 2 (Header / Cookie / cURL) & Mode 3 (Automated Login CI / Staging)
+    if (secretRequired && !secret.trim()) {
+      setSecretError(effectiveAuthKind === 'login' && !isClerkClient ? 'Enter the account password.' : 'Enter the credential secret.')
+      requestAnimationFrame(() => {
+        const el = document.querySelector<HTMLInputElement>('[data-slot="persona-form"] [name="secret"]')
+        el?.scrollIntoView({ block: 'nearest' })
+        el?.focus()
+      })
+      return
+    }
     const headerNameRaw = headerName.trim()
     const loginUrlRaw = loginUrl.trim()
     if (editingPersona) {
@@ -1107,15 +1129,20 @@ export function PersonaFormModal({
     >
       <DialogContent
         data-capture-active={activeCapture ? 'true' : 'false'}
+        initialFocus={roleLabelRef}
         className={cn(
-          'flex flex-col overflow-hidden p-0 transition-[width,height,max-width,max-height,opacity,scale] duration-200 ease-out',
+          // Size changes snap (no layout tween); only the enter/exit opacity+scale animates.
+          'flex flex-col overflow-hidden p-0 transition-[opacity,scale] duration-[var(--d2)] ease-kovo',
           activeCapture
             ? 'h-[92vh] max-h-[92vh] w-[95vw] max-w-[1600px]'
-            : 'max-h-[90vh] w-full max-w-[720px]',
+            : 'mb-auto mt-[min(12vh,96px)] max-h-[calc(100vh-min(12vh,96px)-32px)] w-full max-w-[720px]',
         )}
       >
         {activeCapture ? (
-          <div className="flex min-h-0 flex-1 flex-col bg-panel">
+          <div
+            key="capture"
+            className="flex min-h-0 flex-1 flex-col bg-panel transition-opacity duration-150 ease-kovo starting:opacity-0 motion-reduce:transition-none"
+          >
             {/* Browser Window Title Chrome */}
             <div className="flex shrink-0 flex-wrap items-center justify-between gap-2.5 border-b border-line bg-raise px-3.5 py-2">
               <div className="flex min-w-0 items-center gap-2.5">
@@ -1369,7 +1396,12 @@ export function PersonaFormModal({
             </div>
           </div>
         ) : (
-          <form className="flex min-h-0 flex-1 flex-col" onSubmit={handleSubmit}>
+          <form
+            key="form"
+            className="flex min-h-0 flex-1 flex-col transition-opacity duration-150 ease-kovo starting:opacity-0 motion-reduce:transition-none"
+            onSubmit={handleSubmit}
+            data-slot="persona-form"
+          >
             <DialogHeader className="shrink-0 flex-row items-center justify-between gap-2.5 border-b border-line bg-raise px-4 py-3">
               <DialogTitle className="text-[13.5px] font-semibold text-fg">
                 {editingPersona ? 'Edit test account' : 'Add test account'}
@@ -1396,6 +1428,7 @@ export function PersonaFormModal({
                   <label className="grid min-w-0 gap-1.5 text-[12px] font-medium text-fg-muted">
                     Account label
                     <Input
+                      ref={roleLabelRef}
                       className="w-full min-w-0"
                       name="roleLabel"
                       required
@@ -1550,7 +1583,7 @@ export function PersonaFormModal({
                       )}
                       <Button
                         type="button"
-                        variant="default"
+                        variant="outline"
                         className="h-[28px] shrink-0 px-3"
                         disabled={captureBusy || personaAction.pending}
                         onClick={() => void handleStartInteractiveCapture()}
@@ -1723,13 +1756,20 @@ export function PersonaFormModal({
                           className="w-full"
                           name="secret"
                           type="password"
-                          required={secretRequired}
                           maxLength={4096}
                           autoComplete="off"
+                          aria-invalid={secretError ? true : undefined}
+                          aria-describedby={secretError ? 'persona-secret-err' : undefined}
                           value={secret}
-                          onChange={e => setSecret(e.target.value)}
+                          onChange={e => {
+                            setSecret(e.target.value)
+                            if (secretError) setSecretError('')
+                          }}
                           placeholder={keepingSameAuthKind ? 'Leave blank to keep existing secret' : 'Never displayed back after saving'}
                         />
+                        {secretError && (
+                          <p id="persona-secret-err" className="form-error m-0 text-[11.5px] font-normal">{secretError}</p>
+                        )}
                       </label>
                     </div>
                   ) : (
@@ -1739,13 +1779,20 @@ export function PersonaFormModal({
                         className="w-full"
                         name="secret"
                         type="password"
-                        required={secretRequired}
                         maxLength={4096}
                         autoComplete="off"
+                        aria-invalid={secretError ? true : undefined}
+                        aria-describedby={secretError ? 'persona-secret-err' : undefined}
                         value={secret}
-                        onChange={e => setSecret(e.target.value)}
+                        onChange={e => {
+                          setSecret(e.target.value)
+                          if (secretError) setSecretError('')
+                        }}
                         placeholder={keepingSameAuthKind ? 'Leave blank to keep existing secret' : 'Never displayed back after saving'}
                       />
+                      {secretError && (
+                        <p id="persona-secret-err" className="form-error m-0 text-[11.5px] font-normal">{secretError}</p>
+                      )}
                     </label>
                   )}
                 </div>
@@ -1761,17 +1808,24 @@ export function PersonaFormModal({
                         className="w-full font-mono text-[12px]"
                         name="secret"
                         type="password"
-                        required={secretRequired}
                         maxLength={4096}
                         autoComplete="off"
+                        aria-invalid={secretError ? true : undefined}
+                        aria-describedby={secretError ? 'persona-secret-err' : undefined}
                         value={secret}
-                        onChange={e => setSecret(e.target.value)}
+                        onChange={e => {
+                          setSecret(e.target.value)
+                          if (secretError) setSecretError('')
+                        }}
                         placeholder={
                           keepingSameAuthKind
                             ? 'Leave blank to keep existing secret'
                             : 'Paste __client cookie value from DevTools (clerk.yourdomain.com)'
                         }
                       />
+                      {secretError && (
+                        <p id="persona-secret-err" className="form-error m-0 text-[11.5px] font-normal">{secretError}</p>
+                      )}
                       <small className="text-[11.5px] font-normal text-fg-subtle">
                         Legacy adapter — prefer <strong>Browser Session</strong> for universal auto-refresh across all identity providers.
                       </small>
@@ -1812,13 +1866,20 @@ export function PersonaFormModal({
                         className="w-full"
                         name="secret"
                         type="password"
-                        required={secretRequired}
                         maxLength={4096}
                         autoComplete="off"
+                        aria-invalid={secretError ? true : undefined}
+                        aria-describedby={secretError ? 'persona-secret-err' : undefined}
                         value={secret}
-                        onChange={e => setSecret(e.target.value)}
+                        onChange={e => {
+                          setSecret(e.target.value)
+                          if (secretError) setSecretError('')
+                        }}
                         placeholder={keepingSameAuthKind ? 'Leave blank to keep existing secret' : 'Encrypted on your machine'}
                       />
+                      {secretError && (
+                        <p id="persona-secret-err" className="form-error m-0 text-[11.5px] font-normal">{secretError}</p>
+                      )}
                     </label>
                   </div>
                 )
@@ -1924,11 +1985,20 @@ export function PersonaFormModal({
                   </label>
                 </DisclosureContent>
               </Disclosure>
-
-              <FormError error={personaAction.error} />
             </DialogBody>
 
             <DialogFooter className="shrink-0 flex-wrap items-center justify-between gap-2.5 px-4 py-2.5">
+              {personaAction.error && (
+                <p
+                  ref={submitErrorRef}
+                  role="alert"
+                  tabIndex={-1}
+                  data-slot="submit-error"
+                  className="form-error m-0 max-h-24 basis-full overflow-y-auto text-[12px] outline-none [overflow-wrap:anywhere]"
+                >
+                  {personaAction.error}
+                </p>
+              )}
               <span className="min-w-0 text-[12px] text-fg-subtle">
                 Credentials stay encrypted on your machine and are never sent to AI models.
               </span>

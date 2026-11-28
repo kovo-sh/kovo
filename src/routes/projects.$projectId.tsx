@@ -1,8 +1,9 @@
-import { createFileRoute, Link, useLocation, useNavigate, useRouter } from '@tanstack/react-router'
-import { useEffect, useMemo, useState } from 'react'
+import { createFileRoute, Link, notFound, useLocation, useNavigate, useRouter } from '@tanstack/react-router'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { projectData, removeProject, removeProjectAsset, testPersonaAuthAction } from '../actions.ts'
 import { isRunDeleteBlocked } from '../server/run-status.ts'
 import { Icon } from '../components/run/icons.tsx'
+import { formatCount } from '../components/run-state.ts'
 import { ProjectEditModal } from '../components/project/ProjectEditModal.tsx'
 import { ProjectGuardrailsTab } from '../components/project/ProjectGuardrailsTab.tsx'
 import { ProjectInventoryTab } from '../components/project/ProjectInventoryTab.tsx'
@@ -31,7 +32,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '../components/ui/dropdown-menu.tsx'
-import { type PublicPersona } from '../domain.ts'
+import { id as uuidSchema, type PublicPersona } from '../domain.ts'
 import { cn } from '../lib/cn.ts'
 
 type ProjectSearch = {
@@ -48,9 +49,63 @@ export const Route = createFileRoute('/projects/$projectId')({
       ? { syncError: search.syncError.trim().slice(0, 300) }
       : {}),
   }),
-  loader: ({ params }) => projectData({ data: { projectId: params.projectId } }),
+  // Malformed ids never reach the server fn (whose validator would 500 with a
+  // ZodError); a missing project maps to the same 404 view inside the shell.
+  params: {
+    parse: (raw: { projectId: string }) => {
+      if (!uuidSchema.safeParse(raw.projectId).success) throw notFound()
+      return raw
+    },
+  },
+  loader: async ({ params }) => {
+    try {
+      return await projectData({ data: { projectId: params.projectId } })
+    } catch (err) {
+      if (err instanceof Error && /project not found/i.test(err.message)) throw notFound()
+      throw err
+    }
+  },
+  notFoundComponent: ProjectNotFound,
   component: ProjectPage,
 })
+
+function ProjectNotFound() {
+  return (
+    <main className="flex min-h-0 flex-1 flex-col bg-panel" data-slot="project-not-found">
+      <header className="sticky top-0 z-20 flex h-11 flex-none items-center gap-2 border-b border-line bg-panel px-3.5 md:px-[22px]">
+        <Link className="whitespace-nowrap text-[13px] text-fg-subtle transition-colors hover:text-fg" to="/">
+          Projects
+        </Link>
+      </header>
+      <div className="mx-auto flex w-full max-w-[360px] flex-col items-center gap-3 px-6 py-16 text-center">
+        <h1 className="m-0 text-[13px] font-medium leading-5 text-fg">Project not found</h1>
+        <p className="m-0 text-balance text-[12px] leading-5 text-fg-subtle">
+          This project may have been deleted, or the link is incomplete.
+        </p>
+        <Link to="/" className={cn(buttonVariants({ variant: 'outline' }), 'mt-1')}>
+          Back to projects
+        </Link>
+      </div>
+    </main>
+  )
+}
+
+/** Header seed summary: first origin plus a neutral "+N" so long lists never crush the name. */
+function HeaderSeedSummary({ seeds }: { seeds: readonly string[] }) {
+  if (seeds.length === 0) return null
+  return (
+    <span
+      className="flex min-w-0 max-w-[40%] flex-none items-center gap-1.5 text-fg-subtle max-[720px]:hidden"
+      title={seeds.join('\n')}
+      data-slot="header-seed-summary"
+    >
+      <span className="min-w-0 truncate font-mono text-[12px]">{safeHost(seeds[0]!)}</span>
+      {seeds.length > 1 && (
+        <Badge variant="neutral" className="bg-sunk tabular-nums">+{formatCount(seeds.length - 1)}</Badge>
+      )}
+    </span>
+  )
+}
 
 function ProjectPage() {
   const data = Route.useLoaderData()
@@ -74,6 +129,7 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
   const [deleteProjectError, setDeleteProjectError] = useState('')
   const [selectedPersonaIds, setSelectedPersonaIds] = useState<string[]>(() => personas.map(p => p.id))
   const [personaTests, setPersonaTests] = useState<Record<string, PersonaTestState>>({})
+  const deleteCancelRef = useRef<HTMLButtonElement | null>(null)
 
   const validPersonaIds = useMemo(() => new Set(personas.map(p => p.id)), [personas])
   const activeSelectedPersonaIds = useMemo(
@@ -212,23 +268,25 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
     <main className="flex min-h-0 flex-1 flex-col bg-panel font-sans text-base text-fg antialiased">
       <header className="sticky top-0 z-20 flex-none border-b border-line bg-panel px-3.5 md:px-[22px]">
         <div className="flex h-11 min-w-0 items-center gap-2">
-          <Link className="whitespace-nowrap text-[13px] text-fg-subtle transition-colors hover:text-fg" to="/">
+          {/* Below 720px the rail already links Projects; give the name the room instead. */}
+          <Link className="whitespace-nowrap text-[13px] text-fg-subtle transition-colors hover:text-fg max-[720px]:hidden" to="/">
             Projects
           </Link>
-          <span className="text-fg-faint" aria-hidden="true">/</span>
-          <h1 className="min-w-0 truncate text-[13.5px] font-semibold tracking-[-0.005em] text-fg">
+          <span className="text-fg-faint max-[720px]:hidden" aria-hidden="true">/</span>
+          <h1 className="min-w-[4ch] truncate text-[13.5px] font-semibold tracking-[-0.005em] text-fg" title={project.name}>
             {project.name}
           </h1>
           {project.environment === 'local-lab' && <Badge variant="warn">Local Lab</Badge>}
-          <span
-            className="min-w-0 flex-1 truncate font-mono text-[12px] text-fg-subtle"
-            title={project.seeds.join(', ')}
-          >
-            {project.seeds.map(safeHost).join(', ')}
-          </span>
+          <HeaderSeedSummary seeds={project.seeds} />
           <div className="ml-auto flex flex-none items-center gap-1.5">
-            <Button variant="default" onClick={() => setNewRunOpen(true)}>
-              New run
+            <Button
+              variant="default"
+              className="max-[720px]:size-7 max-[720px]:px-0"
+              aria-label="New run"
+              onClick={() => setNewRunOpen(true)}
+            >
+              <Icon name="plus" size={13} />
+              <span className="max-[720px]:sr-only">New run</span>
             </Button>
             <DropdownMenu>
               <DropdownMenuTrigger
@@ -334,6 +392,7 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
               key={project.id}
               data={data}
               onSelectTab={selectTab}
+              onNewRun={() => setNewRunOpen(true)}
             />
           )}
           {activeTab === 'runs' && (
@@ -406,6 +465,7 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
       >
         <DialogContent
           role="alertdialog"
+          initialFocus={deleteCancelRef}
           className="flex max-h-[calc(100vh-56px)] max-w-[460px] flex-col overflow-hidden p-0"
         >
           <DialogHeader className="flex-row items-center justify-between gap-2.5 border-b border-line bg-raise px-4 py-2.5">
@@ -430,17 +490,19 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
           </DialogHeader>
           <DialogBody className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto p-4">
             <DialogDescription className="text-[12.5px] leading-5 text-fg-muted">
-              Permanently delete <strong className="font-semibold text-fg">{project.name}</strong> and all associated data, local synced repos, and test account credentials. This cannot be undone.
+              Permanently delete <strong className="font-semibold text-fg [overflow-wrap:anywhere]">{project.name}</strong> and all associated data, local synced repos, and test account credentials. This cannot be undone.
             </DialogDescription>
             <div className="flex flex-col gap-2 rounded-lg border border-line bg-sunk px-3 py-2.5">
-              <div className="line-clamp-2 text-[13px] font-medium text-fg">{project.name}</div>
+              <div className="line-clamp-2 text-[13px] font-medium text-fg [overflow-wrap:anywhere]" title={project.name}>
+                {project.name}
+              </div>
               <div className="flex flex-wrap items-center gap-1.5 tabular-nums">
                 <Badge variant="neutral" className="bg-panel">
-                  {runs.length} {runs.length === 1 ? 'run' : 'runs'}
+                  {formatCount(runs.length)} {runs.length === 1 ? 'run' : 'runs'}
                 </Badge>
                 <Badge variant="neutral" className="bg-panel">
-                  {totalFindings} {totalFindings === 1 ? 'finding' : 'findings'}
-                  {totalConfirmed > 0 ? ` (${totalConfirmed} confirmed)` : ''}
+                  {formatCount(totalFindings)} {totalFindings === 1 ? 'finding' : 'findings'}
+                  {totalConfirmed > 0 ? ` (${formatCount(totalConfirmed)} confirmed)` : ''}
                 </Badge>
                 {personas.length > 0 && (
                   <Badge variant="neutral" className="bg-panel">
@@ -473,6 +535,7 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
           </DialogBody>
           <DialogFooter>
             <Button
+              ref={deleteCancelRef}
               type="button"
               variant="ghost"
               disabled={deletingProject}

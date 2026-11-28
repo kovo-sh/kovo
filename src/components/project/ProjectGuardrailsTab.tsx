@@ -503,7 +503,7 @@ export function ProjectGuardrailsTab({ data }: Props) {
             <div className="flex flex-wrap items-center gap-1.5">
               <Button
                 type="button"
-                variant={addRuleOpen ? 'ghost' : 'default'}
+                variant={addRuleOpen ? 'ghost' : 'outline'}
                 aria-expanded={addRuleOpen}
                 onClick={() => {
                   setAddRuleOpen(v => !v)

@@ -10,7 +10,7 @@ import { fmtDur } from '../run/format.ts'
 import { StatusGlyph } from '../run/glyphs.tsx'
 import { Icon } from '../run/icons.tsx'
 import { runStatusLabel } from '../run/meta.ts'
-import { capabilityTierMeta, formatUsd, phaseNames } from '../run-state.ts'
+import { capabilityTierMeta, formatCount, formatUsd, phaseNames } from '../run-state.ts'
 import { formatFullDateTime, formatRelativeTime, useNow } from '../shell/AppShell.tsx'
 import { Badge } from '../ui/badge.tsx'
 import { Button } from '../ui/button.tsx'
@@ -101,7 +101,7 @@ export function filterProjectRuns<
 }
 
 function plural(count: number, singular: string, pluralWord = `${singular}s`): string {
-  return `${count} ${count === 1 ? singular : pluralWord}`
+  return `${formatCount(count)} ${count === 1 ? singular : pluralWord}`
 }
 
 function statusDotClass(status: string | undefined): string {
@@ -248,11 +248,8 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
           </span>
         </div>
         <div className="flex items-center gap-3">
+          {/* The page header owns the single filled "New run"; the empty state below offers its own. */}
           {rerunError && <span className="text-[12px] text-danger" role="alert">{rerunError}</span>}
-          <Button type="button" variant="default" onClick={handleNewRun}>
-            <Icon name="plus" size={13} />
-            New run
-          </Button>
         </div>
       </div>
 
@@ -314,7 +311,7 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
                 New run
               </Button>
             }
-            className="max-w-[440px] py-9"
+            className="max-w-[440px] py-9 [overflow-wrap:anywhere]"
           />
         </div>
       ) : filteredRuns.length === 0 ? (
@@ -371,12 +368,12 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
                       <span aria-hidden="true">·</span>
                       <span>
                         {plural(run.findingCount, 'finding')}
-                        {run.confirmedCount > 0 ? ` (${run.confirmedCount} confirmed)` : ''}
+                        {run.confirmedCount > 0 ? ` (${formatCount(run.confirmedCount)} confirmed)` : ''}
                       </span>
                       <span aria-hidden="true">·</span>
-                      <span>{run.turnsUsed} turns</span>
+                      <span>{formatCount(run.turnsUsed)} turns</span>
                       <span aria-hidden="true">·</span>
-                      <span>{run.spentRequests} reqs</span>
+                      <span>{formatCount(run.spentRequests)} reqs</span>
                       <span aria-hidden="true">·</span>
                       <span>{formatUsd(run.spentUsd)}</span>
                       {durationLabel && (
@@ -486,10 +483,10 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
                     </Badge>
                     <Badge variant="neutral" className="bg-panel">
                       {plural(runToDelete.findingCount, 'finding')}
-                      {runToDelete.confirmedCount > 0 ? ` (${runToDelete.confirmedCount} confirmed)` : ''}
+                      {runToDelete.confirmedCount > 0 ? ` (${formatCount(runToDelete.confirmedCount)} confirmed)` : ''}
                     </Badge>
                     <Badge variant="neutral" className="bg-panel">
-                      {runToDelete.spentRequests} req · {formatUsd(runToDelete.spentUsd)}
+                      {formatCount(runToDelete.spentRequests)} req · {formatUsd(runToDelete.spentUsd)}
                     </Badge>
                   </div>
                 </div>

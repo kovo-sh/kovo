@@ -77,9 +77,18 @@ export const owaspCategoryLabels: Record<OwaspCategory, string> = {
   'llm-ai-security': 'LLM & AI Security',
 }
 
+const usdFormatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' })
+const countFormatter = new Intl.NumberFormat('en-US')
+
+/** Grouped USD ("$1,234.56"); sub-cent spend reads "<$0.01". */
 export function formatUsd(amount: number) {
-  if (!Number.isFinite(amount)) return '$0.00'
-  return amount < 0.01 && amount > 0 ? '<$0.01' : `$${amount.toFixed(2)}`
+  if (!Number.isFinite(amount)) return usdFormatter.format(0)
+  return amount < 0.01 && amount > 0 ? '<$0.01' : usdFormatter.format(amount)
+}
+
+/** Grouped integer counts for run metadata ("999,999"). Non-finite values read as 0. */
+export function formatCount(n: number) {
+  return countFormatter.format(Number.isFinite(n) ? n : 0)
 }
 
 export const boardKindLabels: Record<BoardMessageKind, string> = {
