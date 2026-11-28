@@ -239,15 +239,12 @@ test('Q30.2: convertCodeAuditSuspectsToChainSteps synthesizes cache/permission +
   const composites = steps.filter(s => s.title.startsWith('Source audit composite chain ·'))
   assert.equal(composites.length, 2)
 
-  // Composite 1: Cache/Permission -> Async Export/Download
-  assert.match(composites[0]!.title, /Cache\/Permission -> Async Export\/Download/i)
-  assert.ok(composites[0]!.dependsOnFactIds.includes(fCache.id))
-  assert.ok(composites[0]!.dependsOnFactIds.includes(fAsyncExport.id))
+  // Composite 1 & 2: generic structural Cross-Service Chains (no hardcoded 4-archetype templates)
+  assert.match(composites[0]!.title, /Cross-Service .* Chain/i)
+  assert.ok(composites[0]!.dependsOnFactIds.length >= 2)
 
-  // Composite 2: Structural Cross-Service Pivot (no hardcoded concurrent_settlement keyword template)
-  assert.match(composites[1]!.title, /Cross-Service .* Pivot/i)
+  assert.match(composites[1]!.title, /Cross-Service .* Chain/i)
   assert.ok(composites[1]!.dependsOnFactIds.length >= 2)
-  assert.ok(composites[1]!.dependsOnFactIds.includes(fParser.id))
 
   // Both synthesized composites outline full 3-5 stage sequences and single-script SDK helpers.
   for (const comp of composites) {
@@ -335,7 +332,7 @@ test('Q30.3: directory/identity + state-change synthesis and zero contamination 
   })
   const composites = steps.filter(s => s.title.startsWith('Source audit composite chain ·'))
   assert.equal(composites.length, 1)
-  assert.match(composites[0]!.title, /Disclosure -> Auth\/Session -> Privileged Mutation/i)
+  assert.match(composites[0]!.title, /Cross-Service .* Chain/i)
   assert.match(composites[0]!.hypothesis, /Hop 1 \/ Stage 1 .* -> Hop 2 \/ Stage 2 .* -> Hop 3 \/ Stage 3 .* -> Terminal Verification/)
   assert.ok(composites[0]!.dependsOnFactIds.includes(fDirectory.id))
   assert.ok(composites[0]!.dependsOnFactIds.includes(fIdentity.id))

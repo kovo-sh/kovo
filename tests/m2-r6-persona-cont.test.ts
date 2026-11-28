@@ -195,7 +195,7 @@ describe('M2 R6 Fix 1: multi-tenant persona classification, prompt separation, h
     assert.equal(verifyCalls, 1)
   })
 
-  test('gb-dataflow-synthesizer prefers multiTenant persona on cache-bleed/dual-tenant chains and standard low-priv persona otherwise', () => {
+  test('gb-dataflow-synthesizer selects lowest-privilege configured persona consistently without keyword-based persona rewriting', () => {
     const personas = [
       { handle: 'owner_a', roleLabel: 'owner' },
       { handle: 'member_a', roleLabel: 'member' },
@@ -213,14 +213,17 @@ describe('M2 R6 Fix 1: multi-tenant persona classification, prompt separation, h
       personas,
     })
     assert.ok(cacheRes.chains.length >= 1)
-    assert.match(cacheRes.chains[0]!.step.hypothesis, /Base persona:\s*shared_actor\b/)
-    assert.match(cacheRes.chains[0]!.step.hypothesis, /Relevant personas:\s*shared_actor\b/)
+    assert.match(cacheRes.chains[0]!.step.hypothesis, /Base persona:\s*member_a\b/)
+    assert.match(cacheRes.chains[0]!.step.hypothesis, /Relevant personas:\s*member_a\b/)
 
     const regularRes = synthesizeGreyBoxDataflowGraph({
       approvedOrigins: [AUTH_ORIGIN, API_ORIGIN],
       endpoints: [
         { id: 'r1', origin: AUTH_ORIGIN, method: 'POST', pathTemplate: '/oauth/invites', riskScore: 80 },
         { id: 'r2', origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/invites/redeem', riskScore: 85 },
+      ],
+      endpointParams: [
+        { endpointId: 'r2', name: 'invite_token', location: 'body', inferredType: 'string' },
       ],
       brokerExchanges: [
         { origin: AUTH_ORIGIN, method: 'POST', pathAndQuery: '/oauth/invites', status: 201, personaHandle: 'owner_a', bodyPreview: JSON.stringify({ invite_token: 'inv_1' }) },

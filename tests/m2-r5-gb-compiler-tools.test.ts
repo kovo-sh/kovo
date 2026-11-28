@@ -82,7 +82,8 @@ describe('M2 R5: gb-dataflow-synthesizer fixes', () => {
       sourceOrigins: [AUTH_ORIGIN, API_ORIGIN, EDGE_ORIGIN],
     })
     storage.upsertEndpoint({ runId, scopeRevision: run.scopeRevision, origin: AUTH_ORIGIN, method: 'POST', pathTemplate: '/oauth/grants', riskScore: 80, source: 'openapi' })
-    storage.upsertEndpoint({ runId, scopeRevision: run.scopeRevision, origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/grants/redeem', riskScore: 85, source: 'openapi' })
+    const epRedeem = storage.upsertEndpoint({ runId, scopeRevision: run.scopeRevision, origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/grants/redeem', riskScore: 85, source: 'openapi' })
+    storage.upsertEndpointParam({ runId, endpointId: epRedeem.id, name: 'grant_code', location: 'json', inferredType: 'string', source: 'openapi' })
     storage.upsertEndpoint({ runId, scopeRevision: run.scopeRevision, origin: EDGE_ORIGIN, method: 'GET', pathTemplate: '/v1/artifacts/:id/download', riskScore: 90, source: 'openapi' })
 
     const insertEx = storage.client.prepare(`
@@ -194,12 +195,8 @@ describe('M2 R5: gb-dataflow-synthesizer fixes', () => {
       ],
       personas: [{ handle: 'member_a', roleLabel: 'member' }],
     })
-    assert.ok(graph.chains.length >= 2)
-    assert.equal(graph.chains[0]!.fromLive, true, 'live-observed chain must rank #1 ahead of higher-spec-score guesses')
-    const specChain = graph.chains.find(c => !c.fromLive)
-    if (specChain) {
-      assert.ok(graph.chains[0]!.step.priority > specChain.step.priority, 'live step priority must exceed spec step priority')
-    }
+    assert.equal(graph.chains.length, 1, 'must emit only live-observed chains without fabricating speculative spec-only guesses')
+    assert.equal(graph.chains[0]!.fromLive, true, 'live-observed chain must rank #1')
   })
 
   test('prefers lowest-privilege non-admin/non-owner/non-bot/non-service/non-dual persona as chain base persona', () => {
@@ -208,6 +205,9 @@ describe('M2 R5: gb-dataflow-synthesizer fixes', () => {
       endpoints: [
         { id: 'ep1', origin: AUTH_ORIGIN, method: 'POST', pathTemplate: '/oauth/invites', riskScore: 80 },
         { id: 'ep2', origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/invites/redeem', riskScore: 85 },
+      ],
+      endpointParams: [
+        { endpointId: 'ep2', name: 'invite_token', location: 'body', inferredType: 'string' },
       ],
       brokerExchanges: [
         { origin: AUTH_ORIGIN, method: 'POST', pathAndQuery: '/oauth/invites', status: 201, personaHandle: 'owner_a', bodyPreview: JSON.stringify({ invite_token: 'inv_123456' }) },

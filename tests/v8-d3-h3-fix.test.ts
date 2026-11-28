@@ -375,7 +375,7 @@ test('assignment-brief surfaces exact 1-line ctx.hmac_sign/ctx.jwt_sign/ctx.awai
   const mh = injected.find(s => s.name === MULTIHOP_CHAINS_SKILL)
   assert.ok(mh, 'multihop-chains must be pre-injected')
   assert.ok(mh.excerpt.length <= 1200)
-  for (const tok of ['ctx.seal_capability', 'ctx.hmac_sign', 'ctx.jwt_sign', 'ctx.await_async', 'ctx.prove_composite', 'invariant_enforced_hardened', 'link/token stubs']) {
+  for (const tok of ['ctx.seal_capability', 'ctx.hmac_sign', 'ctx.jwt_sign', 'ctx.await_async', 'ctx.prove_composite', 'CompositeProofReceipt']) {
     assert.ok(mh.excerpt.includes(tok), `1200-char multihop-chains excerpt missing "${tok}"`)
   }
 })

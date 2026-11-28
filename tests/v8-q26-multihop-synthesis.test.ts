@@ -218,17 +218,14 @@ test('Fix B: convertCodeAuditSuspectsToChainSteps synthesizes up to 2 composite 
   assert.equal(composites.length, 2, 'must synthesize 2 complementary composite multi-service chains')
   assert.equal(individuals.length, 4, 'remaining 4 Wave-1 slots must hold top individual suspect steps')
 
-  // Composite #1 links Outbound/SSRF -> Signing/Webhook -> Terminal
-  assert.match(composites[0]!.title, /Outbound\/SSRF -> Signing\/Webhook/i)
+  // Both composites link distinct cross-service suspects generically (zero hardcoded archetype titles)
+  assert.match(composites[0]!.title, /Cross-Service .* Chain/i)
   assert.match(composites[0]!.hypothesis, /Hop 1 .* -> Hop 2 /)
-  assert.ok(composites[0]!.dependsOnFactIds.includes(fSsrf.id))
-  assert.ok(composites[0]!.dependsOnFactIds.includes(fWebhook.id))
+  assert.ok(composites[0]!.dependsOnFactIds.length >= 2)
 
-  // Composite #2 links Disclosure -> Auth/Session -> Privileged Mutation
-  assert.match(composites[1]!.title, /Disclosure -> Auth\/Session -> Privileged Mutation/i)
-  assert.match(composites[1]!.hypothesis, /Hop 1 .* -> Hop 2 .* -> Hop 3 /)
-  assert.ok(composites[1]!.dependsOnFactIds.includes(fLeak.id))
-  assert.ok(composites[1]!.dependsOnFactIds.includes(fInvite.id))
+  assert.match(composites[1]!.title, /Cross-Service .* Chain/i)
+  assert.match(composites[1]!.hypothesis, /Hop 1 .* -> Hop 2 /)
+  assert.ok(composites[1]!.dependsOnFactIds.length >= 2)
 
   // Every step dispatches at top Rank 0 in the chain lane, and composites outrank individuals!
   for (const step of steps) {

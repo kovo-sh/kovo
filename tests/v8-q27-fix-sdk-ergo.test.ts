@@ -274,9 +274,9 @@ test('Documented recipes use valid DERIVED_SECRET_KINDS, stay within LOC/byte bu
   assert.ok(KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.split('\n').length <= 12)
   assert.ok(KOVO_VERIFY_TOOL_DESCRIPTION.includes('kind: "hmac_key"'))
 
-  // Line ~104 fix: invalid 'signing_material' must not appear; valid 'hmac_key' must be used in the 4-hop recipe
+  // Invalid 'signing_material' must not appear; valid DerivedSecretKind must be used in multihop-chains.md
   assert.equal(playbook.includes('signing_material'), false, 'multihop-chains.md must not reference invalid kind signing_material')
-  assert.ok(playbook.includes("kind: 'hmac_key'"), 'multihop-chains.md 4-hop recipe must use valid kind hmac_key')
+  assert.ok(playbook.includes("kind: 'bearer_token'"), 'multihop-chains.md recipe must use valid DerivedSecretKind')
   assert.equal(prompts.includes('signing_material'), false, 'agent-prompts.ts must not reference invalid kind signing_material')
   assert.equal(prompts.includes('prove_composite(replayMode='), false, 'agent-prompts.ts must pass object to prove_composite')
 

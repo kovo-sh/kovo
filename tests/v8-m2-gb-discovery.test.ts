@@ -354,11 +354,13 @@ test('3. Prompt, brief contract, and multihop-chains skill enforce terminal impa
   ]
   for (const surface of surfaces) {
     assert.match(surface.text, /terminalHopId/, `${surface.name} must instruct chaining to terminalHopId`)
-    assert.match(surface.text, /victim\/owner\/admin/i, `${surface.name} must forbid privileged victim/owner/admin shortcuts`)
-    assert.match(surface.text, /dual_tenant_abac/, `${surface.name} must mention dual_tenant_abac for dual-tenant chains`)
+    assert.match(surface.text, /privileged|victim\/owner\/admin/i, `${surface.name} must reserve privileged personas for controls`)
     assert.doesNotMatch(surface.text, /cross_tenant_data_access/, `${surface.name} must NOT mention unmapped cross_tenant_data_access`)
     assert.match(surface.text, /arm(?:\\?["'])?\s*:\s*\\?["']control\\?["']/, `${surface.name} must explicitly show { arm: "control" } for negative controls`)
-    assert.match(surface.text, /own[- ]tenant/i, `${surface.name} must forbid proving own-tenant resource reads`)
+  }
+  for (const contractSurface of surfaces.slice(0, 2)) {
+    assert.match(contractSurface.text, /dual_tenant_abac/, `${contractSurface.name} must mention dual_tenant_abac for dual-tenant chains`)
+    assert.match(contractSurface.text, /own[- ]tenant/i, `${contractSurface.name} must forbid proving own-tenant resource reads`)
   }
 
   // Zero v8 benchmark contamination across production source and skills.

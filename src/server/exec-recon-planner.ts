@@ -923,12 +923,12 @@ function repoBasenameSlug(raw: string): string {
 function stemAffinityToken(raw: string): string {
   const tok = raw.toLowerCase().replace(/[^a-z0-9]/g, '')
   if (!tok) return ''
+  if (tok.length > 5 && tok.endsWith('ers')) return tok.slice(0, -3)
+  if (tok.length > 5 && tok.endsWith('er') && !/(?:server|worker|cluster|master|helper|member|folder|header|broker|driver|runner|ledger|docker|center|number|filter|render|router|parser)$/.test(tok)) return tok.slice(0, -2)
+  if (tok.length > 5 && tok.endsWith('ing')) return tok.slice(0, -3)
   if (tok.length > 4 && tok.endsWith('ies')) return `${tok.slice(0, -3)}y`
   if (tok.length > 4 && /(?:ches|shes|xes|zes|ses)$/.test(tok)) return tok.slice(0, -2)
-  if (tok.length > 3 && tok.endsWith('s') && !/(?:ss|us|is|status|access)$/.test(tok)) {
-    return tok.slice(0, -1)
-  }
-  return tok
+  return tok.length > 3 && tok.endsWith('s') && !/(?:ss|us|is|status|access)$/.test(tok) ? tok.slice(0, -1) : tok
 }
 
 function tokenizeAffinitySlug(raw: string): string[] {
@@ -1608,7 +1608,7 @@ function hopKindToCapabilityKind(kind: ChainHop['artifactKind']): CapabilityKind
 export const CHECKPOINT_CAP_SKILL_PREFIX = 'checkpoint_cap:'
 export const MAX_WORKSPACE_DIGEST_BYTES = 8 * 1024
 export const HOP_CONTINUATION_DIRECTIVE =
-  'Continue from the verified hop checkpoint — do not repeat already-verified discovery hops; advance the next unverified boundary using sealed capability handles and confirm end-to-end via ctx.prove_composite.'
+  'Continue from the verified hop checkpoint — do not repeat verified discovery hops; advance the next boundary with sealed handles and confirm via ctx.prove_composite.'
 
 export function extractCheckpointCapIdFromStep(step: { skills?: readonly string[] }): string | null {
   for (const skill of step.skills ?? []) {

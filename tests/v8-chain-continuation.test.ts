@@ -514,7 +514,7 @@ test('enqueueHopContinuationOnRotation persists <= 2 KB v8.hop_checkpoint.v1 che
   assert.ok(step1.skills.includes(`${CHAIN_CONTINUATION_SKILL_PREFIX}1`))
   assert.ok(step1.skills.includes(`${CHECKPOINT_CAP_SKILL_PREFIX}${cap2}`))
   assert.equal(classifyDispatchLane(step1), 'chain')
-  assert.ok(step1.hypothesis.includes('DO NOT re-read source or repeat Hops 1–2'))
+  assert.ok(step1.hypothesis.includes(HOP_CONTINUATION_DIRECTIVE))
   assert.ok(step1.hypothesis.includes('ctx.prove_composite'))
 
   // Duplicate call on the same rotated parent step is idempotent

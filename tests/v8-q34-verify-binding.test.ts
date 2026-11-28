@@ -623,8 +623,8 @@ test('multihop-chains.md covers hmac_sign/jwt_sign binding and await_async flat 
   assert.match(guide, /value_binding/)
   assert.match(guide, /derived_crypto_binding/)
   assert.match(guide, /ctx\.await_async/)
-  assert.match(guide, /exchangeId.*exchange/s)
-  assert.match(guide, /download\/artifact URL/i)
+  assert.match(guide, /triggerExchangeId/)
+  assert.match(guide, /correlationId/)
 
   const compLoc = readFileSync(join(REPO_ROOT, 'src/server/composite-receipt.ts'), 'utf8').trimEnd().split('\n').length
   const rpcLoc = readFileSync(join(REPO_ROOT, 'src/server/verify-rpc.ts'), 'utf8').trimEnd().split('\n').length

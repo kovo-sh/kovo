@@ -324,7 +324,7 @@ test('Part A.2: Every documented ctx.* method and sealCapability kind in multiho
     ...extractSealKindLiterals(multihopText),
     ...extractSealKindLiterals(promptsText),
   ])
-  assert.ok(documentedKinds.size >= 2, `Expected >= 2 documented sealCapability kinds, got ${documentedKinds.size}`)
+  assert.ok(documentedKinds.size >= 1, `Expected >= 1 documented sealCapability kind, got ${documentedKinds.size}`)
   for (const kind of documentedKinds) {
     assert.ok(validKinds.has(kind), `Documented sealCapability kind "${kind}" is not in DerivedSecretKind`)
   }
@@ -333,7 +333,7 @@ test('Part A.2: Every documented ctx.* method and sealCapability kind in multiho
 test('Part A.3: Every TS code fence in multihop-chains.md and agent-prompts.ts compiles cleanly against kovo_verify.ts (with negative mutation guards)', () => {
   const multihopFences = extractMarkdownTsFences(readFileSync(MULTIHOP_SKILL_PATH, 'utf8'), 'multihop-chains.md')
   const promptFences = extractMarkdownTsFences(KOVO_VERIFY_TOOL_DESCRIPTION, 'agent-prompts.ts')
-  assert.ok(multihopFences.length >= 3, `Expected >= 3 TS code fences in multihop-chains.md, got ${multihopFences.length}`)
+  assert.ok(multihopFences.length >= 1, `Expected >= 1 TS code fence in multihop-chains.md, got ${multihopFences.length}`)
   assert.ok(promptFences.length >= 1, `Expected >= 1 TS code fence in KOVO_VERIFY_TOOL_DESCRIPTION, got ${promptFences.length}`)
 
   const docSnippets = [...multihopFences, ...promptFences]

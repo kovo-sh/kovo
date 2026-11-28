@@ -3,13 +3,13 @@ Tags: multihop, hop-checkpoint, composite-receipt, derived-custody, async-pivot
 Summary: Verify multi-hop causal chains end-to-end with ctx.chain, sealed capability custody, and CompositeProofReceipt.
 
 ## 1. Checkpoint & Exploration Discipline
-- When given a `hopCheckpoint` (`doNotRediscover: true`), start from its verified `capabilityHandles[]` (`cap:hop_<id>:<slot>`) and advance `nextGoal` instead of repeating earlier hops or re-probing `prunedBranches[]`.
-- Explore routes and parameters with `http_request`/`kovo_http` first; never call `kovo_verify` solely to seal a single hop. Execute the full causal sequence inside one `kovo_verify` script ending in `ctx.chain(...).prove()` / `ctx.prove_composite`.
+- With a `hopCheckpoint` (`doNotRediscover: true`), resume from `capabilityHandles[]` (`cap:hop_<id>:<slot>`) and advance `nextGoal`; skip `prunedBranches[]`.
+- Explore with `http_request`/`kovo_http` first; never call `kovo_verify` solely to seal one hop. Run the full chain in one `kovo_verify` script ending in `ctx.chain(...).prove()` / `ctx.prove_composite`.
 
 ## 2. Derived Capability Custody & Helpers
-- **Seal intermediate artifacts (`ctx.seal_capability`):** Assert `2xx` before sealing, and use structured selectors (`jsonPath`, `header`, `cookie`, or `value` — NEVER `regex`). Inject sealed handles (`cap:hop_<id>:<slot>`) into downstream requests via `{ capability: { handle, target: "bearer" | "header" | "cookie" | "url" }, role: "probe" }` (omit `as` when sending a minted bearer/session token).
-- **Cryptographic derivation:** Use `ctx.hmac_sign` / `ctx.jwt_sign` over a sealed key handle to produce host-attested `derivedFromCapabilityId` signatures/tokens without exposing raw key bytes.
-- **Bounded async convergence:** Use `ctx.await_async({ pollRequest, matchPredicate, triggerExchangeId, correlationId })` for background jobs or delayed side effects instead of unbounded sleep loops.
+- **Seal (`ctx.seal_capability`):** Assert `2xx` first; use `jsonPath`, `header`, `cookie`, or `value` (NEVER `regex`). Inject `cap:hop_<id>:<slot>` via `{ capability: { handle, target: "bearer" | "header" | "cookie" | "url" }, role: "probe" }` (omit `as` for minted bearer tokens).
+- **Crypto (`ctx.hmac_sign` / `ctx.jwt_sign`):** Derive host-attested `derivedFromCapabilityId` signatures/tokens from sealed handles without exposing raw keys.
+- **Async (`ctx.await_async`):** Poll `{ pollRequest, matchPredicate, triggerExchangeId, correlationId }` instead of sleep loops.
 
 ## 3. Connected `CompositeProofReceipt` DAG (`ctx.chain` / `ctx.prove_composite`)
 Prefer `ctx.chain({ chainId, terminalVulnClass })` to auto-track hops, targets, and causal edges (`value_binding`, `derived_crypto_binding`, `state_transition_binding` with pre-mutation `{ arm: "control" }` `ablationExchangeIds` as the same actor, and `async_pivot_binding`):
