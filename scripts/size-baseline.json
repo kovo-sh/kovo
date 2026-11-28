@@ -89,7 +89,7 @@
     "src/server/exec-dispatch.ts::dispatchFrontierWave": 284,
     "src/server/exec-dispatch.ts::synthesizeRuntimeCompositeWave1Steps": 392,
     "src/server/exec-floor-lane.ts::ExecFloorLane.runDeterministicInvestigation": 298,
-    "src/server/exec-floor-lane.ts::ExecFloorLane.runEngineInvestigation": 386,
+    "src/server/exec-floor-lane.ts::ExecFloorLane.runEngineInvestigation": 379,
     "src/server/exec-recon-planner.ts::ExecReconPlanner.assignmentBriefForStep": 227,
     "src/server/exec-recon-planner.ts::ExecReconPlanner.captureBaselineObservations": 245,
     "src/server/exec-recon-planner.ts::ExecReconPlanner.enqueueHopContinuationOnRotation": 391,
