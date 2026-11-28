@@ -94,7 +94,7 @@ export type HostSignableRecord = HostTranscriptEntry | HostOobEvent | HostBrowse
 export interface CompositeOracleEvaluator { evaluate: (factLog: HostFactLog, pointerRef: { kind: 'v8_family'; family: V8OracleFamily; rawInput?: Record<string, unknown>; econCtx?: EconomicAutoHydrateContext } | { kind: 'single_hop'; receipt: ProofReceipt | unknown }, policyContext?: { signingKey?: string; strictHostDerivation?: boolean }) => { confirmed: boolean; reason: string; singleHop?: ReceiptVerification } }
 export interface CompositeVerifyOptions {
   attackerPersonas?: readonly string[]; forbiddenShortcutPersonas?: readonly string[]; dualTenantAbacPersonas?: readonly string[]; benchmarkMode?: boolean; requireCleanSessionFlag?: boolean; signingKey?: string
-  v8OracleInput?: Record<string, unknown>; strictHostDerivation?: boolean; factLog?: HostFactLog; oracleEvaluator?: CompositeOracleEvaluator; personaRoleLabels?: Readonly<Record<string, string>>
+  v8OracleInput?: Record<string, unknown>; strictHostDerivation?: boolean; factLog?: HostFactLog; oracleEvaluator?: CompositeOracleEvaluator; personaRoleLabels?: Readonly<Record<string, string>>; policyJudge?: import('./policy-judge.ts').PolicyJudgeOptions /* A3 Tier-2: applied by TerminalOracleRegistry only when terminal impact is undecided */
   verifyTerminalImpact?: (receipt: CompositeProofReceipt, transcript: HostSignedTranscript) => { confirmed: boolean; reason: string; family?: string; evidence?: Record<string, unknown> }
 }
 export interface VerifiedEdgeResult { edgeIndex: number; kind: CausalEdgeKind; fromHopId: string; toHopId: string; verified: boolean; reason: string; evidence?: Record<string, unknown> }
@@ -103,7 +103,7 @@ export interface CompositeReceiptVerification {
   confirmed: boolean; chainId: string; terminalVulnClass: string; replayMode: ReplayMode; modeBVerified: boolean; hopCount: number
   verifiedEdges: VerifiedEdgeResult[]; reason: string; failedStage?: CompositeFailureStage; rejectedBy?: string | null; missingEvidence?: string[]
   terminalOracleFamily?: V8OracleFamily | string | null; terminalEndpoint?: string | null; terminalOrigin?: string | null
-  terminalVerification?: ReceiptVerification; evidence?: Record<string, unknown>
+  terminalVerification?: ReceiptVerification; evidence?: Record<string, unknown>; verdict?: import('./policy-judge.ts').PolicyJudgeVerdict; policyJudgeDecision?: import('./policy-judge.ts').PolicyJudgeDecision; compiledPredicate?: import('./policy-judge.ts').CompiledVerifyFixPredicate
 }
 /** Host-stamped replay mode: schema-failed verdicts never parsed a receipt, so they are never stamped Mode A `fresh_clean_replay`. */
 export const resolveTranscriptReplayMode = (v: Pick<CompositeReceiptVerification, 'replayMode' | 'failedStage'> | null | undefined): ReplayMode | undefined => (v && v.failedStage !== 'schema' && (REPLAY_MODES as readonly string[]).includes(v.replayMode) ? v.replayMode : undefined)

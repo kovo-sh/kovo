@@ -184,9 +184,10 @@ const SEVERITY_RANK: Record<Finding['severity'], number> = {
 const STATUS_PRIORITY: Record<ExistingFindingRef['status'], number> = {
   confirmed: 0,
   static_verified: 1,
-  pending: 2,
-  inconclusive: 3,
-  dismissed: 4,
+  needs_review: 2,
+  pending: 3,
+  inconclusive: 4,
+  dismissed: 5,
 }
 
 /**

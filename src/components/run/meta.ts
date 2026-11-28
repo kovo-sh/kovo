@@ -24,18 +24,22 @@ export const SEV_ORDER: Record<string, number> = { critical: 0, high: 1, medium:
 export const SEV_LABEL: Record<string, string> = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low', informational: 'Info', info: 'Info' }
 export const SEV_COL: Record<string, string> = { critical: 'var(--crit)', high: 'var(--high)', medium: 'var(--med)', low: 'var(--fg-2)', informational: 'var(--fg-4)' }
 
-/** Display status for findings: runtime `confirmed` is strictly separated from `static_verified` advisories. */
-export type FindingDisplayStatus = 'confirmed' | 'static_verified' | 'pending' | 'inconclusive' | 'dismissed'
+/**
+ * Display status for findings: runtime `confirmed` is strictly separated from `static_verified`
+ * advisories and from Tier-2 `needs_review` (policy-judge findings awaiting operator review).
+ */
+export type FindingDisplayStatus = 'confirmed' | 'static_verified' | 'needs_review' | 'pending' | 'inconclusive' | 'dismissed'
 export function normFStatus(s: string): FindingDisplayStatus {
   if (s === 'confirmed' || s === 'verified') return 'confirmed'
   if (s === 'static_verified') return 'static_verified'
+  if (s === 'needs_review') return 'needs_review'
   if (s === 'pending' || s === 'proposed') return 'pending'
   return s === 'dismissed' ? 'dismissed' : 'inconclusive'
 }
-export const FSTAT_ORDER: Record<string, number> = { confirmed: 0, verified: 0, static_verified: 1, pending: 2, proposed: 2, inconclusive: 3, dismissed: 4 }
+export const FSTAT_ORDER: Record<string, number> = { confirmed: 0, verified: 0, static_verified: 1, needs_review: 2, pending: 3, proposed: 3, inconclusive: 4, dismissed: 5 }
 
 export const ST_LABEL: Record<string, string> = {
-  confirmed: 'Confirmed by replay', static_verified: 'Static advisory', verified: 'Verified', proposed: 'Proposed',
+  confirmed: 'Confirmed by replay', static_verified: 'Static advisory', needs_review: 'Needs review', verified: 'Verified', proposed: 'Proposed',
   pending: 'Awaiting verification', inconclusive: 'Inconclusive', dismissed: 'Dismissed', complete: 'Complete',
   failed: 'Failed', paused: 'Paused', budget_paused: 'Budget paused', stopped: 'Stopped', canceled: 'Canceled',
   tainted: 'Tainted', ready: 'Ready', waiting: 'Waiting', running: 'Running', queued: 'Queued',

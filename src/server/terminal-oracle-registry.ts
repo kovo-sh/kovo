@@ -12,6 +12,7 @@
  *      and exchange ordering strictly from `HostFactLog` — never from untrusted worker claim scalars.
  */
 import {
+  compositeProofReceiptSchema,
   registerDefaultCompositeOracleEvaluator,
   singleReceiptToComposite,
   verifyCompositeReceipt,
@@ -23,6 +24,8 @@ import {
   type HostSignedTranscript,
   type ReplayMode,
 } from './composite-receipt.ts'
+import { evaluatePolicyJudge, type PolicyJudgeDecision, type PolicyJudgeOptions, type PolicyJudgeVerdict } from './policy-judge.ts'
+import { compileVerifyFixPredicate, type CompiledVerifyFixPredicate } from './verify-fix-predicate.ts'
 import type { HostFactLog } from './host-fact-log.ts'
 import type { ImpactStep } from './oracle-invariants.ts'
 import {
@@ -126,6 +129,8 @@ export interface TerminalOraclePolicyContext {
   runId?: string
   /** Explicitly host-trusted composite verification options. */
   compositeOptions?: Omit<CompositeVerifyOptions, 'signingKey'>
+  /** Host-configured Tier-2 skeptic policy judge (fail-closed; only consulted when Tier-1 terminal impact is undecided). */
+  policyJudge?: PolicyJudgeOptions
   /** R3-17: Environment mode enforced by budgeted publicness replay stage (defaults to `'prod_readonly'`). */
   environmentMode?: PublicnessReplayEnvironmentMode
   /** R3-17: Optional per-run finite budget ledger for active publicness replay checks. */
@@ -152,6 +157,11 @@ export interface TerminalOracleResult {
   readonly v8Decision?: V8OracleDecision
   readonly composite?: CompositeReceiptVerification
   readonly evidence?: Record<string, unknown>
+  /** Three-way verdict when Tier-2 ran (`needs_review` is never confirmed). */
+  readonly verdict?: PolicyJudgeVerdict
+  readonly policyJudgeDecision?: PolicyJudgeDecision
+  /** 0-LLM Verify Fix predicate compiled from the confirming host-signed transcript. */
+  readonly compiledPredicate?: CompiledVerifyFixPredicate
 }
 
 export type SingleHopRuleHandler = (
@@ -565,6 +575,38 @@ function defaultV8FamilyHandler(
   return evaluateV8OracleFamily(family, { ...hydrated, verifySignature } as V8OracleInputMap[typeof family])
 }
 
+const tier2ResultFields = (c: CompositeReceiptVerification): Pick<TerminalOracleResult, 'verdict' | 'policyJudgeDecision' | 'compiledPredicate'> => ({
+  ...(c.verdict ? { verdict: c.verdict } : {}), ...(c.policyJudgeDecision ? { policyJudgeDecision: c.policyJudgeDecision } : {}), ...(c.compiledPredicate ? { compiledPredicate: c.compiledPredicate } : {}),
+})
+
+/**
+ * Tier-1 → Tier-2 hand-off for composite verdicts. A Tier-1 confirmation is never overridden: it
+ * only gains a compiled 0-LLM Verify Fix predicate. The host-configured policy judge is consulted
+ * ONLY when every integrity/edge/provenance/replay stage passed and terminal impact alone was
+ * undecided; its fail-closed clamping (`needs_review`, never `confirmed` without repo or refusal
+ * proof) is authoritative.
+ */
+function withTier2PolicyJudge(policy: TerminalOraclePolicyContext, transcript: HostSignedTranscript, rawReceipt: unknown, composite: CompositeReceiptVerification): CompositeReceiptVerification {
+  const parsed = compositeProofReceiptSchema.safeParse(rawReceipt)
+  if (!parsed.success) return composite
+  const receipt = parsed.data, signingKey = policy.signingKey
+  if (composite.confirmed) {
+    const compiledPredicate = signingKey ? compileVerifyFixPredicate(receipt, transcript, { confirmed: true, signingKey, vulnClass: composite.terminalVulnClass, evidence: composite.terminalVerification?.evidence ?? composite.evidence }) : null
+    return compiledPredicate ? { ...composite, compiledPredicate } : composite
+  }
+  const judge = policy.policyJudge ?? policy.compositeOptions?.policyJudge
+  if (!judge || composite.failedStage !== 'terminal_impact') return composite
+  const citedExchangeIds = [...receipt.hops.flatMap(h => h.exchangeIds), ...receipt.terminalImpact.preChainControlExchangeIds, ...receipt.terminalImpact.postChainReadbackExchangeIds]
+  const decision = evaluatePolicyJudge({ ...judge, vulnClass: composite.terminalVulnClass, exchanges: transcript.entries ?? [], citedExchangeIds, ...(signingKey ? { signingKey } : {}) })
+  const compiledPredicate = decision.confirmed && signingKey ? compileVerifyFixPredicate(receipt, transcript, { confirmed: true, signingKey, vulnClass: composite.terminalVulnClass, policyJudgeDecision: decision }) : null
+  return {
+    ...composite, confirmed: decision.confirmed, verdict: decision.verdict, policyJudgeDecision: decision,
+    ...(decision.confirmed ? { failedStage: undefined, rejectedBy: null, missingEvidence: [] } : {}),
+    reason: `Tier-2 policy judge ${decision.verdict}: ${decision.reason} (Tier-1: ${composite.reason})`.slice(0, 600),
+    ...(compiledPredicate ? { compiledPredicate } : {}),
+  }
+}
+
 export class UnregisteredTerminalOracleError extends Error {
   constructor(message: string) {
     super(message)
@@ -667,7 +709,7 @@ export class TerminalOracleRegistry {
           reason: sanitized.bindingError,
         }
       }
-      const composite = verifyCompositeReceipt(sanitized.receipt, hostTranscript, {
+      const composite = withTier2PolicyJudge(policyContext, hostTranscript, sanitized.receipt, verifyCompositeReceipt(sanitized.receipt, hostTranscript, {
         oracleEvaluator: this,
         ...(policyContext.compositeOptions ?? {}),
         ...(policyContext.signingKey ? { signingKey: policyContext.signingKey } : {}),
@@ -677,9 +719,9 @@ export class TerminalOracleRegistry {
         ...(policyContext.requireCleanSessionFlag !== undefined ? { requireCleanSessionFlag: policyContext.requireCleanSessionFlag } : {}),
         strictHostDerivation: true,
         factLog,
-      })
+      }))
       return {
-        confirmed: composite.confirmed,
+        confirmed: composite.confirmed, ...tier2ResultFields(composite),
         kind: 'composite',
         familyOrRule: String(composite.terminalOracleFamily ?? composite.terminalVulnClass),
         reason: composite.reason,

@@ -56,6 +56,7 @@ import {
 } from './derived-custody.ts'
 import { checkCoverage, readComparisons, verificationCommand, type EvidenceReview } from './evidence-checks.ts'
 import { isFixedEligibleFailureReason } from './retest-health.ts'
+import { executeCompiledVerifyFixPredicate, readCompiledVerifyFixPredicate } from './verify-fix-predicate.ts'
 import type { ExecBoardManager } from './exec-board.ts'
 import {
   ExecServiceModule,
@@ -610,11 +611,8 @@ const ORACLE_FAMILY_ALIAS_GROUP: Readonly<Record<string, string>> = {
 }
 
 const FINDING_STATUS_PRIORITY: Readonly<Record<Finding['status'], number>> = {
-  confirmed: 0,
-  static_verified: 1,
-  pending: 2,
-  inconclusive: 3,
-  dismissed: 4,
+  confirmed: 0, static_verified: 1, needs_review: 2,
+  pending: 3, inconclusive: 4, dismissed: 5,
 }
 
 export interface AgentProofTargetInfo {
@@ -1434,7 +1432,7 @@ export function serializeCompositeProofReceiptRow(
   return {
     ...base,
     compositeReceipt: comp,
-    compositeVerification: compVer,
+    compositeVerification: compVer, ...(compVer.compiledPredicate ? { compiledPredicate: compVer.compiledPredicate } : {}),
     hopActors,
   }
 }
@@ -3830,13 +3828,15 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     const persistedProof = this.storage.replaySpecProof(run.id, specRow.id)
     const hasHostTrustedEnvelope = findingRow.provenance === 'floor'
       || Boolean(persistedProof && persistedProof.verdict === 'confirmed')
-    const retestRes = await retestReplaySpec({
+    const compiledPredicate = readCompiledVerifyFixPredicate(specRow.proofReceipt) // A3: 0-LLM compiled predicate first; legacy replay only without one.
+    const retestParams = {
       ...this.baseReplayRunnerParams(
         specRow.spec, run.id, job.assignment.id, grant, job.controller.signal, reposDir,
         createExchangeRecorder(this.storage, () => run, job.assignment.id, currentSecrets),
       ),
-      envelopeTrust: hasHostTrustedEnvelope ? 'host_persisted' : 'untrusted',
-    })
+      envelopeTrust: hasHostTrustedEnvelope ? 'host_persisted' as const : 'untrusted' as const,
+    }
+    const retestRes = compiledPredicate ? await executeCompiledVerifyFixPredicate(compiledPredicate, retestParams) : await retestReplaySpec(retestParams)
 
     const current = this.storage.run(run.id)
     this.storage.transaction(() => {
@@ -3846,7 +3846,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         `Verify Fix retest · ${findingRow.finding.title}`,
         JSON.stringify({
           findingId,
-          replaySpecId: specRow.id,
+          replaySpecId: specRow.id, ...(compiledPredicate ? { verifyFixMode: 'compiled_predicate_0llm', predicateSha256: compiledPredicate.predicateSha256 } : {}),
           verdict: retestRes.verdict,
           outcome: retestRes.replay.outcome,
           exchangeIds: retestRes.replay.exchangeIds,
@@ -3908,7 +3908,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       ? 'runtime_confirmed'
       : status === 'dismissed'
         ? 'dismissed'
-        : status === 'inconclusive' || status === 'pending'
+        : status === 'inconclusive' || status === 'pending' || status === 'needs_review'
           ? 'open_proof_gap'
           : 'static_advisory'
     const persistedRecord = {

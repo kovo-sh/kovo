@@ -31,8 +31,8 @@ type Sort = 'severity' | 'status' | 'title'
 type Tab = 'all' | FindingDisplayStatus
 const GROUPS: [Group, string][] = [['severity', 'Severity'], ['origin', 'Origin'], ['status', 'Status'], ['none', 'None']]
 const SORTS: [Sort, string][] = [['severity', 'Severity'], ['status', 'Status'], ['title', 'Title']]
-const TABS: [Tab, string][] = [['all', 'All'], ['confirmed', 'Confirmed'], ['static_verified', 'Static advisory'], ['pending', 'Awaiting'], ['inconclusive', 'Inconclusive'], ['dismissed', 'Dismissed']]
-const STATUS_KEYS: FindingDisplayStatus[] = ['confirmed', 'static_verified', 'pending', 'inconclusive', 'dismissed']
+const TABS: [Tab, string][] = [['all', 'All'], ['confirmed', 'Confirmed'], ['static_verified', 'Static advisory'], ['needs_review', 'Needs review'], ['pending', 'Awaiting'], ['inconclusive', 'Inconclusive'], ['dismissed', 'Dismissed']]
+const STATUS_KEYS: FindingDisplayStatus[] = ['confirmed', 'static_verified', 'needs_review', 'pending', 'inconclusive', 'dismissed']
 /** Above this many rows the list is windowed (rows stay 36px, heads 32px). */
 const VIRTUAL_AT = 300
 const ROW_H = 36
