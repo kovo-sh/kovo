@@ -51,16 +51,37 @@ export function DialogDescription({ className, ...props }: DialogPrimitive.Descr
   )
 }
 
+export type DialogContentProps = DialogPrimitive.Popup.Props & {
+  /**
+   * Skip the enter/exit transition entirely. Use for keyboard-triggered,
+   * many-times-a-day surfaces (⌘K palette, `?` shortcut sheet) that must be
+   * fully opaque on their first frame. Pointer-opened occasional modals keep
+   * the default 150ms fade + scale.
+   */
+  instant?: boolean
+}
+
+// Enter: 150ms ease-kovo fade (+ .98 scale on the popup). Exit is shorter
+// (100ms) so dismissal feels immediate. Origin stays centred for modals.
+const BACKDROP_MOTION =
+  'transition-opacity duration-150 ease-kovo data-[ending-style]:duration-100 data-[ending-style]:opacity-0 data-[starting-style]:opacity-0'
+const POPUP_MOTION = [
+  'transition-[opacity,scale] duration-150 ease-kovo data-[ending-style]:duration-100',
+  'data-[ending-style]:scale-[.98] data-[ending-style]:opacity-0',
+  'data-[starting-style]:scale-[.98] data-[starting-style]:opacity-0',
+].join(' ')
+const NO_MOTION = 'transition-none duration-0'
+
 /**
  * Portal-rendered content: a single-border panel over a soft scrim, centred in
  * a scrollable viewport. Focus is trapped and restored by Base UI.
  */
-export function DialogContent({ className, children, ...props }: DialogPrimitive.Popup.Props) {
+export function DialogContent({ className, children, instant = false, ...props }: DialogContentProps) {
   return (
     <DialogPrimitive.Portal>
       <DialogPrimitive.Backdrop
         data-slot="dialog-backdrop"
-        className="fixed inset-0 z-[60] bg-scrim transition-opacity duration-150 ease-kovo data-[ending-style]:opacity-0 data-[starting-style]:opacity-0"
+        className={cn('fixed inset-0 z-[60] bg-scrim', instant ? NO_MOTION : BACKDROP_MOTION)}
       />
       <DialogPrimitive.Viewport
         data-slot="dialog-viewport"
@@ -70,9 +91,7 @@ export function DialogContent({ className, children, ...props }: DialogPrimitive
           data-slot="dialog-content"
           className={cn(
             'w-full max-w-[520px] rounded-card border border-line-2 bg-panel text-fg shadow-popover outline-none',
-            'transition-[opacity,scale] duration-150 ease-kovo',
-            'data-[ending-style]:scale-[.98] data-[ending-style]:opacity-0',
-            'data-[starting-style]:scale-[.98] data-[starting-style]:opacity-0',
+            instant ? NO_MOTION : POPUP_MOTION,
             className,
           )}
           {...props}

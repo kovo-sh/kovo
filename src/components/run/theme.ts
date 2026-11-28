@@ -26,6 +26,21 @@ function syncTheme(mode?: Theme | 'system'): Theme {
   return resolved
 }
 
+/**
+ * Run `flip` with every CSS transition suspended for two frames, so a theme
+ * change repaints all surfaces at once instead of rippling through dozens of
+ * colour transitions with mixed durations (`.no-transitions` lives in app.css).
+ */
+function withoutTransitions<T>(flip: () => T): T {
+  const root = document.documentElement
+  root.classList.add('no-transitions')
+  try {
+    return flip()
+  } finally {
+    requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove('no-transitions')))
+  }
+}
+
 /** Effective theme (resolved from `system`) and a toggle that persists an explicit choice. */
 export function useTheme() {
   const [theme, setTheme] = useState<Theme>('light')
@@ -41,7 +56,7 @@ export function useTheme() {
   const toggle = useCallback(() => {
     const next: Theme = resolve() === 'dark' ? 'light' : 'dark'
     try { localStorage.setItem(KEY, next) } catch { /* private mode */ }
-    setTheme(syncTheme(next))
+    setTheme(withoutTransitions(() => syncTheme(next)))
   }, [])
   return { theme, toggle }
 }

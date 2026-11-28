@@ -63,6 +63,15 @@ function CustomProviderIllustration() {
   )
 }
 
+const PROTOCOL_PILL: Record<typeof DEFAULT_PROVIDER.protocol | 'chat-completions' | 'messages', string> = {
+  responses: 'Responses',
+  'chat-completions': 'Chat Completions',
+  messages: 'Messages',
+}
+
+/** Preset card summary derived from DEFAULT_PROVIDER.name ("OpenRouter <model>" -> "OpenRouter · <model>"). */
+const DEFAULT_PROVIDER_SUMMARY = DEFAULT_PROVIDER.name.replace(/^OpenRouter\s+/, 'OpenRouter · ')
+
 function suggestUniqueProfileName(baseName: string, profiles: readonly PublicModelProfile[]): string {
   const base = baseName.trim()
   const existing = new Set(profiles.map(profile => profile.name.trim().toLowerCase()))
@@ -142,15 +151,19 @@ export function ModelProfileSheet({
     >
       <DialogContent className="flex max-h-[calc(100vh-48px)] max-w-[620px] flex-col overflow-hidden rounded-2xl border-line-2 bg-raise p-0">
         <div className="flex flex-none items-center justify-between gap-3 border-b border-line px-4 py-3">
-          <div>
-            <DialogTitle className="text-[14px] font-semibold tracking-[-0.01em] text-fg">
-              {isEditing ? `Edit profile · ${editing!.name}` : 'Add model profile'}
+          <div className="min-w-0 flex-1">
+            <DialogTitle
+              className="truncate text-[14px] font-semibold tracking-[-0.01em] text-fg"
+              title={editing ? editing.name : undefined}
+            >
+              {editing ? `Edit profile · ${editing.name}` : 'Add model profile'}
             </DialogTitle>
           </div>
           <Button
             type="button"
             variant="ghost"
-            className="size-6 min-w-6 rounded-[5px] p-0 text-fg-subtle"
+            size="icon"
+            className="size-6 flex-none rounded-[5px] p-0 text-fg-subtle"
             disabled={action.pending}
             onClick={onClose}
             aria-label="Close modal"
@@ -161,7 +174,7 @@ export function ModelProfileSheet({
 
         <form
           key={formKey}
-          className="flex min-h-0 flex-1 flex-col"
+          className="flex min-h-0 min-w-0 flex-1 flex-col"
           onInput={() => setFeedback('')}
           onSubmit={event => {
             event.preventDefault()
@@ -234,7 +247,7 @@ export function ModelProfileSheet({
                       Default provider
                     </strong>
                     <span className="text-[11.5px] leading-4 text-fg-muted">
-                      e.g. Primary Analyst (OpenRouter / Anthropic / OpenAI) — fast, high-recall default
+                      {DEFAULT_PROVIDER_SUMMARY}. Paste one key; Kovo pre-fills endpoint, model, and limits.
                     </span>
                   </div>
                 </button>
@@ -283,7 +296,7 @@ export function ModelProfileSheet({
                   <Badge variant="neutral" className="bg-panel font-mono font-medium text-fg-muted">
                     {DEFAULT_PROVIDER.model}
                   </Badge>
-                  <Badge variant="neutral" className="font-medium">Responses</Badge>
+                  <Badge variant="neutral" className="font-medium">{PROTOCOL_PILL[DEFAULT_PROVIDER.protocol]}</Badge>
                 </div>
 
                 <label className={FIELD_CLASS}>
@@ -319,7 +332,7 @@ export function ModelProfileSheet({
                     <DisclosureTrigger className="rounded-none bg-transparent px-3 py-2 text-[12px] font-medium text-fg-muted shadow-none hover:bg-hover hover:text-fg">
                       Customize profile name &amp; limits
                     </DisclosureTrigger>
-                    <DisclosureContent keepMounted className="flex flex-col gap-2.5 border-t border-line p-3 data-[closed]:hidden">
+                    <DisclosureContent keepMounted className="flex flex-col gap-2.5 border-t border-line p-3">
                       <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
                         <label className={FIELD_CLASS}>
                           Profile name
@@ -532,7 +545,7 @@ export function ModelProfileSheet({
 
                   <DisclosureContent
                     keepMounted
-                    className="mt-2 flex flex-col gap-2.5 rounded-lg border border-line bg-sunk p-3 data-[closed]:hidden"
+                    className="mt-2 flex flex-col gap-2.5 rounded-lg border border-line bg-sunk p-3"
                   >
                     <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
                       <label className={FIELD_CLASS}>
@@ -618,19 +631,10 @@ export function ModelProfileSheet({
               </>
             )}
 
-            {action.error && (
-              <p role="alert" className="m-0 whitespace-pre-wrap text-[12px] text-danger">
-                {action.error}
-              </p>
-            )}
-            {feedback && (
-              <p role="status" className="m-0 text-[12px] text-ok">
-                {feedback}
-              </p>
-            )}
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-2.5 border-t border-line bg-sunk px-4 py-2.5">
+            <SheetFeedback error={action.error} feedback={feedback} />
             <span className="text-[11.5px] text-fg-subtle">
               Automatic failover only switches providers before a response begins streaming.
             </span>
@@ -649,5 +653,17 @@ export function ModelProfileSheet({
         </form>
       </DialogContent>
     </Dialog>
+  )
+}
+
+/** Save/Test outcome rendered in the sticky footer, right above the buttons that caused it. */
+function SheetFeedback({ error, feedback }: { error: string; feedback: string }) {
+  if (!error && !feedback) return null
+  return (
+    <div className="max-h-24 w-full min-w-0 overflow-y-auto">
+      {error
+        ? <p role="alert" className="m-0 min-w-0 whitespace-pre-wrap text-[12px] text-danger [overflow-wrap:anywhere]">{error}</p>
+        : <p role="status" className="m-0 min-w-0 text-[12px] text-ok-text [overflow-wrap:anywhere]">{feedback}</p>}
+    </div>
   )
 }
