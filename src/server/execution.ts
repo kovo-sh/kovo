@@ -45,7 +45,8 @@ import {
 } from './broker.ts'
 import { CanaryBroker, scanSecondOrderMarkers, type SecondOrderStore } from './canary-broker.ts'
 import { hasCuratedAdvisory, queryCves } from './cve-broker.ts'
-import { DerivedCapabilityVault, resetRunCustodyBudgets } from './derived-custody.ts'
+import { resetRunCustodyBudgets, type DerivedCapabilityVault } from './derived-custody.ts'
+import { disposePrincipalCustodyStore, getOrCreatePrincipalCustodyStore, mergeRunSecretsWithCustody } from './principal-custody.ts'
 import { runAllRunDisposers, settleOrReport, settleOrReportAsync } from './run-disposers.ts'
 import { emitRunLivenessViolations } from './lifecycle.ts'
 import { AssignmentClaimRegistry, claimAssignment, purgeActiveJobsForRun, reapOrphanedRunningAssignments, type ClaimHandle } from './assignment-claim.ts'
@@ -941,15 +942,7 @@ export class Execution {
 
   private evictCapabilityVault(runId: string): void {
     this.capabilityVaults.delete(runId)
-    const safeRunId = /^[A-Za-z0-9._-]{1,128}$/.test(runId)
-      ? runId
-      : runId.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 128) || 'run'
-    const diskPath = existsSync(this.storage.directory)
-      ? join(this.storage.directory, 'capability-vaults', `${safeRunId}.json`)
-      : undefined
-    if (diskPath) {
-      try { rmSync(diskPath, { force: true }) } catch { /* best-effort disk eviction */ }
-    }
+    disposePrincipalCustodyStore(runId, this.storage.directory)
   }
 
   /**
@@ -1292,6 +1285,9 @@ export class Execution {
   } {
     const project = this.storage.project(run.projectId)
     const resolvedPersonas = resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds)
+    const custody = getOrCreatePrincipalCustodyStore(run.id, { persistDir: this.storage.directory })
+    custody.registerPersonas(resolvedPersonas)
+    if (!this.capabilityVaults.has(run.id)) this.capabilityVaults.set(run.id, custody.vault)
     // v6: every worker (always-on floor lane and agentic specialists alike) gets its own composite
     // session clone. A logout/rotation in one clone can never 401 a sibling worker.
     const personas = new Map(
@@ -1315,6 +1311,7 @@ export class Execution {
           },
           h => this.personaAuth.sessions.session(h, run.id)
             ?? (usedUnscopedClone ? this.personaAuth.sessions.session(h) : null),
+          run.id,
         )
         if (!cloned) return [handle, persona] as const
         const tracked = this.workerSessionClones.get(job.assignment.id) ?? []
@@ -1323,19 +1320,8 @@ export class Execution {
         return [handle, cloned.persona] as const
       }),
     )
-    const secrets = personaSecrets(personas)
-    const currentSecrets = () => {
-      const latest = personaSecrets(personas)
-      const seen = new Set(secrets.map(s => `${s.placeholder}\0${s.value}`))
-      for (const item of latest) {
-        const key = `${item.placeholder}\0${item.value}`
-        if (!seen.has(key)) {
-          seen.add(key)
-          secrets.push(item)
-        }
-      }
-      return secrets
-    }
+    const secrets = mergeRunSecretsWithCustody([], personaSecrets(personas), custody)
+    const currentSecrets = () => mergeRunSecretsWithCustody(secrets, personaSecrets(personas), custody)
     const allowLocalLab = project.environment === 'local-lab'
     const readLiveMaxRpsPerOrigin = (): number => {
       try {
@@ -1589,21 +1575,9 @@ export class Execution {
 
   /** Return (or lazily create) the single run-scoped Layer-1 DerivedCapabilityVault shared across all workers. */
   capabilityVaultFor(runId: string): DerivedCapabilityVault {
-    let vault = this.capabilityVaults.get(runId)
-    if (!vault) {
-      const safeRunId = /^[A-Za-z0-9._-]{1,128}$/.test(runId)
-        ? runId
-        : runId.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 128) || 'run'
-      const persistPath = existsSync(this.storage.directory)
-        ? join(this.storage.directory, 'capability-vaults', `${safeRunId}.json`)
-        : undefined
-      vault = new DerivedCapabilityVault({
-        runId: safeRunId,
-        ...(persistPath ? { persistPath } : {}),
-      })
-      this.capabilityVaults.set(runId, vault)
-    }
-    return vault
+    const custody = getOrCreatePrincipalCustodyStore(runId, { persistDir: this.storage.directory })
+    if (!this.capabilityVaults.has(runId)) this.capabilityVaults.set(runId, custody.vault)
+    return custody.vault
   }
 
   /** Return the run-scoped v8 FrontierWaveController bound to Store's CapabilityLedger. */
@@ -2038,6 +2012,7 @@ export class Execution {
     if (this.runAuthStarted.get(run.id) === key) return false
     try {
       const resolved = resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds)
+      getOrCreatePrincipalCustodyStore(run.id, { persistDir: this.storage.directory }).registerPersonas(resolved)
       return [...resolved.values()].some(p => p.authKind === 'login')
     } catch {
       return false
@@ -2074,7 +2049,10 @@ export class Execution {
         if (signal.aborted) return
         let secrets: NamedSecret[] = []
         try {
-          secrets = personaSecrets(resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds))
+          const refreshedPersonas = resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds)
+          const custody = getOrCreatePrincipalCustodyStore(run.id, { persistDir: this.storage.directory })
+          custody.registerPersonas(refreshedPersonas)
+          secrets = mergeRunSecretsWithCustody([], personaSecrets(refreshedPersonas), custody)
         } catch {
           secrets = []
         }
@@ -4112,7 +4090,9 @@ export class Execution {
     const repo = repoOverride?.trim() || hydratedFinding.codeLocations?.[0]?.repo || mountedRepos[0]
     const profiles = privateModelProfiles(this.storage)
     const personas = resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds)
-    const secrets = personaSecrets(personas)
+    const custody = getOrCreatePrincipalCustodyStore(run.id, { persistDir: this.storage.directory })
+    custody.registerPersonas(personas)
+    const secrets = mergeRunSecretsWithCustody([], personaSecrets(personas), custody)
 
     // Gate 6: when a local-lab target exists, rebuild the patched lab and replay the finding's spec.
     // A temporary `retest` assignment supplies the scoped grant (no interactive worker needed).
