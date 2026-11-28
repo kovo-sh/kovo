@@ -158,7 +158,7 @@ export const BASELINE_SOURCE_TEXT_REGEX_ASSERTS: Readonly<Record<string, number>
   'tests/v8-q27-fix-sdk-ergo.test.ts': 3,
   'tests/v8-q32-stub-telemetry.test.ts': 4,
   'tests/v8-q34-verify-binding.test.ts': 9,
-  'tests/v8-sdk-adoption.test.ts': 8,
+  'tests/v8-sdk-adoption.test.ts': 6,
   'tests/v8-sdk-strict-camel.test.ts': 4,
   'tests/v8-wire-graph.test.ts': 1,
   'tests/wavea-route-template.test.ts': 3,
