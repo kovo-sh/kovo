@@ -346,13 +346,10 @@ test('assignment-brief surfaces exact 1-line ctx.hmac_sign/ctx.jwt_sign/ctx.awai
   assert.ok(cryptoPacket.bytes <= ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE)
   const cryptoParsed = JSON.parse(cryptoPacket.text) as { multiHopProofContract?: AssignmentBriefMultiHopContract }
   assert.ok(cryptoParsed.multiHopProofContract)
-  assert.match(cryptoParsed.multiHopProofContract.continueChainRule, /ctx\.seal_capability.*Hops 3-5.*SAME script/i)
-  const cryptoPatterns = (cryptoParsed.multiHopProofContract.helperPatterns ?? []).join('\n')
-  assert.ok(cryptoPatterns.includes('ctx.hmac_sign({ secretHandle:'), `missing hmac_sign 1-liner: ${cryptoPatterns}`)
-  assert.ok(cryptoPatterns.includes('ctx.jwt_sign({ secretHandle:'), `missing jwt_sign 1-liner: ${cryptoPatterns}`)
-  assert.ok(cryptoPatterns.includes('ctx.await_async({ pollRequest:'), `webhook/settlement should also surface await_async 1-liner: ${cryptoPatterns}`)
+  assert.match(cryptoParsed.multiHopProofContract.continueChainRule, /ctx\.seal_capability.*terminalHopId/i)
+  assert.equal(cryptoPacket.text.includes('fast_lab'), false, 'brief must not hardcode profile: "fast_lab"')
 
-  // Async export / PDF worker chain brief
+  // Async export / PDF worker chain brief (uncompacted full contract includes optionalHelpers without fast_lab)
   const asyncPacket = buildAssignmentBriefPacket({
     missionKind: 'chain_step_2',
     origin: 'https://api.example.test',
@@ -364,10 +361,13 @@ test('assignment-brief surfaces exact 1-line ctx.hmac_sign/ctx.jwt_sign/ctx.awai
   })
   assert.ok(asyncPacket.bytes <= ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE)
   const asyncParsed = JSON.parse(asyncPacket.text) as { multiHopProofContract?: AssignmentBriefMultiHopContract }
-  const asyncPatterns = (asyncParsed.multiHopProofContract?.helperPatterns ?? []).join('\n')
-  assert.ok(asyncPatterns.includes('ctx.await_async({ pollRequest:'), `missing await_async 1-liner: ${asyncPatterns}`)
-  assert.ok(asyncPatterns.includes('triggerExchangeId'), `missing triggerExchangeId in await_async pattern: ${asyncPatterns}`)
-  assert.ok(asyncPatterns.includes('correlationId'), `missing correlationId in await_async pattern: ${asyncPatterns}`)
+  const asyncHelpers = asyncParsed.multiHopProofContract?.optionalHelpers ?? ''
+  assert.ok(asyncHelpers.includes('ctx.hmac_sign({ secretHandle'), `missing hmac_sign helper note: ${asyncHelpers}`)
+  assert.ok(asyncHelpers.includes('ctx.jwt_sign({ secretHandle'), `missing jwt_sign helper note: ${asyncHelpers}`)
+  assert.ok(asyncHelpers.includes('ctx.await_async({ pollRequest'), `missing await_async helper note: ${asyncHelpers}`)
+  assert.ok(asyncHelpers.includes('triggerExchangeId'), `missing triggerExchangeId in await_async note: ${asyncHelpers}`)
+  assert.ok(asyncHelpers.includes('correlationId'), `missing correlationId in await_async note: ${asyncHelpers}`)
+  assert.equal(asyncHelpers.includes('fast_lab'), false, 'optionalHelpers must not hardcode profile: "fast_lab"')
 
   // Pre-injected 1200-char multihop-chains excerpt includes ALL 5 helpers + hardened-twin rule + Hop-2 warning
   clearSkillsCache()

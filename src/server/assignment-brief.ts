@@ -22,8 +22,17 @@
  */
 
 import { buildRecordCoverageBriefGuidance } from './coverage-category.ts'
+import {
+  classifyPersonaMetadata,
+  classifyPersonaPrivilege,
+  type PersonaMembershipInput,
+  type PersonaPrivilegeClassification,
+  type PersonaPrivilegeTier,
+} from './persona-privilege.ts'
 import { renderCodeDataflowSlice, type CodeDataflowSlice } from './program-graph.ts'
 import { redact } from './redact.ts'
+
+export { classifyPersonaPrivilege, type PersonaPrivilegeClassification, type PersonaPrivilegeTier }
 
 export const ASSIGNMENT_BRIEF_MAX_BYTES = 1536
 /** Hard ceiling for any brief (compact or expanded with a code slice / hop checkpoint). */
@@ -63,6 +72,13 @@ export interface AssignmentBriefRoute {
 export interface AssignmentBriefPersona {
   handle: string
   role?: string
+  /** Optional explicit privilege level from PersonaVault config. */
+  privilege?: string | null
+  /** Optional explicit tenant identifier from PersonaVault config. */
+  tenant?: string | null
+  tenantRef?: string | null
+  tenants?: readonly string[] | null
+  memberships?: readonly (string | PersonaMembershipInput)[] | Readonly<Record<string, string>> | null
   /** Original configured persona index used for deterministic same-tier tie-breaking. */
   configIndex?: number
   /** Resource IDs harvested for this persona (never tokens/cookies). */
@@ -858,73 +874,19 @@ export interface AssignmentBriefMultiHopContract {
   attackerOriginRule: string
   continueChainRule: string
   optionalHelpers?: string
-  helperPatterns?: string[]
   modeATsRecipe: string
-  hardenedTwinRule: string
 }
 
 export const MULTIHOP_ATTACKER_ORIGIN_RULE =
-  'Run discovery & attack hops as low-privilege/attacker persona(s) ONLY — NEVER privileged victim/owner/admin shortcuts (negative control only, passing { arm: "control" }). For invite, tenant-resolution, rebind, or cross-tenant entry flows, choose an outsider persona whose tenant differs from the target tenant. Shared/dual-tenant persona crossing into non-admin tenant -> dual_tenant_abac (not broken_access_control). Ablation = SAME actor as toHop.'
+  'Run discovery & attack hops as low-privilege/attacker persona(s) ONLY — NEVER privileged victim/owner/admin shortcuts (negative control only, passing { arm: "control" }). For invite, tenant-resolution, rebind, or cross-tenant entry flows, choose an outsider persona whose tenant differs from the target tenant. Shared/multi-tenant persona crossing into non-admin tenant -> dual_tenant_abac (not broken_access_control). Ablation = SAME actor as toHop.'
 
 export const MULTIHOP_CONTINUE_CHAIN_RULE =
-  'Explore with http_request/kovo_http first; NEVER seal-only kovo_verify. Never submit a proof for reading your own tenant resource or stopping at an intermediate invite/token/metadata/job/export-handle/role-write mint — seal (ctx.seal_capability) and chain Hops 3-5 in ONE SAME script to cross-tenant/unauthorized victim impact on terminalHopId via ctx.chain(...).prove().'
+  'Explore with http_request/kovo_http first; NEVER seal-only kovo_verify. Never submit a proof for reading your own tenant resource or stopping at an intermediate invite/token/metadata/job/export-handle/role-write mint — seal (ctx.seal_capability) and chain to cross-tenant/unauthorized victim impact on terminalHopId via ctx.chain(...).prove().'
 
 export const RECORD_COVERAGE_BRIEF_GUIDANCE = buildRecordCoverageBriefGuidance()
 
-export const MULTIHOP_HARDENED_TWIN_RULE =
-  `If a terminal guard holds cleanly, do NOT file a standalone finding on benign Hop 1-2; call record_coverage(status="ruled_out", proofGapReason="invariant_enforced_hardened") with enforcingControl+exchangeIds (or needs_follow_up if no live exchange) and complete_intent.`
-
 export const MULTIHOP_OPTIONAL_HELPERS_NOTE =
-  'Crypto/async hops: ctx.hmac_sign({ secretHandle, payload, alg: "sha256", encoding: "hex" }) | ctx.jwt_sign({ secretHandle, claims, alg: "HS256", hopReceiptId, slot }) -> derived_crypto_binding; ctx.await_async({ pollRequest, matchPredicate, triggerExchangeId, correlationId, profile: "fast_lab" }) -> async_pivot_binding; state mutation -> state_transition_binding (entityId, ablationExchangeIds as SAME actor as toHop).'
-
-export const MULTIHOP_HMAC_SIGN_PATTERN =
-  'const sig = await ctx.hmac_sign({ secretHandle: cap.handle, payload: body, alg: "sha256", encoding: "hex" }) // send sig.signature -> derived_crypto_binding'
-
-export const MULTIHOP_JWT_SIGN_PATTERN =
-  'const minted = await ctx.jwt_sign({ secretHandle: cap.handle, claims: { sub: "svc", scope: "admin" }, alg: "HS256", hopReceiptId: "2", slot: "jwt" }) // use capability: minted.derivedHandle -> derived_crypto_binding'
-
-export const MULTIHOP_AWAIT_ASYNC_PATTERN =
-  'const pol = await ctx.await_async({ pollRequest: { path: "/api/jobs/" + id, as: "<attacker_persona>", role: "probe" }, matchPredicate: { status: 200, jsonPath: "$.status", equals: "completed" }, triggerExchangeId: h1.exchangeId, correlationId: id, profile: "fast_lab" }) // -> async_pivot_binding (pollRecordId: pol.pollRecordId)'
-
-const CRYPTO_HELPER_SIGNAL_RE = /\b(?:webhook|hmac|sign(?:ing|ature|ed)?|secret|salt|jwt|jws|oidc|oauth|token|assertion|bearer|key|crypto|forge)\b/i
-const ASYNC_HELPER_SIGNAL_RE = /\b(?:async|job|export|worker|queue|poll|pdf|render|ssrf|callback|webhook|batch|settlement|ledger|report|download|presign(?:ed)?|signed[_-]?url|storage|cdn)\b/i
-
-function detectMultiHopHelperPatterns(input?: AssignmentBriefInput, compact = false): string[] {
-  if (!input) return []
-  const parts: string[] = []
-  for (const r of [...(input.routes ?? []), ...(input.linkedRoutes ?? [])]) {
-    parts.push(r.path, ...(r.params ?? []))
-  }
-  if (input.hopCheckpoint) {
-    const ng = input.hopCheckpoint.nextGoal
-    parts.push(ng.endpoint, ng.goal, ng.surface ?? '', ng.hypothesisClass ?? '', ng.expectedBinding ?? '')
-    for (const vh of input.hopCheckpoint.verifiedHops ?? []) {
-      parts.push(vh.kind ?? '', vh.surface ?? '', vh.at ?? '', vh.binding ?? '')
-    }
-  }
-  if (input.proofObligation) {
-    parts.push(input.proofObligation.route, input.proofObligation.sink ?? '', input.proofObligation.chain ?? '', input.proofObligation.deliverable ?? '')
-  }
-  if (input.detLead) parts.push(input.detLead.probeClass, input.detLead.signalSummary)
-  if (input.codeSlice) parts.push(input.codeSlice.route ?? '', input.codeSlice.sink?.kind ?? '', input.codeSlice.sink?.at ?? '')
-  const corpus = parts.join(' ')
-  if (!corpus.trim()) return []
-  const patterns: string[] = []
-  if (CRYPTO_HELPER_SIGNAL_RE.test(corpus)) {
-    patterns.push(
-      compact ? 'ctx.hmac_sign({ secretHandle: cap.handle, payload: body, alg: "sha256", encoding: "hex" })' : MULTIHOP_HMAC_SIGN_PATTERN,
-      compact ? 'ctx.jwt_sign({ secretHandle: cap.handle, claims, alg: "HS256", hopReceiptId: "2", slot: "jwt" })' : MULTIHOP_JWT_SIGN_PATTERN,
-    )
-  }
-  if (ASYNC_HELPER_SIGNAL_RE.test(corpus)) {
-    patterns.push(
-      compact
-        ? 'ctx.await_async({ pollRequest: { path, as: "<attacker_persona>", role: "probe" }, matchPredicate: { status: 200 }, triggerExchangeId: h1.exchangeId, correlationId: id, profile: "fast_lab" })'
-        : MULTIHOP_AWAIT_ASYNC_PATTERN,
-    )
-  }
-  return patterns
-}
+  'Crypto/async hops: ctx.hmac_sign({ secretHandle, payload, alg: "sha256", encoding: "hex" }) | ctx.jwt_sign({ secretHandle, claims, alg: "HS256", hopReceiptId, slot }) -> derived_crypto_binding; ctx.await_async({ pollRequest, matchPredicate, triggerExchangeId, correlationId }) -> async_pivot_binding; state mutation -> state_transition_binding (entityId, ablationExchangeIds as SAME actor as toHop).'
 
 /** Exact Mode-A TypeScript kovo_verify recipe (<= 18 lines, live SDK parameter names). */
 export const MULTIHOP_MODE_A_TS_RECIPE = [
@@ -935,7 +897,7 @@ export const MULTIHOP_MODE_A_TS_RECIPE = [
   'const cap = await ctx.seal_capability({ exchange: h1, hopReceiptId: "1", slot: "tok", jsonPath: "$.token" })',
   'const h2 = await ctx.http_send("/api/target", { capability: cap.handle, role: "probe" })',
   'await ctx.prove_composite({',
-  '  // Match terminalVulnClass to actual impact: broken_access_control|privilege_escalation|stale_privilege_use|cross_tenant_export|ledger_overcredit|forged_settlement (dual_tenant_abac ONLY for cross-tenant ABAC w/denied terminal ctrl)',
+  '  // Match terminalVulnClass to actual impact: broken_access_control|privilege_escalation|stale_privilege_use|cross_tenant_export|economic_conservation|webhook_forgery (dual_tenant_abac ONLY for cross-tenant ABAC w/denied terminal ctrl)',
   '  chainId: "chain-1", terminalVulnClass: "broken_access_control", replayMode: "fresh_clean_replay",',
   '  hops: [',
   '    { hopId: "hop_1", surface: "http", target: { origin: ctx.targetOrigin, method: "GET", pathAndQuery: "/api/hop1" }, exchangeIds: [h1.exchangeId], producedCapabilities: [cap.handle], claimedDelta: "Hop 1 capability obtained." },',
@@ -949,7 +911,7 @@ export const MULTIHOP_MODE_A_TS_RECIPE = [
 ].join('\n')
 
 const COMPACT_MULTIHOP_MODE_A_RECIPE =
-  'a="<attacker_persona>"; ctx.http(t,{as:a,arm:"control"}); h1=http_send(hop1,{as:a,role:"probe"}); cap=seal_capability({exchange:h1,slot:"tok",jsonPath:"$.token"}); http_send(t,{capability:cap.handle,role:"probe"}); prove_composite({chainId,terminalVulnClass:"<broken_access_control|privilege_escalation|stale_privilege_use|cross_tenant_export|ledger_overcredit|forged_settlement;dual_tenant_abac w/ctrl>",hops,causalEdges:[value_binding|derived_crypto_binding|state_transition_binding|async_pivot_binding],terminalImpact,replayMode:"fresh_clean_replay"})'
+  'a="<attacker_persona>"; ctx.http(t,{as:a,arm:"control"}); h1=http_send(hop1,{as:a,role:"probe"}); cap=seal_capability({exchange:h1,slot:"tok",jsonPath:"$.token"}); http_send(t,{capability:cap.handle,role:"probe"}); prove_composite({chainId,terminalVulnClass:"<broken_access_control|privilege_escalation|stale_privilege_use|cross_tenant_export|economic_conservation|webhook_forgery;dual_tenant_abac w/ctrl>",hops,causalEdges:[value_binding|derived_crypto_binding|state_transition_binding|async_pivot_binding],terminalImpact,replayMode:"fresh_clean_replay"})'
 
 function isExplicitMultiHopMission(input: Pick<AssignmentBriefInput, 'missionKind' | 'hopCheckpoint'>): boolean {
   return Boolean(input.hopCheckpoint)
@@ -967,96 +929,31 @@ export function isMultiHopBriefInput(
   return isExplicitMultiHopMission(input)
     || (input.codeSlice?.hops?.length ?? 0) >= 2
     || (input.codeSlice?.mounts?.length ?? 0) >= 2
-    || (input.publicOrigins?.length ?? 0) >= 2
     || (input.sealedCapabilityCount ?? 0) > 0
 }
 
 function resolveBriefDefaultCap(input: AssignmentBriefInput): number {
   return input.codeExpansion === 'full'
     || isExplicitMultiHopMission(input)
-    || (input.publicOrigins?.length ?? 0) >= 2
     || (input.sealedCapabilityCount ?? 0) > 0
     ? ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE
     : ASSIGNMENT_BRIEF_MAX_BYTES
 }
 
-export function buildMultiHopProofContract(compact = false, input?: AssignmentBriefInput): AssignmentBriefMultiHopContract {
-  const helperPatterns = detectMultiHopHelperPatterns(input, compact)
+export function buildMultiHopProofContract(compact = false, _input?: AssignmentBriefInput): AssignmentBriefMultiHopContract {
   if (compact) {
     return {
       attackerOriginRule: 'Low-priv(no victim/owner/admin); outsider persona on invite/rebind; non-admin tenant->dual_tenant_abac; SAME actor; {arm:"control"}.',
-      continueChainRule: 'kovo_http; no own-tenant; ctx.seal_capability Hops 3-5->terminalHopId+ctx.chain().prove() in SAME script.',
-      ...(helperPatterns.length ? { helperPatterns } : {}),
+      continueChainRule: 'kovo_http; no own-tenant; ctx.seal_capability->terminalHopId+ctx.chain().prove() in SAME script.',
       modeATsRecipe: COMPACT_MULTIHOP_MODE_A_RECIPE,
-      hardenedTwinRule: 'Hardened: record_coverage(status="ruled_out",proofGapReason="invariant_enforced_hardened")+complete_intent.',
     }
   }
   return {
     attackerOriginRule: MULTIHOP_ATTACKER_ORIGIN_RULE,
     continueChainRule: MULTIHOP_CONTINUE_CHAIN_RULE,
     optionalHelpers: MULTIHOP_OPTIONAL_HELPERS_NOTE,
-    ...(helperPatterns.length ? { helperPatterns } : {}),
     modeATsRecipe: MULTIHOP_MODE_A_TS_RECIPE,
-    hardenedTwinRule: MULTIHOP_HARDENED_TWIN_RULE,
   }
-}
-
-export type PersonaPrivilegeTier = 'low' | 'standard' | 'multi_tenant' | 'revoked_stale' | 'elevated'
-
-export interface PersonaPrivilegeClassification {
-  tier: PersonaPrivilegeTier
-  elevated: boolean
-  multiTenant: boolean
-  revokedStale: boolean
-  rank: number
-}
-
-const ELEVATED_PERSONA_TOKEN_RE = /(?:^|[^a-z0-9])(?:owner|admin|superadmin|superuser|root|bot|service|svc|system|internal|moderator|mod|staff|operator)(?:[^a-z0-9]|$)/i
-const HIGH_ADMIN_PERSONA_TOKEN_RE = /(?:^|[^a-z0-9])(?:owner|admin|superadmin|superuser|root)(?:[^a-z0-9]|$)/i
-const LOW_PRIV_PERSONA_TOKEN_RE = /(?:^|[^a-z0-9])(?:viewer|guest|readonly|read_only|limited|basic|member|user|standard|customer|employee|external|unprivileged|analyst|contributor|reader)(?:[^a-z0-9]|$)/i
-const MULTI_TENANT_TOKEN_RE = /(?:^|[^a-z0-9])(?:dual|multi[_-]?tenant|cross[_-]?tenant|shared[_-]?tenant)(?:[^a-z0-9]|$)/i
-const REVOKED_STALE_TOKEN_RE = /(?:^|[^a-z0-9])(?:revoked|demoted|disabled|suspended|former|expired)(?:[^a-z0-9]|$)/i
-const MEMBERSHIP_PAIR_RE = /(?:\[[^\]]+\]|[^,;\s]+[:@][^,;\s]+)/
-
-function inspectRoleMemberships(roleLabel?: string | null): { hasMultiTenantLowPriv: boolean; allExplicitMembershipsElevated: boolean } {
-  const raw = (roleLabel ?? '').trim()
-  if (!raw) return { hasMultiTenantLowPriv: false, allExplicitMembershipsElevated: false }
-  const stripped = raw.replace(/^.*?\bmemberships?\s*[:=]\s*/i, '')
-  const hadMembershipsPrefix = stripped !== raw
-  const parts = stripped.split(/[,;]+/).map(s => s.trim()).filter(Boolean)
-  if (parts.length < 2) return { hasMultiTenantLowPriv: false, allExplicitMembershipsElevated: false }
-  const pairCount = parts.filter(part => MEMBERSHIP_PAIR_RE.test(part)).length
-  if (!hadMembershipsPrefix && pairCount < 2) return { hasMultiTenantLowPriv: false, allExplicitMembershipsElevated: false }
-  const hasLowOrNonElevated = parts.some(part => LOW_PRIV_PERSONA_TOKEN_RE.test(part) || !ELEVATED_PERSONA_TOKEN_RE.test(part))
-  return {
-    hasMultiTenantLowPriv: hasLowOrNonElevated,
-    allExplicitMembershipsElevated: !hasLowOrNonElevated,
-  }
-}
-
-/** Generic, zero-app-literal privilege tier classification for persona ordering and base-actor selection. */
-export function classifyPersonaPrivilege(
-  handle: string,
-  roleLabel?: string | null,
-): PersonaPrivilegeClassification {
-  const combined = `${handle ?? ''} ${roleLabel ?? ''}`
-  if (REVOKED_STALE_TOKEN_RE.test(combined)) {
-    return { tier: 'revoked_stale', elevated: false, multiTenant: false, revokedStale: true, rank: 3 }
-  }
-  const memberships = inspectRoleMemberships(roleLabel)
-  if (
-    memberships.hasMultiTenantLowPriv
-    || (!memberships.allExplicitMembershipsElevated && MULTI_TENANT_TOKEN_RE.test(combined))
-  ) {
-    return { tier: 'multi_tenant', elevated: false, multiTenant: true, revokedStale: false, rank: 2 }
-  }
-  if (ELEVATED_PERSONA_TOKEN_RE.test(combined)) {
-    return { tier: 'elevated', elevated: true, multiTenant: false, revokedStale: false, rank: HIGH_ADMIN_PERSONA_TOKEN_RE.test(combined) ? 5 : 4 }
-  }
-  if (LOW_PRIV_PERSONA_TOKEN_RE.test(combined)) {
-    return { tier: 'low', elevated: false, multiTenant: false, revokedStale: false, rank: 0 }
-  }
-  return { tier: 'standard', elevated: false, multiTenant: false, revokedStale: false, rank: 1 }
 }
 
 interface WorkingState {
@@ -1084,7 +981,15 @@ function normalizeAndOrderBriefPersonas(
   return (rawPersonas ?? [])
     .map((p, idx) => {
       const handle = cleanText(p.handle, 48)
-      const priv = classifyPersonaPrivilege(handle, p.role)
+      const priv = classifyPersonaMetadata({
+        handle,
+        role: p.role,
+        privilege: p.privilege,
+        tenant: p.tenant,
+        tenantRef: p.tenantRef,
+        tenants: p.tenants,
+        memberships: p.memberships,
+      })
       const role = p.role ? cleanText(p.role, 48) : undefined
       const harvestedIds = [...new Set((p.harvestedIds ?? []).map(cleanHarvestedId).filter(Boolean))].slice(0, 6)
       const configIndex = typeof p.configIndex === 'number' && Number.isFinite(p.configIndex) ? p.configIndex : idx

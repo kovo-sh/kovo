@@ -30,6 +30,7 @@ interface MockCallLog {
   edges: Array<Record<string, unknown>>
   stateTransitions: Array<Record<string, unknown>>
   httpCalls: Array<{ target: unknown; opts: Record<string, unknown> }>
+  awaitAsyncCalls: Array<Record<string, unknown>>
   raceCalls: Array<Record<string, unknown>>
   sealCalls: Array<Record<string, unknown>>
   proveArgs: Array<Record<string, unknown>>
@@ -37,7 +38,7 @@ interface MockCallLog {
 
 function createMockCtx(responses: Array<{ status?: number; json?: unknown; headers?: Record<string, string> }>) {
   const log: MockCallLog = {
-    chainArgs: [], controls: [], controlInsideHop: false, readbacks: [], hops: [], edges: [], stateTransitions: [], httpCalls: [], raceCalls: [], sealCalls: [], proveArgs: [],
+    chainArgs: [], controls: [], controlInsideHop: false, readbacks: [], hops: [], edges: [], stateTransitions: [], httpCalls: [], awaitAsyncCalls: [], raceCalls: [], sealCalls: [], proveArgs: [],
   }
   let exCounter = 0
   let capCounter = 0
@@ -128,6 +129,13 @@ function createMockCtx(responses: Array<{ status?: number; json?: unknown; heade
     },
     async http_send(target: unknown, opts: Record<string, unknown> = {}) {
       return sendMockHttp(target, opts)
+    },
+    async await_async(input: Record<string, unknown>) {
+      log.awaitAsyncCalls.push(input)
+      const pollReq = (input.pollRequest ?? {}) as Record<string, unknown>
+      const target = pollReq.origin ? { origin: pollReq.origin, path: pollReq.path } : pollReq.path
+      const ex = await sendMockHttp(target, pollReq, true)
+      return { converged: true, pollRecordId: 'poll_1', exchangeId: ex.exchangeId, exchange: ex }
     },
     async seal_capability(input: Record<string, unknown>) {
       capCounter += 1
@@ -926,20 +934,20 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
     })
     assert.equal(compiled.ok, true)
     assert.ok(compiled.script)
-    assert.match(compiled.script, /if \(step_1\.status === 202\) await new Promise\(\(r\) => setTimeout\(r, \d+\)\)/)
-    assert.match(compiled.script, /if \(step_1\.status === 202\) await ctx\.http_send\(/)
+    assert.doesNotMatch(compiled.script, /setTimeout/)
+    assert.match(compiled.script, /if \(step_1\.status === 202\) await ctx\.await_async\(/)
     assert.match(compiled.script, /role:\s*"setup"/)
+    assert.match(compiled.script, /triggerExchangeId:\s*step_1\.exchangeId/)
 
     const fn = loadCompiledEntrypoint(compiled.script)
     const { ctx, log } = createMockCtx([
       { status: 403 }, // synthesized control
       { status: 202, json: { jobId: 'job_live_991122' } }, // step_1
-      { status: 200, json: { status: 'ready' } }, // detached setup poll
+      { status: 200, json: { status: 'ready' } }, // ctx.await_async poll
       { status: 200, json: { leakedSecret: 'secret_live_1122' } }, // step_2
     ])
-    const t0 = Date.now()
     await fn(ctx)
-    assert.ok(Date.now() - t0 >= 350, 'Expected compiled script to wait after 202 before downstream consumption')
+    assert.equal(log.awaitAsyncCalls.length, 1, 'Expected compiled script to invoke ctx.await_async after 202')
     assert.deepEqual(log.hops, ['step_1', 'step_2'])
     assert.equal(log.httpCalls[2]!.target, '/api/v1/jobs/cap:hop_1:cap_1/status')
     assert.equal(log.httpCalls[2]!.opts.role, 'setup')
@@ -1200,7 +1208,7 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
       },
     ]
 
-    for (const cls of ['economic_conservation', 'conserved_balance', 'ledger_overcredit', 'over_refund', 'double_spend', 'race_condition', 'double-spend']) {
+    for (const cls of ['economic_conservation', 'conserved_balance', 'over_refund', 'double_spend', 'race_condition', 'double-spend']) {
       const compiled = compileTraceToKovoVerifyScript({
         submission: {
           title: `Concurrent refund ${cls}`,
@@ -1366,15 +1374,19 @@ describe('optd-trace-compiler: compileTraceToKovoVerifyScript', () => {
     assert.equal(log1.httpCalls[1]!.opts.as, 'member_a', 'step_1 with missing persona must inherit low-privilege member_a')
     assert.equal(log1.httpCalls[2]!.opts.as, undefined, 'step_2 injecting bearer capability keeps as: undefined')
 
-    // 2) step_1 has missing persona, step_2 has dual_member, readback has viewer_b on non-dual class -> picks viewer_b over dual_member
+    // 2) step_1 has missing persona, step_2 has structured multi-tenant persona, readback has viewer_b on non-dual class -> picks viewer_b over multi-tenant
     const dualVsViewer: RecordedRequestExchange[] = [
       { exchangeId: 's1_nil', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/v1/orders/ord_77/rebind', status: 200, responseJson: { ok: true }, timestampMs: 10 },
       { exchangeId: 's2_dual', origin: 'https://app.example.test', method: 'POST', pathAndQuery: '/api/v1/orders/ord_77/settle', persona: 'dual_member', status: 200, responseJson: { settled: true }, timestampMs: 20 },
       { exchangeId: 'rb_low', origin: 'https://app.example.test', method: 'GET', pathAndQuery: '/api/v1/orders/ord_77', persona: 'viewer_b', status: 200, responseJson: { settled: true }, timestampMs: 30 },
     ]
     const c2 = compileTraceToKovoVerifyScript({
-      submission: { title: 'Prefer viewer over dual_member on forged_settlement', vulnClass: 'forged_settlement', exchangeIds: ['s1_nil', 's2_dual', 'rb_low'], terminalExchangeId: 's2_dual', readbackExchangeId: 'rb_low' },
+      submission: { title: 'Prefer viewer over multi-tenant persona on non-dual class', vulnClass: 'business_logic', exchangeIds: ['s1_nil', 's2_dual', 'rb_low'], terminalExchangeId: 's2_dual', readbackExchangeId: 'rb_low' },
       exchanges: dualVsViewer,
+      personaMetadata: [
+        { handle: 'dual_member', roleLabel: 'memberships=admin:org_a,viewer:org_b' },
+        { handle: 'viewer_b', roleLabel: 'viewer', tenant: 'org_b' },
+      ],
       runOrigin: 'https://app.example.test',
     })
     assert.equal(c2.ok, true)

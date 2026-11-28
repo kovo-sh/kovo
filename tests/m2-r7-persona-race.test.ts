@@ -348,21 +348,10 @@ describe('M2 R7 Fix 1: revoked_stale persona ranking and active low-priv primacy
   })
 })
 
-describe('M2 R7 Fix 2: bounded economic/race escalation gate in complete_intent and tightened race burst detection', () => {
-  test('complete_intent blocks ONCE with economic_race_escalation_required after mutating confirmation without race, then allows cleanly after http(mode="race")', async () => {
+describe('Phase 0 cleanup: complete_intent completes cleanly after mutating confirmation without forced race escalation gate', () => {
+  test('complete_intent succeeds on first call after confirmed mutating finding (submit_exploit_trace or kovo_verify) without blocking for N>=5 race', async () => {
     const completions: IntentCompletion[] = []
     const recorded = new Map<string, RecordedRequestExchange>([
-      // 4 concurrent GETs within 50ms MUST NOT falsely count as a mutating race burst!
-      ['get-1', { exchangeId: 'get-1', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/orders', persona: 'member_a', status: 200, responseJson: { items: [] }, timestampMs: 100 }],
-      ['get-2', { exchangeId: 'get-2', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/orders', persona: 'member_a', status: 200, responseJson: { items: [] }, timestampMs: 110 }],
-      ['get-3', { exchangeId: 'get-3', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/orders', persona: 'member_a', status: 200, responseJson: { items: [] }, timestampMs: 120 }],
-      ['get-4', { exchangeId: 'get-4', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/orders', persona: 'member_a', status: 200, responseJson: { items: [] }, timestampMs: 130 }],
-      // 4 sequential POSTs spanning 300ms (> 250ms) MUST NOT count as a concurrent race burst!
-      ['slow-1', { exchangeId: 'slow-1', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/orders', persona: 'member_a', status: 201, responseJson: { orderId: 'o1' }, timestampMs: 1000 }],
-      ['slow-2', { exchangeId: 'slow-2', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/orders', persona: 'member_a', status: 201, responseJson: { orderId: 'o2' }, timestampMs: 1100 }],
-      ['slow-3', { exchangeId: 'slow-3', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/orders', persona: 'member_a', status: 201, responseJson: { orderId: 'o3' }, timestampMs: 1200 }],
-      ['slow-4', { exchangeId: 'slow-4', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/orders', persona: 'member_a', status: 201, responseJson: { orderId: 'o4' }, timestampMs: 1300 }],
-      // 3-hop mutating chain ending in GET readback terminal
       ['hop-1', { exchangeId: 'hop-1', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/orders', persona: 'member_a', status: 201, requestJson: { amount: 100 }, responseJson: { orderId: 'ord_9' }, timestampMs: 3000 }],
       ['hop-2', { exchangeId: 'hop-2', origin: API_ORIGIN, method: 'PATCH', pathAndQuery: '/v1/orders/ord_9/rebind', persona: 'member_a', status: 200, requestJson: { targetId: 'acct_b' }, responseJson: { ok: true }, timestampMs: 4000 }],
       ['hop-3', { exchangeId: 'hop-3', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/orders/ord_9', persona: 'member_a', status: 200, responseJson: { orderId: 'ord_9', balance: 500 }, timestampMs: 5000 }],
@@ -370,8 +359,8 @@ describe('M2 R7 Fix 2: bounded economic/race escalation gate in complete_intent 
 
     const tools = buildConsolidatedExploiterToolset({
       handlers: makeDummyHandlers(),
-      runId: 'run-r7-gate',
-      assignmentId: 'asg-r7-gate',
+      runId: 'run-r7-no-gate',
+      assignmentId: 'asg-r7-no-gate',
       publicOrigins: [API_ORIGIN],
       personasPub: [{ handle: 'member_a', role: 'member' }],
       recordedExchanges: recorded,
@@ -385,10 +374,8 @@ describe('M2 R7 Fix 2: bounded economic/race escalation gate in complete_intent 
     })
 
     const submit = tools.find(t => t.name === 'submit_exploit_trace')!
-    const httpTool = tools.find(t => t.name === 'http')!
     const complete = tools.find(t => t.name === 'complete_intent')!
 
-    // 1. Confirm 3-hop mutating chain ending in GET readback -> MUST trigger mutating_economic_variant_check
     const subRes = JSON.parse(extractText(await submit.execute({
       title: 'Order rebind mutating chain verified via readback',
       vulnClass: 'broken_access_control',
@@ -396,202 +383,14 @@ describe('M2 R7 Fix 2: bounded economic/race escalation gate in complete_intent 
       terminalExchangeId: 'hop-3',
     }, {} as never, { abortSignal: new AbortController().signal } as never))) as Record<string, unknown>
     assert.equal(subRes.confirmed, true)
-    assert.equal(subRes.keepChaining, true)
-    assert.equal(subRes.escalationReason, 'mutating_economic_variant_check')
+    assert.equal(subRes.keepChaining, undefined)
 
-    // 2. Calling complete_intent without running race -> BLOCKED ONCE with economic_race_escalation_required
-    const blockedRaw = await complete.execute({
-      status: 'proved',
-      summary: 'Confirmed order rebind.',
-    }, {} as never, { abortSignal: new AbortController().signal } as never)
-    assert.equal(blockedRaw.isError, true)
-    const blocked = JSON.parse(extractText(blockedRaw)) as Record<string, unknown>
-    assert.equal(blocked.ok, false)
-    assert.equal(blocked.blocked, true)
-    assert.equal(blocked.reason, 'economic_race_escalation_required')
-    assert.match(String(blocked.message), /N >= 5/i)
-    assert.equal(completions.length, 0, 'onCompleteIntent must not fire when blocked')
-
-    // 3. Worker runs http(mode="race") with N = 5 parallel calls
-    await httpTool.execute({
-      mode: 'race',
-      requests: Array.from({ length: 5 }, () => ({
-        origin: API_ORIGIN,
-        method: 'POST',
-        pathAndQuery: '/v1/orders/ord_9/settle',
-        persona: 'member_a',
-      })),
-    }, {} as never, { abortSignal: new AbortController().signal } as never)
-
-    // 4. Subsequent complete_intent succeeds cleanly
     const doneRaw = await complete.execute({
       status: 'proved',
-      summary: 'Confirmed order rebind and tested concurrent settlement race.',
-    }, {} as never, { abortSignal: new AbortController().signal } as never) as { isError?: boolean; control?: { terminate?: boolean }; output?: Array<{ type: string; text?: string }> }
+      summary: 'Confirmed order rebind.',
+    }, {} as never, { abortSignal: new AbortController().signal } as never) as { isError?: boolean; control?: { terminate?: boolean } }
     assert.notEqual(doneRaw.isError, true)
     assert.equal(doneRaw.control?.terminate, true)
     assert.equal(completions.length, 1)
-  })
-
-  test('complete_intent escalation gate is strictly bounded (never loops even without a race call) and respects remaining budget', async () => {
-    const completions: IntentCompletion[] = []
-    const recorded = new Map<string, RecordedRequestExchange>([
-      ['m1', { exchangeId: 'm1', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/payouts', persona: 'member_a', status: 201, responseJson: { payoutId: 'p1' }, timestampMs: 1000 }],
-    ])
-
-    const tools = buildConsolidatedExploiterToolset({
-      handlers: makeDummyHandlers(),
-      runId: 'run-r7-noloop',
-      assignmentId: 'asg-r7-noloop',
-      publicOrigins: [API_ORIGIN],
-      personasPub: [{ handle: 'member_a', role: 'member' }],
-      recordedExchanges: recorded,
-      hasMountedRepos: false,
-      allowWebSearch: false,
-      scrub: v => v,
-      rootSignal: new AbortController().signal,
-      inlineLimit: 16_384,
-      onCompleteIntent: c => { completions.push(c) },
-      runKovoVerify: async () => ({ confirmed: true, findingId: 'f-r7-noloop' }),
-    })
-
-    const submit = tools.find(t => t.name === 'submit_exploit_trace')!
-    const complete = tools.find(t => t.name === 'complete_intent')!
-
-    await submit.execute({
-      title: 'Sequential payout mutation',
-      vulnClass: 'economic_conservation',
-      exchangeIds: ['m1'],
-      terminalExchangeId: 'm1',
-    }, {} as never, { abortSignal: new AbortController().signal } as never)
-
-    // First complete_intent -> blocked once
-    const first = await complete.execute({ status: 'proved', summary: 'Done 1' }, {} as never, { abortSignal: new AbortController().signal } as never)
-    assert.equal(first.isError, true)
-    assert.equal((JSON.parse(extractText(first)) as Record<string, unknown>).reason, 'economic_race_escalation_required')
-    assert.equal(completions.length, 0)
-
-    // Second complete_intent without running race -> allowed (escalationGateConsumed prevents looping!)
-    const second = await complete.execute({ status: 'proved', summary: 'Done 2' }, {} as never, { abortSignal: new AbortController().signal } as never) as { isError?: boolean; control?: { terminate?: boolean } }
-    assert.notEqual(second.isError, true)
-    assert.equal(second.control?.terminate, true)
-    assert.equal(completions.length, 1)
-
-    // Separate session with exhausted budget -> complete_intent is NOT blocked
-    const exhaustedCompletions: IntentCompletion[] = []
-    const exhaustedTools = buildConsolidatedExploiterToolset({
-      handlers: makeDummyHandlers(),
-      runId: 'run-r7-budget',
-      assignmentId: 'asg-r7-budget',
-      publicOrigins: [API_ORIGIN],
-      personasPub: [{ handle: 'member_a', role: 'member' }],
-      recordedExchanges: recorded,
-      hasMountedRepos: false,
-      allowWebSearch: false,
-      scrub: v => v,
-      rootSignal: new AbortController().signal,
-      inlineLimit: 16_384,
-      hasRemainingBudget: () => false,
-      onCompleteIntent: c => { exhaustedCompletions.push(c) },
-      runKovoVerify: async () => ({ confirmed: true, findingId: 'f-r7-budget' }),
-    })
-    await exhaustedTools.find(t => t.name === 'submit_exploit_trace')!.execute({
-      title: 'Budget-exhausted payout',
-      vulnClass: 'economic_conservation',
-      exchangeIds: ['m1'],
-      terminalExchangeId: 'm1',
-    }, {} as never, { abortSignal: new AbortController().signal } as never)
-    const noBlock = await exhaustedTools.find(t => t.name === 'complete_intent')!.execute({
-      status: 'proved',
-      summary: 'Budget exhausted, closing cleanly.',
-    }, {} as never, { abortSignal: new AbortController().signal } as never) as { isError?: boolean; control?: { terminate?: boolean } }
-    assert.notEqual(noBlock.isError, true)
-    assert.equal(noBlock.control?.terminate, true)
-    assert.equal(exhaustedCompletions.length, 1)
-  })
-
-  test('4 concurrent mutating POST/DELETE exchanges within 250ms OR kovo_verify ch.race attempt satisfy raceBurstAttempted without blocking complete_intent', async () => {
-    // 1. 4 concurrent POST exchanges within 200ms (<= 250ms) -> race burst detected -> no gate block
-    const fastMutating = new Map<string, RecordedRequestExchange>([
-      ['r1', { exchangeId: 'r1', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/payouts/settle', persona: 'member_a', status: 200, timestampMs: 5000 }],
-      ['r2', { exchangeId: 'r2', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/payouts/settle', persona: 'member_a', status: 200, timestampMs: 5060 }],
-      ['r3', { exchangeId: 'r3', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/payouts/settle', persona: 'member_a', status: 200, timestampMs: 5120 }],
-      ['r4', { exchangeId: 'r4', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/payouts/settle', persona: 'member_a', status: 200, timestampMs: 5180 }],
-    ])
-    const completions1: IntentCompletion[] = []
-    const tools1 = buildConsolidatedExploiterToolset({
-      handlers: makeDummyHandlers(),
-      runId: 'run-r7-burst',
-      assignmentId: 'asg-r7-burst',
-      publicOrigins: [API_ORIGIN],
-      personasPub: [{ handle: 'member_a', role: 'member' }],
-      recordedExchanges: fastMutating,
-      hasMountedRepos: false,
-      allowWebSearch: false,
-      scrub: v => v,
-      rootSignal: new AbortController().signal,
-      inlineLimit: 16_384,
-      onCompleteIntent: c => { completions1.push(c) },
-      runKovoVerify: async () => ({ confirmed: true, findingId: 'f-r7-burst' }),
-    })
-    const sub1 = JSON.parse(extractText(await tools1.find(t => t.name === 'submit_exploit_trace')!.execute({
-      title: 'Concurrent payout burst',
-      vulnClass: 'economic_conservation',
-      exchangeIds: ['r1'],
-      terminalExchangeId: 'r1',
-    }, {} as never, { abortSignal: new AbortController().signal } as never))) as Record<string, unknown>
-    assert.equal(sub1.keepChaining, undefined)
-    const done1 = await tools1.find(t => t.name === 'complete_intent')!.execute({ status: 'proved', summary: 'Already raced.' }, {} as never, { abortSignal: new AbortController().signal } as never) as { isError?: boolean; control?: { terminate?: boolean } }
-    assert.notEqual(done1.isError, true)
-    assert.equal(done1.control?.terminate, true)
-    assert.equal(completions1.length, 1)
-
-    // 2. Direct kovo_verify confirms sequential mutating script -> worker then tries ch.race (even unconfirmed on hardened twin) -> complete_intent succeeds without blocking
-    const seqRec = new Map<string, RecordedRequestExchange>([
-      ['k1', { exchangeId: 'k1', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/transfers', persona: 'member_a', status: 200, timestampMs: 100 }],
-    ])
-    let kvCall = 0
-    const completions2: IntentCompletion[] = []
-    const tools2 = buildConsolidatedExploiterToolset({
-      handlers: makeDummyHandlers({
-        kovo_verify: async () => {
-          kvCall += 1
-          if (kvCall === 1) {
-            return { confirmed: true, findingId: 'f-kv-seq', compositeReceipt: { chainId: 'c1', terminalVulnClass: 'economic_conservation', hopCount: 3, confirmed: true } }
-          }
-          return { confirmed: false, reason: 'hardened_no_overcredit' }
-        },
-      }),
-      runId: 'run-r7-kv',
-      assignmentId: 'asg-r7-kv',
-      publicOrigins: [API_ORIGIN],
-      personasPub: [{ handle: 'member_a', role: 'member' }],
-      recordedExchanges: seqRec,
-      hasMountedRepos: false,
-      allowWebSearch: false,
-      scrub: v => v,
-      rootSignal: new AbortController().signal,
-      inlineLimit: 16_384,
-      onCompleteIntent: c => { completions2.push(c) },
-      runKovoVerify: async () => ({ confirmed: true }),
-    })
-    const kv = tools2.find(t => t.name === 'kovo_verify')!
-    const kv1 = JSON.parse(extractText(await kv.execute({
-      title: 'Sequential transfer mutation',
-      script: 'const ch = ctx.chain("c1", "economic_conservation"); await ch.step("POST /v1/transfers", { method: "POST" }); return await ch.prove({ claimedImpact: "mutation" })',
-    }, {} as never, { abortSignal: new AbortController().signal } as never))) as Record<string, unknown>
-    assert.equal(kv1.keepChaining, true)
-    assert.equal(kv1.escalationReason, 'mutating_economic_variant_check')
-
-    // Worker runs ch.race attempt in kovo_verify (returns confirmed: false because target was hardened)
-    await kv.execute({
-      title: 'Concurrent transfer race check',
-      script: 'const ch = ctx.chain("c2", "economic_conservation"); await ch.race({ request: { path: "/v1/transfers", method: "POST" }, count: 6 }); return await ch.prove({ claimedImpact: "race" })',
-    }, {} as never, { abortSignal: new AbortController().signal } as never)
-
-    const done2 = await tools2.find(t => t.name === 'complete_intent')!.execute({ status: 'proved', summary: 'Confirmed sequential; race ruled out.' }, {} as never, { abortSignal: new AbortController().signal } as never) as { isError?: boolean; control?: { terminate?: boolean } }
-    assert.notEqual(done2.isError, true)
-    assert.equal(done2.control?.terminate, true)
-    assert.equal(completions2.length, 1)
   })
 })

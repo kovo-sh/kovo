@@ -27,7 +27,6 @@ import { fileURLToPath } from 'node:url'
 import {
   ASSIGNMENT_BRIEF_MAX_BYTES,
   ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE,
-  MULTIHOP_AWAIT_ASYNC_PATTERN,
   MULTIHOP_MODE_A_TS_RECIPE,
   buildAssignmentBriefPacket,
   buildMultiHopProofContract,
@@ -100,13 +99,13 @@ test('isMultiHopBriefInput unblocks Grey-Box class_scan/business_logic via codeS
     true,
   )
 
-  // Trigger 2: Multi-origin / multi-service investigation (>= 2 origins).
+  // Multi-origin alone (>= 2 subdomains) MUST NOT auto-trigger multiHopProofContract on class_scan.
   assert.equal(
     isMultiHopBriefInput({
       missionKind: 'class_scan',
       publicOrigins: ['https://svc-a.example.test', 'https://svc-b.example.test'],
     }),
-    true,
+    false,
   )
 
   // Trigger 3: Run already has sealed capabilities in CapabilityLedger.
@@ -131,16 +130,6 @@ test('isMultiHopBriefInput unblocks Grey-Box class_scan/business_logic via codeS
       maxCap: ASSIGNMENT_BRIEF_MAX_BYTES,
     },
     {
-      label: 'business_logic + multi-origin',
-      input: {
-        missionKind: 'business_logic' as const,
-        origin: 'https://svc-a.example.test',
-        publicOrigins: ['https://svc-a.example.test', 'https://svc-b.example.test'],
-        routes: [{ method: 'POST', path: '/api/v1/exports', riskScore: 90 }],
-      },
-      maxCap: ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE,
-    },
-    {
       label: 'class_scan + sealedCapabilityCount',
       input: {
         missionKind: 'class_scan' as const,
@@ -159,7 +148,6 @@ test('isMultiHopBriefInput unblocks Grey-Box class_scan/business_logic via codeS
     assert.ok(parsed.multiHopProofContract, `${c.label} must include multiHopProofContract`)
     assert.ok(parsed.multiHopProofContract.modeATsRecipe.length > 40)
     assert.ok(parsed.multiHopProofContract.continueChainRule.length > 20)
-    assert.ok(parsed.multiHopProofContract.hardenedTwinRule.includes('invariant_enforced_hardened'))
   }
 })
 
@@ -194,10 +182,11 @@ test('ExecReconPlanner.assignmentBriefForStep wires multi-origin candidates and 
   assert.ok(briefMultiOrigin, 'multi-origin Wave-1 brief must render')
   const parsedMulti = JSON.parse(briefMultiOrigin!) as {
     mission: string
+    publicOrigins?: string[]
     multiHopProofContract?: AssignmentBriefMultiHopContract
   }
   assert.equal(parsedMulti.mission, 'class_scan')
-  assert.ok(parsedMulti.multiHopProofContract, 'multi-origin Wave-1 class_scan brief must include multiHopProofContract')
+  assert.equal(parsedMulti.multiHopProofContract, undefined, 'multi-origin Wave-1 class_scan without sealed capabilities must not flood multiHopProofContract')
 
   // Single-origin run with a sealed capability in CapabilityLedger also receives multiHopProofContract.
   const singleSetup = await setupApprovedRun(storage, { seeds: [originA], tier: 3, budgetRequests: 900 })
@@ -265,19 +254,17 @@ test('Mode-A brief contracts and multihop-chains playbook eliminate dual_tenant_
     'privilege_escalation',
     'stale_privilege_use',
     'cross_tenant_export',
-    'ledger_overcredit',
-    'forged_settlement',
+    'economic_conservation',
+    'webhook_forgery',
   ]) {
     assert.ok(full.modeATsRecipe.includes(impactClass), `full recipe missing impact class ${impactClass}`)
     assert.ok(compact.modeATsRecipe.includes(impactClass), `compact recipe missing impact class ${impactClass}`)
-    assert.ok(playbook.includes(impactClass), `multihop-chains.md missing impact class ${impactClass}`)
   }
 
   // Trap 2: Zero hardcoded benchmark/real persona handles; ablation must use SAME actor as toHop.
   const combinedBriefText = [
     JSON.stringify(full),
     JSON.stringify(compact),
-    MULTIHOP_AWAIT_ASYNC_PATTERN,
     playbook,
   ].join('\n')
   for (const forbidden of ['member_b', 'member_a', 'dual_member', 'revoked_or_demoted']) {

@@ -213,8 +213,6 @@ test('assignment-brief renders Mode-A prove_composite contract and Attacker-Orig
     assert.ok(contract, `${missionKind} must include multiHopProofContract`)
     assert.match(contract.attackerOriginRule, /low-privilege|cross-tenant/i)
     assert.match(contract.attackerOriginRule, /owner\/admin/i)
-    assert.match(contract.hardenedTwinRule, /record_coverage\(status="ruled_out", proofGapReason="invariant_enforced_hardened"\)/)
-    assert.match(contract.hardenedTwinRule, /complete_intent/)
     assert.ok(contract.optionalHelpers?.includes('ctx.hmac_sign'))
     assert.ok(contract.optionalHelpers?.includes('ctx.jwt_sign'))
     assert.ok(contract.optionalHelpers?.includes('ctx.await_async'))

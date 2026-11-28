@@ -64,10 +64,16 @@ describe('M2 R6 Fix 1: multi-tenant persona classification, prompt separation, h
     assert.equal(bracketMulti.elevated, false)
     assert.equal(bracketMulti.multiTenant, true)
 
-    const dualToken = classifyPersonaPrivilege('dual_user', 'dual tenant')
-    assert.equal(dualToken.tier, 'multi_tenant')
-    assert.equal(dualToken.elevated, false)
-    assert.equal(dualToken.multiTenant, true)
+    // Bare "dual" string without structured memberships/multi-tenant metadata is NOT classified as multi_tenant
+    const bareDual = classifyPersonaPrivilege('dual_user', 'dual tenant')
+    assert.equal(bareDual.tier, 'standard')
+    assert.equal(bareDual.elevated, false)
+    assert.equal(bareDual.multiTenant, false)
+
+    const explicitMulti = classifyPersonaPrivilege('shared_user', 'multi-tenant')
+    assert.equal(explicitMulti.tier, 'multi_tenant')
+    assert.equal(explicitMulti.elevated, false)
+    assert.equal(explicitMulti.multiTenant, true)
 
     // Multi-tenant where ALL memberships are admin/owner stays globally elevated
     const allAdminMulti = classifyPersonaPrivilege('global_ops', 'memberships=owner:org_a,admin:org_b')
@@ -141,7 +147,7 @@ describe('M2 R6 Fix 1: multi-tenant persona classification, prompt separation, h
     assert.equal(userPrompt.primaryAttackerBasePersona, 'member_a')
     assert.deepEqual(userPrompt.attackerBasePersonas.personas.map(p => p.handle), ['member_a'])
     assert.deepEqual(userPrompt.multiTenantBasePersonas?.personas.map(p => p.handle), ['shared_actor'])
-    assert.match(userPrompt.multiTenantBasePersonas?.instruction ?? '', /Multi-Tenant Base Personas — use for cross-tenant \/ cache-bleed \/ dual-tenant ABAC chains!/i)
+    assert.match(userPrompt.multiTenantBasePersonas?.instruction ?? '', /Multi-Tenant Base Personas/i)
     assert.deepEqual(userPrompt.elevatedReferencePersonas?.personas.map(p => p.handle), ['owner_a'])
 
     const recorded = new Map<string, RecordedRequestExchange>([
@@ -241,10 +247,10 @@ describe('M2 R6 Fix 2: configured-order primary low-priv tie-breaking and single
     }).text) as { personas: Array<{ handle: string }> }
     assert.deepEqual(brief.personas.map(p => p.handle), ['member_z', 'member_a', 'owner_a'])
 
-    // 2. exploiter prompt: primaryAttackerBasePersona is first configured low-priv persona & instructs single-actor continuity
+    // 2. exploiter prompt: primaryAttackerBasePersona is first configured low-priv persona & instructs non-elevated attacker personas
     const sys = buildExploiterSystemPrompt({ hasMountedRepos: false, allowWebSearch: false })
-    assert.match(sys, /primaryAttackerBasePersona/i)
-    assert.match(sys, /single-actor continuity/i)
+    assert.match(sys, /attackerBasePersonas/i)
+    assert.match(sys, /elevatedReferencePersonas/i)
 
     const user = JSON.parse(buildExploiterUserPrompt({
       goal: 'Verify tenant boundaries',
@@ -264,7 +270,7 @@ describe('M2 R6 Fix 2: configured-order primary low-priv tie-breaking and single
     assert.equal(user.primaryAttackerBasePersona, 'member_z')
     assert.equal(user.attackerBasePersonas.primary, 'member_z')
     assert.deepEqual(user.attackerBasePersonas.personas.map(p => p.handle), ['member_z', 'member_a'])
-    assert.match(user.attackerBasePersonas.instruction, /single-actor continuity/i)
+    assert.match(user.attackerBasePersonas.instruction, /non-elevated personas/i)
 
     // 3. gb-dataflow-synthesizer: member_a configured at index 0 beats member_b even when member_b dominates Phase-0 observations,
     //    and member_z configured before member_a wins over alphabetical member_a!
@@ -290,8 +296,8 @@ describe('M2 R6 Fix 2: configured-order primary low-priv tie-breaking and single
   })
 })
 
-describe('M2 R6 Fix 3: mutating/economic deeper variant continuation (bounded, no looping)', () => {
-  test('submit_exploit_trace attaches keepChaining + escalationGuidance on shallow sequential economic_conservation confirmation, does not loop on repeat, and skips when race already ran', async () => {
+describe('Phase 0 cleanup: confirmed mutating and shallow findings complete without forced keepChaining loops', () => {
+  test('submit_exploit_trace confirms mutating findings cleanly without forced race/escalation keepChaining', async () => {
     const seqRecorded = new Map<string, RecordedRequestExchange>([
       ['ex-1', { exchangeId: 'ex-1', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/wallets/w1/credit', persona: 'member_a', status: 200, requestJson: { amount: 10 }, responseJson: { creditId: 'cr_1', balance: 110 }, timestampMs: 1000 }],
       ['ex-2', { exchangeId: 'ex-2', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/wallets/w1/credit', persona: 'member_a', status: 200, requestJson: { amount: 10 }, responseJson: { creditId: 'cr_2', balance: 120 }, timestampMs: 3300 }],
@@ -321,54 +327,10 @@ describe('M2 R6 Fix 3: mutating/economic deeper variant continuation (bounded, n
       terminalExchangeId: 'ex-3',
     }, {} as never, { abortSignal: new AbortController().signal } as never))) as Record<string, unknown>
     assert.equal(first.confirmed, true)
-    assert.equal(first.keepChaining, true)
-    assert.equal(first.escalationReason, 'mutating_economic_variant_check')
-    assert.match(String(first.escalationGuidance), /numeric boundary \/ cap/i)
-    assert.match(String(first.escalationGuidance), /N >= 5/i)
-
-    // Second confirmation in the same session MUST NOT loop keepChaining
-    const second = JSON.parse(extractText(await submit.execute({
-      title: 'Follow-up wallet payout check',
-      vulnClass: 'economic_conservation',
-      exchangeIds: ['ex-1', 'ex-2', 'ex-3'],
-      terminalExchangeId: 'ex-3',
-    }, {} as never, { abortSignal: new AbortController().signal } as never))) as Record<string, unknown>
-    assert.equal(second.confirmed, true)
-    assert.equal(second.keepChaining, undefined, 'must not loop keepChaining once mutating escalation was already prompted')
-
-    // Separate session where http(mode="race") with >=4 parallel calls ALREADY ran -> NO keepChaining
-    const racedTools = buildConsolidatedExploiterToolset({
-      handlers: makeDummyHandlers(),
-      runId: 'run-econ-raced',
-      assignmentId: 'asg-econ-raced',
-      publicOrigins: [API_ORIGIN],
-      personasPub: [{ handle: 'member_a', role: 'member' }],
-      recordedExchanges: seqRecorded,
-      hasMountedRepos: false,
-      allowWebSearch: false,
-      scrub: v => v,
-      rootSignal: new AbortController().signal,
-      inlineLimit: 16_384,
-      onCompleteIntent: () => undefined,
-      runKovoVerify: async () => ({ confirmed: true, findingId: 'f-econ-race' }),
-    })
-    const httpTool = racedTools.find(t => t.name === 'http')!
-    await httpTool.execute({
-      mode: 'race',
-      requests: Array.from({ length: 5 }, () => ({ origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/wallets/w1/payout', persona: 'member_a' })),
-    }, {} as never, { abortSignal: new AbortController().signal } as never)
-    const submitRaced = racedTools.find(t => t.name === 'submit_exploit_trace')!
-    const racedRes = JSON.parse(extractText(await submitRaced.execute({
-      title: 'Raced wallet payout check',
-      vulnClass: 'economic_conservation',
-      exchangeIds: ['ex-1', 'ex-2', 'ex-3'],
-      terminalExchangeId: 'ex-3',
-    }, {} as never, { abortSignal: new AbortController().signal } as never))) as Record<string, unknown>
-    assert.equal(racedRes.confirmed, true)
-    assert.equal(racedRes.keepChaining, undefined, 'must not attach keepChaining once a concurrent race burst was already exercised')
+    assert.equal(first.keepChaining, undefined)
   })
 
-  test('direct kovo_verify attaches bounded mutating/economic keepChaining when no race op ran, skips when ch.race ran, and agent-prompts documents the rule', async () => {
+  test('direct kovo_verify confirms mutating scripts cleanly without forced keepChaining loops', async () => {
     const recorded = new Map<string, RecordedRequestExchange>([
       ['p1', { exchangeId: 'p1', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/transfers', persona: 'member_a', status: 200, timestampMs: 100 }],
     ])
@@ -395,155 +357,12 @@ describe('M2 R6 Fix 3: mutating/economic deeper variant continuation (bounded, n
     })
     const kv = tools.find(t => t.name === 'kovo_verify')!
 
-    const noRaceRes = JSON.parse(extractText(await kv.execute({
+    const res = JSON.parse(extractText(await kv.execute({
       title: 'Sequential transfer logic confirmation',
       script: 'const ch = ctx.chain("c1", "economic_conservation"); await ch.step("POST /v1/transfers", { method: "POST" }); return await ch.prove({ claimedImpact: "overcredit" })',
     }, {} as never, { abortSignal: new AbortController().signal } as never))) as Record<string, unknown>
-    assert.equal(noRaceRes.confirmed, true)
-    assert.equal(noRaceRes.keepChaining, true)
-    assert.equal(noRaceRes.escalationReason, 'mutating_economic_variant_check')
-
-    // Bounded on repeat
-    const repeatRes = JSON.parse(extractText(await kv.execute({
-      title: 'Second confirmation',
-      script: 'const ch = ctx.chain("c2", "economic_conservation"); await ch.step("POST /v1/transfers", { method: "POST" }); return await ch.prove({ claimedImpact: "overcredit" })',
-    }, {} as never, { abortSignal: new AbortController().signal } as never))) as Record<string, unknown>
-    assert.equal(repeatRes.confirmed, true)
-    assert.equal(repeatRes.keepChaining, undefined)
-
-    // Fresh session with ch.race(...) in script -> NO keepChaining
-    const toolsWithRace = buildConsolidatedExploiterToolset({
-      handlers: makeDummyHandlers({
-        kovo_verify: async () => ({
-          confirmed: true,
-          findingId: 'f-kv-race',
-          compositeReceipt: { chainId: 'c3', terminalVulnClass: 'economic_conservation', hopCount: 3, confirmed: true },
-        }),
-      }),
-      runId: 'run-kv-race',
-      assignmentId: 'asg-kv-race',
-      publicOrigins: [API_ORIGIN],
-      personasPub: [{ handle: 'member_a', role: 'member' }],
-      recordedExchanges: recorded,
-      hasMountedRepos: false,
-      allowWebSearch: false,
-      scrub: v => v,
-      rootSignal: new AbortController().signal,
-      inlineLimit: 16_384,
-      onCompleteIntent: () => undefined,
-      runKovoVerify: async () => ({ confirmed: true }),
-    })
-    const kvRace = toolsWithRace.find(t => t.name === 'kovo_verify')!
-    const withRaceRes = JSON.parse(extractText(await kvRace.execute({
-      title: 'Concurrent race transfer confirmation',
-      script: 'const ch = ctx.chain("c3", "economic_conservation"); await ch.race({ request: { path: "/v1/transfers", method: "POST" }, count: 6 }); return await ch.prove({ claimedImpact: "race overcredit" })',
-    }, {} as never, { abortSignal: new AbortController().signal } as never))) as Record<string, unknown>
-    assert.equal(withRaceRes.confirmed, true)
-    assert.equal(withRaceRes.keepChaining, undefined)
-
-    // Verify agent-prompts.ts contract carries numeric boundary + concurrent race N >= 5 guidance within line/length caps
-    assert.match(KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN, /numeric boundary\/cap/i)
-    assert.match(KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN, /concurrent `race` \(`N >= 5`/i)
-    assert.ok(KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.split('\n').length <= 6)
+    assert.equal(res.confirmed, true)
+    assert.equal(res.keepChaining, undefined)
     assert.ok(KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.length <= 2000)
-  })
-})
-
-describe('M2 R6 Fix 4: shallow 1-2 hop capability-grant continuation', () => {
-  test('returns keepChaining + downstream chaining guidance on shallow 1-2 hop redeem/resolve token grant and signed-URL fetch, without firing on deep read-only terminals or looping', async () => {
-    const recorded = new Map<string, RecordedRequestExchange>([
-      ['inv-1', {
-        exchangeId: 'inv-1', origin: AUTH_ORIGIN, method: 'POST', pathAndQuery: '/v1/invites/lookup',
-        persona: 'member_a', status: 200, responseJson: { invite_code: 'inv_abc123' }, timestampMs: 100,
-      }],
-      ['inv-2', {
-        exchangeId: 'inv-2', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/invites/redeem',
-        persona: 'member_a', status: 200, requestJson: { invite_code: 'inv_abc123' },
-        responseJson: { token: 'tok_minted_xyz', role: 'admin', tenant: 'org_b' }, timestampMs: 200,
-      }],
-      ['url-1', {
-        exchangeId: 'url-1', origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/exports/presign',
-        persona: 'member_a', status: 200, responseJson: { signed_url: `${EDGE_ORIGIN}/v1/exports/exp_9/download?sig=deadbeef1234` }, timestampMs: 300,
-      }],
-      ['url-2', {
-        exchangeId: 'url-2', origin: EDGE_ORIGIN, method: 'GET', pathAndQuery: '/v1/exports/exp_9/download?sig=deadbeef1234',
-        persona: 'member_a', status: 200, responseBody: 'id,data\n1,secret\n', timestampMs: 400,
-      }],
-      ['deep-1', {
-        exchangeId: 'deep-1', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/projects',
-        persona: 'member_a', status: 200, responseJson: { projectId: 'prj_9' }, timestampMs: 500,
-      }],
-      ['deep-2', {
-        exchangeId: 'deep-2', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/projects/prj_9/records',
-        persona: 'member_a', status: 200, responseJson: { recordId: 'rec_9' }, timestampMs: 600,
-      }],
-      ['deep-3', {
-        exchangeId: 'deep-3', origin: API_ORIGIN, method: 'GET', pathAndQuery: '/v1/records/rec_9',
-        persona: 'member_a', status: 200, responseJson: { owner: 'org_b', secretValue: 'classified' }, timestampMs: 700,
-      }],
-    ])
-
-    const makeSubmit = () => buildConsolidatedExploiterToolset({
-      handlers: makeDummyHandlers(),
-      runId: 'run-cap-cont',
-      assignmentId: 'asg-cap-cont',
-      publicOrigins: [AUTH_ORIGIN, API_ORIGIN, EDGE_ORIGIN],
-      personasPub: [{ handle: 'member_a', role: 'member' }],
-      recordedExchanges: recorded,
-      hasMountedRepos: false,
-      allowWebSearch: false,
-      scrub: v => v,
-      rootSignal: new AbortController().signal,
-      inlineLimit: 16_384,
-      onCompleteIntent: () => undefined,
-      runKovoVerify: async () => ({ confirmed: true, findingId: 'f-cap-1' }),
-    }).find(t => t.name === 'submit_exploit_trace')!
-
-    // 1. Shallow 2-hop POST .../redeem returning { token, role, tenant } -> keepChaining + downstream consumer guidance
-    const submitRedeem = makeSubmit()
-    const redeemRes = JSON.parse(extractText(await submitRedeem.execute({
-      title: 'Cross-tenant invite redeem grants token',
-      vulnClass: 'privilege_escalation',
-      exchangeIds: ['inv-1', 'inv-2'],
-      terminalExchangeId: 'inv-2',
-    }, {} as never, { abortSignal: new AbortController().signal } as never))) as Record<string, unknown>
-    assert.equal(redeemRes.confirmed, true)
-    assert.equal(redeemRes.keepChaining, true)
-    assert.equal(redeemRes.escalationReason, 'shallow_capability_grant')
-    assert.match(String(redeemRes.escalationGuidance), /downstream consumer routes/i)
-    assert.match(String(redeemRes.escalationGuidance), /approve, rebind, payout, vault, transfer/i)
-
-    // Repeat shallow capability-grant in the same session does NOT loop shallow_capability_grant
-    const repeatCapRes = JSON.parse(extractText(await submitRedeem.execute({
-      title: 'Signed URL fetch in same session',
-      vulnClass: 'cross_tenant_export',
-      exchangeIds: ['url-1', 'url-2'],
-      terminalExchangeId: 'url-2',
-    }, {} as never, { abortSignal: new AbortController().signal } as never))) as Record<string, unknown>
-    assert.equal(repeatCapRes.confirmed, true)
-    assert.equal(repeatCapRes.keepChaining, undefined)
-
-    // 2. Fresh session: shallow 2-hop signed-URL fetch -> keepChaining + downstream consumer guidance
-    const submitSignedUrl = makeSubmit()
-    const urlRes = JSON.parse(extractText(await submitSignedUrl.execute({
-      title: 'Cross-tenant signed URL download',
-      vulnClass: 'cross_tenant_export',
-      exchangeIds: ['url-1', 'url-2'],
-      terminalExchangeId: 'url-2',
-    }, {} as never, { abortSignal: new AbortController().signal } as never))) as Record<string, unknown>
-    assert.equal(urlRes.confirmed, true)
-    assert.equal(urlRes.keepChaining, true)
-    assert.equal(urlRes.escalationReason, 'shallow_capability_grant')
-
-    // 3. Fresh session: deep 3-hop read-only GET terminal -> NO keepChaining
-    const submitDeep = makeSubmit()
-    const deepRes = JSON.parse(extractText(await submitDeep.execute({
-      title: 'Deep 3-hop cross-tenant read',
-      vulnClass: 'bola',
-      exchangeIds: ['deep-1', 'deep-2', 'deep-3'],
-      terminalExchangeId: 'deep-3',
-    }, {} as never, { abortSignal: new AbortController().signal } as never))) as Record<string, unknown>
-    assert.equal(deepRes.confirmed, true)
-    assert.equal(deepRes.keepChaining, undefined)
   })
 })
