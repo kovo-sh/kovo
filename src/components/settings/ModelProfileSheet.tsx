@@ -3,6 +3,8 @@ import { saveModel, testModel } from '../../actions.ts'
 import { DEFAULT_PROVIDER, roleAffinities, thinkingLevels } from '../../domain.ts'
 import type { PublicModelProfile, RoleAffinity, ThinkingLevel } from '../../domain.ts'
 import { cn } from '../../lib/cn.ts'
+import { MODEL_POOL_PRESETS, presetProfileFields } from '../../model-pool-presets.ts'
+import type { ModelPoolPreset, ModelPoolPresetId } from '../../model-pool-presets.ts'
 import { useAction } from '../common.tsx'
 import { Icon } from '../run/icons.tsx'
 import { Badge } from '../ui/badge.tsx'
@@ -11,6 +13,7 @@ import { Checkbox } from '../ui/checkbox.tsx'
 import { Dialog, DialogContent, DialogTitle } from '../ui/dialog.tsx'
 import { Disclosure, DisclosureContent, DisclosureTrigger } from '../ui/disclosure.tsx'
 import { Input, NativeSelect } from '../ui/input.tsx'
+import { useServerDraft } from './useServerDraft.ts'
 
 export interface ModelProfileSheetProps {
   open: boolean
@@ -72,6 +75,54 @@ const PROTOCOL_PILL: Record<typeof DEFAULT_PROVIDER.protocol | 'chat-completions
 /** Preset card summary derived from DEFAULT_PROVIDER.name ("OpenRouter <model>" -> "OpenRouter · <model>"). */
 const DEFAULT_PROVIDER_SUMMARY = DEFAULT_PROVIDER.name.replace(/^OpenRouter\s+/, 'OpenRouter · ')
 
+/** Editable configuration of a profile (no health fields), used to detect edits made elsewhere. */
+function profileConfigKey(profile: PublicModelProfile): string {
+  const { name, endpoint, model, protocol, priority, enabled, contextWindow, maxTokens, thinkingLevel, roleAffinity, inputCostPerMtok, cachedInputCostPerMtok, outputCostPerMtok } = profile
+  return JSON.stringify([name, endpoint, model, protocol, priority, enabled, contextWindow, maxTokens, thinkingLevel, roleAffinity, inputCostPerMtok, cachedInputCostPerMtok, outputCostPerMtok])
+}
+
+/**
+ * Shared failover presets (`src/model-pool-presets.ts`, also used by the CLI) as compact
+ * cards: one click pre-fills name, endpoint, model, protocol, priority and limits, so only
+ * the API key is left to enter.
+ */
+function PresetStrip({ activeId, onSelect }: { activeId: ModelPoolPresetId | null; onSelect: (preset: ModelPoolPreset) => void }) {
+  return (
+    <div className="flex flex-col gap-1.5" role="group" aria-labelledby="model-preset-heading">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5">
+        <span id="model-preset-heading" className="text-[12px] font-medium text-fg-muted">Failover presets</span>
+        <span className="text-[11.5px] text-fg-subtle">Pre-fills everything except the API key</span>
+      </div>
+      <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-3">
+        {MODEL_POOL_PRESETS.map(preset => {
+          const active = preset.id === activeId
+          return (
+            <button
+              key={preset.id}
+              type="button"
+              aria-pressed={active}
+              data-preset={preset.id}
+              className={cn(
+                'flex h-auto w-full min-w-0 cursor-pointer flex-col items-start gap-0.5 whitespace-normal rounded-lg border px-2.5 py-2 text-left font-normal shadow-none transition-colors',
+                active
+                  ? 'border-accent-line bg-accent-soft hover:bg-accent-soft'
+                  : 'border-line-2 bg-panel hover:border-line-strong hover:bg-hover',
+              )}
+              onClick={() => onSelect(preset)}
+            >
+              <span className="flex w-full min-w-0 items-center justify-between gap-1.5">
+                <strong className="min-w-0 truncate text-[12.5px] font-semibold leading-[18px] text-fg">{preset.label}</strong>
+                <span className="flex-none text-[11px] font-medium tabular-nums text-fg-subtle">{preset.tier}</span>
+              </span>
+              <span className="w-full min-w-0 truncate font-mono text-[11px] leading-4 text-fg-muted" title={preset.model}>{preset.model}</span>
+            </button>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 function suggestUniqueProfileName(baseName: string, profiles: readonly PublicModelProfile[]): string {
   const base = baseName.trim()
   const existing = new Set(profiles.map(profile => profile.name.trim().toLowerCase()))
@@ -96,23 +147,41 @@ export function ModelProfileSheet({
   const [feedback, setFeedback] = useState('')
   const [advancedOpen, setAdvancedOpen] = useState(Boolean(editing))
   const [formKey, setFormKey] = useState(0)
+  const [presetId, setPresetId] = useState<ModelPoolPresetId | null>(null)
+  // Edit mode is draft-safe: background polls never re-key the form. If the profile's
+  // configuration changes elsewhere while the sheet is open, offer a reload instead.
+  const [openedFor, setOpenedFor] = useState<string | null>(null)
+  const [formSource, setFormSource] = useState<PublicModelProfile>()
+  const liveEditing = editing ? profiles.find(profile => profile.id === editing.id) ?? editing : undefined
+  const [, , serverDraft] = useServerDraft(liveEditing ? profileConfigKey(liveEditing) : '', {
+    hold: Boolean(open && editing && openedFor === editing.id),
+  })
 
   useEffect(() => {
-    if (!open) return
+    if (!open) {
+      setOpenedFor(null)
+      return
+    }
     setMode(editing ? 'custom' : 'default')
     setFeedback('')
     setAdvancedOpen(Boolean(editing))
+    setPresetId(null)
+    setFormSource(undefined)
+    setOpenedFor(editing?.id ?? null)
     setFormKey(k => k + 1)
   }, [open, editing])
 
   const isEditing = Boolean(editing)
   const isDefaultMode = !isEditing && mode === 'default'
+  const preset = !isEditing && presetId ? MODEL_POOL_PRESETS.find(p => p.id === presetId) : undefined
 
   const nextPriority = profiles.length === 0 ? 100 : Math.max(10, Math.min(...profiles.map(p => p.priority)) - 10)
   const suggestedName = isDefaultMode || profiles.length === 0
     ? suggestUniqueProfileName(DEFAULT_PROVIDER.name, profiles)
     : suggestUniqueProfileName(`Custom profile ${profiles.length + 1}`, profiles)
-  const defaults = editing ?? {
+  const defaults = (editing ? formSource ?? editing : undefined)
+    ?? (preset ? { ...presetProfileFields(preset), name: suggestUniqueProfileName(preset.name, profiles) } : undefined)
+    ?? {
     name: suggestedName,
     endpoint: DEFAULT_PROVIDER.endpoint,
     model: DEFAULT_PROVIDER.model,
@@ -129,8 +198,24 @@ export function ModelProfileSheet({
   }
 
   function selectMode(next: SetupMode) {
-    if (next === mode) return
+    if (next === mode && !presetId) return
     setMode(next)
+    setPresetId(null)
+    setFeedback('')
+    setFormKey(k => k + 1)
+  }
+
+  function applyPreset(next: ModelPoolPreset) {
+    setMode('custom')
+    setPresetId(next.id)
+    setFeedback('')
+    setAdvancedOpen(false)
+    setFormKey(k => k + 1)
+  }
+
+  function reloadFromServer() {
+    setFormSource(liveEditing)
+    serverDraft.acceptServer()
     setFeedback('')
     setFormKey(k => k + 1)
   }
@@ -171,6 +256,15 @@ export function ModelProfileSheet({
             <Icon name="close" size={14} className={CLOSE_ICON_CLASS} />
           </Button>
         </div>
+
+        {isEditing && serverDraft.serverChanged && (
+          <div role="status" data-testid="updated-elsewhere" className="flex flex-none flex-wrap items-center gap-x-2 gap-y-1 border-b border-line bg-warn-soft px-4 py-2 text-[12px] text-warn-text">
+            <span className="min-w-0 flex-1">Updated elsewhere · this profile changed since you opened it.</span>
+            <Button type="button" variant="outline" className="h-6 rounded-[5px] px-[7px] text-[12px]" disabled={action.pending} onClick={reloadFromServer}>
+              Reload
+            </Button>
+          </div>
+        )}
 
         <form
           key={formKey}
@@ -229,10 +323,10 @@ export function ModelProfileSheet({
                 <button
                   type="button"
                   role="radio"
-                  aria-checked={mode === 'default'}
+                  aria-checked={mode === 'default' && !presetId}
                   className={cn(
                     'flex h-auto w-full cursor-pointer flex-col gap-2.5 whitespace-normal rounded-[9px] border px-[13px] py-3 text-left font-normal shadow-none transition-colors',
-                    mode === 'default'
+                    mode === 'default' && !presetId
                       ? 'border-accent-line bg-accent-soft text-fg hover:bg-accent-soft'
                       : 'border-line-2 bg-panel text-fg hover:border-line-strong hover:bg-hover',
                   )}
@@ -255,10 +349,10 @@ export function ModelProfileSheet({
                 <button
                   type="button"
                   role="radio"
-                  aria-checked={mode === 'custom'}
+                  aria-checked={mode === 'custom' && !presetId}
                   className={cn(
                     'flex h-auto w-full cursor-pointer flex-col gap-2.5 whitespace-normal rounded-[9px] border px-[13px] py-3 text-left font-normal shadow-none transition-colors',
-                    mode === 'custom'
+                    mode === 'custom' && !presetId
                       ? 'border-accent-line bg-accent-soft text-fg hover:bg-accent-soft'
                       : 'border-line-2 bg-panel text-fg hover:border-line-strong hover:bg-hover',
                   )}
@@ -279,6 +373,8 @@ export function ModelProfileSheet({
                 </button>
               </div>
             )}
+
+            {!isEditing && <PresetStrip activeId={presetId} onSelect={applyPreset} />}
 
             {isDefaultMode ? (
               <>
@@ -507,7 +603,7 @@ export function ModelProfileSheet({
 
                 <label className={FIELD_CLASS}>
                   <span>
-                    API key{' '}
+                    {preset ? `${preset.provider} API key` : 'API key'}{' '}
                     {isEditing && (
                       <small className="text-[11.5px] font-normal text-fg-subtle">
                         (optional — leave blank to keep stored key)
@@ -522,6 +618,7 @@ export function ModelProfileSheet({
                     minLength={isEditing ? undefined : 8}
                     maxLength={512}
                     autoComplete="off"
+                    autoFocus={Boolean(preset)}
                     placeholder={isEditing ? 'Leave blank to keep existing API key' : 'Enter your provider key'}
                   />
                   <small className="text-[11.5px] font-normal text-fg-subtle" title="Stored privately on this machine">

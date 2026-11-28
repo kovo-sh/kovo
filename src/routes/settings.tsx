@@ -1,5 +1,5 @@
 import { createFileRoute, Link, useNavigate, useRouter } from '@tanstack/react-router'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import {
   clearGithubToken,
   getGithubStatus,
@@ -7,6 +7,7 @@ import {
   listModels,
   removeModelProfile,
   saveGithubToken,
+  setModelProfilePriorities,
   testModel,
   toggleModelProfile,
   updateWorkspaceAction,
@@ -17,6 +18,7 @@ import { useGithubDeviceFlow } from '../components/github/useGithubDeviceFlow.ts
 import { GithubInstallBanner } from '../components/project/GithubInstallBanner.tsx'
 import { Icon } from '../components/run/icons.tsx'
 import { ModelProfileSheet } from '../components/settings/ModelProfileSheet.tsx'
+import { useServerDraft } from '../components/settings/useServerDraft.ts'
 import { Badge } from '../components/ui/badge.tsx'
 import { Button, buttonVariants } from '../components/ui/button.tsx'
 import { Card } from '../components/ui/card.tsx'
@@ -27,6 +29,7 @@ import { Input } from '../components/ui/input.tsx'
 import { id } from '../domain.ts'
 import type { PublicModelProfile } from '../domain.ts'
 import { cn } from '../lib/cn.ts'
+import { failoverPriorities, failoverRoleLabel } from '../model-pool-presets.ts'
 
 const CLOSE_ICON_CLASS =
   'block size-3.5 shrink-0 fill-none stroke-current [stroke-width:1.5] [stroke-linecap:round] [stroke-linejoin:round]'
@@ -81,11 +84,156 @@ function githubConnectionSummary(status: GithubStatusData): { label: string; ton
   }
 }
 
+/** Identity of the saved GitHub connection (no secrets): changes when it is connected, switched or removed. */
+function githubConnectionKey(status: GithubStatusData): string {
+  return [status.configured ? 'on' : 'off', status.authKind, status.tokenKind, status.login, status.source, status.clientIdSource]
+    .map(part => part ?? '')
+    .join('|')
+}
+
+/** Compact "Updated elsewhere · Reload" affordance for draft-protected fields. */
+function UpdatedElsewhereHint({ onReload, className }: { onReload: () => void; className?: string }) {
+  return (
+    <span role="status" data-testid="updated-elsewhere" className={cn('inline-flex items-center gap-1 text-[11.5px] font-medium text-warn-text', className)}>
+      <i className="inline-block size-1.5 flex-none rounded-full bg-warn" aria-hidden="true" />
+      Updated elsewhere
+      <span aria-hidden="true" className="text-fg-faint">·</span>
+      <button
+        type="button"
+        className="h-auto cursor-pointer whitespace-normal rounded-[4px] border-0 bg-transparent p-0 text-[11.5px] font-medium text-accent-text underline-offset-2 shadow-none hover:underline"
+        onClick={onReload}
+      >
+        Reload
+      </button>
+    </span>
+  )
+}
+
+const SUBTLE_DISCLOSURE_TRIGGER =
+  'h-auto w-full rounded-none bg-transparent px-0 py-0.5 text-[12.5px] font-medium whitespace-normal text-fg-muted shadow-none hover:bg-transparent hover:text-fg'
+
+interface OtherWaysToConnectProps {
+  status: GithubStatusData
+  showCustomApp: boolean
+  patInput: string
+  onPatInput: (value: string) => void
+  savingPat: boolean
+  disconnecting: boolean
+  onSavePat: () => void
+  clientIdInput: string
+  onClientIdInput: (value: string) => void
+  startingFlow: boolean
+  onStartCustomApp: () => void
+  changedElsewhere: boolean
+  onReloadConnection: () => void
+}
+
+/**
+ * Secondary connection paths (read-only PAT, custom GitHub App / Enterprise) behind one
+ * collapsed disclosure, so the GitHub App sign-in stays the single prominent action.
+ * Opens by default only when no App sign-in is available.
+ */
+function OtherWaysToConnect(props: OtherWaysToConnectProps) {
+  const { status, changedElsewhere } = props
+  return (
+    <div className="border-t border-line px-4 py-3">
+      <Disclosure defaultOpen={!status.githubDeviceFlowConfigured || changedElsewhere}>
+        <DisclosureTrigger className={SUBTLE_DISCLOSURE_TRIGGER}>
+          Other ways to connect
+          <span className="font-normal text-fg-subtle">Read-only token · Enterprise</span>
+        </DisclosureTrigger>
+        <DisclosureContent className="flex flex-col gap-3.5 pt-2.5" aria-label="Other ways to connect GitHub">
+          {changedElsewhere && <UpdatedElsewhereHint onReload={props.onReloadConnection} />}
+          <PatConnectSection {...props} />
+          {props.showCustomApp && <CustomAppConnectSection {...props} />}
+        </DisclosureContent>
+      </Disclosure>
+    </div>
+  )
+}
+
+function PatConnectSection({ patInput, onPatInput, savingPat, disconnecting, onSavePat }: OtherWaysToConnectProps) {
+  return (
+    <div className="flex flex-col gap-2" data-slot="github-pat">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="text-[12.5px] leading-[18px] text-fg-muted" title="Stored privately on this machine">
+          <strong className="font-medium text-fg">Read-only access token.</strong> Scope it to <strong className="text-fg">Contents: Read-only</strong> and paste it below (stored privately on your machine).
+        </span>
+        <a
+          className={cn(buttonVariants({ variant: 'outline' }), 'h-6 rounded-[5px] px-[7px] text-[12px] no-underline')}
+          href="https://github.com/settings/personal-access-tokens/new"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          Create read-only token ↗
+        </a>
+      </div>
+      <div className="flex items-center gap-2">
+        <Input
+          className="flex-1 font-mono text-[12px]!"
+          type="password"
+          value={patInput}
+          onChange={e => onPatInput(e.target.value)}
+          placeholder="github_pat_…"
+          autoComplete="off"
+          disabled={savingPat || disconnecting}
+          aria-label="Read-only GitHub access token"
+        />
+        <Button
+          type="button"
+          variant="default"
+          disabled={savingPat || disconnecting || patInput.trim().length < 10}
+          onClick={onSavePat}
+        >
+          {savingPat ? 'Saving…' : 'Save token'}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function CustomAppConnectSection({ status, clientIdInput, onClientIdInput, startingFlow, savingPat, onStartCustomApp }: OtherWaysToConnectProps) {
+  return (
+    <div className="flex flex-col gap-2 border-t border-line pt-3" data-slot="github-custom-app">
+      <span className="text-[12.5px] leading-[18px] text-fg-muted">
+        <strong className="font-medium text-fg">Custom GitHub App / Enterprise.</strong>{' '}
+        {status.clientIdSource === 'env'
+          ? 'A custom GitHub App Client ID is active via KOVO_GITHUB_CLIENT_ID. Enter a Client ID below to override it for this sign-in.'
+          : status.clientIdSource === 'vault'
+            ? 'A custom GitHub App Client ID is saved on this machine. Enter another Client ID below to switch apps.'
+            : 'By default, Kovo uses the official Kovo Security GitHub App. Enter a custom Client ID only for GitHub Enterprise Server or custom organization apps.'}
+      </span>
+      <div className="flex items-center gap-2">
+        <Input
+          className="flex-1 font-mono text-[12px]!"
+          type="text"
+          value={clientIdInput}
+          onChange={e => onClientIdInput(e.target.value)}
+          placeholder="Iv23li…"
+          autoComplete="off"
+          disabled={startingFlow || savingPat}
+          aria-label="Custom GitHub App Client ID"
+        />
+        <Button
+          type="button"
+          variant="outline"
+          disabled={startingFlow || savingPat || clientIdInput.trim().length < 6}
+          onClick={onStartCustomApp}
+        >
+          {startingFlow ? 'Starting…' : 'Sign in with custom App'}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
 function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusData }) {
   const router = useRouter()
   const [status, setStatus] = useState<GithubStatusData>(initialStatus)
   const [reconnecting, setReconnecting] = useState(false)
-  const [patInput, setPatInput] = useState('')
+  // Secrets are never echoed back, so the PAT's server value is always empty: revalidation
+  // and polls can never clear a token that is being typed.
+  const [patInput, setPatInput] = useServerDraft('')
   const [savingPat, setSavingPat] = useState(false)
   const [disconnecting, setDisconnecting] = useState(false)
   const [confirmDisconnect, setConfirmDisconnect] = useState(false)
@@ -119,6 +267,11 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
     codeCopied,
   } = device
   const displayError = error || deviceFlowError
+  // The connection itself can change elsewhere (another tab, a paired device). While a token
+  // or client ID is being typed the connect panel stays put and offers a reload instead.
+  const typingCredential = patInput.length > 0 || clientIdInput.length > 0
+  const [, , connection] = useServerDraft(githubConnectionKey(status), { hold: typingCredential })
+  const connectionChangedElsewhere = typingCredential && connection.serverChanged
 
   const isGithubAppSession = status.configured && (status.authKind === 'github_app_device' || status.tokenKind === 'github_app')
 
@@ -203,7 +356,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
   }
 
   const badge = githubConnectionSummary(status)
-  const showConnectPanel = !status.configured || reconnecting
+  const showConnectPanel = !status.configured || reconnecting || connectionChangedElsewhere
 
   return (
     <section className="flex flex-col gap-3.5 border-t border-line pt-6" aria-labelledby="github-integration-heading">
@@ -364,90 +517,25 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
         )}
 
         {showConnectPanel && (
-          <div className="border-t border-line px-4 py-3">
-            <Disclosure>
-              <DisclosureTrigger className="h-auto w-full rounded-none bg-transparent px-0 py-0.5 text-[12.5px] font-medium whitespace-normal text-fg-muted shadow-none hover:bg-transparent hover:text-fg">
-                Or connect with a read-only GitHub token
-              </DisclosureTrigger>
-              <DisclosureContent className="flex flex-col gap-2 pt-2.5">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span
-                    className="text-[12.5px] leading-[18px] text-fg-muted"
-                    title="Stored privately on this machine"
-                  >
-                    Scope a read-only token to <strong className="text-fg">Contents: Read-only</strong> and paste it below (stored privately on your machine).
-                  </span>
-                  <a
-                    className={cn(buttonVariants({ variant: 'outline' }), 'h-6 rounded-[5px] px-[7px] text-[12px] no-underline')}
-                    href="https://github.com/settings/personal-access-tokens/new"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    Create read-only token ↗
-                  </a>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Input
-                    className="flex-1 font-mono text-[12px]!"
-                    type="password"
-                    value={patInput}
-                    onChange={e => setPatInput(e.target.value)}
-                    placeholder="github_pat_…"
-                    autoComplete="off"
-                    disabled={savingPat || disconnecting}
-                    aria-label="Read-only GitHub access token"
-                  />
-                  <Button
-                    type="button"
-                    variant="default"
-                    disabled={savingPat || disconnecting || patInput.trim().length < 10}
-                    onClick={() => void handleSavePat()}
-                  >
-                    {savingPat ? 'Saving…' : 'Save token'}
-                  </Button>
-                </div>
-              </DisclosureContent>
-            </Disclosure>
-          </div>
-        )}
-
-        {showConnectPanel && !deviceFlow && (
-          <div className="border-t border-line px-4 py-3">
-            <Disclosure defaultOpen={!status.githubDeviceFlowConfigured}>
-              <DisclosureTrigger className="h-auto w-full rounded-none bg-transparent px-0 py-0.5 text-[12.5px] font-medium whitespace-normal text-fg-muted shadow-none hover:bg-transparent hover:text-fg">
-                Advanced: custom GitHub App / Enterprise
-              </DisclosureTrigger>
-              <DisclosureContent className="flex flex-col gap-2 pt-2.5">
-                <span className="text-[12.5px] leading-[18px] text-fg-muted">
-                  {status.clientIdSource === 'env'
-                    ? 'A custom GitHub App Client ID is active via KOVO_GITHUB_CLIENT_ID. Enter a Client ID below to override it for this sign-in.'
-                    : status.clientIdSource === 'vault'
-                      ? 'A custom GitHub App Client ID is saved on this machine. Enter another Client ID below to switch apps.'
-                      : 'By default, Kovo uses the official Kovo Security GitHub App. Enter a custom Client ID only for GitHub Enterprise Server or custom organization apps.'}
-                </span>
-                <div className="flex items-center gap-2">
-                  <Input
-                    className="flex-1 font-mono text-[12px]!"
-                    type="text"
-                    value={clientIdInput}
-                    onChange={e => setClientIdInput(e.target.value)}
-                    placeholder="Iv23li…"
-                    autoComplete="off"
-                    disabled={startingFlow || savingPat}
-                    aria-label="Custom GitHub App Client ID"
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    disabled={startingFlow || savingPat || clientIdInput.trim().length < 6}
-                    onClick={() => void device.start()}
-                  >
-                    {startingFlow ? 'Starting…' : 'Sign in with custom App'}
-                  </Button>
-                </div>
-              </DisclosureContent>
-            </Disclosure>
-          </div>
+          <OtherWaysToConnect
+            status={status}
+            showCustomApp={!deviceFlow}
+            patInput={patInput}
+            onPatInput={setPatInput}
+            savingPat={savingPat}
+            disconnecting={disconnecting}
+            onSavePat={() => void handleSavePat()}
+            clientIdInput={clientIdInput}
+            onClientIdInput={setClientIdInput}
+            startingFlow={startingFlow}
+            onStartCustomApp={() => void device.start()}
+            changedElsewhere={connectionChangedElsewhere}
+            onReloadConnection={() => {
+              setPatInput('')
+              setClientIdInput('')
+              connection.acceptServer()
+            }}
+          />
         )}
 
         {displayError && (
@@ -526,17 +614,133 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
   )
 }
 
-function healthLabel(profile: PublicModelProfile): { text: string; tone: 'ok' | 'warn' | 'bad' | 'off' } {
-  if (!profile.enabled) return { text: 'Disabled', tone: 'off' }
+/** Whole seconds left on an open circuit's cooldown (0 when none is running). */
+function cooldownSeconds(profile: PublicModelProfile, now: number): number {
+  if (!profile.enabled || profile.healthState !== 'open' || !profile.cooldownUntil) return 0
+  return Math.max(0, Math.ceil((profile.cooldownUntil - now) / 1000))
+}
+
+/** "42s" / "2m 05s" for the live cooldown countdown. */
+function formatCooldown(secs: number): string {
+  if (secs < 60) return `${secs}s`
+  return `${Math.floor(secs / 60)}m ${String(secs % 60).padStart(2, '0')}s`
+}
+
+function healthLabel(profile: PublicModelProfile, now: number): { text: string; tone: 'ok' | 'warn' | 'bad' | 'off'; cooldown: number } {
+  if (!profile.enabled) return { text: 'Disabled', tone: 'off', cooldown: 0 }
   if (profile.healthState === 'open') {
-    if (profile.cooldownUntil && profile.cooldownUntil > Date.now()) {
-      const secs = Math.max(1, Math.ceil((profile.cooldownUntil - Date.now()) / 1000))
-      return { text: `Temporarily unavailable (${secs}s)`, tone: 'bad' }
-    }
-    return { text: 'Temporarily unavailable', tone: 'bad' }
+    const cooldown = cooldownSeconds(profile, now)
+    return { text: cooldown > 0 ? 'Cooling down' : 'Unavailable', tone: 'bad', cooldown }
   }
-  if (profile.healthState === 'half_open') return { text: 'Recovering', tone: 'warn' }
-  return { text: 'Healthy', tone: 'ok' }
+  if (profile.healthState === 'half_open') return { text: 'Recovering', tone: 'warn', cooldown: 0 }
+  return { text: 'Healthy', tone: 'ok', cooldown: 0 }
+}
+
+/** A circuit that is open or half-open needs live polling until it closes again. */
+function needsHealthWatch(profile: PublicModelProfile): boolean {
+  return profile.enabled && profile.healthState !== 'closed'
+}
+
+export const HEALTH_POLL_MS = 10_000
+const COOLDOWN_TICK_MS = 1_000
+
+/** Shared 1s clock, running only while a cooldown is counting down. */
+function useCooldownClock(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!active) return
+    setNow(Date.now())
+    const timer = window.setInterval(() => setNow(Date.now()), COOLDOWN_TICK_MS)
+    return () => window.clearInterval(timer)
+  }, [active])
+  return now
+}
+
+/** Move one profile `delta` places in the ranked list (null when it would leave the list). */
+function moveProfile(list: readonly PublicModelProfile[], index: number, delta: -1 | 1): PublicModelProfile[] | null {
+  const target = index + delta
+  if (index < 0 || target < 0 || target >= list.length) return null
+  const next = [...list]
+  const [moved] = next.splice(index, 1)
+  next.splice(target, 0, moved!)
+  const priorities = failoverPriorities(next.length)
+  return next.map((profile, rank) => ({ ...profile, priority: priorities[rank]! }))
+}
+
+interface LiveProfiles {
+  profiles: PublicModelProfile[]
+  now: number
+  reordering: boolean
+  reorderError: string
+  reorder: (profileId: string, delta: -1 | 1) => Promise<boolean>
+}
+
+/**
+ * The model pool as shown on screen: loader data, refreshed every 10s (paused while the tab is
+ * hidden) whenever a circuit is open / half-open, with optimistic reorders rolled back on error.
+ * Polls read only `listModels`, so workspace / GitHub drafts are never revalidated underneath.
+ */
+function useLiveProfiles(loaderProfiles: PublicModelProfile[]): LiveProfiles {
+  const router = useRouter()
+  const [override, setOverride] = useState<{ source: PublicModelProfile[]; profiles: PublicModelProfile[] }>()
+  const [reordering, setReordering] = useState(false)
+  const [reorderError, setReorderError] = useState('')
+  const reorderingRef = useRef(false)
+  const sourceRef = useRef(loaderProfiles)
+  sourceRef.current = loaderProfiles
+  const profiles = override && override.source === loaderProfiles ? override.profiles : loaderProfiles
+  const watching = profiles.some(needsHealthWatch)
+  const counting = profiles.some(p => p.enabled && p.healthState === 'open' && Boolean(p.cooldownUntil))
+  const now = useCooldownClock(counting)
+  const expired = profiles.filter(p => p.enabled && p.healthState === 'open' && p.cooldownUntil !== null && p.cooldownUntil <= now).length
+
+  const poll = useCallback(async () => {
+    if (typeof document !== 'undefined' && document.hidden) return
+    try {
+      const next = await listModels()
+      if (!reorderingRef.current) setOverride({ source: sourceRef.current, profiles: next })
+    } catch {
+      // Keep the last known pool; the next tick retries.
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!watching) return
+    const timer = window.setInterval(() => void poll(), HEALTH_POLL_MS)
+    const onVisible = () => { if (!document.hidden) void poll() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [watching, poll])
+
+  // A countdown that reaches zero flips the circuit to half-open server-side: fetch it now.
+  useEffect(() => { if (expired > 0) void poll() }, [expired, poll])
+
+  const reorder = useCallback(async (profileId: string, delta: -1 | 1) => {
+    const previous = profiles
+    const next = moveProfile(previous, previous.findIndex(p => p.id === profileId), delta)
+    if (!next || reorderingRef.current) return false
+    reorderingRef.current = true
+    setReordering(true)
+    setReorderError('')
+    setOverride({ source: sourceRef.current, profiles: next })
+    try {
+      await setModelProfilePriorities({ data: { order: next.map(p => p.id) } })
+      await router.invalidate()
+      return true
+    } catch (failure) {
+      setOverride({ source: sourceRef.current, profiles: previous })
+      setReorderError(failure instanceof Error ? failure.message : 'Kovo could not save the failover order.')
+      return false
+    } finally {
+      reorderingRef.current = false
+      setReordering(false)
+    }
+  }, [profiles, router])
+
+  return { profiles, now, reordering, reorderError, reorder }
 }
 
 function poolSummary(profiles: PublicModelProfile[]): { label: string; tone: 'ok' | 'warn' | 'danger' | 'neutral' } {
@@ -605,18 +809,12 @@ function statusTextClass(tone: 'ok' | 'warn' | 'bad' | 'off'): string {
 }
 
 function WorkspaceSettingsBand({ workspace }: { workspace: { id: string; name: string } }) {
-  const [name, setName] = useState(() => workspace.name)
+  const [focused, setFocused] = useState(false)
+  // Revalidation only replaces the input while it is pristine and unfocused; a dirty or
+  // focused draft is never clobbered and gets an "Updated elsewhere · Reload" hint instead.
+  const [name, setName, draft] = useServerDraft(workspace.name, { hold: focused })
   const [notice, setNotice] = useState('')
   const action = useAction()
-  // Last server value the field was synced to: revalidation only replaces the
-  // input while it is pristine, so an unsaved draft is never clobbered.
-  const syncedRef = useRef(workspace.name)
-
-  useEffect(() => {
-    const previous = syncedRef.current
-    syncedRef.current = workspace.name
-    setName(current => (current === previous ? workspace.name : current))
-  }, [workspace.name])
 
   const trimmed = name.trim()
   const unchanged = trimmed === workspace.name
@@ -648,12 +846,23 @@ function WorkspaceSettingsBand({ workspace }: { workspace: { id: string; name: s
           }}
         >
           <div className="flex flex-col gap-2.5 px-4 py-3.5 sm:flex-row sm:items-end sm:gap-3">
-            <label className="grid flex-1 gap-1.5 text-[12px] font-medium text-fg-muted">
-              Workspace name
+            <div className="grid flex-1 gap-1.5">
+              <div className="flex min-h-4 flex-wrap items-center justify-between gap-x-3 gap-y-1">
+                <label htmlFor="workspace-name-input" className="text-[12px] font-medium text-fg-muted">Workspace name</label>
+                {draft.serverChanged && name !== workspace.name && (
+                  <UpdatedElsewhereHint onReload={() => {
+                    draft.acceptServer()
+                    setNotice('')
+                  }} />
+                )}
+              </div>
               <Input
+                id="workspace-name-input"
                 className="w-full"
                 name="workspaceName"
                 value={name}
+                onFocus={() => setFocused(true)}
+                onBlur={() => setFocused(false)}
                 onChange={e => {
                   setName(e.target.value)
                   if (notice) setNotice('')
@@ -663,7 +872,7 @@ function WorkspaceSettingsBand({ workspace }: { workspace: { id: string; name: s
                 required
                 disabled={action.pending}
               />
-            </label>
+            </div>
             <Button
               type="submit"
               variant="default"
@@ -724,8 +933,246 @@ function ProfileMetaLine({ profile, updated }: {
   )
 }
 
+const TH_CLASS = 'h-8 whitespace-nowrap border-b border-line bg-sunk px-3.5 text-[11.5px] font-medium text-fg-subtle'
+const ROW_BUTTON = 'h-6 rounded-[5px] px-[7px] text-[12px]'
+
+interface ModelPoolTableProps {
+  profiles: PublicModelProfile[]
+  now: number
+  busy: boolean
+  /** A reorder is in flight: move buttons stay focusable (re-entry is guarded) so focus never drops. */
+  reordering: boolean
+  testingId: string | null
+  onTest: (profile: PublicModelProfile) => void
+  onEdit: (profile: PublicModelProfile) => void
+  onToggle: (profile: PublicModelProfile) => void
+  onDelete: (profile: PublicModelProfile) => void
+  onMove: (profile: PublicModelProfile, delta: -1 | 1) => Promise<boolean>
+}
+
+/** Failover roles: enabled profiles take Primary, Fallback 1, … in list order; disabled ones are skipped. */
+function failoverRoles(profiles: readonly PublicModelProfile[]): string[] {
+  let enabledRank = 0
+  return profiles.map(p => (p.enabled ? failoverRoleLabel(++enabledRank) : 'Skipped · disabled'))
+}
+
+function ModelPoolTable({ profiles, now, busy, reordering, testingId, onTest, onEdit, onToggle, onDelete, onMove }: ModelPoolTableProps) {
+  const tableRef = useRef<HTMLTableElement>(null)
+  const focusAfterMove = useRef<{ id: string; dir: 'up' | 'down' } | null>(null)
+  const roles = failoverRoles(profiles)
+  // Reordering moves the row (and may disable the pressed button at a boundary): keep
+  // keyboard focus on the moved profile's move control after every re-render of the order.
+  useLayoutEffect(() => {
+    const target = focusAfterMove.current
+    if (!target) return
+    const row = tableRef.current?.querySelector<HTMLElement>(`tr[data-profile-id="${target.id}"]`)
+    const button = row?.querySelector<HTMLButtonElement>(`[data-move="${target.dir}"]:not(:disabled)`)
+      ?? row?.querySelector<HTMLButtonElement>('[data-move]:not(:disabled)')
+    if (button && document.activeElement !== button) button.focus()
+    if (!reordering) focusAfterMove.current = null
+  }, [profiles, reordering])
+  const move = (profile: PublicModelProfile, delta: -1 | 1) => {
+    focusAfterMove.current = { id: profile.id, dir: delta < 0 ? 'up' : 'down' }
+    void onMove(profile, delta)
+  }
+  return (
+    <Card className="overflow-x-auto border-line">
+      <table ref={tableRef} className="w-full border-collapse text-left" aria-label="Configured model profiles">
+        <thead>
+          <tr>
+            <th className={cn(TH_CLASS, 'w-[1%] pr-1 pl-2.5 text-center')}><span className="sr-only">Failover order</span><span aria-hidden="true">#</span></th>
+            {/* Preferred share for the contained profile column (its content no longer sizes it). */}
+            <th className={cn(TH_CLASS, 'w-[34%] pl-2')}>Profile &amp; model</th>
+            <th className={TH_CLASS}>Status</th>
+            <th className={TH_CLASS}>Failover &amp; limits</th>
+            <th className={TH_CLASS}>Pricing (per 1M)</th>
+            <th className={cn(TH_CLASS, 'text-right')}>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {profiles.map((profile, index) => (
+            <ModelPoolRow
+              key={profile.id}
+              profile={profile}
+              rank={index + 1}
+              role={roles[index]!}
+              last={index === profiles.length - 1}
+              now={now}
+              busy={busy}
+              testing={testingId === profile.id}
+              onTest={onTest}
+              onEdit={onEdit}
+              onToggle={onToggle}
+              onDelete={onDelete}
+              onMove={move}
+            />
+          ))}
+        </tbody>
+      </table>
+    </Card>
+  )
+}
+
+interface ModelPoolRowProps {
+  profile: PublicModelProfile
+  rank: number
+  role: string
+  last: boolean
+  now: number
+  busy: boolean
+  testing: boolean
+  onTest: (profile: PublicModelProfile) => void
+  onEdit: (profile: PublicModelProfile) => void
+  onToggle: (profile: PublicModelProfile) => void
+  onDelete: (profile: PublicModelProfile) => void
+  onMove: (profile: PublicModelProfile, delta: -1 | 1) => void
+}
+
+function RankCell({ profile, rank, last, busy, onMove }: Pick<ModelPoolRowProps, 'profile' | 'rank' | 'last' | 'busy' | 'onMove'>) {
+  return (
+    <td className="w-[1%] py-[9px] pr-1 pl-2.5 align-middle">
+      <div className="flex items-center gap-1.5">
+        <span
+          className="grid size-5 flex-none place-items-center rounded-full border border-line-2 bg-panel text-[11px] font-semibold tabular-nums text-fg"
+          data-testid="failover-rank"
+          aria-label={`Failover rank ${rank}`}
+        >
+          {rank}
+        </span>
+        <div className="flex flex-col gap-0.5">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            data-move="up"
+            className="size-[18px] rounded-[4px] p-0 text-fg-subtle"
+            disabled={busy || rank === 1}
+            aria-label={`Move up: ${profile.name}`}
+            title="Move up"
+            onClick={() => onMove(profile, -1)}
+          >
+            <Icon name="chev" size={12} className="rotate-180" />
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            data-move="down"
+            className="size-[18px] rounded-[4px] p-0 text-fg-subtle"
+            disabled={busy || last}
+            aria-label={`Move down: ${profile.name}`}
+            title="Move down"
+            onClick={() => onMove(profile, 1)}
+          >
+            <Icon name="chev" size={12} />
+          </Button>
+        </div>
+      </div>
+    </td>
+  )
+}
+
+function StatusCell({ profile, now }: { profile: PublicModelProfile; now: number }) {
+  const status = healthLabel(profile, now)
+  const title = status.cooldown > 0
+    ? `Temporarily unavailable · retrying in ${formatCooldown(status.cooldown)}`
+    : profile.healthState === 'open' ? 'Temporarily unavailable' : status.text
+  return (
+    <td className="px-3.5 py-[11px] align-middle">
+      {/* Status swaps colour instantly (no transition) so a flip is never mistaken for motion. */}
+      <div className="flex flex-col gap-0.5 whitespace-nowrap transition-none" data-testid="profile-status" title={title}>
+        <span className={cn('inline-flex items-center gap-[7px] text-[12.5px] transition-none', statusTextClass(status.tone))}>
+          <i className={cn('inline-block size-1.5 flex-none rounded-full transition-none', toneDotClass(status.tone))} aria-hidden="true" />
+          {status.text}
+        </span>
+        {status.cooldown > 0 && (
+          <small className="pl-[13px] text-[11.5px] text-fg-subtle">
+            Retry in{' '}
+            <span className="tabular-nums" data-testid="cooldown-remaining" suppressHydrationWarning>{formatCooldown(status.cooldown)}</span>
+          </small>
+        )}
+      </div>
+    </td>
+  )
+}
+
+function ModelPoolRow({ profile, rank, role, last, now, busy, testing, onTest, onEdit, onToggle, onDelete, onMove }: ModelPoolRowProps) {
+  const updated = formatHumanTime(profile.updatedAt)
+  return (
+    <tr
+      data-enabled={profile.enabled}
+      data-profile-id={profile.id}
+      className="border-b border-line transition-colors last:border-b-0 hover:bg-hover data-[enabled=false]:opacity-65"
+    >
+      <RankCell profile={profile} rank={rank} last={last} busy={busy} onMove={onMove} />
+      <td className="max-w-[460px] py-[11px] pr-3.5 pl-2 align-middle">
+        {/* contain-inline-size: unbroken names, model IDs and URLs never raise the
+            column's min-content width, so Status and Actions stay on screen. */}
+        <div className="flex min-w-[200px] max-w-[460px] flex-col gap-[3px] contain-inline-size">
+          <div className="flex min-w-0 flex-wrap items-center gap-[7px]">
+            <span className="line-clamp-2 min-w-0 font-medium text-fg [overflow-wrap:anywhere]" title={profile.name}>
+              {profile.name}
+            </span>
+            <span className="min-w-0 max-w-full truncate font-mono text-[11.5px] text-fg-muted" title={profile.model}>
+              {profile.model}
+            </span>
+          </div>
+          <ProfileMetaLine profile={profile} updated={updated} />
+          {profile.lastError && (
+            <span className="mt-0.5 max-w-[440px] truncate text-[11.5px] text-danger" title={profile.lastError}>
+              Last error: {profile.lastError}
+            </span>
+          )}
+        </div>
+      </td>
+      <StatusCell profile={profile} now={now} />
+      <td className="px-3.5 py-[11px] align-middle">
+        <div className="flex flex-col gap-0.5 whitespace-nowrap text-[12px] tabular-nums text-fg-muted">
+          <span>
+            <span className="font-medium text-fg" data-testid="failover-role">{role}</span>
+            <span className="text-fg-subtle"> · priority {profile.priority}</span>
+          </span>
+          <small className="text-[11.5px] text-fg-subtle">
+            {formatK(profile.contextWindow)} ctx · {formatK(profile.maxTokens)} out · {profile.thinkingLevel}
+          </small>
+        </div>
+      </td>
+      <td className="px-3.5 py-[11px] align-middle">
+        <div className="flex flex-col gap-0.5 whitespace-nowrap text-[12px] tabular-nums text-fg-muted">
+          <span>{formatRate(profile.inputCostPerMtok)} in · {formatRate(profile.outputCostPerMtok)} out</span>
+          <small className="text-[11.5px] text-fg-subtle">{formatRate(profile.cachedInputCostPerMtok)} cached</small>
+        </div>
+      </td>
+      <td className="px-3.5 py-[11px] text-right align-middle">
+        <div className="inline-flex items-center justify-end gap-1 whitespace-nowrap">
+          <Button type="button" variant="outline" className={ROW_BUTTON} disabled={busy} onClick={() => onTest(profile)}>
+            {testing ? 'Testing…' : 'Test'}
+          </Button>
+          <Button type="button" variant="ghost" className={ROW_BUTTON} disabled={busy} onClick={() => onEdit(profile)}>
+            Edit
+          </Button>
+          <Button type="button" variant="ghost" className={ROW_BUTTON} disabled={busy} onClick={() => onToggle(profile)}>
+            {profile.enabled ? 'Disable' : 'Enable'}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            className={cn(ROW_BUTTON, 'border-0 bg-transparent text-fg-subtle shadow-none hover:bg-danger-soft hover:text-danger')}
+            disabled={busy}
+            onClick={() => onDelete(profile)}
+          >
+            Delete
+          </Button>
+        </div>
+      </td>
+    </tr>
+  )
+}
+
 function SettingsWorkbenchPage() {
-  const { profiles, githubStatus, workspace } = Route.useLoaderData()
+  const { profiles: loaderProfiles, githubStatus, workspace } = Route.useLoaderData()
+  const live = useLiveProfiles(loaderProfiles)
+  const profiles = live.profiles
   const { runId } = Route.useSearch()
   const navigate = useNavigate()
   const poolAction = useAction()
@@ -833,15 +1280,15 @@ function SettingsWorkbenchPage() {
         </div>
       </header>
 
-      {poolAction.error && (
+      {(poolAction.error || live.reorderError) && (
         <div
           role="alert"
           className="flex min-w-0 flex-none items-center gap-2.5 border-b border-line bg-danger-soft px-4 py-2 text-[12.5px] text-danger [overflow-wrap:anywhere] sm:px-6"
         >
-          <span className="min-w-0 flex-1">{poolAction.error}</span>
+          <span className="min-w-0 flex-1">{poolAction.error || live.reorderError}</span>
         </div>
       )}
-      {pageStatus && !poolAction.error && (
+      {pageStatus && !poolAction.error && !live.reorderError && (
         <div
           role="status"
           className="flex min-w-0 flex-none items-center gap-2.5 border-b border-line bg-ok-soft px-4 py-2 text-[12.5px] text-ok-text [overflow-wrap:anywhere] sm:px-6"
@@ -873,7 +1320,7 @@ function SettingsWorkbenchPage() {
               title="Keys are stored privately on this machine"
             >
               {profiles.length > 0
-                ? `${enabledCount} of ${profiles.length} enabled · highest priority tried first`
+                ? `${enabledCount} of ${profiles.length} enabled · tried in failover order, top first`
                 : '0 profiles configured · keys stored privately on your machine'}
             </span>
           </div>
@@ -893,156 +1340,33 @@ function SettingsWorkbenchPage() {
               />
             </Card>
           ) : (
-            <Card className="overflow-x-auto border-line">
-              <table className="w-full border-collapse text-left" aria-label="Configured model profiles">
-                <thead>
-                  <tr>
-                    {/* Preferred share for the contained profile column (its content no longer sizes it). */}
-                    <th className="h-8 w-[36%] whitespace-nowrap border-b border-line bg-sunk px-3.5 text-[11.5px] font-medium text-fg-subtle">
-                      Profile &amp; model
-                    </th>
-                    <th className="h-8 whitespace-nowrap border-b border-line bg-sunk px-3.5 text-[11.5px] font-medium text-fg-subtle">
-                      Status
-                    </th>
-                    <th className="h-8 whitespace-nowrap border-b border-line bg-sunk px-3.5 text-[11.5px] font-medium text-fg-subtle">
-                      Priority &amp; limits
-                    </th>
-                    <th className="h-8 whitespace-nowrap border-b border-line bg-sunk px-3.5 text-[11.5px] font-medium text-fg-subtle">
-                      Pricing (per 1M)
-                    </th>
-                    <th className="h-8 whitespace-nowrap border-b border-line bg-sunk px-3.5 text-right text-[11.5px] font-medium text-fg-subtle">
-                      Actions
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {profiles.map(profile => {
-                    const status = healthLabel(profile)
-                    const isRowTesting = testingId === profile.id && poolAction.pending
-                    const updated = formatHumanTime(profile.updatedAt)
-                    return (
-                      <tr
-                        key={profile.id}
-                        data-enabled={profile.enabled}
-                        className="border-b border-line transition-colors last:border-b-0 hover:bg-hover data-[enabled=false]:opacity-65"
-                      >
-                        <td className="max-w-[460px] px-3.5 py-[11px] align-middle">
-                          {/* contain-inline-size: unbroken names, model IDs and URLs never raise the
-                              column's min-content width, so Status and Actions stay on screen. */}
-                          <div className="flex min-w-[200px] max-w-[460px] flex-col gap-[3px] contain-inline-size">
-                            <div className="flex min-w-0 flex-wrap items-center gap-[7px]">
-                              <span
-                                className="line-clamp-2 min-w-0 font-medium text-fg [overflow-wrap:anywhere]"
-                                title={profile.name}
-                              >
-                                {profile.name}
-                              </span>
-                              <span
-                                className="min-w-0 max-w-full truncate font-mono text-[11.5px] text-fg-muted"
-                                title={profile.model}
-                              >
-                                {profile.model}
-                              </span>
-                            </div>
-                            <ProfileMetaLine profile={profile} updated={updated} />
-                            {profile.lastError && (
-                              <span
-                                className="mt-0.5 max-w-[440px] truncate text-[11.5px] text-danger"
-                                title={profile.lastError}
-                              >
-                                Last error: {profile.lastError}
-                              </span>
-                            )}
-                          </div>
-                        </td>
-                        <td className="px-3.5 py-[11px] align-middle">
-                          <span
-                            className={cn(
-                              'inline-flex items-center gap-[7px] whitespace-nowrap text-[12.5px]',
-                              statusTextClass(status.tone),
-                            )}
-                            title={profile.healthState === 'closed' ? 'Healthy' : status.text}
-                          >
-                            <i
-                              className={cn('inline-block size-1.5 flex-none rounded-full', toneDotClass(status.tone))}
-                              aria-hidden="true"
-                            />
-                            {status.text}
-                          </span>
-                        </td>
-                        <td className="px-3.5 py-[11px] align-middle">
-                          <div className="flex flex-col gap-0.5 whitespace-nowrap text-[12px] tabular-nums text-fg-muted">
-                            <span>Priority {profile.priority}</span>
-                            <small className="text-[11.5px] text-fg-subtle">
-                              {formatK(profile.contextWindow)} ctx · {formatK(profile.maxTokens)} out · {profile.thinkingLevel}
-                            </small>
-                          </div>
-                        </td>
-                        <td className="px-3.5 py-[11px] align-middle">
-                          <div className="flex flex-col gap-0.5 whitespace-nowrap text-[12px] tabular-nums text-fg-muted">
-                            <span>
-                              {formatRate(profile.inputCostPerMtok)} in · {formatRate(profile.outputCostPerMtok)} out
-                            </span>
-                            <small className="text-[11.5px] text-fg-subtle">
-                              {formatRate(profile.cachedInputCostPerMtok)} cached
-                            </small>
-                          </div>
-                        </td>
-                        <td className="px-3.5 py-[11px] text-right align-middle">
-                          <div className="inline-flex items-center justify-end gap-1 whitespace-nowrap">
-                            <Button
-                              type="button"
-                              variant="outline"
-                              className="h-6 rounded-[5px] px-[7px] text-[12px]"
-                              disabled={poolAction.pending}
-                              onClick={() => handleRowTest(profile)}
-                            >
-                              {isRowTesting ? 'Testing…' : 'Test'}
-                            </Button>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              className="h-6 rounded-[5px] px-[7px] text-[12px]"
-                              disabled={poolAction.pending}
-                              onClick={() => openEdit(profile)}
-                            >
-                              Edit
-                            </Button>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              className="h-6 rounded-[5px] px-[7px] text-[12px]"
-                              disabled={poolAction.pending}
-                              onClick={() => {
-                                setPageStatus('')
-                                void poolAction.submit(
-                                  () => toggleModelProfile({ data: { profileId: profile.id, enabled: !profile.enabled } }),
-                                  () => setPageStatus(`${profile.name} ${profile.enabled ? 'disabled' : 'enabled'}.`),
-                                )
-                              }}
-                            >
-                              {profile.enabled ? 'Disable' : 'Enable'}
-                            </Button>
-                            <Button
-                              type="button"
-                              variant="outline"
-                              className="h-6 rounded-[5px] border-0 bg-transparent px-[7px] text-[12px] text-fg-subtle shadow-none hover:bg-danger-soft hover:text-danger"
-                              disabled={poolAction.pending}
-                              onClick={() => {
-                                setPageStatus('')
-                                setConfirmDelete(profile)
-                              }}
-                            >
-                              Delete
-                            </Button>
-                          </div>
-                        </td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </Card>
+            <ModelPoolTable
+              profiles={profiles}
+              now={live.now}
+              busy={poolAction.pending}
+              reordering={live.reordering}
+              testingId={poolAction.pending ? testingId : null}
+              onTest={handleRowTest}
+              onEdit={openEdit}
+              onToggle={profile => {
+                setPageStatus('')
+                void poolAction.submit(
+                  () => toggleModelProfile({ data: { profileId: profile.id, enabled: !profile.enabled } }),
+                  () => setPageStatus(`${profile.name} ${profile.enabled ? 'disabled' : 'enabled'}.`),
+                )
+              }}
+              onDelete={profile => {
+                setPageStatus('')
+                setConfirmDelete(profile)
+              }}
+              onMove={(profile, delta) => {
+                setPageStatus('')
+                return live.reorder(profile.id, delta).then(ok => {
+                  if (ok) setPageStatus(`${profile.name} moved ${delta < 0 ? 'up' : 'down'} in the failover order.`)
+                  return ok
+                })
+              }}
+            />
           )}
         </section>
 

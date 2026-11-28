@@ -23,6 +23,7 @@ import {
   shortText,
   updatePersona as updatePersonaSchema,
 } from './domain.ts'
+import { failoverPriorities } from './model-pool-presets.ts'
 import { execution } from './server/execution.ts'
 import {
   cancelGithubDeviceFlow,
@@ -125,6 +126,54 @@ export const toggleModelProfile = createServerFn({ method: 'POST' })
 export const removeModelProfile = createServerFn({ method: 'POST' })
   .validator(z.object({ profileId: id }))
   .handler(({ data }) => deleteModelProfile(data.profileId))
+
+/** Ranked failover order (index 0 = Primary): every pool profile exactly once. */
+const modelProfileOrder = z.object({
+  order: z.array(id).min(1).max(100)
+    .refine(ids => new Set(ids).size === ids.length, 'Each model profile may appear only once in the failover order.'),
+})
+
+/**
+ * Persist an explicit failover order. Priorities are rewritten in steps of 10 and
+ * descending (the pool tries the highest priority first): rank 1 (Primary) of N
+ * gets N×10, the last fallback gets 10. The order must name every profile in the
+ * workspace exactly once, so a stale tab can never silently drop a profile.
+ */
+/** Query deps are injected (never imported at module scope) so this export stays out of the client bundle. */
+export interface ModelProfileOrderDeps {
+  modelProfiles: typeof tables.modelProfiles
+  and: typeof and
+  eq: typeof eq
+}
+
+export function setModelProfilePrioritiesInStore(order: readonly string[], storage: Store, deps: ModelProfileOrderDeps) {
+  const { modelProfiles } = deps
+  const rows = storage.db.select({ id: modelProfiles.id }).from(modelProfiles)
+    .where(deps.eq(modelProfiles.workspaceId, storage.workspace.id)).all()
+  const known = new Set(rows.map(row => row.id))
+  if (order.length !== known.size || order.some(profileId => !known.has(profileId))) {
+    throw new Error('The model pool changed since this page loaded. Reload settings and try again.')
+  }
+  const priorities = failoverPriorities(order.length)
+  const now = Date.now()
+  storage.transaction(() => {
+    order.forEach((profileId, index) => {
+      storage.db.update(modelProfiles)
+        .set({ priority: priorities[index]!, updatedAt: now })
+        .where(deps.and(deps.eq(modelProfiles.id, profileId), deps.eq(modelProfiles.workspaceId, storage.workspace.id)))
+        .run()
+    })
+  })
+  return { ok: true as const, priorities: order.map((profileId, index) => ({ id: profileId, priority: priorities[index]! })) }
+}
+
+export const setModelProfilePriorities = createServerFn({ method: 'POST' })
+  .validator(modelProfileOrder)
+  .handler(({ data }) => {
+    const result = setModelProfilePrioritiesInStore(data.order, store(), { modelProfiles: tables.modelProfiles, and, eq })
+    execution().wake()
+    return result
+  })
 
 // --- Projects, Assets, Specs, GitHub Sync & Personas ---
 

@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { cn } from '../../lib/cn.ts'
+import { StatePanel } from './state-panel.tsx'
 
 export type EmptyStateProps = {
   /** Optional SVG (or any node) rendered above the title. */
@@ -14,29 +14,22 @@ export type EmptyStateProps = {
 
 /**
  * Canonical empty state: optional icon slot, title, short description, and a
- * single CTA. Constrained width keeps long descriptions readable on wide pages.
+ * single CTA. A thin `StatePanel` (kind `empty`, section layout) that keeps the
+ * historical `empty-state*` data slots callers style against.
  */
 export function EmptyState({ icon, title, description, action, className, children }: EmptyStateProps) {
   return (
-    <div
-      data-slot="empty-state"
-      className={cn('mx-auto flex w-full max-w-[360px] flex-col items-center gap-3 px-6 py-10 text-center', className)}
+    <StatePanel
+      kind="empty"
+      variant="section"
+      slot="empty-state"
+      icon={icon ?? null}
+      title={title}
+      description={description}
+      action={action}
+      className={className}
     >
-      {icon ? (
-        <div data-slot="empty-state-icon" className="flex size-8 flex-none items-center justify-center text-fg-faint [&>svg]:size-7">
-          {icon}
-        </div>
-      ) : null}
-      <div className="flex flex-col gap-1">
-        <h3 data-slot="empty-state-title" className="text-[13px] font-medium leading-5 text-fg">{title}</h3>
-        {description ? (
-          <p data-slot="empty-state-description" className="text-[12px] leading-5 text-fg-subtle text-balance">
-            {description}
-          </p>
-        ) : null}
-      </div>
       {children}
-      {action ? <div data-slot="empty-state-action" className="mt-1 flex items-center justify-center gap-2">{action}</div> : null}
-    </div>
+    </StatePanel>
   )
 }

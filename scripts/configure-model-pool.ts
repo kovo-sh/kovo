@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
  * Key-safe 3-tier DeepSeek V4.1 Flash model pool configurator (Track E1).
+ * Tier definitions come from the shared `src/model-pool-presets.ts`.
  *
  * Reads owner-only (mode 0600) API key files from disk and idempotently upserts:
  *   - Priority 300: Morph Ultra DeepSeek V4.1 Flash (chat-completions, $0 marginal)
@@ -21,6 +22,7 @@ import {
 } from '../src/server/model-settings.ts'
 import { Store } from '../src/server/store.ts'
 import type { PublicModelProfile } from '../src/domain.ts'
+import { modelPoolPreset } from '../src/model-pool-presets.ts'
 
 export interface PoolTierPreset {
   readonly idKey: 'morph' | 'opencode'
@@ -36,34 +38,28 @@ export interface PoolTierPreset {
   readonly outputCostPerMtok: number
 }
 
-export const POOL_TIER_PRESETS: readonly PoolTierPreset[] = [
-  {
-    idKey: 'morph',
-    name: 'Morph Ultra DeepSeek V4.1 Flash',
-    endpoint: 'https://api.morphllm.com/v1',
-    model: 'morph-dsv41flash-1017',
-    protocol: 'chat-completions',
-    priority: 300,
-    contextWindow: 1_048_576,
-    thinkingLevel: 'medium',
-    inputCostPerMtok: 0,
-    cachedInputCostPerMtok: 0,
-    outputCostPerMtok: 0,
-  },
-  {
-    idKey: 'opencode',
-    name: 'OpenCode Go DeepSeek V4.1 Flash',
-    endpoint: 'https://opencode.ai/inference/go/openai/v1',
-    model: 'deepseek-v4.1-flash',
-    protocol: 'chat-completions',
-    priority: 200,
-    contextWindow: 1_048_576,
-    thinkingLevel: 'medium',
-    inputCostPerMtok: 0,
-    cachedInputCostPerMtok: 0,
-    outputCostPerMtok: 0,
-  },
-] as const
+/** CLI tier view of the shared presets (`src/model-pool-presets.ts`, also used by the Settings sheet). */
+function poolTier(idKey: PoolTierPreset['idKey']): PoolTierPreset {
+  const preset = modelPoolPreset(idKey)
+  if (preset.protocol !== 'chat-completions' || preset.thinkingLevel !== 'medium') {
+    throw new Error(`Model pool preset ${idKey} must use chat-completions with medium thinking.`)
+  }
+  return {
+    idKey,
+    name: preset.name,
+    endpoint: preset.endpoint,
+    model: preset.model,
+    protocol: preset.protocol,
+    priority: preset.priority,
+    contextWindow: preset.contextWindow,
+    thinkingLevel: preset.thinkingLevel,
+    inputCostPerMtok: preset.inputCostPerMtok,
+    cachedInputCostPerMtok: preset.cachedInputCostPerMtok,
+    outputCostPerMtok: preset.outputCostPerMtok,
+  }
+}
+
+export const POOL_TIER_PRESETS: readonly PoolTierPreset[] = [poolTier('morph'), poolTier('opencode')]
 
 export interface ConfigureModelPoolOptions {
   dataDir: string
