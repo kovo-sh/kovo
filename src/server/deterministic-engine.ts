@@ -1212,7 +1212,7 @@ function scoreObjectReadback(
   if (route.placeholderIndex >= 0 && route.placeholderIndex === route.segments.length - 1 && route.segments.length > 1) {
     const routeNoun = route.segments[route.placeholderIndex - 1]!.toLowerCase()
     const mutationNoun = mutation.segments[mutation.placeholderIndex - 1]?.toLowerCase()
-    // A sibling listing of the same record family: `DELETE /api/admin/people/{{id}}` -> `GET /api/people/{{id}}`.
+    // A sibling listing of the same record family: `DELETE /api/<collection>/{{id}}` -> `GET /api/<collection>/{{id}}`.
     if (routeNoun && routeNoun === mutationNoun) return 70
     // Same identifier contract on a different prefix (`/api/v1/...` legacy aliases).
     if (idParamName && route.paramName && route.paramName.toLowerCase() === idParamName.toLowerCase()) return 60

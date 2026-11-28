@@ -69,15 +69,15 @@ export async function diffFileTraversal(ctx: DiffContext): Promise<DiffOutcome> 
   const controlOk = controls.length > 0 && controls.every(c => c.status >= 400 || c.body.length === 0)
   const controlBodies = controls.map(c => c.body).join('\n')
   const passwdSignature = /^[A-Za-z0-9_.-]+:[^:\n]*:\d+:\d+:[^:\n]*:[^:\n]*:[^\n]*$/m
-  // Generic read oracles: classic passwd, a synthetic app secret, and a well-known log file. The
-  // `.log` variants keep a suffix check satisfied (`name.endsWith('.log')`) while still escaping.
+  // Generic read oracles: classic passwd plus standard OS metadata files. The `.log`-style
+  // variants are not needed: a content differential only needs a file the served root cannot
+  // produce, and a nonexistent-sibling control already covers the negative side.
   const candidates: Array<{ value: string; kind: 'passwd' | 'content' }> = [
     { value: '../../../../etc/passwd', kind: 'passwd' },
     { value: '../../../../../../etc/passwd', kind: 'passwd' },
-    { value: '../../../../app/config/secrets.env', kind: 'content' },
-    { value: '../../../../app/.env', kind: 'content' },
-    { value: '../../../../var/log/system/audit.log', kind: 'content' },
-    { value: '../../var/log/system/audit.log', kind: 'content' },
+    { value: '../../../../etc/hostname', kind: 'content' },
+    { value: '../../../../etc/os-release', kind: 'content' },
+    { value: '../../../../etc/hosts', kind: 'content' },
     { value: '../secret.txt', kind: 'content' },
     { value: '../private/secret.txt', kind: 'content' },
     { value: '../flag.txt', kind: 'content' },

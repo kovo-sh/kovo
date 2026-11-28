@@ -178,7 +178,7 @@ export async function diffAuthorizationMatrix(ctx: DiffContext): Promise<DiffOut
   if (req.secretScan && req.viewerPersona && !actors.some(a => a.persona === req.viewerPersona)) {
     actors.push({ actor: 'viewer_persona', persona: req.viewerPersona })
   }
-  const secretPattern = /rb[s]_[a-z0-9]+_[0-9a-f]{12}/
+  const secretPattern = /\bAKIA[0-9A-Z]{16}\b|\b(secret|token|api[_-]?key|apikey|password|credential)[^A-Za-z0-9]{0,8}[A-Za-z0-9]+[_.-][A-Za-z0-9]+[_.-][a-f0-9]{6,}/ // generic credential shape; no fixture canary grammar
 
   const matrix: Array<Record<string, unknown>> = []
   const orderedIds = ids.slice(0, 6)

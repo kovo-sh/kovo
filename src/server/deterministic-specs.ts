@@ -1478,8 +1478,8 @@ function synthCsrf(hyp: EngineHypothesis, result: DifferentialResult): Synthesiz
 // Credential exposure on a read route
 // ---------------------------------------------------------------------------------------------
 
-/** Cross-actor read of a sensitive response (matrix `secret_disclosed` signal, redacted-safe). */
-const GENERIC_CREDENTIAL_PATTERN = 'rb[s]_[A-Za-z0-9]+_[0-9a-f]{12}'
+/** Generic credential shape: a credential noun followed by a multi-part synthetic key value. */
+const GENERIC_CREDENTIAL_PATTERN = 'AKIA[0-9A-Z]{16}|(secret|token|api[_-]?key|apikey|password|credential)[^A-Za-z0-9]{0,8}[A-Za-z0-9]+[_.-][A-Za-z0-9]+[_.-][a-f0-9]{6,}'
 
 /**
  * Credential exposure on a read surface. Two evidence shapes are accepted, both content-bound:

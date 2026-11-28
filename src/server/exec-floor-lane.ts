@@ -127,7 +127,7 @@ const DETERMINISTIC_WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
  * Route admission for briefing/OpenAPI references. A read route still needs an injectable
  * parameter or a resource id to be worth a differential probe, but a write route is a real
  * endpoint even when the reference leaks no body fields (body-only create/action routes such as
- * `POST /api/refunds/lines`). Keep those with their declared method instead of dropping them.
+ * `POST /api/<collection>/<action>`). Keep those with their declared method instead of dropping them.
  */
 function deterministicRouteIsTestable(method: string, pathTemplate: string, hasInjectable: boolean): boolean {
   if (hasInjectable) return true
@@ -253,9 +253,10 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
 
 
   /**
-   * Extract entry routes from JSON route maps/config docs already fetched during recon
-   * (e.g. `/app-config.json`, `/routes`, OpenAPI JSON). Bounded and generic: any object with a
-   * `path`/`pathTemplate` string or an array of `/api/...` strings qualifies.
+   * Extract entry routes from JSON route maps/config docs already fetched during recon (a
+   * discovered `routes`/`config`/`openapi` document). Bounded and generic: any object with a
+   * `path`/`pathTemplate` string or an array of absolute API path strings qualifies. Documents are
+   * never fetched speculatively from a hardcoded path list — only the observed surface is parsed.
    */
   async deriveRuntimeRouteMapTargets(
     run: Run,
@@ -277,44 +278,10 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
       return []
     }
     const configPathRe = /(?:app-config|config|routes|manifest|openapi|swagger|api-docs)(?:\.[a-z]+)?(?:\?|$)/i
-    let configExchanges = summaries
+    const configExchanges = summaries
       .filter(ex => ex.method === 'GET' && ex.status >= 200 && ex.status < 300 && /json/i.test(ex.mediaType))
       .filter(ex => configPathRe.test(ex.pathAndQuery))
       .slice(0, 4)
-
-    // Phase-0 may not have fetched the runtime route map yet; fetch at most two generic config
-    // candidates so recon-derived routes are still reachable in deterministic mode.
-    if (configExchanges.length === 0) {
-      const origin = [...approvedOrigins].sort()[0]
-      const alreadyFetched = new Set(summaries.map(ex => ex.pathAndQuery))
-      for (const candidate of ['/app-config.json', '/api/routes', '/routes.json']) {
-        if (configExchanges.length >= 2) break
-        if (alreadyFetched.has(candidate) || signal.aborted) continue
-        try {
-          const ex = await this.broker.executeHttp({
-            origin,
-            method: 'GET',
-            pathAndQuery: candidate,
-            followRedirects: false,
-            runId: run.id,
-            assignmentId: assignment.id,
-          }, grant, signal)
-          const id = recordExchange(ex)
-          if (ex.status >= 200 && ex.status < 300 && /json/i.test(ex.mediaType)) {
-            configExchanges.push({
-              id,
-              origin: ex.origin,
-              method: ex.method,
-              pathAndQuery: ex.pathAndQuery,
-              status: ex.status,
-              mediaType: ex.mediaType,
-            })
-          }
-        } catch {
-          // Config probing is best-effort; continue with whatever recon already recorded.
-        }
-      }
-    }
 
     const normalizeTemplate = (value: string) =>
       value.replace(/\{([a-z][a-z0-9_]*):([a-z][a-z0-9_-]*)\}/gi, '$2').slice(0, 300)
@@ -964,13 +931,6 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
           ...await this.deriveRuntimeRouteMapTargets(current, approvedOrigins, grant, claimed, signal, recordExchange),
           ...codeLeadIdentifierTargets,
           ...codeLeadTargets,
-          ...(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1'
-            ? [...approvedOrigins].sort().flatMap(origin =>
-                this.expandConventionalSurfaceTargets(
-                  origin,
-                  [...storedEndpoints, ...specTargets],
-                ))
-            : []),
         ].filter((target, idx, all) =>
           all.findIndex(other => other.origin === target.origin && other.method === target.method && other.pathTemplate === target.pathTemplate) === idx,
         )
@@ -1259,67 +1219,6 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
     } finally {
       this.completeFloorWorker(claimed.id, 'Deterministic engine complete.')
     }
-  }
-
-
-  /**
-   * Local-lab-only conventional action/noun expansion. Every candidate is still differentially
-   * verified, so an extra route can only add a verified finding, never a raw claim.
-   */
-  expandConventionalSurfaceTargets(
-    origin: string,
-    existing: ReadonlyArray<{ method: string; pathTemplate: string }>,
-  ): DerivedRouteTarget[] {
-    const seen = new Set(existing.map(ep => `${origin}|${ep.method.toUpperCase()}|${ep.pathTemplate}`))
-    const out: DerivedRouteTarget[] = []
-    const add = (method: string, pathTemplate: string, riskScore = 12) => {
-      const key = `${origin}|${method}|${pathTemplate}`
-      if (seen.has(key)) return
-      if (!pathTemplate.startsWith('/') || pathTemplate.length > 200) return
-      if (/\.(?:js|css|map|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|mp4|pdf|zip|gz)$/i.test(pathTemplate)) return
-      seen.add(key)
-      const params: DerivedRouteParam[] = []
-      for (const match of pathTemplate.matchAll(/:([A-Za-z0-9_]+)/g)) params.push({ name: match[1], location: 'path' })
-      out.push({ origin, method, pathTemplate, riskScore, source: 'conventional', params })
-    }
-    const conventional: ReadonlyArray<[string, string, number]> = [
-      ['GET', '/api/tokens', 18], ['POST', '/api/tokens', 15],
-      ['GET', '/api/v1/whoami', 18], ['POST', '/api/v1/login', 12],
-      ['GET', '/api/admin/activity', 18], ['GET', '/api/admin/users', 10],
-      ['POST', '/api/admin/impersonate', 20],
-      ['GET', '/api/staff', 12], ['POST', '/api/staff/:userId/role', 20],
-      ['GET', '/api/downloads/reports', 18], ['POST', '/api/apps/import', 25],
-      ['GET', '/api/v1/downloads/download', 20],
-      ['POST', '/api/seats', 15], ['POST', '/api/credits', 12],
-      ['POST', '/api/enrollments/accept', 18],
-      ['GET', '/api/v1/search', 22],
-      ['GET', '/api/accounts/search', 20],
-      ['POST', '/api/queries/run', 22], ['POST', '/api/logs/filter', 22],
-      ['GET', '/api/logs/view', 20], ['GET', '/api/logs', 8],
-      ['GET', '/api/hooks', 14], ['POST', '/api/hooks', 22],
-      ['POST', '/api/hooks/:webhookId/ping', 18],
-      ['GET', '/api/links', 16], ['GET', '/api/links/:iid', 14],
-      ['POST', '/api/links/:iid/fetch', 18],
-      ['GET', '/api/v1/checkout/return', 18], ['GET', '/api/checkout/return', 16],
-      ['POST', '/api/v1/orders/:orderId/confirm', 18],
-      ['POST', '/api/orders/:orderId/confirm', 16],
-      ['GET', '/api/v1/reports/sales', 16], ['GET', '/api/reports/sales', 16],
-      ['POST', '/api/issues/:ticketId/notes', 18], ['GET', '/api/issues/:ticketId/view', 14],
-      ['POST', '/api/jobs/:jobId/trigger', 16], ['POST', '/api/jobs/:jobId/complete', 14],
-      ['POST', '/api/sso/import', 18], ['GET', '/api/sso/start', 10],
-      ['GET', '/api/v1/customers/:customerId', 14], ['GET', '/api/v1/orders/:orderId', 14],
-      ['GET', '/api/v1/wares/:productId/photos', 16], ['POST', '/api/v1/wares/:productId/photos', 22],
-      ['POST', '/api/v1/manifests', 22], ['POST', '/api/v1/product-import', 18],
-    ]
-    for (const [method, path, risk] of conventional) add(method, path, risk)
-    for (const ep of existing) {
-      const bare = ep.pathTemplate.split('?')[0] || '/'
-      if (bare.split('/').filter(Boolean).length > 4) continue
-      if (/:/.test(bare)) continue
-      if (ep.method.toUpperCase() === 'GET') add('POST', bare, 8)
-      else if (ep.method.toUpperCase() === 'POST') add('GET', bare, 8)
-    }
-    return out.slice(0, 60)
   }
 
 
