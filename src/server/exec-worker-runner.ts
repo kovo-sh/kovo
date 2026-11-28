@@ -26,7 +26,7 @@ import { createProviderLlmCall, evaluateSubmissionDedupe, extractSpecDedupeField
 import type { ExecBoardManager } from './exec-board.ts'
 import {
   ProviderNoTokenWatchdog, createAutoDisposedRunState, type RunOrchestrationStateStore,
-  buildBolaTestQueue, classifyWorkerErrorToStepStatus, collectAllPages, computeDynamicStepBudget,
+  buildBolaTestQueue, classifyWorkerErrorToStepStatus, collectAllPages, compactText, computeDynamicStepBudget,
   evaluateTransientProviderRetry, extractAssignedTargetRoutes, hardChainStepsCeiling,
   isMultiHopChainStep, isRetryableChainStepStatus, mapSessionStatusToStepStatus,
   percentile, providerStallAbortMs, reinvestigationKey, resolveWorkerSettlementMs,
@@ -41,8 +41,7 @@ import { DETERMINISTIC_PARAM_HINT_RE } from './exec-floor-lane.ts'
 import { isPersistentWorkflowContinuationStep, sortPersonasLowPrivFirst, type ExecReconPlanner } from './exec-recon-planner.ts'
 import { FindingsRepository } from './store-findings.ts'
 import { STATIC_AST_LIVE_TARGET_REJECT_MESSAGE, guardConfirmedFindingMutation, isLiveRuntimeVerificationRun, type ExecVerifier, type InlineDeferredFindingCandidate } from './exec-verify.ts'
-import {
-  extractVerifiedNegativeEdge } from './exploiter-tools.ts'
+import { extractVerifiedNegativeEdge } from './exploiter-tools.ts'
 import { normalizeRouteTemplate } from './route-template.ts'
 import { resolveProfilePoolForRole, type ResolvedModelProfile } from './model-settings.ts'
 import type { PersonaAuthManager, PersonaSessionClone } from './persona-auth.ts'
@@ -55,7 +54,7 @@ import { defaultRetryGovernor, peekLatestProviderFailureForProfile } from './ret
 import { sanitizeWorkerFactData } from './run-actor.ts'
 import { resolveRunSafetyBudgets } from './run-safety-budgets.ts'
 import { brokerExchanges, type ChainStepTerminalStatus } from './schema.ts'
-import type { Assignment, BoardMessageRow, ChainStep, Run } from './store.ts'
+import type { Assignment, BoardMessageRow, BrokerExchange, ChainStep, Fact, Run } from './store.ts'
 import { probeDifferential, probeSurface } from './surface-engine.ts'
 import { isDecoupledOrPtcExploiterEnabled, prepareExploiterSession } from './ptc-exploiter.ts'
 import type { RecordedRequestExchange } from './trace-proof-compiler.ts'
@@ -162,48 +161,49 @@ export interface EffectiveWorkerElapsedInput {
   /** Finite maximum stall-wait credit deductible from wall-clock elapsed time (ms). Non-finite values clamp to 0. */
   maxStallCreditMs?: number
 }
-
 export interface EffectiveWorkerElapsedBreakdown {
-  wallElapsedMs: number
-  approvalPausedMs: number
-  providerStallWaitMs: number
-  creditedStallWaitMs: number
-  activeElapsedMs: number
-  effectiveElapsedMs: number
+  wallElapsedMs: number; approvalPausedMs: number; providerStallWaitMs: number
+  creditedStallWaitMs: number; activeElapsedMs: number; effectiveElapsedMs: number
 }
+/** Pure helper computing effective worker elapsed time breakdown for wall-clock rotation decisions. */
+export function computeEffectiveWorkerElapsedBreakdown(input: EffectiveWorkerElapsedInput): EffectiveWorkerElapsedBreakdown {
+  const wallElapsedMs = clampFiniteNonNegativeMs(input.wallElapsedMs), approvalPausedMs = clampFiniteNonNegativeMs(input.approvalPausedMs)
+  const providerStallWaitMs = clampFiniteNonNegativeMs(input.providerStallWaitMs), maxStallCreditMs = clampFiniteNonNegativeMs(input.maxStallCreditMs)
+  const activeElapsedMs = Math.max(0, wallElapsedMs - approvalPausedMs), creditedStallWaitMs = Math.min(providerStallWaitMs, maxStallCreditMs)
+  return { wallElapsedMs, approvalPausedMs, providerStallWaitMs, creditedStallWaitMs, activeElapsedMs, effectiveElapsedMs: Math.max(0, activeElapsedMs - creditedStallWaitMs) }
+}
+export function computeEffectiveWorkerElapsedMs(input: EffectiveWorkerElapsedInput): number { return computeEffectiveWorkerElapsedBreakdown(input).effectiveElapsedMs }
 
-/**
- * Pure helper computing effective worker elapsed time breakdown for wall-clock rotation decisions.
- * Deducts both human approval/run pause time AND bounded provider-stall/retry wait time (capped
- * by finite `maxStallCreditMs`, e.g. `baseWallClockMs`, so total active duration never exceeds
- * the `2x` hard ceiling).
- */
-export function computeEffectiveWorkerElapsedBreakdown(
-  input: EffectiveWorkerElapsedInput,
-): EffectiveWorkerElapsedBreakdown {
-  const wallElapsedMs = clampFiniteNonNegativeMs(input.wallElapsedMs)
-  const approvalPausedMs = clampFiniteNonNegativeMs(input.approvalPausedMs)
-  const providerStallWaitMs = clampFiniteNonNegativeMs(input.providerStallWaitMs)
-  const maxStallCreditMs = clampFiniteNonNegativeMs(input.maxStallCreditMs)
-  const activeElapsedMs = Math.max(0, wallElapsedMs - approvalPausedMs)
-  const creditedStallWaitMs = Math.min(providerStallWaitMs, maxStallCreditMs)
-  const effectiveElapsedMs = Math.max(0, activeElapsedMs - creditedStallWaitMs)
+/** Compact row projections & limit clamp for `search_facts` and `search_exchanges` (Track E2). */
+export interface CompactSearchFactRow {
+  id: string; kind: string; origin: string; summary: string
+  dataPreview?: string; dataTruncated?: true; evidenceIds?: string[]; exchangeIds?: string[]
+}
+export interface CompactSearchExchangeRow {
+  exchangeId: string; origin: string; method: string; pathAndQuery: string; status: number
+  mediaType?: string; bodyPreview?: string
+}
+export const clampSearchLimit = (limit: number | undefined, fallback = 15, max = 40): number =>
+  Math.min(max, Math.max(1, typeof limit === 'number' && Number.isFinite(limit) ? Math.floor(limit) : fallback))
+export function compactSearchFactRow(f: Pick<Fact, 'id' | 'kind' | 'origin' | 'summary' | 'data' | 'evidenceIds' | 'exchangeIds'>): CompactSearchFactRow {
+  const rawData = f.data && typeof f.data === 'object' && Object.keys(f.data).length > 0 ? JSON.stringify(f.data) : ''
+  const dataTruncated = rawData.length > 240
   return {
-    wallElapsedMs,
-    approvalPausedMs,
-    providerStallWaitMs,
-    creditedStallWaitMs,
-    activeElapsedMs,
-    effectiveElapsedMs,
+    id: f.id, kind: f.kind, origin: f.origin, summary: compactText(f.summary ?? '', 200),
+    ...(rawData ? { dataPreview: dataTruncated ? compactText(rawData, 240) : rawData } : {}),
+    ...(dataTruncated ? { dataTruncated: true as const } : {}),
+    ...(f.evidenceIds?.length ? { evidenceIds: f.evidenceIds } : {}),
+    ...(f.exchangeIds?.length ? { exchangeIds: f.exchangeIds } : {}),
   }
 }
-
-/**
- * Pure helper computing effective worker elapsed time (ms) after deducting human approval pauses
- * and bounded provider-stall/retry wait time (capped at `maxStallCreditMs`).
- */
-export function computeEffectiveWorkerElapsedMs(input: EffectiveWorkerElapsedInput): number {
-  return computeEffectiveWorkerElapsedBreakdown(input).effectiveElapsedMs
+export function compactSearchExchangeRow(ex: Pick<BrokerExchange, 'id' | 'origin' | 'method' | 'pathAndQuery' | 'status' | 'mediaType' | 'bodyPreview'>): CompactSearchExchangeRow {
+  const mediaType = ex.mediaType?.trim() || ''
+  const bodyPreview = ex.bodyPreview ? compactText(ex.bodyPreview, 180) : ''
+  return {
+    exchangeId: ex.id, origin: ex.origin, method: ex.method, pathAndQuery: ex.pathAndQuery, status: ex.status,
+    ...(mediaType ? { mediaType } : {}),
+    ...(bodyPreview ? { bodyPreview } : {}),
+  }
 }
 
 /**
@@ -806,10 +806,10 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         return skill
       },
       search_facts: async ({ query, origin, kind, limit }: Parameters<NonNullable<WorkerToolHandlers['search_facts']>>[0]) => {
-        const curRun = this.host.check(job)
-        const currentApproved = this.host.approvedOriginsSet(curRun)
-        return this.storage.listFacts(curRun.id, { includeTainted: false, query, origin, kind, limit })
+        const curRun = this.host.check(job), currentApproved = this.host.approvedOriginsSet(curRun), capped = clampSearchLimit(limit)
+        return this.storage.listFacts(curRun.id, { includeTainted: false, query, origin, kind, limit: capped })
           .filter(f => currentApproved.has(f.origin) && f.sourceOrigins.every(o => currentApproved.has(o)))
+          .slice(0, capped).map(compactSearchFactRow)
       },
       record_fact: async (args: Parameters<NonNullable<WorkerToolHandlers['record_fact']>>[0]) => {
         const curRun = this.host.check(job)
@@ -1878,13 +1878,13 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         search_exchanges: async ({ query, origin, status, limit }) => {
           const curRun = this.host.check(job)
           const currentApproved = this.host.approvedOriginsSet(curRun)
-          const rows = this.storage.searchExchanges(curRun.id, query, { approvedOrigins: currentApproved, origin, limit })
+          const capped = clampSearchLimit(limit)
+          const fetchLimit = status === undefined ? capped : Math.min(100, capped * 3)
+          const rows = this.storage.searchExchanges(curRun.id, query, { approvedOrigins: currentApproved, origin, limit: fetchLimit })
           return rows
             .filter(ex => status === undefined || ex.status === status)
-            .map(ex => ({
-              id: ex.id, exchangeId: ex.id, origin: ex.origin, method: ex.method, pathAndQuery: ex.pathAndQuery,
-              status: ex.status, mediaType: ex.mediaType, bodyPreview: ex.bodyPreview.slice(0, 600),
-            }))
+            .slice(0, capped)
+            .map(compactSearchExchangeRow)
         },
 
         get_exchange: async ({ exchangeId, includeBody }, signal) => {
