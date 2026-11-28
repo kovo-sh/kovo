@@ -15,17 +15,9 @@
  *       `kovoVerifyPromptHint() <= 512 B`, pattern `<= 12` lines, pre-injected excerpt keeps
  *       all Section-1 directives including `invariant_enforced_hardened`).
  *     - Never reference nonexistent `ctx.race(` (always use live SDK `ctx.prove_race_burst`).
- *  2. `convertCodeAuditSuspectsToChainSteps`:
- *     - Synthesizes dedicated 3-5 stage cross-service composite workflows across:
- *       (a) outbound-request + signing/webhook,
- *       (b) cache/permission + async export/download,
- *       (c) directory/identity + state-change,
- *       (d) request-parsing + concurrent settlement.
- *     - Outlines `Stage 1 -> Stage 2 -> Stage 3 -> Terminal Verification` and reminds workers to
- *       verify all stages in ONE script with `ctx.seal_capability`,
- *       `ctx.hmac_sign`/`ctx.jwt_sign`/`ctx.await_async`/`ctx.prove_race_burst`, clean denied
- *       control BEFORE Stage 1, and `ctx.prove_composite`.
- *     - Remains idempotent and synthesizes 0 composites for homogeneous single-category batches.
+ *  2. `convertCodeAuditSuspectsToChainSteps` (heuristic composite synthesis retired in Track B Cut 2):
+ *     - Emits one targeted multi-hop step per suspect with a Cross-Service Sibling Leads block and
+ *       sibling `dependsOnFactIds`; never a `Source audit composite chain` step.
  *  3. Zero v8 benchmark contamination across `src/server/**` and `src/skills/**`.
  */
 import assert from 'node:assert/strict'
@@ -44,11 +36,7 @@ import {
 } from '../src/server/agent-prompts.ts'
 import {
   CODE_AUDIT_WAVE1_MAX_STEPS,
-  chainLaneDispatchRank,
-  classifyDispatchLane,
   convertCodeAuditSuspectsToChainSteps,
-  isMultiHopChainStep,
-  planRoundRobinDispatch,
 } from '../src/server/exec-dispatch.ts'
 import {
   MULTIHOP_CHAINS_SKILL,
@@ -160,121 +148,7 @@ test('Q30.1: prompts, tool guidance, and multihop-chains.md enforce single-scrip
   assert.equal(/\bctx\.race\b/.test(playbook), false, 'multihop-chains.md must not reference nonexistent ctx.race')
 })
 
-test('Q30.2: convertCodeAuditSuspectsToChainSteps synthesizes cache/permission + async export and request-parsing + concurrent settlement workflows', async (t) => {
-  const { storage } = makeStore(t)
-  const { run } = await setupApprovedRun(storage, { seeds: [ORIGIN], tier: 2 })
-  const asset = run.candidates.find(c => run.approved.includes(c.id))!
-  const auditor = storage.makeWorker(run, 'threat_model', asset, 'Source-First Code Audit', 'Audit')
-
-  // Pair A: Cache/permission + async export/download
-  const fCache = storage.addFact(run, auditor, {
-    kind: 'code_audit_suspect',
-    origin: ORIGIN,
-    summary: 'Shared permission cache omits tenant key prefix allowing cross-tenant cache prime.',
-    data: {
-      subkind: 'code_audit_suspect',
-      file: 'services/authz/perm-cache.ts',
-      line: 44,
-      routeOrAction: 'GET /api/v1/orgs/:orgId/permissions',
-      sinkKind: 'api_route',
-      authCheck: 'member',
-      ownershipCheck: 'missing',
-      hypothesis: 'Priming permission cache on own tenant populates shared cache key for target org.',
-    },
-  })
-  const fAsyncExport = storage.addFact(run, auditor, {
-    kind: 'code_audit_suspect',
-    origin: ORIGIN,
-    summary: 'Async export worker queues foreign org dataset and exposes downloadable file when ready.',
-    data: {
-      subkind: 'code_audit_suspect',
-      file: 'services/exports/worker.ts',
-      line: 118,
-      routeOrAction: 'POST /api/v1/orgs/:orgId/exports',
-      sinkKind: 'upload_storage',
-      authCheck: 'cached_perm',
-      ownershipCheck: 'missing',
-      hypothesis: 'Export job runs asynchronously and serves generated archive via download route.',
-    },
-  })
-
-  // Pair B: Request-parsing + concurrent settlement
-  const fParser = storage.addFact(run, auditor, {
-    kind: 'code_audit_suspect',
-    origin: ORIGIN,
-    summary: 'Gateway request parsing normalizes duplicate JSON keys differently from downstream validator.',
-    data: {
-      subkind: 'code_audit_suspect',
-      file: 'services/gateway/parser.ts',
-      line: 72,
-      routeOrAction: 'POST /api/v1/settlements/submit',
-      sinkKind: 'api_route',
-      authCheck: 'member',
-      ownershipCheck: 'weak',
-      hypothesis: 'Request parser differential bypasses idempotency header check at gateway.',
-    },
-  })
-  const fRace = storage.addFact(run, auditor, {
-    kind: 'code_audit_suspect',
-    origin: ORIGIN,
-    summary: 'Concurrent settlement ledger credit lacks row lock allowing double-spend overcredit.',
-    data: {
-      subkind: 'code_audit_suspect',
-      file: 'services/ledger/settlement.ts',
-      line: 163,
-      routeOrAction: 'POST /api/v1/ledger/settle',
-      sinkKind: 'db_query',
-      authCheck: 'member',
-      ownershipCheck: 'missing',
-      hypothesis: 'Parallel burst settlement requests over-credit balance without idempotency lock.',
-    },
-  })
-
-  const steps = convertCodeAuditSuspectsToChainSteps(storage, run, [fCache, fAsyncExport, fParser, fRace], undefined, {
-    maxSteps: CODE_AUDIT_WAVE1_MAX_STEPS,
-    promoteMultiHop: true,
-  })
-
-  assert.equal(steps.length, 6, '2 composites + 4 individual suspects fill the 6-step Wave-1 budget')
-  const composites = steps.filter(s => s.title.startsWith('Source audit composite chain ·'))
-  assert.equal(composites.length, 2)
-
-  // Composite 1 & 2: generic structural Cross-Service Chains (no hardcoded 4-archetype templates)
-  assert.match(composites[0]!.title, /Cross-Service .* Chain/i)
-  assert.ok(composites[0]!.dependsOnFactIds.length >= 2)
-
-  assert.match(composites[1]!.title, /Cross-Service .* Chain/i)
-  assert.ok(composites[1]!.dependsOnFactIds.length >= 2)
-
-  // Both synthesized composites outline full 3-5 stage sequences and single-script SDK helpers.
-  for (const comp of composites) {
-    assert.equal(isMultiHopChainStep(comp), true)
-    assert.equal(classifyDispatchLane(comp), 'chain')
-    assert.equal(chainLaneDispatchRank(comp), 0)
-    assert.match(comp.hypothesis, /Stage 1 .* -> .*Stage 2 .* -> .*Stage 3 .* -> Terminal Verification/)
-    assert.match(comp.hypothesis, /Verify ALL stages in ONE kovo_verify script/i)
-    assert.match(comp.hypothesis, /run clean denied control BEFORE Stage 1/i)
-    assert.match(comp.hypothesis, /ctx\.seal_capability/)
-    assert.match(comp.hypothesis, /ctx\.hmac_sign\/ctx\.jwt_sign\/ctx\.await_async\/ctx\.prove_race_burst/)
-    assert.match(comp.hypothesis, /ctx\.prove_composite/)
-    assert.match(comp.hypothesis, /never stop at an intermediate info-disclosure, job creation, cache prime, or token\/link stub/i)
-    assert.ok(comp.hypothesis.length <= 1200, `composite hypothesis must stay <= 1200 chars without store truncation (got ${comp.hypothesis.length})`)
-  }
-
-  // Round-robin dispatch prioritizes the two synthesized composite workflows ahead of individuals.
-  const plan = planRoundRobinDispatch(steps, 3)
-  assert.equal(plan.ordered[0]!.id, composites[0]!.id)
-  assert.equal(plan.ordered[1]!.id, composites[1]!.id)
-
-  // Idempotency across repeated calls.
-  const rerun = convertCodeAuditSuspectsToChainSteps(storage, run, [fCache, fAsyncExport, fParser, fRace], undefined, {
-    maxSteps: CODE_AUDIT_WAVE1_MAX_STEPS,
-    promoteMultiHop: true,
-  })
-  assert.equal(rerun.length, 0)
-})
-
-test('Q30.3: directory/identity + state-change synthesis and zero contamination / live SDK check', async (t) => {
+test('Q30.3: directory/identity + state-change suspects become per-suspect multi-hop steps with sibling leads (no composite synthesis) and zero contamination / live SDK check', async (t) => {
   const { storage } = makeStore(t)
   const { run } = await setupApprovedRun(storage, { seeds: [ORIGIN], tier: 2 })
   const asset = run.candidates.find(c => run.approved.includes(c.id))!
@@ -330,13 +204,18 @@ test('Q30.3: directory/identity + state-change synthesis and zero contamination 
     maxSteps: CODE_AUDIT_WAVE1_MAX_STEPS,
     promoteMultiHop: true,
   })
-  const composites = steps.filter(s => s.title.startsWith('Source audit composite chain ·'))
-  assert.equal(composites.length, 1)
-  assert.match(composites[0]!.title, /Cross-Service .* Chain/i)
-  assert.match(composites[0]!.hypothesis, /Hop 1 \/ Stage 1 .* -> Hop 2 \/ Stage 2 .* -> Hop 3 \/ Stage 3 .* -> Terminal Verification/)
-  assert.ok(composites[0]!.dependsOnFactIds.includes(fDirectory.id))
-  assert.ok(composites[0]!.dependsOnFactIds.includes(fIdentity.id))
-  assert.ok(composites[0]!.dependsOnFactIds.includes(fStateChange.id))
+  // Heuristic composite synthesis is retired (World Graph planner owns chains): every suspect
+  // becomes one targeted multi-hop step that cites its cross-service siblings as parent facts.
+  assert.equal(steps.filter(s => s.title.startsWith('Source audit composite chain ·')).length, 0)
+  assert.equal(steps.length, 3)
+  for (const step of steps) {
+    assert.ok(step.title.startsWith('Source audit verify ·'), step.title)
+    assert.ok(step.skills.includes('multihop-chains'))
+    assert.match(step.hypothesis, /Cross-Service Sibling Leads/)
+  }
+  const directoryStep = steps.find(s => s.dependsOnFactIds[0] === fDirectory.id)!
+  assert.ok(directoryStep.dependsOnFactIds.includes(fIdentity.id))
+  assert.ok(directoryStep.dependsOnFactIds.includes(fStateChange.id))
 
   // Verify no leased source file introduces nonexistent ctx.race( and zero v8 benchmark contamination.
   for (const relPath of ['src/server/agent-prompts.ts', 'src/server/exec-dispatch.ts', 'src/skills/multihop-chains.md']) {

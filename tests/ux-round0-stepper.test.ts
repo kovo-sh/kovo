@@ -729,6 +729,7 @@ describe('Round-0 stage stepper, live telemetry, and collapsed traffic drawer', 
 
       const stepper = page.getByTestId('round0-stage-stepper')
       await stepper.waitFor({ state: 'visible', timeout: 15_000 })
+      await page.locator('[data-testid="round0-stage-fingerprint"][data-stage-status="done"]').waitFor({ state: 'visible', timeout: 10_000 })
 
       // 1. Verify 5-step stepper states (Step 1 done, Step 2 active, Steps 3-5 pending)
       assert.equal(await page.getByTestId('round0-stage-fingerprint').getAttribute('data-stage-status'), 'done')

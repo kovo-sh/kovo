@@ -7,7 +7,7 @@ import type { CSSProperties } from 'react'
 import { clamp } from './format.ts'
 import { cn } from './tw.ts'
 
-export const DUR = { d1: 120, d2: 180, d3: 240, counter: 420, camera: 320 } as const
+export const DUR = { d1: 120, d2: 180, d3: 240, counter: 240, camera: 320 } as const
 export const EASE_CSS = 'cubic-bezier(.2,.8,.2,1)'
 
 /** The same Bézier solved numerically, for JS-driven animation (counters, cameras). */
@@ -47,14 +47,15 @@ export function useReducedMotion() {
 export const T = (ms: number) => (reducedMotion() ? 0 : ms)
 
 /** Animate a number over time with the shared curve. */
-export function tween(from: number, to: number, dur: number, onFrame: (v: number) => void) {
-  if (reducedMotion() || dur <= 0 || from === to) { onFrame(to); return () => {} }
+export function tween(from: number, to: number, dur: number, onFrame: (v: number) => void, onDone?: () => void) {
+  if (reducedMotion() || dur <= 0 || from === to) { onFrame(to); onDone?.(); return () => {} }
   const t0 = performance.now()
   let raf = 0
   const step = (now: number) => {
     const p = Math.min(1, (now - t0) / dur)
-    onFrame(from + (to - from) * ease(p))
+    onFrame(p >= 1 ? to : from + (to - from) * ease(p))
     if (p < 1) raf = requestAnimationFrame(step)
+    else onDone?.()
   }
   raf = requestAnimationFrame(step)
   return () => cancelAnimationFrame(raf)
@@ -66,25 +67,31 @@ const lastCounter = new Map<string, number>()
 const lastMeter = new Map<string, number>()
 
 /**
- * Counter that ticks (420 ms) from its previous value. `id` keys the memory:
+ * Counter that ticks (240 ms) from its previous value. `id` keys the memory:
  * reuse the same id across runs (e.g. "ov.requests") to tick on run switch.
+ * Frames write `textContent` through a ref, so React commits once per value change
+ * (not once per frame); changes under 1% of the value land without a tween.
  */
 export function AnimatedNumber({ id, value, format = n => Math.round(n).toLocaleString('en-US') }: {
   id: string
   value: number
   format?: (n: number) => string
 }) {
-  const from = lastCounter.get(id)
-  const [shown, setShown] = useState(from ?? value)
+  const [shown, setShown] = useState(() => lastCounter.get(id) ?? value)
+  const ref = useRef<HTMLSpanElement>(null)
   const fmt = useRef(format)
   fmt.current = format
   useEffect(() => {
     const start = lastCounter.get(id)
     lastCounter.set(id, value)
-    if (start == null || start === value) { setShown(value); return }
-    return tween(start, value, DUR.counter, setShown)
+    const el = ref.current
+    const write = (v: number) => { if (el) el.textContent = fmt.current(v) }
+    const settle = () => { write(value); setShown(value) }
+    const scale = Math.max(Math.abs(value), Math.abs(start ?? 0))
+    if (start == null || start === value || !el || (scale > 0 && Math.abs(value - start) / scale < 0.01)) { settle(); return }
+    return tween(start, value, DUR.counter, write, settle)
   }, [id, value])
-  return <span className="num">{fmt.current(shown)}</span>
+  return <span ref={ref} className="num">{fmt.current(shown)}</span>
 }
 
 /**
@@ -128,7 +135,7 @@ export function Meter({ id, value, warn, wide, className, style, title, barColor
     <i
       ref={ref}
       className={cn(
-        'absolute inset-0 origin-left rounded-[4px] transition-transform duration-500 ease-kovo motion-reduce:transition-none',
+        'absolute inset-0 origin-left transition-transform duration-[var(--d3)] ease-kovo motion-reduce:transition-none',
         w ? 'bg-warn' : 'bg-fg-muted',
       )}
       style={{ transform: 'scaleX(var(--v, 0))', ...(barColor ? { background: barColor } : undefined) }}

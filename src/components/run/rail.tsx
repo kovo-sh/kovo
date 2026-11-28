@@ -121,9 +121,9 @@ export function QueueRailBadge({
     : `${activeDecideCount} to decide`
   return <span
     className={cn(
-      'num inline-block h-[17px] min-w-[18px] rounded-[9px] px-[5px] text-center text-[11px] font-semibold leading-[17px] transition-transform duration-300',
+      'num inline-block h-[17px] min-w-[18px] rounded-[9px] px-[5px] text-center text-[11px] font-semibold leading-[17px] transition-transform duration-[var(--d2)] ease-spring',
       'bg-accent text-accent-fg',
-      pulse && 'scale-115',
+      pulse && 'scale-[1.08]',
     )}
     title={title}
     data-testid="rail-queue-badge"
@@ -226,7 +226,7 @@ export function Rail() {
         <span className="flex gap-1.5 overflow-hidden whitespace-nowrap text-[11.5px] leading-4 text-fg-subtle">
           <span className="num" suppressHydrationWarning>{fmtAgo(r.createdAt)}</span>
           <span>{runStatusLabel(r.status)}</span>
-          {r.findings > 0 && <span className="num ml-auto">{r.findings}</span>}
+          {r.findings > 0 && <span className="num ml-auto">{fmtN(r.findings)}</span>}
         </span>
       </span>
     </Link>
@@ -249,7 +249,7 @@ export function Rail() {
         <span className="whitespace-nowrap">Search…</span>
         <KbdGroup keys={['mod', 'K']} className="ml-auto" />
       </button>
-      <div className="min-h-0 flex-1 overflow-auto px-2.5 pb-2 pt-0.5">
+      <div className="min-h-0 flex-1 scroll-pb-4 overflow-auto px-2.5 pb-4 pt-0.5 [mask-image:linear-gradient(#000_calc(100%-16px),transparent)]" data-testid="rail-scroll">
         <div className={cn(sectionHeadingClass, 'pt-1.5')}>
           <span>Investigation</span>
         </div>
@@ -377,6 +377,42 @@ export function Rail() {
         </button>
       </div>
     </aside>
-    {devicesOpen && <DevicesSessionModal onClose={() => setDevicesOpen(false)} />}
+    <DevicesSessionModal open={devicesOpen} onClose={() => setDevicesOpen(false)} />
   </>
+}
+
+/**
+ * Context-free rail for the run-level error boundary: renders even when the
+ * run data providers failed, so navigation never disappears with the run.
+ */
+export function RailFallback({ projectId, runId }: { projectId: string; runId: string }) {
+  const { theme, toggle } = useTheme()
+  const isDark = theme === 'dark'
+  return <aside className="flex min-h-0 flex-col border-r border-line bg-rail" aria-label="Run navigation">
+    <div className="flex h-12 flex-none items-center gap-[9px] pl-4 pr-3.5 text-[13px] font-normal tracking-[-0.003em] text-fg">
+      <KovoMark />
+      <Link to="/" className="whitespace-nowrap font-semibold tracking-[-0.01em] text-fg" title="All projects">Kovo</Link>
+      <span className="ml-auto text-[12px] text-fg-subtle">Local</span>
+    </div>
+    <nav className="flex min-h-0 flex-1 flex-col gap-px px-2.5 pt-0.5" aria-label="Workspace">
+      <Link to="/projects/$projectId" params={{ projectId }} search={{ tab: 'runs' }} className={railItemBase} title="View all runs for this project">
+        <Icon name="list" className="text-fg-subtle" />
+        <span className="min-w-0 flex-1 truncate">All runs</span>
+      </Link>
+      <Link to="/" className={railItemBase} title="All projects">
+        <Icon name="grid" className="text-fg-subtle" />
+        <span className="min-w-0 flex-1 truncate">Projects</span>
+      </Link>
+      <Link to="/settings" search={{ runId }} className={railItemBase} title="Model and integration settings">
+        <Icon name="sliders" className="text-fg-subtle" />
+        <span className="min-w-0 flex-1 truncate">Settings</span>
+      </Link>
+    </nav>
+    <div className="flex flex-none items-center gap-1 border-t border-line px-2.5 py-2">
+      <button type="button" className={runIconBtn()} onClick={toggle} title="Toggle theme (⇧T)">
+        <Icon name={isDark ? 'sun' : 'moon'} />
+        <span className="text-[12px]">{isDark ? 'Light' : 'Dark'}</span>
+      </button>
+    </div>
+  </aside>
 }

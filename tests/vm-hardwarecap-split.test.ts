@@ -20,7 +20,6 @@ import {
   PhaseBConcurrencyController,
   computeHostPhaseBConcurrencyCap,
   parseEnvPhaseBConcurrencyOverride,
-  synthesizeRuntimeCompositeWave1Steps,
 } from '../src/server/exec-dispatch.ts'
 import {
   DOCKER_VERIFY_MAX_CEILING,
@@ -33,7 +32,6 @@ import {
   hasUnexpandedJsTemplateArtifact,
   runPhase0Recon,
 } from '../src/server/phase0-recon.ts'
-import { extractRuntimeCatalogFromFacts } from '../src/server/invariant-runtime-parity.ts'
 import type { BrokerExchangeResult, Grant, RequestBroker } from '../src/server/broker.ts'
 import { makeStore, setupApprovedRun } from './v4-tier-helpers.ts'
 
@@ -361,7 +359,11 @@ test('runPhase0Recon filters JS template artifacts and groups generic structural
 
   // Generic structural collection -> member -> sub-route grouping emits edges for non-fintech `widgets` + `qux`
   const facts = storage.listFacts(runId, { includeTainted: false, limit: 100 })
-  const catalog = extractRuntimeCatalogFromFacts(facts, new Set([ORIGIN]))
+  const catalog = {
+    apiDependencies: facts
+      .filter(f => f.origin === ORIGIN && f.data?.subkind === 'runtime_api_dependencies' && Array.isArray(f.data?.apiDependencies))
+      .flatMap(f => f.data!.apiDependencies as Array<{ producer: string; consumer: string }>),
+  }
   assert.ok(
     catalog.apiDependencies.some(d => d.producer.includes('/api/v1/widgets') && d.consumer.includes('/api/v1/widgets/{widgetId}') && !d.consumer.includes('/qux')),
     `expected structural collection->member edge on widgets, got ${JSON.stringify(catalog.apiDependencies)}`,
@@ -370,12 +372,4 @@ test('runPhase0Recon filters JS template artifacts and groups generic structural
     catalog.apiDependencies.some(d => d.producer.includes('/api/v1/widgets/{widgetId}') && d.consumer.includes('/api/v1/widgets/{widgetId}/qux')),
     `expected structural member->subroute edge on widgets/qux, got ${JSON.stringify(catalog.apiDependencies)}`,
   )
-
-  // synthesizeRuntimeCompositeWave1Steps also chains generic collection/member mutators without lifeBuckets
-  const steps = synthesizeRuntimeCompositeWave1Steps(storage, run, {
-    sourceMounted: false,
-    endpoints: endpoints.filter(ep => ep.pathTemplate.startsWith('/api/v1/widgets')),
-  })
-  assert.ok(steps.length >= 1, 'expected Wave-1 composite step synthesized from generic structural collection/member mutators')
-  assert.ok(steps.some(s => s.hypothesis.includes('/api/v1/widgets')))
 })

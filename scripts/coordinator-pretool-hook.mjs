@@ -6,14 +6,13 @@
  * (`.agents/skills/coordinator/SKILL.md`) when running in coordinator mode:
  *
  *  - Hard-blocks inline coordinator `run_command` invocations containing
- *    `ssh`, `docker exec`, `sqlite3`, `rg`, `grep` (including `git grep`),
- *    and inline `read_file`/`view_file` targeting `src/`, `worker/`, or
- *    `benchmarks/` (plus `grep_search`).
- *  - Always allows whitelisted coordinator orchestration commands (`git`,
- *    `scripts/merge-stream.sh`, `scripts/certify-v8.ts`,
- *    `scripts/benchmark-multihop.ts`, `scripts/parallel-pulse.sh`,
- *    `scripts/worker-source-hash.sh`, `npm run worker:build`, `uptime`, `df`,
- *    `ls`).
+ *    `ssh`, `docker exec`, `sqlite3`, and inline `read_file`/`view_file`
+ *    targeting `src/`, `worker/`, or `benchmarks/`.
+ *  - Allows `grep`/`rg`/`git grep`/`grep_search` and whitelisted coordinator
+ *    orchestration commands (`git`, `scripts/merge-stream.sh`,
+ *    `scripts/certify-v8.ts`, `scripts/benchmark-multihop.ts`,
+ *    `scripts/parallel-pulse.sh`, `scripts/worker-source-hash.sh`,
+ *    `npm run worker:build`, `uptime`, `df`, `ls`).
  *  - Safety-critical: NEVER blocks swarm workers (worktrees/`*`/swarm-`*` or
  *    `inherit` workers) or subagents (`research`/`self`). Fails open on
  *    malformed/incomplete payloads so the hook can never wedge a session.
@@ -45,7 +44,6 @@ const WHITELISTED_DIRECT_CMDS = new Set(['uptime', 'df', 'ls'])
 
 const WRAPPER_CMDS_NO_ARG = new Set(['sudo', 'nohup', 'command', 'time', 'exec'])
 const SHELL_CMDS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh'])
-const GREP_CMDS = new Set(['grep', 'egrep', 'fgrep'])
 const SCRIPT_RUNNERS = new Set(['bash', 'sh', 'zsh', 'node', 'tsx', 'npx'])
 const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/
 
@@ -507,10 +505,9 @@ function isWhitelistedInvocation({ rawCmd, cmd, args }) {
   // Direct whitelisted host/status commands (`uptime`, `df`, `ls`)
   if (WHITELISTED_DIRECT_CMDS.has(cmd)) return true
 
-  // `git ...` (all git orchestration commands except `git grep`, which is handled before whitelist)
+  // `git ...` (all git orchestration commands including `git grep`)
   if (cmd === 'git') {
-    const sub = findGitSubcommand(args)
-    return sub !== 'grep'
+    return true
   }
 
   // `npm run worker:build`
@@ -530,19 +527,6 @@ function isWhitelistedInvocation({ rawCmd, cmd, args }) {
   }
 
   return false
-}
-
-function findGitSubcommand(args) {
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i]
-    if (a === '-C' || a === '-c' || a === '--git-dir' || a === '--work-tree') {
-      i++ // skip flag argument
-      continue
-    }
-    if (a.startsWith('-')) continue
-    return a
-  }
-  return ''
 }
 
 function findDockerSubcommand(args) {
@@ -593,30 +577,6 @@ export function evaluateRunCommand(commandLine) {
         decision: 'deny',
         reason:
           "Coordinator PreToolUse guard: inline `sqlite3` is blocked in coordinator mode. Delegate live DB inspection to `invoke_subagent(typeName: 'self')` (return a <=10-line summary) or read-only forensics to `invoke_subagent(typeName: 'research')`. Emergency override: KOVO_COORDINATOR_HOOK_BYPASS=1.",
-      }
-    }
-
-    if (cmd === 'rg') {
-      return {
-        decision: 'deny',
-        reason:
-          "Coordinator PreToolUse guard: inline `rg` codebase/log search is blocked in coordinator mode. Delegate local codebase, benchmark, or log forensics to `invoke_subagent(typeName: 'research')` for a concise structural summary. Emergency override: KOVO_COORDINATOR_HOOK_BYPASS=1.",
-      }
-    }
-
-    if (GREP_CMDS.has(cmd)) {
-      return {
-        decision: 'deny',
-        reason:
-          "Coordinator PreToolUse guard: inline `grep` search is blocked in coordinator mode. Delegate local codebase, benchmark, or log forensics to `invoke_subagent(typeName: 'research')` for a concise structural summary. Emergency override: KOVO_COORDINATOR_HOOK_BYPASS=1.",
-      }
-    }
-
-    if (cmd === 'git' && findGitSubcommand(args) === 'grep') {
-      return {
-        decision: 'deny',
-        reason:
-          "Coordinator PreToolUse guard: inline `git grep` search is blocked in coordinator mode. Delegate local codebase forensics to `invoke_subagent(typeName: 'research')` for a concise structural summary. Emergency override: KOVO_COORDINATOR_HOOK_BYPASS=1.",
       }
     }
 
@@ -745,14 +705,6 @@ export function evaluatePreToolUse(payload, env = process.env) {
                   ? args.file_path
                   : ''
       return evaluateReadFile(targetPath, payload)
-    }
-
-    if (toolName === 'grep_search') {
-      return {
-        decision: 'deny',
-        reason:
-          "Coordinator PreToolUse guard: inline `grep_search` is blocked in coordinator mode. Delegate local codebase forensics to `invoke_subagent(typeName: 'research')`. Emergency override: KOVO_COORDINATOR_HOOK_BYPASS=1.",
-      }
     }
 
     return { decision: 'allow' }

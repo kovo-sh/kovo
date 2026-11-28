@@ -1,7 +1,7 @@
 /**
  * v7 agent-conversion — unit tests for Layer-3 `kovo_verify` ergonomics, route obligation
  * coverage from verify transcripts/dynamic scripts, premature early-exit guard on unprobed
- * assigned routes, and semantic non-floor class prioritization.
+ * assigned routes.
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
@@ -10,18 +10,11 @@ import {
   KOVO_VERIFY_SPEC_SHAPE,
   KOVO_VERIFY_TOOL_DESCRIPTION,
   SpecSubmissionTracker,
-  coordinatorPlannerPrompt,
   earlyExitEligible,
   gapValidationRejectedMessage,
   specSubmissionRequiredMessage,
 } from '../src/server/agent-session.ts'
 import { buildAssignmentBrief, renderSettlementSpecDirective } from '../src/server/assignment-brief.ts'
-import {
-  classifySemanticEndpointClasses,
-  createGraphCoordinator,
-  prioritizeSemanticEndpoints,
-} from '../src/server/graph-coordinator.ts'
-import type { CoordinatorEndpoint } from '../src/server/graph-coordinator.ts'
 
 test('kovo_verify tool description and repair directives clearly guide inline script + all 5 typed helpers', () => {
   assert.match(KOVO_VERIFY_TOOL_DESCRIPTION, /pass `script` inline/i)
@@ -76,50 +69,6 @@ test('assignment brief preserves confirmed floor findingId for read-only chain p
   }
   assert.equal(parsed.alreadyConfirmedOnOrigin?.[0]?.findingId, 'finding-floor-1')
   assert.deepEqual(parsed.personas?.[0]?.harvestedIds, ['ord-101', 'ord-102'])
-})
-
-test('graph-coordinator classifies and prioritizes unconfirmed non-floor semantic classes even after basic floor sweeps', () => {
-  const origin = 'https://app.example'
-  const endpoints: CoordinatorEndpoint[] = [
-    { id: 'ep-confirmed', origin, method: 'POST', pathTemplate: '/api/v1/checkout/confirm', riskScore: 95, coveragePct: 100, testedClasses: [] },
-    { id: 'ep-race', origin, method: 'POST', pathTemplate: '/api/v1/wallets/:id/redeem', riskScore: 80, coveragePct: 20, testedClasses: ['sqli'] },
-    { id: 'ep-jwt', origin, method: 'GET', pathTemplate: '/api/v1/oauth/tokens', riskScore: 70, coveragePct: 15, testedClasses: ['authz'] },
-    { id: 'ep-read', origin, method: 'GET', pathTemplate: '/api/v1/health', riskScore: 50, coveragePct: 10, testedClasses: ['sqli'] },
-  ]
-
-  assert.ok(classifySemanticEndpointClasses(endpoints[1]!).includes('race'))
-  assert.ok(classifySemanticEndpointClasses(endpoints[2]!).includes('auth_protocol'))
-  assert.deepEqual(classifySemanticEndpointClasses(endpoints[3]!), [])
-
-  const prioritized = prioritizeSemanticEndpoints(endpoints, {
-    confirmedPaths: new Set(['/api/v1/checkout/confirm']),
-  })
-  assert.deepEqual(prioritized.map(entry => entry.endpoint.id), ['ep-race', 'ep-jwt'])
-
-  const coord = createGraphCoordinator({
-    deps: {
-      listEndpoints: () => endpoints,
-      listFacts: () => [],
-      listFindings: () => [],
-    },
-    approvedOrigins: [origin],
-  })
-  const page = coord.queryEndpoints({ untestedSemanticOnly: true })
-  assert.ok(page.items.some(ep => ep.id === 'ep-race'), 'race endpoint surfaced even though floor tested sqli')
-  assert.ok(!page.items.some(ep => ep.id === 'ep-read'), 'plain health read excluded from semantic filter')
-
-  const plannerText = coordinatorPlannerPrompt({
-    goal: 'Audit app',
-    roundNo: 1,
-    capabilityTier: 2,
-    approvedOrigins: [origin],
-    budgetRemaining: { usd: 5, requests: 500 },
-    dynamicStepBudget: 24,
-    pendingOob: 0,
-    chainSteps: [],
-  })
-  assert.match(plannerText, /untestedSemanticOnly=true/)
-  assert.match(plannerText, /read-only chain primitives/)
 })
 
 test('earlyExitEligible blocks premature early exit while assigned target routes are still unprobed', () => {

@@ -40,11 +40,11 @@ moving — **not** doing hands-on codebase digging or editing yourself.
 - Sleep zero-cost with `swarm_wait(since=<last_seq>)` while workers run.
 
 ### What the coordinator NEVER DOES
-- **Never `grep`, `find`, or `read_file` across the codebase** to investigate
-  bugs, trace code paths, or inspect source files. Spawn a read-only
-  diagnostician/researcher worker (or `research` subagent) to inspect the files
-  and return a concise structural summary (files, line numbers, root cause,
-  recommended lease split).
+- **Never deep-dive `read_file` across source code** to investigate bugs, trace
+  code paths, or inspect large files (quick `grep`/`rg`/`git grep` lookups are
+  allowed). Spawn a read-only diagnostician/researcher worker (or `research`
+  subagent) for deep codebase forensics and return a concise structural summary
+  (files, line numbers, root cause, recommended lease split).
 - **Never `edit_file` or `write_file` production, benchmark, or test code** in
   the coordinator thread. Always delegate edits to a writer worker in an
   isolated worktree.
@@ -66,7 +66,7 @@ according to this table:
 | Task Category | Route To | Scope & Output Contract |
 | :------------ | :------- | :---------------------- |
 | Trivial orchestration check (max **1** call/turn: `git status`/`log`, `scripts/certify-v8.ts`, `scripts/benchmark-multihop.ts`, `scripts/merge-stream.sh`, `scripts/parallel-pulse.sh`, `scripts/worker-source-hash.sh`, `npm run worker:build`, `manage_task`, `uptime`, `df`, `ls`) | **Coordinator (direct)** | Scorecard, merge, branch status, build, or host-health check only. Never chain inline digging after an orchestration check. |
-| Local codebase / benchmark / log forensics (`rg`/`grep`, `read_file` on `src/`/`worker/`/`benchmarks/`, `report.json` reject signatures, `.meta.json` details) | `invoke_subagent(typeName: "research")` | Read-only inspection; returns concise structural summary (files, line numbers, mechanism class, recommended lease split; zero raw bodies/probes). |
+| Local codebase / benchmark / log forensics (`read_file` on `src/`/`worker/`/`benchmarks/`, `report.json` reject signatures, `.meta.json` details, deep code traces) | `invoke_subagent(typeName: "research")` | Read-only inspection; returns concise structural summary (files, line numbers, mechanism class, recommended lease split; zero raw bodies/probes). |
 | Live VM / SSH / Docker / DB / network debugging (`ssh`, `docker exec`, `sqlite3`, container logs, port/network probes) | `invoke_subagent(typeName: "self")` | Isolated shell/SSH/Docker/DB investigation; returns a **<=10-line** structured summary of findings and next action. |
 | Code edits / fixes / tests / docs | `--tier standard`: `node scripts/dispatch-worker.mjs` (Claude Code `opus`); `--tier security-adjacent` or exit `42`: `swarm(action="add", workspace="share")` (Gemini Neon) | Exclusive disjoint file lease in an isolated worktree; commits locally and reports SHA + summary (escalate via the [3-tier ladder](#option-3--hard-no-opus-4-8-fallback-bridge-scriptsdispatch-workermjs); use OpenCode fallback below on content-safety block). |
 
@@ -78,13 +78,13 @@ on `PreToolUse` to enforce this routing mechanically when coordinator mode is
 active:
 
 - **Hard-blocks** coordinator inline `run_command` containing `ssh`,
-  `docker exec`, `sqlite3`, `rg`, `grep` (including `git grep`), and inline
-  `read_file`/`view_file` targeting `src/`, `worker/`, or `benchmarks/`.
-- **Always allows** whitelisted orchestration commands (`git`,
-  `scripts/merge-stream.sh`, `scripts/certify-v8.ts`,
-  `scripts/benchmark-multihop.ts`, `scripts/parallel-pulse.sh`,
-  `scripts/worker-source-hash.sh`, `npm run worker:build`, `uptime`, `df`,
-  `ls`).
+  `docker exec`, `sqlite3`, and inline `read_file`/`view_file` targeting
+  `src/`, `worker/`, or `benchmarks/`.
+- **Always allows** `grep`/`rg`/`git grep`/`grep_search` and whitelisted
+  orchestration commands (`git`, `scripts/merge-stream.sh`,
+  `scripts/certify-v8.ts`, `scripts/benchmark-multihop.ts`,
+  `scripts/parallel-pulse.sh`, `scripts/worker-source-hash.sh`,
+  `npm run worker:build`, `uptime`, `df`, `ls`).
 - **Never blocks subagents or swarm workers:** enforces only when the active
   conversation owns `.system_generated/swarm/swarm.json` (`swarm_id ===
   conversationId`) or `KOVO_COORDINATOR_MODE=1` is explicitly set outside
@@ -271,7 +271,7 @@ Before issuing tool calls in any turn, verify:
    - Local codebase / benchmark / log forensics -> `invoke_subagent(typeName: "research")`
    - Live VM / SSH / Docker / DB / network debugging -> `invoke_subagent(typeName: "self")` (returns <=10-line summary)
    - Code edits / fixes -> `scripts/dispatch-worker.mjs` (standard) or `swarm(action="add", workspace="share")` (security-adjacent / exit `42`)
-2. Am I about to `grep`/`rg`, `ssh`, `docker exec`, `sqlite3`, `read_file` on
+2. Am I about to run `ssh`, `docker exec`, `sqlite3`, `read_file` on
    `src/`/`worker/`/`benchmarks/`, or print benchmark forensics
    (`topRejectDetails`, finding titles, routes/error signatures,
    `failureReason`, corpus entries, `truth/blueprint.ts`)? **Stop — keep the

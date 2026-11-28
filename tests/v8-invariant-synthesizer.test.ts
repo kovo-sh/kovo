@@ -15,7 +15,6 @@ import {
   buildEntityLifecycleSlices,
   buildGuardAsymmetryMatrix,
   buildTrustBoundaryGraph,
-  inferRuntimeInvariantHypotheses,
   synthesizeInvariants,
   toCapabilityLedgerSeeds,
 } from '../src/server/invariant-synthesizer.ts'
@@ -530,129 +529,7 @@ describe('Analyzer 3: Bounded Semantic Slice Builder (<= 1,600 B & <= 10% Budget
   })
 })
 
-describe('Runtime Parity Adapter (Grey-Box / Black-Box) & Unified Orchestrator', () => {
-  test('emits identical hypothesis and CapabilityLedger seed schema from runtime observations, OpenAPI, GraphQL, and SPA routes', () => {
-    const runtime = inferRuntimeInvariantHypotheses({
-      mode: 'grey-box',
-      personaObservations: [
-        {
-          persona: 'revoked_admin',
-          isRevokedOrDemoted: true,
-          surface: 'http',
-          serviceOrigin: 'https://api.example.test',
-          method: 'GET',
-          path: '/api/v1/projects/proj-1',
-          status: 401,
-        },
-        {
-          persona: 'revoked_admin',
-          isRevokedOrDemoted: true,
-          surface: 'sse',
-          serviceOrigin: 'https://runner.example.test',
-          method: 'GET',
-          path: '/events/projects/proj-1',
-          status: 200,
-        },
-        {
-          persona: 'member_b',
-          tenantId: 'org-b',
-          surface: 'cdn',
-          serviceOrigin: 'https://cdn.example.test',
-          method: 'GET',
-          path: '/public/profile/org-a.css',
-          status: 200,
-          responseHeaders: { 'Cache-Control': 'public, max-age=300', 'X-Cache': 'HIT' },
-        },
-      ],
-      openApiOperations: [
-        {
-          method: 'GET',
-          path: '/api/v1/secrets/:id',
-          security: [{ bearerAuth: [] }],
-          parameters: ['tenantId', 'id'],
-          serviceOrigin: 'https://api.example.test',
-        },
-        {
-          method: 'POST',
-          path: '/api/v1/secrets/batch',
-          security: [],
-          requestBodyKeys: ['ids', 'status'],
-          serviceOrigin: 'https://api.example.test',
-        },
-      ],
-      graphqlCatalog: {
-        endpoint: '/graphql',
-        serviceOrigin: 'https://api.example.test',
-        fields: [
-          { name: 'secretPreview', kind: 'query', args: ['id'], requiresAuth: false },
-          { name: 'updateSecret', kind: 'mutation', args: ['id', 'value'], requiresAuth: true, requiredRole: 'admin' },
-        ],
-      },
-      spaRoutes: [
-        {
-          path: '/admin/approvals',
-          serviceOrigin: 'https://app.example.test',
-          requiredRoles: ['org_admin'],
-          stateActions: ['approve', 'reopen', 'refund'],
-          apiCalls: [{ method: 'POST', path: '/api/v1/payouts/:id/approve' }],
-        },
-      ],
-    })
-
-    assert.equal(runtime.mode, 'grey-box')
-    assert.ok(runtime.hypotheses.length >= 4)
-    assert.equal(runtime.capabilitySeeds.length, runtime.hypotheses.length)
-
-    // Verify revoked SSE surface asymmetry
-    const revokedHyp = runtime.hypotheses.find(h => h.surface === 'sse' && h.kind === 'runtime_surface_asymmetry')
-    assert.ok(revokedHyp, 'expected revoked SSE runtime asymmetry')
-    const revokedSeed = runtime.capabilitySeeds.find(s => s.metadata.hypothesisId === revokedHyp.id)
-    assert.ok(revokedSeed)
-    assert.equal(revokedSeed.temporalState, 'revoked')
-    assert.equal(revokedSeed.promotionStatus, 'capability_only')
-
-    // Verify CDN cache divergence
-    assert.ok(runtime.hypotheses.some(h => h.capabilityKind === 'parser_or_cache_primitive' && h.surface === 'cdn'))
-
-    // Verify OpenAPI / GraphQL catalog asymmetry
-    assert.ok(runtime.hypotheses.some(h => h.entity === 'secret' && h.kind === 'policy_asymmetry'))
-
-    // Verify SPA route hypothesis
-    assert.ok(runtime.hypotheses.some(h => h.evidence.some(e => e.includes('spa_route=/admin/approvals'))))
-
-    for (const h of runtime.hypotheses) {
-      assertValidHypothesisSchema(h)
-      assert.equal(h.mode, 'grey-box')
-    }
-
-    // Black-box parity via unified orchestrator
-    const blackBox = synthesizeInvariants({
-      mode: 'black-box',
-      runtime: {
-        personaObservations: [
-          { persona: 'user_a', surface: 'http', method: 'GET', path: '/api/orders/1', status: 403 },
-          { persona: 'user_a', surface: 'http', method: 'POST', path: '/api/orders/batch', status: 200, isBatch: true },
-        ],
-      },
-    })
-    assert.equal(blackBox.mode, 'black-box')
-    assert.equal(blackBox.hypotheses.length, 1)
-    assertValidHypothesisSchema(blackBox.hypotheses[0])
-    assert.deepEqual(blackBox.capabilitySeeds, toCapabilityLedgerSeeds(blackBox.hypotheses))
-
-    // Determinism check
-    const blackBox2 = synthesizeInvariants({
-      mode: 'black-box',
-      runtime: {
-        personaObservations: [
-          { persona: 'user_a', surface: 'http', method: 'GET', path: '/api/orders/1', status: 403 },
-          { persona: 'user_a', surface: 'http', method: 'POST', path: '/api/orders/batch', status: 200, isBatch: true },
-        ],
-      },
-    })
-    assert.equal(JSON.stringify(blackBox), JSON.stringify(blackBox2))
-  })
-
+describe('Unified Orchestrator', () => {
   test('white-box synthesizeInvariants combines all 3 analyzers, compose boundaries, and WS handlers into unified quarantined CapabilitySeeds', () => {
     const sourceFiles: SourceFileInput[] = [
       {
@@ -721,6 +598,16 @@ describe('Runtime Parity Adapter (Grey-Box / Black-Box) & Unified Orchestrator',
       assert.equal(seed.promotionStatus, 'capability_only')
       assert.match(seed.artifactDigest, /^[0-9a-f]{64}$/)
       assert.ok(seed.capId.startsWith('cap:synth_'))
+    }
+    assert.deepEqual(wb.capabilitySeeds, toCapabilityLedgerSeeds(wb.hypotheses))
+  })
+
+  test('grey-box and black-box modes emit zero hypotheses (no-source planning is owned by the World Graph planner)', () => {
+    for (const mode of ['grey-box', 'black-box'] as const) {
+      const result = synthesizeInvariants({ mode })
+      assert.equal(result.mode, mode)
+      assert.deepEqual(result.hypotheses, [])
+      assert.deepEqual(result.capabilitySeeds, [])
     }
   })
 })

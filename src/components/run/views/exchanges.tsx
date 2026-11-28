@@ -10,7 +10,7 @@ import { searchRunExchanges } from '../../../actions.ts'
 import { formatExchangeAsCurl } from '../../curl-parser.ts'
 import { Dropdown, FilterBox, matchQ, Tabs, useDebounced, VList } from '../controls.tsx'
 import { useFullExchange, useRun, useRunModel } from '../data.tsx'
-import { EmptyState, KbdGroup, LinkRow, Props, Section, Seg, Skeleton, Tag } from '../display.tsx'
+import { EmptyState, FindingTitle, InlineError, KbdGroup, LinkRow, Props, Section, Seg, Skeleton, Tag } from '../display.tsx'
 import { fmtAgo, fmtFullDateTime, fmtN, fmtRel, fmtTimeS, host, plural, prettyBody } from '../format.ts'
 import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
@@ -109,8 +109,19 @@ function useExchangeRows(hits: SearchHit[]) {
 
 type Item = { type: 'head'; key: string; label: string; count: number; icon: 'globe' | 'lock' } | { type: 'row'; key: string; r: XRow }
 
+/** Empty list body: a lagging newest window (no filter) is not "Nothing matches". */
+function ExchangesEmpty({ filtered, total, onReload }: { filtered: boolean; total: number; onReload: () => void }) {
+  if (filtered || total <= 0) {
+    return <EmptyState icon="search" title="Nothing matches" style={{ paddingTop: 80 }}>Try a different filter or switch tabs.</EmptyState>
+  }
+  return <EmptyState icon="exchanges" title={`${fmtN(total)} ${total === 1 ? 'exchange' : 'exchanges'} recorded`} style={{ paddingTop: 80 }}
+    action={<button type="button" className={runBtn()} onClick={onReload}>Reload</button>}>
+    The newest window of exchanges has not loaded yet.
+  </EmptyState>
+}
+
 export function ExchangesView() {
-  const { detail, counts, eventsReady } = useRun()
+  const { detail, counts, eventsReady, refresh } = useRun()
   const model = useRunModel()
   const nav = useNav()
   const [tab, setTab] = useViewState<Tab>('exchanges.tab', 'all')
@@ -237,7 +248,7 @@ export function ExchangesView() {
     </div>}
     {!rows.length && !eventsReady ? <Skeleton /> :
       <VList items={items} itemKey={it => it.key} height={height} scrollToIndex={scrollIdx} footer={shown.length ? footer : undefined}
-        empty={<EmptyState icon="search" title="Nothing matches" style={{ paddingTop: 80 }}>Try a different filter or switch tabs.</EmptyState>}
+        empty={<ExchangesEmpty filtered={!!(active.length || q.trim() || tab !== 'all')} total={counts.exchanges} onReload={() => { void refresh() }} />}
         render={(it, _i, style) => {
           if (it.type === 'head') {
             const ck = it.key.slice(2)
@@ -252,8 +263,8 @@ export function ExchangesView() {
           const r = it.r
           return <div key={it.key} style={style} className={cn(RW.row, selId === r.id && RW.rowCur)} data-id={r.id}
             onClick={() => nav.select({ kind: 'exchange', id: r.id })}>
-            <span className="w-16 flex-none font-mono text-[12px] tabular-nums text-fg-subtle">{fmtRel(r.t, model.base)}</span>
-            <span className={cn('w-[46px] flex-none font-mono text-[12px] font-medium', r.denied && r.method === '—' ? 'text-fg-faint' : 'text-fg-muted')}>{r.method}</span>
+            <span className="w-[72px] flex-none whitespace-nowrap font-mono text-[12px] tabular-nums text-fg-subtle">{fmtRel(r.t, model.base)}</span>
+            <span className={cn('w-[56px] flex-none font-mono text-[12px] font-medium', r.denied && r.method === '—' ? 'text-fg-faint' : 'text-fg-muted')}>{r.method}</span>
             <span className={cn('w-[34px] flex-none text-right font-mono text-[12px] tabular-nums', r.denied ? 'inline-flex justify-end text-danger' : httpCodeClass(r.status))}>
               {r.denied ? <Icon name="slash" size={13} /> : r.status}
             </span>
@@ -265,7 +276,7 @@ export function ExchangesView() {
                   : <span className="font-sans text-[13px] text-danger">{r.reason ?? r.note ?? 'Blocked by safety rules'}</span>
                 : r.path}
             </span>
-            {r.persona && group !== 'persona' && <span className="flex-none"><Tag icon="lock">{r.persona}</Tag></span>}
+            {r.persona && group !== 'persona' && <span className="min-w-0 max-w-[160px] shrink"><Tag icon="lock" title={r.persona}>{r.persona}</Tag></span>}
             {hitIds.has(r.id) && <span className="inline-flex flex-none text-fg-subtle" title="Matched in the body or headers by server search"><Icon name="search" size={12} /></span>}
             <span className="w-[56px] flex-none text-right font-mono text-[12px] tabular-nums text-fg-subtle">{r.dur != null ? fmtN(r.dur) + 'ms' : ''}</span>
           </div>
@@ -296,21 +307,27 @@ function HeaderTable({ headers, flagged }: { headers: Record<string, string> | u
     const isSec = !isFlag && SECURITY_HEADERS.has(lk)
     return <tr key={k}>
       <td className={cn(
-        'w-[42%] break-all border-b border-line py-[3px] pr-2.5 align-top text-[11.5px] leading-[17px]',
+        'w-[44%] min-w-[172px] break-normal border-b border-line py-[3px] pr-2.5 align-top text-[11.5px] leading-[17px] [overflow-wrap:anywhere]',
         isFlag
           ? 'bg-warn-soft font-medium text-warn before:mb-px before:mr-1.5 before:inline-block before:size-[5px] before:rounded-full before:bg-warn before:align-middle before:content-[""]'
           : isSec
             ? 'text-fg before:mb-px before:mr-1.5 before:inline-block before:size-[5px] before:rounded-full before:bg-fg-subtle before:align-middle before:content-[""]'
             : 'text-fg-subtle',
       )}>{k}</td>
-      <td className={cn('break-all border-b border-line py-[3px] align-top text-[11.5px] leading-[17px] text-fg-muted', isFlag && 'bg-warn-soft')}>
+      <td className={cn('border-b border-line py-[3px] align-top text-[11.5px] leading-[17px] text-fg-muted [overflow-wrap:anywhere]', !/\s/.test(String(headers![k])) && 'break-all', isFlag && 'bg-warn-soft')}>
         {String(headers![k])}
       </td>
     </tr>
   })}</tbody></table>
 }
 
-function ExchangeInspector({ sel }: InspectorProps) {
+/** Remount key: a failed full-exchange read is not cached, so bumping it re-runs loadExchange. */
+function ExchangeInspector(props: InspectorProps) {
+  const [attempt, setAttempt] = useState(0)
+  return <ExchangeInspectorBody key={props.sel.id + ':' + attempt} {...props} onRetry={() => setAttempt(n => n + 1)} />
+}
+
+function ExchangeInspectorBody({ sel, onRetry }: InspectorProps & { onRetry: () => void }) {
   const { detail, events } = useRun()
   const model = useRunModel()
   const links = useLinks()
@@ -336,10 +353,10 @@ function ExchangeInspector({ sel }: InspectorProps) {
       <PaneHeader title="Blocked request" sub={ev ? <span title={`${fmtFullDateTime(ev.createdAt)} · Event #${ev.id}`} suppressHydrationWarning>{fmtAgo(ev.createdAt)}</span> : undefined} />
       <PaneBody><div className={RW.detail}>
         {!ev ? <Skeleton rows={4} /> : <>
-          <div className="mb-2.5 flex flex-wrap gap-1.5">
+          <div className="mb-2.5 flex min-w-0 flex-wrap gap-1.5">
             <Tag icon="slash" title={ev.kind}>{ev.kind === 'broker.circuit_open' ? 'Rate limit pause' : 'Blocked by safety proxy'}</Tag>
             {method && <Tag mono>{method}</Tag>}
-            {persona && <Tag icon="lock">{persona}</Tag>}
+            {persona && <Tag icon="lock" className="max-w-[240px]" title={persona}>{persona}</Tag>}
           </div>
           {path
             ? <h2 className="m-0 mb-3 break-all font-mono text-[13px] font-medium leading-5 text-fg"><span className="text-fg-subtle">{origin}</span>{path}</h2>
@@ -350,7 +367,7 @@ function ExchangeInspector({ sel }: InspectorProps) {
             ...(method ? [['Method', <span className="font-mono text-[12px]">{method}</span>] as [ReactNode, ReactNode]] : []),
             ...(path ? [['Path', <span className="font-mono text-[12px] break-all">{path}</span>] as [ReactNode, ReactNode]] : []),
             ...(persona ? [['Test account', <span className="font-mono text-[12px]">{persona}</span>] as [ReactNode, ReactNode]] : []),
-            ...(origin ? [['Origin', <span className="font-mono text-[12px]">{host(origin)}</span>, () => links.host(origin)] as [ReactNode, ReactNode, () => void]] : []),
+            ...(origin ? [['Origin', <span className="block min-w-0 truncate font-mono text-[12px]" title={origin}>{host(origin)}</span>, () => links.host(origin)] as [ReactNode, ReactNode, () => void]] : []),
             ...(w ? [['Worker', <><StatusGlyph status={w.status} /><span className="min-w-0 truncate">{w.title}</span><Icon name="workflow" /></>, () => links.worker(w.id)] as [ReactNode, ReactNode, () => void]] : []),
           ]} />
           <p className="my-1.5 mb-2 flex items-center gap-1.5 text-[12px] leading-[18px] text-fg-subtle">{reason ? ev.message : 'The safety proxy blocked this request before it left Kovo: the host is outside the approved scope or paused by a safety pause. Nothing was sent.'}</p>
@@ -402,23 +419,23 @@ function ExchangeInspector({ sel }: InspectorProps) {
       extra={<button type="button" className={runIconBtn()} title="Copy as cURL" aria-label="Copy as cURL" onClick={copyCurl}><Icon name="copy" />cURL</button>}
     />
     <PaneBody><div className={RW.detail}>
-      <div className="mb-2.5 flex flex-wrap gap-1.5">
+      <div className="mb-2.5 flex min-w-0 flex-wrap gap-1.5">
         <Tag mono>{method || '—'}</Tag>
         <Tag mono className={httpCodeClass(status)}>{status || '—'}</Tag>
-        {persona ? <Tag icon="lock">{persona}</Tag> : <Tag>Anonymous</Tag>}
+        {persona ? <Tag icon="lock" className="max-w-[240px]" title={persona}>{persona}</Tag> : <Tag>Anonymous</Tag>}
         {dur != null && <Tag className="tabular-nums">{fmtN(dur)} ms</Tag>}
       </div>
       <h2 className="m-0 mb-3 break-all font-mono text-[13px] font-medium leading-5 text-fg"><span className="text-fg-subtle">{origin}</span>{path || (full ? '' : '…')}</h2>
       <Props rows={[
         ...(t ? [['Time', <span className="tabular-nums">{fmtTimeS(t)} <span className="font-mono text-[12px] text-fg-subtle">{fmtRel(t, model.base)}</span></span>] as [ReactNode, ReactNode]] : []),
-        ['Origin', <span className="font-mono text-[12px]">{host(origin)}</span>, () => links.host(origin)],
+        ['Origin', <span className="block min-w-0 truncate font-mono text-[12px]" title={origin}>{host(origin)}</span>, () => links.host(origin)],
         ...(finalOrigin && finalOrigin !== origin ? [['Final origin', <span className="font-mono text-[12px]">{host(finalOrigin)}</span>] as [ReactNode, ReactNode]] : []),
         ...(redirects.some(x => x !== origin && x !== finalOrigin) ? [['Redirects', <span className="rw-wrap whitespace-normal break-words font-mono text-[12px] leading-[18px]">{redirects.map(host).join(' → ')}</span>] as [ReactNode, ReactNode]] : []),
         ['Media type', <span className="font-mono text-[12px]">{mediaType || (full ? '—' : '…')}</span>],
         ...(w ? [['Worker', <><StatusGlyph status={w.status} /><span className="min-w-0 truncate">{w.title}</span><Icon name="workflow" /></>, () => links.worker(w.id)] as [ReactNode, ReactNode, () => void]] : []),
       ]} />
       {fs.length > 0 && <Section title="Cited by" right={plural(fs.length, 'finding')}>
-        {fs.map(f => <LinkRow key={f.id} glyph={<SevGlyph sev={f.severity} />} right={stLabel(normFStatus(f.status))} onClick={() => links.finding(f.id)}>{f.title}</LinkRow>)}
+        {fs.map(f => <LinkRow key={f.id} glyph={<SevGlyph sev={f.severity} />} right={stLabel(normFStatus(f.status))} onClick={() => links.finding(f.id)}><FindingTitle title={f.title} /></LinkRow>)}
       </Section>}
       {(evIds.length > 0 || (bodyArt && model.evidenceById.has(bodyArt))) && <Section title="Evidence" right={evIds.length || 1}>
         {(bodyArt && model.evidenceById.has(bodyArt) && !evIds.includes(bodyArt) ? [bodyArt, ...evIds] : evIds).slice(0, 8).map(e => {
@@ -426,7 +443,7 @@ function ExchangeInspector({ sel }: InspectorProps) {
           return <LinkRow key={e} icon="fact" right={evd.kind} trailing="chevR" onClick={() => links.evidence(e)}>{evd.title}</LinkRow>
         })}
       </Section>}
-      {err ? <p className="my-1.5 mb-2 flex items-center gap-1.5 text-[12px] leading-[18px] text-fg-subtle">Couldn’t load the full request and response for this exchange.</p> : !full ? <Section title="Headers"><Skeleton rows={5} /></Section> : <>
+      {err ? <InlineError className="my-2" title="Couldn’t load the full request and response for this exchange." onRetry={onRetry} /> : !full ? <Section title="Headers"><Skeleton rows={5} /></Section> : <>
         <Section title="Security headers" right={BASELINE.filter(([h]) => respKeys.has(h)).length + ' of ' + BASELINE.length}>
           <div className="mb-2.5 flex flex-wrap gap-[5px]">{BASELINE.map(([h, l]) => {
             const has = respKeys.has(h)

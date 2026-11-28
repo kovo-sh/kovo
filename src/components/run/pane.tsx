@@ -119,6 +119,11 @@ export function EvidenceInspector({ sel }: InspectorProps) {
   </>
 }
 
+/** Middle-truncate a path so rows sharing a prefix still show their distinguishing tail. */
+export function midTruncatePath(path: string, head = 18, tail = 24): string {
+  return path.length > head + tail + 1 ? path.slice(0, head) + '…' + path.slice(-tail) : path
+}
+
 /**
  * One exchange as a cross-link row: method · status · (host) path, opening it in
  * Exchanges. Exchanges outside the loaded newest-500 window are read by id.
@@ -130,17 +135,20 @@ export function ExchangeLink({ id, showHost = true }: { id: string; showHost?: b
   const full = useFullExchange(id, !summary)
   const x = summary ?? full
   const open = () => links.exchange(id)
+  const fullTitle = x ? [x.method, host(x.origin) + (x.pathAndQuery ?? '')].filter(Boolean).join(' ') : undefined
   return <div
     className="flex min-h-[30px] cursor-pointer items-center gap-2 -mx-2 rounded-control px-2 text-[12px] text-fg-muted transition-[background-color,color] duration-[var(--d1)] hover:bg-hover hover:text-fg"
     role="button"
     tabIndex={0}
+    data-slot="exchange-link"
+    title={fullTitle}
     onClick={open}
     onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open() } }}
   >
     <span className="w-11 flex-none font-mono text-[12px] text-fg-subtle">{x ? x.method : '—'}</span>
-    <span className={cn('w-7 flex-none font-mono text-[12px]', httpCodeClass(x?.status))}>{x?.status ?? ''}</span>
+    <span className={cn('w-7 flex-none font-mono text-[12px] tabular-nums', httpCodeClass(x?.status))}>{x?.status ?? ''}</span>
     <span className="min-w-0 flex-1 truncate font-mono text-[12px]">
-      {x ? (showHost ? host(x.origin) : '') + x.pathAndQuery
+      {x ? (showHost ? host(x.origin) : '') + midTruncatePath(x.pathAndQuery ?? '')
         : <span className="text-fg-subtle">{full === null ? 'Exchange ' + short(id) : 'Loading…'}</span>}
     </span>
     <Icon name="ext" />

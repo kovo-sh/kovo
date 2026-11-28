@@ -6982,9 +6982,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         apiDependencies: persistedApiDeps.length,
       },
     )
-    // Persist bounded summary facts so `collectRuntimeDiscoveryInput` / `extractRuntimeCatalogFromFacts`
-    // can feed SPA routes, GraphQL catalogs, and OpenAPI security/operationId metadata directly into
-    // `inferRuntimeInvariantHypotheses` both pre-floor and post-Phase-A-floor.
+    // Persist bounded summary facts so SPA routes, GraphQL catalogs, and OpenAPI security/operationId
+    // metadata stay visible to fact consumers (World Graph planner snapshot, worker briefs).
     try {
       const runRow = storage.run(runId)
       const assignmentRow = params.assignmentId

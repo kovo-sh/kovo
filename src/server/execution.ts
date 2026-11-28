@@ -197,7 +197,6 @@ import {
   plannerDebounceMs,
   resolvePhaseRequestBudgets,
   resolveFloorLaneMode,
-  chainHypothesisDispatchSteps,
   computeDynamicStepBudget,
   STRANDED_READY_STOP_REASONS,
   DISPATCH_FUNNEL_COUNT_KEYS,
@@ -1556,8 +1555,6 @@ export class Execution {
   private executeInlineVerification(...a: Parameters<ExecVerifier['executeInlineVerification']>) { return this.verifier.executeInlineVerification(...a) }
   private baselineFinding(...a: Parameters<ExecVerifier['baselineFinding']>) { return this.verifier.baselineFinding(...a) }
 
-  private coordinatorDeps(...a: Parameters<ExecReconPlanner['coordinatorDeps']>) { return this.reconPlanner.coordinatorDeps(...a) }
-  private dispatchChainRound(...a: Parameters<ExecReconPlanner['dispatchChainRound']>) { return this.reconPlanner.dispatchChainRound(...a) }
   private runChainPlanner(...a: Parameters<ExecReconPlanner['runChainPlanner']>) { return this.reconPlanner.runChainPlanner(...a) }
   private alreadyConfirmedRefs(...a: Parameters<ExecReconPlanner['alreadyConfirmedRefs']>) { return this.reconPlanner.alreadyConfirmedRefs(...a) }
   private detLeadSummaries(...a: Parameters<ExecReconPlanner['detLeadSummaries']>) { return this.reconPlanner.detLeadSummaries(...a) }
@@ -3106,7 +3103,6 @@ export class Execution {
       this.reconPlanner.ensureWave1InvariantChainSteps(
         this.storage.run(run.id),
         this.approvedOriginsSet(run),
-        { postFloor: this.agenticLaneCompleted.has(this.deterministicLaneKey(run)) },
       )
     } catch { /* invariant chain promotion is additive */ }
 

@@ -84,7 +84,6 @@ test('C1.2: agent-session.ts maintains strict re-export identity parity with age
     'coordinatorPrompt',
     'threatModelPrompt',
     'chainPlannerPrompt',
-    'coordinatorPlannerPrompt',
     'patchAuthorPrompt',
     'patchReviewerPrompt',
     'workerInvestigationPrompt',

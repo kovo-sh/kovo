@@ -110,8 +110,8 @@ export function buildVerdict(d: Detail, findings: readonly FindingRow[], interru
   } else {
     const top = SEV.find(s => c.byConfirmedSeverity[s] > 0)
     if (!top) {
-      hed = 'No weakness could be confirmed across ' + hostsW + '.'
-      const dekParts: string[] = []
+      hed = hosts ? 'No weakness could be confirmed across ' + hostsW + '.' : 'Nothing was tested.'
+      const dekParts: string[] = hosts ? [] : ['No hosts were in scope.']
       if (n.static_verified) dekParts.push(wp(n.static_verified, 'static advisory', 'static advisories') + ' (not runtime-confirmed).')
       if (n.inconclusive) dekParts.push(wp(n.inconclusive, 'observation remains', 'observations remain') + ' inconclusive.')
       dek = dekParts.length ? dekParts.join(' ') : null
@@ -133,7 +133,9 @@ export function buildVerdict(d: Detail, findings: readonly FindingRow[], interru
     const k = confirmed.length
     const ratio = standing ? k / standing : 0
     const word = live ? 'Provisional' : ratio >= 0.6 ? 'High' : ratio >= 0.3 ? 'Moderate' : 'Limited'
-    const parts = [k + ' of ' + standing + ' standing findings confirmed by automated replay']
+    const parts = [standing
+      ? k + ' of ' + standing + ' standing findings confirmed by automated replay'
+      : c.total ? 'No standing findings remain' : 'No findings to verify']
     if (n.static_verified) parts.push(n.static_verified + ' static ' + (n.static_verified === 1 ? 'advisory' : 'advisories'))
     if (n.dismissed) parts.push(n.dismissed + ' dismissed on replay')
     if (n.inconclusive) parts.push(n.inconclusive + ' inconclusive')
@@ -430,6 +432,61 @@ export function computeRunEnd(d: Detail): number {
   return max
 }
 
+// ---------------------------------------------------------------- boundary normalisation
+
+type Loose = Record<string, unknown>
+const arr = <T>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : [])
+const str = (v: unknown, fallback: string) => (typeof v === 'string' ? v : v == null ? fallback : String(v))
+/** Coerce nullable array/string fields on each row; rows that are not objects are dropped. */
+const rows = (v: unknown, arrays: readonly string[], strings: Readonly<Record<string, string>> = {}): Loose[] => {
+  const out: Loose[] = []
+  for (const row of arr<unknown>(v)) {
+    if (!row || typeof row !== 'object') continue
+    const r = row as Loose
+    let next: Loose | null = null
+    const set = (k: string, val: unknown) => { (next ??= { ...r })[k] = val }
+    for (const k of arrays) if (!Array.isArray(r[k])) set(k, [])
+    for (const k in strings) if (typeof r[k] !== 'string') set(k, str(r[k], strings[k]))
+    out.push(next ?? r)
+  }
+  return out
+}
+
+/**
+ * Normalise a run detail at the data boundary (initial load and every refresh / SSE merge)
+ * so one malformed row (`sourceOrigins: null`, a missing title) cannot throw inside
+ * `buildRunModel` and take the whole run page down. Pure: returns a shallow-copied detail
+ * and only copies rows that needed coercion.
+ */
+export function normalizeRunDetail(detail: Detail): Detail {
+  const d = detail as unknown as Loose
+  const run = (d.run && typeof d.run === 'object' ? d.run : {}) as Loose
+  const project = (d.project && typeof d.project === 'object' ? d.project : {}) as Loose
+  const tm = d.threatModel && typeof d.threatModel === 'object' ? d.threatModel as Loose : null
+  const out: Loose = {
+    ...d,
+    run: { ...run, approved: arr(run.approved), candidates: rows(run.candidates, [], { origin: '' }) },
+    project: { ...project, seeds: arr<unknown>(project.seeds).filter((x): x is string => typeof x === 'string'), name: str(project.name, 'Untitled project') },
+    threatModel: tm ? { ...tm, entries: rows(tm.entries, ['surfaceTags'], { origin: '' }) } : d.threatModel ?? null,
+    assignments: rows(d.assignments, ['sourceOrigins', 'parentFactIds'], { title: 'Untitled worker', phase: 'investigation', status: 'queued', id: '' }),
+    findings: rows(d.findings, ['evidenceIds', 'exchangeIds'], { title: '', origin: '', category: '', id: '' }),
+    chainSteps: rows(d.chainSteps, ['dependsOnStepIds', 'dependsOnFactIds'], { id: '' }),
+    exchangesSummary: rows(d.exchangesSummary, [], { origin: '', id: '' }),
+    approvals: rows(d.approvals, [], { origin: '', method: 'GET', pathAndQuery: '', id: '' }),
+    coverageEntries: rows(d.coverageEntries, [], { origin: '', category: '', id: '' }),
+    evidence: rows(d.evidence, [], { id: '' }),
+    facts: rows(d.facts, [], { id: '' }),
+    messages: rows(d.messages, []),
+    reports: rows(d.reports, []),
+    boardMembers: rows(d.boardMembers, []),
+    boardMessages: rows(d.boardMessages, []),
+    retestRuns: rows(d.retestRuns, []),
+  }
+  if ('patchProposals' in d) out.patchProposals = rows(d.patchProposals, [])
+  if ('endpoints' in d) out.endpoints = rows(d.endpoints, [])
+  return out as unknown as Detail
+}
+
 export function buildRunModel(d: Detail, now = Date.now()): RunModel {
   const byId = <T extends { id: string }>(xs: readonly T[]) => new Map(xs.map(x => [x.id, x]))
   const push = <K, V>(m: Map<K, V[]>, k: K, v: V) => { const a = m.get(k); if (a) a.push(v); else m.set(k, [v]) }
@@ -518,17 +575,43 @@ export function coverageCounts(cov: readonly Coverage[]) {
   return order.filter(k => ct[k]).map(k => ({ status: k, label: COV_L[k], count: ct[k] }))
 }
 
-/** Exchange (and broker denial) histogram across the run's timeline. */
+/**
+ * Exchange (and broker denial) histogram across the run's traffic window. The domain comes from
+ * traffic timestamps only, so a late non-traffic event (restart recovery, interruption) cannot
+ * stretch the axis and pile every request into the first bin.
+ */
 export function trafficHistogram(m: RunModel, events: readonly RunEvent[], bins = 36) {
-  const t0 = m.base
-  const tEnd = Math.max(m.end, events.length ? events[events.length - 1].createdAt : 0)
+  const allowed: number[] = []
+  const denied: number[] = []
+  for (const e of events) {
+    if (e.kind === 'broker.allowed') allowed.push(e.createdAt)
+    else if (e.kind === 'broker.denied') denied.push(e.createdAt)
+  }
+  // Prefer the event stream (complete); fall back to the loaded exchange window.
+  const ok = allowed.length ? allowed : m.detail.exchangesSummary.map(e => e.createdAt)
+  let t0 = Infinity
+  let tEnd = -Infinity
+  const span1 = (t: number) => { if (Number.isFinite(t)) { if (t < t0) t0 = t; if (t > tEnd) tEnd = t } }
+  for (const t of ok) span1(t)
+  for (const t of denied) span1(t)
+  if (!allowed.length) {
+    for (const e of m.detail.exchangesSummary) {
+      if (typeof e.durationMs === 'number' && Number.isFinite(e.durationMs) && e.durationMs > 0) span1(e.createdAt + e.durationMs)
+    }
+  }
+  if (!Number.isFinite(t0)) { t0 = m.base; tEnd = m.end }
   const span = Math.max(1, tEnd - t0)
   const out = Array.from({ length: bins }, () => [0, 0] as [number, number])
   const put = (t: number, k: 0 | 1) => { out[Math.min(bins - 1, Math.max(0, Math.floor((t - t0) / span * bins)))][k]++ }
-  const allowed = events.filter(e => e.kind === 'broker.allowed')
-  // Prefer the event stream (complete); fall back to the loaded exchange window.
-  if (allowed.length) allowed.forEach(e => put(e.createdAt, 0))
-  else m.detail.exchangesSummary.forEach(e => put(e.createdAt, 0))
-  events.filter(e => e.kind === 'broker.denied').forEach(e => put(e.createdAt, 1))
-  return { bins: out, t0, t1: tEnd, max: Math.max(1, ...out.map(b => b[0] + b[1])) }
+  for (const t of ok) put(t, 0)
+  for (const t of denied) put(t, 1)
+  let max = 1
+  for (const b of out) if (b[0] + b[1] > max) max = b[0] + b[1]
+  return { bins: out, t0, t1: tEnd, max }
+}
+
+/** Aggregate status of a group of workers (paused/waiting beats running beats failed beats complete). */
+export function aggStatus(list: readonly { status: string }[]) {
+  const has = (s: string) => list.some(a => a.status === s)
+  return has('paused') || has('waiting_approval') ? 'paused' : has('running') ? 'running' : has('failed') ? 'failed' : 'complete'
 }

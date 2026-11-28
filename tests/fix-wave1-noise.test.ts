@@ -1,6 +1,5 @@
 /**
- * Regression suite for P0 #3a, P0 #3b, P1 #4b, and P1 #5a:
- * - P0 #3a: Exclude static CDN asset extensions/prefixes & anonymous personas from `hyp_rt_cache` cache-bleed hypotheses
+ * Regression suite for P0 #3b, P1 #4b, and P1 #5a:
  * - P0 #3b: Stop minting fake `POST /_actions/<fn>` routes for Next.js `"use server"` functions; record metadata hints instead
  * - P1 #4b: Multi-repo mounted workspaces attach real bounded `phase0.code_slices` (`code_slices_attached > 0`)
  * - P1 #5a: Phase-0 uniform edge-protection wall fingerprinting (Vercel Deployment Protection 401, Cloudflare Access 302/403)
@@ -14,9 +13,6 @@ import { describe, test } from 'node:test'
 import type { TestContext } from 'node:test'
 import { RequestBroker } from '../src/server/broker.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant } from '../src/server/broker.ts'
-import {
-  inferRuntimeInvariantHypotheses,
-} from '../src/server/invariant-synthesizer.ts'
 import {
   extractStaticFrameworkRoutes,
   runPhase0Recon,
@@ -91,101 +87,6 @@ function makeExchange(
     createdAt: Date.now(),
   } as unknown as BrokerExchangeResult
 }
-
-describe('P0 #3a: Eliminate Wave-1 CDN static-asset & anonymous cache-bleed spam', () => {
-  test('all static asset extensions, static prefixes, and anonymous personas are excluded from hyp_rt_cache', () => {
-    const cacheHeaders = { 'Cache-Control': 'public, max-age=31536000', 'X-Cache': 'HIT' }
-    const staticPaths = [
-      '/logo.png',
-      '/icons/arrow.svg',
-      '/hero.jpg',
-      '/photo.jpeg',
-      '/banner.webp',
-      '/spinner.gif',
-      '/favicon.ico',
-      '/bundle.css',
-      '/app.js',
-      '/chunk.mjs',
-      '/app.js.map',
-      '/fonts/inter.woff',
-      '/fonts/inter.woff2',
-      '/fonts/mono.ttf',
-      '/fonts/legacy.eot',
-      '/pic.avif',
-      '/intro.mp4',
-      '/clip.webm',
-      '/terms.pdf',
-      '/robots.txt',
-      '/sitemap.xml',
-      '/_next/static/chunks/main-1234.js',
-      '/_next/image?url=%2Fhero.png&w=640&q=75',
-      '/static/logo',
-      '/assets/brand/mark',
-      '/images/cover',
-      '/fonts/sans',
-      '/favicon',
-    ]
-
-    const result = inferRuntimeInvariantHypotheses({
-      mode: 'grey-box',
-      personaObservations: [
-        ...staticPaths.map(path => ({
-          persona: 'user_a',
-          surface: 'cdn' as const,
-          serviceOrigin: 'https://cdn.app.test',
-          method: 'GET',
-          path,
-          status: 200,
-          responseHeaders: cacheHeaders,
-        })),
-        ...['anonymous', 'anon', 'ANONYMOUS', 'unauthenticated', '', '   '].map((persona, i) => ({
-          persona,
-          surface: 'http' as const,
-          serviceOrigin: 'https://api.app.test',
-          method: 'GET',
-          path: `/api/public-${i}`,
-          status: 200,
-          responseHeaders: cacheHeaders,
-        })),
-        // Non-static API routes under /api/assets and /api/images with authenticated persona MUST still emit
-        { persona: 'user_a', surface: 'http', serviceOrigin: 'https://api.app.test', method: 'GET', path: '/api/v1/assets/123', status: 200, responseHeaders: { 'Cache-Control': 'public, max-age=300' } },
-      ],
-    })
-
-    const cacheHyps = result.hypotheses.filter(h => h.id.startsWith('hyp_rt_cache_'))
-    assert.equal(cacheHyps.length, 1, `Expected only /api/v1/assets/123, got: ${cacheHyps.map(h => h.targetRoute).join(', ')}`)
-    assert.equal(cacheHyps[0]!.targetRoute, 'GET /api/v1/assets/123')
-  })
-
-  test('static assets and anonymous personas NEVER generate hyp_rt_cache, while authenticated API endpoints STILL do', () => {
-    const cacheHeaders = { 'Cache-Control': 'public, max-age=31536000', 'X-Cache': 'HIT' }
-    const result = inferRuntimeInvariantHypotheses({
-      mode: 'grey-box',
-      personaObservations: [
-        // Anonymous CDN static assets (the exact spam pattern from cdf8b04e)
-        { persona: 'anonymous', surface: 'cdn', serviceOrigin: 'https://cdn.app.test', method: 'GET', path: '/logo.png', status: 200, responseHeaders: cacheHeaders },
-        { persona: 'anonymous', surface: 'cdn', serviceOrigin: 'https://cdn.app.test', method: 'GET', path: '/icon.svg', status: 200, responseHeaders: cacheHeaders },
-        { persona: 'anonymous', surface: 'cdn', serviceOrigin: 'https://cdn.app.test', method: 'GET', path: '/_next/static/chunks/framework.js', status: 200, responseHeaders: cacheHeaders },
-        { persona: 'anonymous', surface: 'http', serviceOrigin: 'https://app.test', method: 'GET', path: '/_next/image?url=%2Fhero.png&w=384', status: 200, responseHeaders: cacheHeaders },
-        // Authenticated persona fetching static assets -> still NOT cache-bleed spam
-        { persona: 'user_a', surface: 'cdn', serviceOrigin: 'https://cdn.app.test', method: 'GET', path: '/banner.png', status: 200, responseHeaders: cacheHeaders },
-        { persona: 'user_a', surface: 'http', serviceOrigin: 'https://app.test', method: 'GET', path: '/_next/static/chunks/app.js', status: 200, responseHeaders: cacheHeaders },
-        { persona: 'user_a', surface: 'http', serviceOrigin: 'https://app.test', method: 'GET', path: '/static/theme.css', status: 200, responseHeaders: cacheHeaders },
-        // Anonymous persona on an API endpoint -> MUST NOT emit cross-user cache-bleed
-        { persona: 'anonymous', surface: 'http', serviceOrigin: 'https://api.app.test', method: 'GET', path: '/api/public-catalog', status: 200, responseHeaders: cacheHeaders },
-        { persona: 'anon', surface: 'http', serviceOrigin: 'https://api.app.test', method: 'GET', path: '/api/pricing', status: 200, responseHeaders: cacheHeaders },
-        // Genuine authenticated API endpoint with public cacheable response and no Vary: Authorization/Cookie -> MUST emit hyp_rt_cache!
-        { persona: 'user_a', surface: 'http', serviceOrigin: 'https://api.app.test', method: 'GET', path: '/api/account', status: 200, responseHeaders: { 'Cache-Control': 'public, max-age=300' } },
-      ],
-    })
-
-    const cacheHyps = result.hypotheses.filter(h => h.id.startsWith('hyp_rt_cache_'))
-    assert.equal(cacheHyps.length, 1, `Expected exactly 1 hyp_rt_cache hypothesis, got ${cacheHyps.length}: ${cacheHyps.map(h => h.targetRoute).join(', ')}`)
-    assert.equal(cacheHyps[0]!.targetRoute, 'GET /api/account')
-    assert.equal(cacheHyps[0]!.serviceOrigin, 'https://api.app.test')
-    assert.ok(cacheHyps[0]!.evidence.includes('persona=user_a'))
-  })
-})
 
 describe('P0 #3b: Stop emitting fake POST /_actions/<fn> endpoints for Next.js "use server"', () => {
   test('"use server" functions record serverActions metadata without minting synthetic /_actions/* routes', async t => {

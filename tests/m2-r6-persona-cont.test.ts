@@ -7,12 +7,9 @@ import {
   buildExploiterSystemPrompt,
   buildExploiterUserPrompt,
 } from '../src/server/exploiter-tools.ts'
-import { synthesizeGreyBoxDataflowGraph } from '../src/server/gb-dataflow-synthesizer.ts'
 import type { RecordedRequestExchange } from '../src/server/trace-proof-compiler.ts'
 
 const API_ORIGIN = 'https://api.m2r6-lab.example'
-const EDGE_ORIGIN = 'https://edge.m2r6-lab.example'
-const AUTH_ORIGIN = 'https://auth.m2r6-lab.example'
 
 function extractText(res: { output?: Array<{ type: string; text?: string }> }): string {
   return (res.output ?? []).map(p => p.text ?? '').join('\n')
@@ -195,48 +192,10 @@ describe('M2 R6 Fix 1: multi-tenant persona classification, prompt separation, h
     assert.equal(verifyCalls, 1)
   })
 
-  test('gb-dataflow-synthesizer selects lowest-privilege configured persona consistently without keyword-based persona rewriting', () => {
-    const personas = [
-      { handle: 'owner_a', roleLabel: 'owner' },
-      { handle: 'member_a', roleLabel: 'member' },
-      { handle: 'shared_actor', roleLabel: 'memberships=admin:org_a,viewer:org_b' },
-    ]
-    const cacheRes = synthesizeGreyBoxDataflowGraph({
-      approvedOrigins: [API_ORIGIN, EDGE_ORIGIN],
-      endpoints: [
-        { id: 'c1', origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/cache/prime', riskScore: 80 },
-        { id: 'c2', origin: EDGE_ORIGIN, method: 'GET', pathTemplate: '/v1/cache/:id/export', riskScore: 86 },
-      ],
-      brokerExchanges: [
-        { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/cache/prime', status: 200, personaHandle: 'member_a', bodyPreview: JSON.stringify({ cache_id: 'c_1' }) },
-      ],
-      personas,
-    })
-    assert.ok(cacheRes.chains.length >= 1)
-    assert.match(cacheRes.chains[0]!.step.hypothesis, /Base persona:\s*member_a\b/)
-    assert.match(cacheRes.chains[0]!.step.hypothesis, /Relevant personas:\s*member_a\b/)
-
-    const regularRes = synthesizeGreyBoxDataflowGraph({
-      approvedOrigins: [AUTH_ORIGIN, API_ORIGIN],
-      endpoints: [
-        { id: 'r1', origin: AUTH_ORIGIN, method: 'POST', pathTemplate: '/oauth/invites', riskScore: 80 },
-        { id: 'r2', origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/invites/redeem', riskScore: 85 },
-      ],
-      endpointParams: [
-        { endpointId: 'r2', name: 'invite_token', location: 'body', inferredType: 'string' },
-      ],
-      brokerExchanges: [
-        { origin: AUTH_ORIGIN, method: 'POST', pathAndQuery: '/oauth/invites', status: 201, personaHandle: 'owner_a', bodyPreview: JSON.stringify({ invite_token: 'inv_1' }) },
-      ],
-      personas,
-    })
-    assert.ok(regularRes.chains.length >= 1)
-    assert.match(regularRes.chains[0]!.step.hypothesis, /Base persona:\s*member_a\b/)
-  })
 })
 
 describe('M2 R6 Fix 2: configured-order primary low-priv tie-breaking and single-actor continuity', () => {
-  test('assignment-brief, exploiter user/system prompt, and gb-dataflow-synthesizer preserve configIndex ASC within same tier over alphabetical or harvestedIds/observation frequency', () => {
+  test('assignment-brief and exploiter user/system prompt preserve configIndex ASC within same tier over alphabetical or harvestedIds/observation frequency', () => {
     // 1. assignment-brief: member_z configured at index 0 with 0 harvestedIds beats member_a at index 1 with 3 harvestedIds
     const brief = JSON.parse(buildAssignmentBriefPacket({
       missionKind: 'multihop_chain',
@@ -274,28 +233,6 @@ describe('M2 R6 Fix 2: configured-order primary low-priv tie-breaking and single
     assert.equal(user.attackerBasePersonas.primary, 'member_z')
     assert.deepEqual(user.attackerBasePersonas.personas.map(p => p.handle), ['member_z', 'member_a'])
     assert.match(user.attackerBasePersonas.instruction, /non-elevated personas/i)
-
-    // 3. gb-dataflow-synthesizer: member_a configured at index 0 beats member_b even when member_b dominates Phase-0 observations,
-    //    and member_z configured before member_a wins over alphabetical member_a!
-    const synthRes = synthesizeGreyBoxDataflowGraph({
-      approvedOrigins: [API_ORIGIN, EDGE_ORIGIN],
-      endpoints: [
-        { id: 'e1', origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/orders', riskScore: 80 },
-        { id: 'e2', origin: EDGE_ORIGIN, method: 'POST', pathTemplate: '/v1/orders/:id/approve', riskScore: 85 },
-      ],
-      brokerExchanges: [
-        { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/orders', status: 201, personaHandle: 'member_b', bodyPreview: JSON.stringify({ order_id: 'ord_1' }) },
-        { origin: EDGE_ORIGIN, method: 'POST', pathAndQuery: '/v1/orders/ord_1/approve', status: 200, personaHandle: 'member_b', bodyPreview: JSON.stringify({ ok: true }) },
-      ],
-      personas: [
-        { handle: 'member_z', roleLabel: 'member' },
-        { handle: 'member_a', roleLabel: 'member' },
-        { handle: 'member_b', roleLabel: 'member' },
-      ],
-    })
-    assert.ok(synthRes.chains.length >= 1)
-    assert.match(synthRes.chains[0]!.step.hypothesis, /Base persona:\s*member_z\b/)
-    assert.match(synthRes.chains[0]!.step.hypothesis, /Relevant personas:\s*member_z, member_a, member_b\b/)
   })
 })
 
