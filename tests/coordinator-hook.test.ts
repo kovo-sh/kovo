@@ -135,7 +135,7 @@ describe('coordinator PreToolUse hook & config (A4 #1)', () => {
     assert.match(skill, /file:line` \+ symbol\/function name/)
   })
 
-  it('allows whitelisted orchestration commands in coordinator mode', () => {
+  it('allows whitelisted orchestration commands and grep/rg/git grep/grep_search in coordinator mode', () => {
     const brain = makeFakeBrain({
       convId: 'coord-conv-001',
       withSwarmJson: true,
@@ -148,6 +148,11 @@ describe('coordinator PreToolUse hook & config (A4 #1)', () => {
         'git log --oneline -n 10',
         'git commit -m "docs: mention ssh and grep in message"',
         'git log --grep=ssh -n 5',
+        'rg -n "verifyClaim" src/server/',
+        'grep -rn "verifyClaim" src/',
+        'git status && grep -n foo benchmarks/multihop-saas/README.md',
+        'git grep "verifyClaim" src/',
+        'echo $(rg "token" worker/)',
         'scripts/merge-stream.sh agents/coord-hook-delegation',
         'bash scripts/merge-stream.sh agents/foo',
         'npx tsx scripts/certify-v8.ts --out /tmp/score.json',
@@ -177,14 +182,29 @@ describe('coordinator PreToolUse hook & config (A4 #1)', () => {
             args: { CommandLine: cmd },
           },
         })
-        assert.equal(out.decision, 'allow', `expected allow for whitelisted command: ${cmd}`)
+        assert.equal(out.decision, 'allow', `expected allow for command: ${cmd}`)
       }
+
+      const grepSearchOut = runHook({
+        conversationId: 'coord-conv-001',
+        artifactDirectoryPath: brain.brainDir,
+        transcriptPath: brain.transcriptPath,
+        cwd: '/home/omarchy/kovo',
+        workspacePaths: ['/home/omarchy/kovo'],
+        hookEventName: 'PreToolUse',
+        toolCall: {
+          id: 'toolu_allow_grep_search',
+          name: 'grep_search',
+          args: { Query: 'verifyClaim', SearchPath: '/home/omarchy/kovo/src' },
+        },
+      })
+      assert.equal(grepSearchOut.decision, 'allow', 'expected allow for grep_search')
     } finally {
       brain.cleanup()
     }
   })
 
-  it('hard-blocks ssh, docker exec, sqlite3, rg, grep, and git grep in coordinator mode', () => {
+  it('hard-blocks ssh, docker exec, and sqlite3 in coordinator mode', () => {
     const brain = makeFakeBrain({
       convId: 'coord-conv-002',
       withSwarmJson: true,
@@ -199,11 +219,6 @@ describe('coordinator PreToolUse hook & config (A4 #1)', () => {
         { cmd: 'docker exec kovo-worker-1 ps aux', expectedSubagent: 'self' },
         { cmd: "newgrp docker -c 'docker exec -it kovo-worker ls'", expectedSubagent: 'self' },
         { cmd: 'sqlite3 ~/guardian-data/kovo.db "SELECT count(*) FROM runs"', expectedSubagent: 'self' },
-        { cmd: 'rg -n "verifyClaim" src/server/', expectedSubagent: 'research' },
-        { cmd: 'grep -rn "verifyClaim" src/', expectedSubagent: 'research' },
-        { cmd: 'git status && grep -n foo benchmarks/multihop-saas/README.md', expectedSubagent: 'research' },
-        { cmd: 'git grep "verifyClaim" src/', expectedSubagent: 'research' },
-        { cmd: 'echo $(rg "token" worker/)', expectedSubagent: 'research' },
       ]
 
       for (const tc of blockedCases) {
