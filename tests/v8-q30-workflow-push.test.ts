@@ -244,10 +244,10 @@ test('Q30.2: convertCodeAuditSuspectsToChainSteps synthesizes cache/permission +
   assert.ok(composites[0]!.dependsOnFactIds.includes(fCache.id))
   assert.ok(composites[0]!.dependsOnFactIds.includes(fAsyncExport.id))
 
-  // Composite 2: Request-Parsing -> Concurrent Settlement
-  assert.match(composites[1]!.title, /Request-Parsing -> Concurrent Settlement/i)
+  // Composite 2: Structural Cross-Service Pivot (no hardcoded concurrent_settlement keyword template)
+  assert.match(composites[1]!.title, /Cross-Service .* Pivot/i)
+  assert.ok(composites[1]!.dependsOnFactIds.length >= 2)
   assert.ok(composites[1]!.dependsOnFactIds.includes(fParser.id))
-  assert.ok(composites[1]!.dependsOnFactIds.includes(fRace.id))
 
   // Both synthesized composites outline full 3-5 stage sequences and single-script SDK helpers.
   for (const comp of composites) {
