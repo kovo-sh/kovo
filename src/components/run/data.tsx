@@ -15,7 +15,8 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import type { ReactNode } from 'react'
 import { commandRun, readExchange, readRunEventsPage, runData, runShellData } from '../../actions.ts'
 import type { RunCommand } from '../../domain.ts'
-import { buildRunModel, buildVerdict } from './model.ts'
+import { buildRunModel, buildVerdict, normalizeRunDetail } from './model.ts'
+import { operatorErrorCopy } from './format.ts'
 import type { Detail, RunEvent, RunModel, Verdict } from './model.ts'
 
 /** A run command without the envelope fields (runId, requestId) the data layer adds. */
@@ -416,7 +417,10 @@ export function RunDataProvider({ initial, children, onError }: {
   onError?: (message: string) => void
 }) {
   const [snapshot, setSnapshot] = useState<Detail>()
-  const detail = snapshot && snapshot.run.id === initial.run.id && snapshot.cursor >= initial.cursor ? snapshot : initial
+  const rawDetail = snapshot && snapshot.run.id === initial.run.id && snapshot.cursor >= initial.cursor ? snapshot : initial
+  // Boundary normalisation: initial load, every refresh and every SSE-driven snapshot pass
+  // through here, so a malformed row can never throw inside buildRunModel.
+  const detail = useMemo(() => normalizeRunDetail(rawDetail), [rawDetail])
   const runId = initial.run.id
   const [now, setNow] = useState(() => Date.now())
   const model = useMemo(() => buildRunModel(detail, now), [detail, now])
@@ -612,7 +616,7 @@ export function RunDataProvider({ initial, children, onError }: {
       await refresh()
       return result
     } catch (failure) {
-      const message = failure instanceof Error ? failure.message : 'Kovo could not complete the action.'
+      const message = failure instanceof Error || typeof failure === 'string' ? operatorErrorCopy(failure) : 'Kovo could not complete the action.'
       setError(message)
       onErrorRef.current?.(message)
       if (command.action === 'scope') await refresh()

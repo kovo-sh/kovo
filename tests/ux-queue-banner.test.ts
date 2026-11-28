@@ -303,7 +303,7 @@ test('QueueRailBadge hides at 0 and renders solid bg-accent text-accent-fg font-
   assert.match(approvalHtml, /bg-accent/)
   assert.match(approvalHtml, /text-accent-fg/)
   assert.match(approvalHtml, /font-semibold/)
-  assert.match(approvalHtml, /scale-115/)
+  assert.match(approvalHtml, /scale-\[1\.08\]/)
   assert.match(approvalHtml, /title="2 waiting for approval"/)
   assert.match(approvalHtml, />2<\/span>/)
   assert.doesNotMatch(approvalHtml, /bg-warn-soft|text-warn/)

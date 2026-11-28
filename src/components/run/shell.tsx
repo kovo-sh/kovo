@@ -1,8 +1,8 @@
 // The run workspace shell: providers, rail, run line header, view outlet,
 // resizable inspector pane, global keyboard model, palette, toasts.
-import { Link, useNavigate } from '@tanstack/react-router'
-import { useCallback, useEffect, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
+import { Link, useNavigate, useRouter } from '@tanstack/react-router'
+import { Component, useCallback, useEffect, useRef, useState } from 'react'
+import type { ErrorInfo, ReactNode } from 'react'
 import { BoardPane, useBoardSeen } from './coordinator.tsx'
 import { RunDataProvider, useRun } from './data.tsx'
 import { ACTIONS, approvalCommand, DecisionsProvider, useDecisions } from './decisions.tsx'
@@ -13,14 +13,13 @@ import { KeyboardProvider, useShortcuts } from './keyboard.tsx'
 import { VIEWS } from './meta.ts'
 import type { ViewId } from './meta.ts'
 import type { Approval, Detail, RunEvent } from './model.ts'
-import { useReducedMotion } from './motion.tsx'
 import { NavProvider, selKey, useNav } from './nav.tsx'
 import type { Sel } from './nav.tsx'
 import { OverlaysProvider, useOverlays } from './overlays.tsx'
 import { FallbackInspector } from './pane.tsx'
 import { PaletteProvider, usePalette } from './palette.tsx'
 import { PanelErrorBoundary } from './panel-error-boundary.tsx'
-import { Rail } from './rail.tsx'
+import { Rail, RailFallback } from './rail.tsx'
 import { useTheme } from './theme.ts'
 import { ToastProvider, useToast } from './toast.tsx'
 import { cn, runBtn } from './tw.ts'
@@ -64,22 +63,87 @@ export function RunShell({ detail, view, sel }: { detail: Detail; view: ViewId; 
   const switchRun = useCallback((id: string, v?: ViewId) => {
     void navigate({ to: '/runs/$runId', params: { runId: id }, search: v ? { view: v } : {} })
   }, [navigate])
-  return <div className="relative h-screen overflow-hidden bg-bg font-sans text-[13px] leading-5 tracking-[-0.003em] text-fg antialiased">
+  return <div className="relative h-screen overflow-clip bg-bg font-sans text-[13px] leading-5 tracking-[-0.003em] text-fg antialiased">
     <KeyboardProvider>
       <ToastProvider>
-        <DataWithToasts detail={detail}>
-          <NavWithRun runId={runId} view={view} sel={sel} go={go} switchRun={switchRun}>
-            <DecisionsProvider>
-              <OverlaysProvider>
-                <PaletteProvider>
-                  <Workspace />
-                </PaletteProvider>
-              </OverlaysProvider>
-            </DecisionsProvider>
-          </NavWithRun>
-        </DataWithToasts>
+        <RunErrorBoundary resetKey={detail} projectId={detail.run.projectId} runId={runId}>
+          <DataWithToasts detail={detail}>
+            <NavWithRun runId={runId} view={view} sel={sel} go={go} switchRun={switchRun}>
+              <DecisionsProvider>
+                <OverlaysProvider>
+                  <PaletteProvider>
+                    <Workspace />
+                  </PaletteProvider>
+                </OverlaysProvider>
+              </DecisionsProvider>
+            </NavWithRun>
+          </DataWithToasts>
+        </RunErrorBoundary>
       </ToastProvider>
     </KeyboardProvider>
+  </div>
+}
+
+interface RunErrorBoundaryProps {
+  /** Changing this (e.g. a fresh `detail` after `router.invalidate()`) clears the error. */
+  resetKey: unknown
+  projectId: string
+  runId: string
+  children: ReactNode
+}
+
+/**
+ * Run-level error boundary above `RunDataProvider`: a malformed record that
+ * throws while building the run model keeps the rail and offers a reload,
+ * instead of replacing the whole page with the root error screen.
+ */
+class RunErrorBoundary extends Component<RunErrorBoundaryProps, { error: string | null }> {
+  override state: { error: string | null } = { error: null }
+
+  static getDerivedStateFromError(error: unknown): { error: string } {
+    const msg = error instanceof Error ? error.message.trim() : typeof error === 'string' ? error.trim() : ''
+    return { error: msg.slice(0, 240) || 'Unexpected rendering error.' }
+  }
+
+  override componentDidCatch(error: Error, info: ErrorInfo): void {
+    console.error('[kovo] run workspace failed to render', error, info.componentStack)
+  }
+
+  override componentDidUpdate(prev: RunErrorBoundaryProps): void {
+    if (this.state.error !== null && prev.resetKey !== this.props.resetKey) this.setState({ error: null })
+  }
+
+  override render(): ReactNode {
+    if (this.state.error === null) return this.props.children
+    return <RunErrorFallback projectId={this.props.projectId} runId={this.props.runId} message={this.state.error} />
+  }
+}
+
+function RunErrorFallback({ projectId, runId, message }: { projectId: string; runId: string; message: string }) {
+  const router = useRouter()
+  const [reloading, setReloading] = useState(false)
+  const reload = () => {
+    setReloading(true)
+    void router.invalidate().finally(() => setReloading(false))
+  }
+  return <div className="grid h-screen grid-cols-[232px_minmax(0,1fr)] overflow-clip">
+    <RailFallback projectId={projectId} runId={runId} />
+    <main className="flex min-h-0 min-w-0 items-center justify-center overflow-clip bg-panel p-6" aria-label="Run">
+      <div className="flex max-w-[440px] flex-col items-start gap-2.5" role="alert" data-testid="run-error-boundary">
+        <span className="inline-flex size-8 items-center justify-center rounded-full bg-danger-soft text-danger"><Icon name="alert" /></span>
+        <h2 className="m-0 text-[15px] font-semibold text-fg">This run couldn’t be displayed</h2>
+        <p className="m-0 text-[12.5px] leading-[19px] text-fg-muted">
+          A record in this run could not be read, so the workspace stopped rendering. Reloading fetches fresh run data; the scan itself is unaffected.
+        </p>
+        <p className="m-0 max-w-full break-words font-mono text-[11.5px] leading-[17px] text-fg-subtle [overflow-wrap:anywhere]">{message}</p>
+        <div className="mt-1 flex items-center gap-1.5">
+          <button type="button" className={runBtn({ variant: 'primary' })} disabled={reloading} onClick={reload} data-testid="run-error-reload">
+            <Icon name="replay" />{reloading ? 'Reloading…' : 'Reload run'}
+          </button>
+          <Link className={runBtn({ variant: 'ghost' })} to="/projects/$projectId" params={{ projectId }} search={{ tab: 'runs' }}>Back to project</Link>
+        </div>
+      </div>
+    </main>
   </div>
 }
 
@@ -125,21 +189,16 @@ function Workspace() {
   useGlobalShortcuts(hideBoardBeforeApproval)
   useBoardSeen()
   const View = VIEW_COMPONENTS[nav.view]
-  const rm = useReducedMotion()
   const paneHidden = hideBoardBeforeApproval || nav.paneCollapsed
   const cols = paneHidden
     ? 'grid-cols-[232px_minmax(0,1fr)_0px]'
     : 'grid-cols-[232px_minmax(0,1fr)_var(--pane-w,404px)] max-[1180px]:[--pane-w:360px]'
   return <div
-    className={cn(
-      'grid h-screen',
-      cols,
-      !resizing && !rm && 'transition-[grid-template-columns] duration-[var(--d2)] ease-kovo',
-    )}
+    className={cn('grid h-screen overflow-clip', cols, resizing && 'select-none')}
     style={paneW && !paneHidden ? { ['--pane-w' as string]: paneW + 'px' } : undefined}
   >
     <Rail />
-    <main className="relative flex min-h-0 min-w-0 flex-col bg-panel" aria-label="Run">
+    <main className="relative flex min-h-0 min-w-0 flex-col overflow-clip bg-panel" aria-label="Run">
       <RunHeader />
       <RunBanners />
       <div key={nav.view} className="relative flex min-h-0 flex-1 flex-col" id="vh">
@@ -155,8 +214,8 @@ function Workspace() {
     {!hideBoardBeforeApproval && <aside
       ref={paneRef}
       className={cn(
-        'relative flex min-h-0 min-w-0 flex-col border-l border-line bg-panel transition-opacity duration-[var(--d2)] ease-kovo motion-reduce:transition-none',
-        nav.paneCollapsed && 'pointer-events-none overflow-hidden border-l-transparent opacity-0 duration-[var(--d1)]',
+        'relative flex min-h-0 min-w-0 flex-col overflow-clip [overflow-clip-margin:4px] border-l border-line bg-panel transition-opacity duration-[var(--d2)] ease-kovo motion-reduce:transition-none',
+        nav.paneCollapsed && 'pointer-events-none border-l-transparent opacity-0 duration-[var(--d1)]',
       )}
       aria-label="Inspector"
       aria-hidden={nav.paneCollapsed || undefined}
@@ -263,6 +322,14 @@ export function latestAuthIssue(events: readonly RunEvent[]): RunEvent | null {
     if (!latest || ev.id > latest.id) latest = ev
   }
   return latest
+}
+
+/** One-sentence budget-paused summary shared by the banner text and its title. */
+export function budgetPausedCopy(r: { spentUsd: number; budgetUsd: number; spentRequests: number; budgetRequests: number }): string {
+  const reqs = r.budgetRequests
+    ? `${fmtN(r.spentRequests)} / ${fmtN(r.budgetRequests)} requests`
+    : `${fmtN(r.spentRequests)} requests (uncapped)`
+  return `Paused at budget: ${fmtUsd(r.spentUsd)} / ${fmtUsd(r.budgetUsd)} · ${reqs}. Partial report saved.`
 }
 
 function openHeaderBudgetPopover() {
@@ -406,8 +473,8 @@ function RunBanners() {
     />}
     {r.status === 'budget_paused' && <div className={wCls} role="status" aria-label="Budget paused" data-testid="budget-paused-banner">
       <Icon name="budget" className="text-warn" />
-      <span className="min-w-0 flex-1 truncate">
-        <b className="font-medium text-fg">Paused at the budget ceiling.</b> Spent {fmtUsd(r.spentUsd)} of {fmtUsd(r.budgetUsd)} and {fmtN(r.spentRequests)} of {r.budgetRequests ? fmtN(r.budgetRequests) : 'uncapped'} requests. A partial report is saved.
+      <span className="num line-clamp-2 min-w-0 flex-1 whitespace-normal" title={budgetPausedCopy(r)}>
+        <b className="font-medium text-fg">Paused at budget:</b> {budgetPausedCopy(r).slice('Paused at budget: '.length)}
       </span>
       <button type="button" data-rl-btn="" className={runBtn({ variant: 'primary' })} onClick={openHeaderBudgetPopover}>
         <Icon name="budget" />Raise budget

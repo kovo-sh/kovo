@@ -14,7 +14,7 @@ import { fmtN, fmtUsd, host, plural, words } from '../format.ts'
 import { StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
-import { runStatusLabel } from '../meta.ts'
+import { PHASE_LABEL, runStatusLabel } from '../meta.ts'
 import { useOverlays } from '../overlays.tsx'
 import { useToast } from '../toast.tsx'
 import { cn, runBtn, RW } from '../tw.ts'
@@ -867,6 +867,48 @@ const STEPS: [string, string][] = [
   ['Report', 'Findings, coverage, and gaps.'],
 ]
 
+/** Why "Approve & start" is unavailable, or null when the only blocker is an in-flight approval. */
+export function approveBlockReason(input: {
+  reviewable: boolean
+  discovery: boolean
+  count: number
+  overLimit: boolean
+  phase: string
+  status: string
+}): string | null {
+  if (input.overLimit) return `Choose up to ${maxScopeHosts} hosts.`
+  if (!input.discovery && input.count === 0) return 'Select at least one host to start the assessment.'
+  if (!input.reviewable) {
+    const phase = PHASE_LABEL[input.phase] ?? input.phase
+    return [
+      'Scope can’t be approved from this view',
+      phase && `during ${phase.toLowerCase()}`,
+      `(run ${runStatusLabel(input.status).toLowerCase()}).`,
+    ].filter(Boolean).join(' ')
+  }
+  return null
+}
+
+/** Assessment track: a continuous segment per step, the current step marked for AT (A-141). */
+function ConsentStepper() {
+  return <ol className="m-0 mt-5 grid list-none grid-cols-5 border-t border-line p-0" aria-label="Assessment steps" data-testid="consent-stepper">
+    {STEPS.map((s, i) => {
+      const cur = i === 0
+      return <li
+        key={s[0]}
+        aria-current={cur ? 'step' : undefined}
+        className={cn(
+          'relative pr-3 pt-2.5 text-[12px] leading-[17px] text-fg-subtle before:absolute before:-top-px before:left-0 before:right-3 before:h-0.5 before:content-[""]',
+          cur ? 'before:bg-accent' : 'before:bg-line-2',
+        )}
+      >
+        <b className={cn('mb-0.5 block font-medium', cur ? 'text-fg' : 'text-fg-muted')}>{s[0]}</b>
+        {s[1]}
+      </li>
+    })}
+  </ol>
+}
+
 /** Overview for a waiting run: "Nothing has been sent yet." */
 export function ConsentView() {
   const { detail, send } = useRun()
@@ -904,12 +946,10 @@ export function ConsentView() {
   const nw = (r.goal || '').split(/\s+/).filter(Boolean).length
   const count = discovery ? hosts.length : draft.assetIds.length
   const overLimit = draft.assetIds.length > maxScopeHosts
-  const canApprove = !approving && canReviewScope(r.phase, r.status) && (discovery || (count > 0 && !overLimit))
-  const footerNote = overLimit
-    ? `Choose up to ${maxScopeHosts} hosts.`
-    : !discovery && count === 0
-      ? 'Select at least one host to start the assessment.'
-      : null
+  const reviewable = canReviewScope(r.phase, r.status)
+  const canApprove = !approving && reviewable && (discovery || (count > 0 && !overLimit))
+  // A disabled "Approve & start" always says why, in the sticky bar and on the button (A-140).
+  const footerNote = approveBlockReason({ reviewable, discovery, count, overLimit, phase: r.phase, status: r.status })
 
   const approve = async () => {
     if (!canApprove) return
@@ -977,21 +1017,7 @@ export function ConsentView() {
         setDraft={setDraft}
         onHostsTouched={() => setUserTouchedHosts(true)}
       />
-      <div className="mt-5 grid grid-cols-5 border-t border-line">
-        {STEPS.map((s, i) => {
-          const cur = i === 0
-          return <div
-            key={s[0]}
-            className={cn(
-              'relative pr-3 pt-2.5 text-[12px] leading-[17px] text-fg-subtle before:absolute before:-top-px before:left-0 before:w-7 before:content-[""]',
-              cur ? 'before:h-0.5 before:bg-accent' : 'before:h-px before:bg-fg-subtle',
-            )}
-          >
-            <b className={cn('mb-0.5 block font-medium', cur ? 'text-fg' : 'text-fg-muted')}>{s[0]}</b>
-            {s[1]}
-          </div>
-        })}
-      </div>
+      <ConsentStepper />
       <LabPanel className="mt-5 border-t border-line" />
     </div>
 
@@ -1005,7 +1031,7 @@ export function ConsentView() {
           {footerNote
             ? <span className="inline-flex items-center gap-1.5 font-medium text-warn">
                 <Icon name="alert" size={13} className="flex-none" />
-                <span className="truncate">{footerNote}</span>
+                <span className="truncate" title={footerNote} data-testid="consent-footer-note">{footerNote}</span>
               </span>
             : <span className="num text-fg-muted">{stickySummary}</span>}
         </div>
@@ -1022,7 +1048,14 @@ export function ConsentView() {
             Cancel
           </Link>
           {!discovery && <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => { if (editing) { setUserTouchedHosts(false); setDraftState(initialDraft(r, defaults, rpsMax)) } else { setEditing(true) } }}>{editing ? 'Reset' : 'Edit scope'}</button>}
-          <button type="button" className={runBtn({ variant: 'primary' })} disabled={!canApprove} onClick={() => void approve()}>
+          <button
+            type="button"
+            className={runBtn({ variant: 'primary' })}
+            disabled={!canApprove}
+            title={canApprove ? undefined : approving ? 'Starting the assessment…' : footerNote ?? undefined}
+            data-testid="consent-approve"
+            onClick={() => void approve()}
+          >
             {approving ? 'Starting…' : <>Approve &amp; start<Kbd inverted className="ml-0.5">A</Kbd></>}
           </button>
         </div>
