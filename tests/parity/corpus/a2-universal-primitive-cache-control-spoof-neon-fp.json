@@ -1,0 +1,131 @@
+{
+  "id": "a2-universal-primitive-cache-control-spoof-neon-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "a2-wire-cache-primed-unauth-control-spoof",
+  "description": "R3-05 independent-review FP (Track A2 universal primitives, reviewer gemini-4-neon-high): an authenticated member (member_a) reads a shared logged-in announcement endpoint whose response body is identical to another member's (member_b) response, using an unauthenticated 401 request as cleanControl. Because Track A2 removed the brittle X-Cache: HIT header check in favor of victim-matched digest + control ablation, wire_framing_and_cache_differential / parser_cache_differential (cache_primed) MUST bind cleanControl to the same attacker principal and HTTP method as attackerProbe and reject unauthenticated 401 controls for authenticated probes, otherwise any shared authenticated endpoint confirms as cache bleed.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/own-org-terminal-guard.ts",
+      "src/server/v8-oracle-families.ts",
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/verify-rpc.ts"
+    ],
+    "classes": [
+      "parser_cache_differential",
+      "cache_bleed"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-525",
+    "category": "cache-deception",
+    "title": "Shared authenticated endpoint misclassified as cache bleed via unauthenticated 401 cleanControl",
+    "impact": "An unauthenticated 401 control does not ablate an authenticated member's read of a shared endpoint; cache_primed must enforce control/variant actor and method parity so matching shared responses fail closed.",
+    "claimedImpact": "other",
+    "claimedBoundary": "other",
+    "vulnClass": "business_logic"
+  },
+  "freeTextLabel": {
+    "title": "Shared logged-in announcement endpoint matches another member response"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member [slug=tenant-a] (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-a2cache-neon-member-a"
+    },
+    {
+      "handle": "member_b",
+      "roleLabel": "member [slug=tenant-b] (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-a2cache-neon-member-b"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_anon_401",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/announcements/public",
+      "persona": null,
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"authentication_required\"}"
+    },
+    {
+      "id": "prime_b",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/announcements/public",
+      "persona": "member_b",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"announcement\":\"Scheduled maintenance Sunday 02:00 UTC\",\"tier\":\"all_members\"}"
+    },
+    {
+      "id": "probe_a",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/announcements/public",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"announcement\":\"Scheduled maintenance Sunday 02:00 UTC\",\"tier\":\"all_members\"}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-A2-WIRE-CACHE-CONTROL-SPOOF-NEON-FP",
+    "terminalVulnClass": "parser_cache_differential",
+    "oracleFamily": "parser_cache_differential",
+    "singleHop": true,
+    "attackerPersonas": [
+      "member_a"
+    ],
+    "preChainControlIds": [
+      "ctl_anon_401",
+      "prime_b"
+    ],
+    "terminalExchangeId": "probe_a",
+    "claimedDelta": "Authenticated member read shared announcement body matching another member after unauthenticated 401 cleanControl.",
+    "v8OracleInput": {
+      "family": "parser_cache_differential",
+      "rawInput": {
+        "mode": "cache_primed",
+        "cacheKey": "GET /api/v1/announcements/public",
+        "cleanControl": "ctl_anon_401",
+        "victimOrPrimeRequest": "prime_b",
+        "attackerProbe": "probe_a"
+      }
+    }
+  }
+}

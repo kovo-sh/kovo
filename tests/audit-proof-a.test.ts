@@ -587,7 +587,8 @@ test('H-1/H-2/H-7: runner fact custody, floor oracle events, and carrier-body hy
 test('audit proof-kernel file budgets and benchmark-literal contamination remain clean', () => {
   const budgets: Record<string, number> = {
     'src/server/composite-receipt.ts': 750,
-    'src/server/v8-oracle-families.ts': 750,
+    // A2: hosts the 5 universal Tier-1 primitives + invariants absorbed from the retired own-org guard.
+    'src/server/v8-oracle-families.ts': 1400,
     'src/server/verify-rpc.ts': 2300,
     'src/server/verify-claims.ts': 2300,
   }

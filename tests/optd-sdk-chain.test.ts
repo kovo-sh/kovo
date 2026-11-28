@@ -29,7 +29,7 @@ import {
   VERIFY_RPC_TOKEN_ENV,
   VerifyRpcServer,
 } from '../src/server/verify-rpc.ts'
-import { normalizeCompositeReceipt, VerifyContext } from '../worker/kovo_verify/kovo_verify.ts'
+import { accessDifferential, normalizeCompositeReceipt, VerifyContext, wireFramingAndCacheDifferential } from '../worker/kovo_verify/kovo_verify.ts'
 
 process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
@@ -409,14 +409,15 @@ test('live VerifyRpcServer: ch.control(404) + pre-hop ch.readback(200) + ch.race
   assert.equal(built.terminalImpact.oracleInput?.finalReadbackExchangeId, postRb2.exchangeId)
   assert.deepEqual(built.terminalImpact.oracleInput?.actionExchangeIds, burst.results.map(r => r.exchangeId))
 
-  // All economic_conservation class aliases trigger oracleInput synthesis without picking 4xx controls
+  // A2: no benchmark class-alias table -> aliases never guess an oracleInput; explicit economic_conservation fills role-tagged slots (never 4xx controls)
   for (const alias of ['conserved_balance', 'ledger_overcredit', 'over_refund', 'double_spend', 'race_condition']) {
     const c = ctx.chain(`chain-alias-${alias}`, alias)
     c.control(deniedCtrl)
     c.readback(preRb)
     c.recordHop({ hopId: 'hop_1', target: 'POST /api/v1/orders/ord-1/refund', exchangeIds: [burst.results[0]!.exchangeId], claimedDelta: 'Refund.' })
     c.readback(postRb2)
-    const r = c.build()
+    assert.equal(c.build().terminalImpact.oracleInput, undefined, `alias ${alias} must not guess an oracleInput`)
+    const r = c.build({ oracleFamily: 'economic_conservation' })
     assert.equal(r.terminalImpact.oracleInput?.baselineReadbackExchangeId, preRb.exchangeId, `alias ${alias} baseline`)
     assert.equal(r.terminalImpact.oracleInput?.finalReadbackExchangeId, postRb2.exchangeId, `alias ${alias} final`)
   }
@@ -480,7 +481,7 @@ test('ChainBuilder.build() produces strictly forward-only edges with zero cycles
   assert.ok(edges.some(e => e.kind === 'value_binding' && e.fromHopId === 'hop_2' && e.toHopId === 'hop_3' && e.capabilityHandle === 'cap:hop_2:s2'))
 })
 
-test('live VerifyRpcServer: dual_tenant_abac leaves oracleInput undefined when omitted so host deriveHostDualTenantRawInput/multiHopDualDag runs, and fills refs when caller supplies oracleInput', async t => {
+test('live VerifyRpcServer: dual_tenant_abac leaves oracleInput undefined when omitted so host deriveHostDualTenantRawInput/multiHopDualDag runs, and explicit primitive helpers name refs by role', async t => {
   const { ctx } = await startFixture(t, 'run-optd-sdk-dual-tenant-synth')
 
   // 1) dual_org_cache_bleed: 0 explicit oracleInput + 0 capability edges + preceding 200 readback before 403 control
@@ -500,12 +501,14 @@ test('live VerifyRpcServer: dual_tenant_abac leaves oracleInput undefined when o
   const proved = await ch.prove({ terminalHopId: 'step_2', terminalExchange: s2, claimedImpact: 'Dual-tenant permission cache bleed into tenant-b.' })
   assert.equal(proved.confirmed, true, `Expected live dual_tenant_abac cache bleed to confirm via host deriveHostDualTenantRawInput: ${JSON.stringify(proved)}`)
 
-  // Explicit primeTenant/targetTenant caller oracleInput infers mode and fills missing exchange refs
-  const builtExplicitBleed = ch.build({ terminalHopId: 'step_2', terminalExchange: s2, oracleInput: { primeTenantId: 'tenant-a', targetTenantId: 'tenant-b' } })
+  // A2: partial caller oracleInput passes through verbatim (no positional prevEx/termEx guessing); the explicit
+  // wire_framing_and_cache_differential helper names every slot by role.
+  const builtPartialBleed = ch.build({ terminalHopId: 'step_2', terminalExchange: s2, oracleInput: { primeTenantId: 'tenant-a', targetTenantId: 'tenant-b' } })
+  assert.deepEqual(builtPartialBleed.terminalImpact.oracleInput, { primeTenantId: 'tenant-a', targetTenantId: 'tenant-b' })
+  const builtExplicitBleed = ch.build({ terminalHopId: 'step_2', terminalExchange: s2, ...wireFramingAndCacheDifferential({ control: ctrl, prime: s1, variant: s2, dualTenant: true }) })
+  assert.equal(builtExplicitBleed.terminalImpact.oracleFamily, 'dual_tenant_abac')
   assert.deepEqual(builtExplicitBleed.terminalImpact.oracleInput, {
     mode: 'dual_org_cache_bleed',
-    primeTenantId: 'tenant-a',
-    targetTenantId: 'tenant-b',
     baselineDeniedControlExchangeId: ctrl.exchangeId,
     primeActionExchangeId: s1.exchangeId,
     bledAccessExchangeId: s2.exchangeId,
@@ -532,7 +535,8 @@ test('live VerifyRpcServer: dual_tenant_abac leaves oracleInput undefined when o
   assert.equal(xRb.status, 200)
 
   assert.equal(chXfer.build({ claimedImpact: 'Unauthorized cross-org transfer of item-77.' }).terminalImpact.oracleInput, undefined)
-  const builtXfer = chXfer.build({ claimedImpact: 'Unauthorized cross-org transfer of item-77.', oracleInput: { mode: 'cross_org_transfer' } })
+  assert.deepEqual(chXfer.build({ claimedImpact: 'Unauthorized cross-org transfer of item-77.', oracleInput: { mode: 'cross_org_transfer' } }).terminalImpact.oracleInput, { mode: 'cross_org_transfer' })
+  const builtXfer = chXfer.build({ claimedImpact: 'Unauthorized cross-org transfer of item-77.', ...accessDifferential({ control: xCtrl, variant: xHop2, readback: xRb, entityId: 'item-77' }) })
   assert.deepEqual(builtXfer.terminalImpact.oracleInput, {
     mode: 'cross_org_transfer',
     sourceControlDeniedExchangeId: xCtrl.exchangeId,
@@ -545,7 +549,7 @@ test('live VerifyRpcServer: dual_tenant_abac leaves oracleInput undefined when o
   const chBatch = ctx.chain('chain-optd-dual-batch', 'dual_tenant_abac')
   chBatch.control(ctrl)
   chBatch.recordHop({ hopId: 'b1', target: 'POST /api/v1/batch', exchangeIds: [s2.exchangeId], claimedDelta: 'Batch read.' })
-  const builtBatch = chBatch.build({ oracleInput: { ownRecordId: 'own-1', foreignRecordId: 'for-2', requestedIds: ['own-1', 'for-2'] } })
+  const builtBatch = chBatch.build({ ...accessDifferential({ control: ctrl, variant: s2, ownRecordId: 'own-1', foreignRecordId: 'for-2', requestedIds: ['own-1', 'for-2'] }) })
   assert.deepEqual(builtBatch.terminalImpact.oracleInput, {
     mode: 'batch_partial_authz',
     ownRecordId: 'own-1',
@@ -839,15 +843,20 @@ test('live VerifyRpcServer: ChainBuilder prunes dangling side-branch hops (warm-
   assert.equal(provedDisc.hopCount, 2, 'Live prove() must keep both disconnected hops instead of collapsing to 1 hop')
 })
 
-test('live VerifyRpcServer: parser_cache_differential auto-synthesizes oracleInput without oracleFamily and ctx.oob_create/ctx.oob_poll attach hop OOB events', async t => {
+test('live VerifyRpcServer: parser_cache_differential uses explicit wire-primitive slots (no positional synthesis) and ctx.oob_create/ctx.oob_poll attach hop OOB events', async t => {
   const { ctx, triggerOob } = await startFixture(t, 'run-optd-sdk-parser-oob', { withCanary: true })
 
-  // 1) parser_cache_differential without explicit oracleFamily auto-synthesizes oracleInput
+  // 1) A2: parser_cache_differential never guesses slots from hop positions; the explicit wire helper names them
   const chParser = ctx.chain('chain-optd-parser-auto', 'parser_cache_differential')
   chParser.control('ex-ctrl-clean')
   chParser.recordHop({ hopId: 'h1', target: 'GET /api/v1/probe', exchangeIds: ['ex-diff-probe'], claimedDelta: 'Differential probe.' })
   chParser.readback('ex-rb-post')
-  assert.deepEqual(chParser.build().terminalImpact.oracleInput, {
+  assert.equal(chParser.build().terminalImpact.oracleInput, undefined)
+  assert.deepEqual(chParser.build({ ...wireFramingAndCacheDifferential({ control: 'ex-ctrl-clean', variant: 'ex-diff-probe', readback: 'ex-rb-post', property: 'path_normalization', differentialFeature: 'dot-segment' }) }).terminalImpact.oracleInput, {
+    mode: 'parser_differential',
+    differentialKind: 'path_normalization',
+    differentialFeature: 'dot-segment',
+    impactKind: 'mutation',
     cleanControlExchangeId: 'ex-ctrl-clean',
     differentialProbeExchangeId: 'ex-diff-probe',
     postMutationReadbackExchangeId: 'ex-rb-post',

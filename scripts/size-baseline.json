@@ -234,7 +234,6 @@
     "src/server/transport.ts::createHttpTransport.proxyHttp1": 197,
     "src/server/unified-diff.ts::parseUnifiedDiff": 267,
     "src/server/untrusted-compute-pool.ts::executeSearchRepoScan": 186,
-    "src/server/v8-oracle-hydrate.ts::hydrateV8OracleInput": 406,
     "src/server/verify-claims.ts::causalFingerprints": 241,
     "src/server/verify-claims.ts::causalFingerprints.<anonymous>": 235,
     "src/server/verify-prove-handlers.ts::handleProveDifferential": 338,
