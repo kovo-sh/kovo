@@ -142,6 +142,7 @@ EXCLUDE_SPECS=(
 
   # playwright-e2e: Real Playwright Chromium browser E2E suites
   "playwright-e2e|tests/e2e-ui-journeys.test.ts|launches real Playwright Chromium browser UI journeys (~27s)"
+  "playwright-e2e|tests/ui-polish-run-workbench.test.ts|launches real Playwright Chromium Run Workbench Bucket A geometry/motion assertions (~80s)"
   "playwright-e2e|tests/v7-realism1-spa.test.ts|launches real Playwright Chromium ScopedBrowser (>60s)"
 
   # batch-boundary-slow: Batch-boundary / regression-floor tier (run by scripts/regression-floor.sh)
