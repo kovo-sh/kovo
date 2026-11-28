@@ -92,8 +92,6 @@
     "src/server/github-repo-sync.ts::measureDirectoryBytes",
     "src/server/github-repo-sync.ts::unlinkProjectMountedRepo",
     "src/server/github-repo-sync.ts::unlinkProjectMountedRepoLocked",
-    "src/server/graph-coordinator.ts::NON_FLOOR_SEMANTIC_CLASSES",
-    "src/server/graph-coordinator.ts::prioritizeSemanticEndpoints",
     "src/server/graph-leads.ts::detLeadEvidenceFactFields",
     "src/server/graph-leads.ts::detLeadEvidenceFieldKeys",
     "src/server/lab-telemetry.ts::ingestLabTelemetry",

@@ -23,7 +23,6 @@ import {
   DISPATCH_FUNNEL_COUNT_KEYS,
   FrontierDispatcher,
   FrontierWaveController,
-  addFunnelCounts,
   circuitBreakAction,
   coordinatorSchedulerDecision,
   dispatchableReadySteps,
@@ -256,27 +255,14 @@ test('dry-round stop reason vocabulary maps the scheduler reason', () => {
 // 4. Structured funnel counts
 // ============================================================================
 
-test('funnel accumulates planned → filtered* → enqueued from structured counts', () => {
+test('empty funnel starts every structured planned → filtered* → enqueued count at zero', () => {
   const funnel = emptyDispatchFunnel(3)
-  addFunnelCounts(funnel, {
-    planned: 19, enqueued: 11, filteredAlreadyConfirmed: 3, filteredCap: 2,
-    filteredDedupe: 1, filteredNoAsset: 1, filteredBudget: 1,
-  })
-  assert.equal(funnel.planned, 19)
-  assert.equal(funnel.enqueued, 11)
-  const filtered = DISPATCH_FUNNEL_COUNT_KEYS
-    .filter(key => key.startsWith('filtered'))
-    .reduce((total, key) => total + funnel[key], 0)
-  assert.equal(funnel.planned, funnel.enqueued + filtered, 'every planned hypothesis is enqueued or attributed to a filter')
+  for (const key of DISPATCH_FUNNEL_COUNT_KEYS) assert.equal(funnel[key], 0, `${key} starts at zero`)
+  assert.ok(DISPATCH_FUNNEL_COUNT_KEYS.includes('planned') && DISPATCH_FUNNEL_COUNT_KEYS.includes('enqueued'))
+  assert.ok(DISPATCH_FUNNEL_COUNT_KEYS.filter(key => key.startsWith('filtered')).length >= 5)
   assert.equal(funnel.roundNo, 3)
   assert.equal(funnel.stopReason, 'running')
-})
-
-test('funnel counts are never negative and ignore unknown keys', () => {
-  const funnel = emptyDispatchFunnel()
-  addFunnelCounts(funnel, { planned: -4, enqueued: 2 } as never)
-  assert.equal(funnel.planned, 0)
-  assert.equal(funnel.enqueued, 2)
+  assert.equal(emptyDispatchFunnel().roundNo, 0)
 })
 
 // ============================================================================

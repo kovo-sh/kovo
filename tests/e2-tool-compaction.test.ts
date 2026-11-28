@@ -1,8 +1,8 @@
 /**
  * Track E2 — Tool Output Compaction Tests.
  *
- * Verifies significant (>50%) serialized JSON byte-size reduction across the 4 compacted
- * read/query tools (`board_read`, `search_facts`, `search_exchanges`, `query_endpoints`)
+ * Verifies significant (>50%) serialized JSON byte-size reduction across the 3 compacted
+ * read/query tools (`board_read`, `search_facts`, `search_exchanges`)
  * while preserving every required ID, pagination cursor, non-empty metadata field, and
  * exact-lookup escape hatch.
  */
@@ -18,16 +18,11 @@ import {
   boardReadMaxLimit,
   createBoardTools,
 } from '../src/server/board-tools.ts'
-import { coordinatorPlannerHandlers } from '../src/server/exec-dispatch.ts'
 import {
   clampSearchLimit,
   compactSearchExchangeRow,
   compactSearchFactRow,
 } from '../src/server/exec-worker-runner.ts'
-import {
-  createGraphCoordinator,
-  type CoordinatorEndpoint,
-} from '../src/server/graph-coordinator.ts'
 import { Store } from '../src/server/store.ts'
 
 const ORIGIN_A = 'https://app.example.test'
@@ -276,110 +271,5 @@ test('search_exchanges compaction caps bodyPreview to 180, removes duplicate id,
   }))
   const legacyBytes = Buffer.byteLength(JSON.stringify(legacyPayload))
   const compactBytes = Buffer.byteLength(JSON.stringify(compactRows))
-  assert.ok(compactBytes < legacyBytes * 0.5, `expected >50% shrink (compact=${compactBytes}, legacy=${legacyBytes})`)
-})
-
-test('query_endpoints compacts default page to 15 (max 25), caps routes <= 140, omits sparse keys, preserves cursors, and cuts JSON >50%', async () => {
-  const longRoute = `/api/v2/organizations/:orgId/workspaces/:workspaceId/deployments/${'segment/'.repeat(20)}:deploymentId/status`
-  assert.ok(longRoute.length > 180)
-
-  const endpoints: CoordinatorEndpoint[] = Array.from({ length: 50 }, (_, i) => ({
-    id: `ep-${String(i).padStart(3, '0')}`,
-    origin: ORIGIN_A,
-    method: i % 2 === 0 ? 'GET' : 'POST',
-    pathTemplate: i === 0 ? longRoute : `/api/v1/resource/${i}`,
-    riskScore: i === 1 ? 85 : 20,
-    coveragePct: i === 1 ? 0 : i === 2 ? 75 : null,
-    testedClasses: i === 2 ? ['bola_idor'] : [],
-    sinkKinds: i === 2 ? ['db_query'] : [],
-    authRequirement: i === 2 ? 'bearerAuth' : null,
-    ownershipGuard: i === 2 ? 'tenant' : null,
-    roleExclusive: i === 2,
-  }))
-
-  const coordinator = createGraphCoordinator({
-    deps: {
-      listEndpoints: () => endpoints,
-      listFacts: () => [],
-      listFindings: () => [],
-      approvedOrigins: () => [ORIGIN_A],
-    },
-  })
-  const handlers = coordinatorPlannerHandlers({ coordinator })
-  const sig = new AbortController().signal
-
-  // Default page size is 15
-  const page1 = (await handlers.query_endpoints!({}, sig)) as {
-    items: Array<Record<string, unknown>>
-    nextCursor: string | null
-    total: number
-  }
-  assert.equal(page1.items.length, 15)
-  assert.equal(page1.total, 50)
-  assert.ok(page1.nextCursor)
-
-  // Max page size clamped to 25
-  const maxPage = (await handlers.query_endpoints!({ limit: 500 }, sig)) as {
-    items: Array<Record<string, unknown>>
-  }
-  assert.equal(maxPage.items.length, 25)
-
-  // Pagination cursor reaches all 50 unique endpoints without drops
-  const byId = new Map<string, Record<string, unknown>>()
-  let cursor: string | undefined
-  for (;;) {
-    const p = (await handlers.query_endpoints!({ cursor }, sig)) as {
-      items: Array<Record<string, unknown>>
-      nextCursor: string | null
-    }
-    for (const item of p.items) byId.set(String(item.id), item)
-    if (!p.nextCursor) break
-    cursor = p.nextCursor
-  }
-  assert.equal(byId.size, 50)
-
-  // Route capped <= 140 and sparse keys omitted; non-empty/zero/true values preserved
-  const ep0 = byId.get('ep-000')!
-  assert.ok(String(ep0.route).length <= 140)
-  assert.equal('coverage' in ep0, false)
-  assert.equal('tested' in ep0, false)
-  assert.equal('sinks' in ep0, false)
-  assert.equal('auth' in ep0, false)
-  assert.equal('guard' in ep0, false)
-  assert.equal('roleExclusive' in ep0, false)
-
-  // Numeric 0 coverage is preserved (only null/undefined omitted)
-  const ep1 = byId.get('ep-001')!
-  assert.equal(ep1.coverage, 0)
-
-  // Populated fields preserved verbatim
-  const ep2 = byId.get('ep-002')!
-  assert.equal(ep2.coverage, 75)
-  assert.deepEqual(ep2.tested, ['bola_idor'])
-  assert.deepEqual(ep2.sinks, ['db_query'])
-  assert.equal(ep2.auth, 'bearerAuth')
-  assert.equal(ep2.guard, 'tenant')
-  assert.equal(ep2.roleExclusive, true)
-
-  // Byte-size reduction >50% vs legacy 25-row sparse page
-  const legacyPage = {
-    total: 50,
-    nextCursor: page1.nextCursor,
-    items: endpoints.slice(0, 25).map(ep => ({
-      id: ep.id,
-      method: ep.method,
-      route: ep.pathTemplate.slice(0, 160),
-      origin: ep.origin,
-      risk: ep.riskScore ?? 0,
-      coverage: ep.coveragePct ?? null,
-      tested: ep.testedClasses ?? [],
-      sinks: ep.sinkKinds ?? [],
-      auth: ep.authRequirement ?? null,
-      guard: ep.ownershipGuard ?? null,
-      roleExclusive: ep.roleExclusive === true,
-    })),
-  }
-  const legacyBytes = Buffer.byteLength(JSON.stringify(legacyPage))
-  const compactBytes = Buffer.byteLength(JSON.stringify(page1))
   assert.ok(compactBytes < legacyBytes * 0.5, `expected >50% shrink (compact=${compactBytes}, legacy=${legacyBytes})`)
 })

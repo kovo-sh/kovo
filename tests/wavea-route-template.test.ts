@@ -5,11 +5,6 @@ import { describe, test } from 'node:test'
 
 import { normalizeConfirmedRouteTemplate } from '../src/server/exec-recon-planner.ts'
 import {
-  planChainRound,
-  structuralTransitionFeasibility,
-  type CausalPlanUnit,
-} from '../src/server/graph-coordinator.ts'
-import {
   assessAuthorizationImpact,
   clearRegisteredCanaryMarkers,
   hasForeignTenantOrOwnerDisclosure,
@@ -20,37 +15,6 @@ import { normalizeDiscoveryTemplate } from '../src/server/phase0-recon.ts'
 import { normalizeRouteTemplate } from '../src/server/route-template.ts'
 
 const REPO_ROOT = resolve(new URL('..', import.meta.url).pathname)
-
-function makeCausalUnit(overrides: Partial<CausalPlanUnit>): CausalPlanUnit {
-  return {
-    unitId: 'u1',
-    capId: 'cap:hop_1:tok',
-    capKind: 'identity_session',
-    primitive: {
-      kind: 'leaked_token',
-      origin: 'https://api.example.invalid',
-      value: 'cap:hop_1:tok',
-      evidenceIds: [],
-      factIds: [],
-      endpoint: '/api/session',
-      method: 'GET',
-      detail: 'session token',
-    },
-    surface: 'http',
-    tenantScope: null,
-    actorPersona: 'member_a',
-    serviceOrigin: 'https://api.example.invalid',
-    hopReceiptId: 'hop-1',
-    verified: true,
-    quarantined: false,
-    terminalEligible: true,
-    targetSurfaceKey: 'https://api.example.invalid|http|/api/session',
-    hypothesisClass: 'broken-access-control',
-    endpoint: '/api/session',
-    method: 'GET',
-    ...overrides,
-  }
-}
 
 describe('Wave A #4: canonical normalizeRouteTemplate', () => {
   test('normalizes UUIDs, ULIDs, numeric IDs, hex/base64url tokens, prefixed IDs, and framework param templates', () => {
@@ -122,61 +86,7 @@ describe('Wave A #4: canonical normalizeRouteTemplate', () => {
   })
 })
 
-describe('Wave A #2b: nullable tenantScope and origin fallback removal', () => {
-  test('structuralTransitionFeasibility does not collapse null tenants or treat null as cross-tenant', () => {
-    const nullUnits: CausalPlanUnit[] = [
-      makeCausalUnit({ unitId: 'u1', capId: 'cap:hop_1:a', capKind: 'identity_session', tenantScope: null }),
-      makeCausalUnit({
-        unitId: 'u2',
-        capId: 'cap:hop_2:b',
-        capKind: 'state_handle',
-        surface: 'async_job',
-        tenantScope: null,
-      }),
-    ]
-    const mixedKnownAndNull: CausalPlanUnit[] = [
-      makeCausalUnit({ unitId: 'u1', capId: 'cap:hop_1:a', capKind: 'identity_session', tenantScope: 'org_a' }),
-      makeCausalUnit({
-        unitId: 'u2',
-        capId: 'cap:hop_2:b',
-        capKind: 'state_handle',
-        surface: 'async_job',
-        tenantScope: null,
-      }),
-    ]
-    const twoKnownTenants: CausalPlanUnit[] = [
-      makeCausalUnit({ unitId: 'u1', capId: 'cap:hop_1:a', capKind: 'identity_session', tenantScope: 'org_a' }),
-      makeCausalUnit({
-        unitId: 'u2',
-        capId: 'cap:hop_2:b',
-        capKind: 'state_handle',
-        surface: 'async_job',
-        tenantScope: 'org_b',
-      }),
-    ]
-
-    const nullScore = structuralTransitionFeasibility(nullUnits, 1)
-    const mixedScore = structuralTransitionFeasibility(mixedKnownAndNull, 1)
-    const crossTenantScore = structuralTransitionFeasibility(twoKnownTenants, 1)
-
-    assert.equal(nullScore.terminalImpactWeight, mixedScore.terminalImpactWeight)
-    assert.ok(
-      crossTenantScore.terminalImpactWeight > mixedScore.terminalImpactWeight,
-      'only two distinct non-null tenants should receive the cross-tenant impact boost',
-    )
-  })
-
-  test('planChainRound never synthesizes https://target.local when no real origin is provided', () => {
-    const planned = planChainRound({
-      primitives: [],
-      endpoints: [],
-      apiDependencies: [
-        { producer: 'POST /api/orders', consumer: 'GET /api/orders/:id', resourceKey: 'orderId' },
-      ],
-    })
-    assert.equal(planned.length, 0)
-  })
-
+describe('Wave A #2b: origin fallback removal', () => {
   test('graph-coordinator and exec-recon-planner contain zero default_tenant or target.local literals', () => {
     const coordinator = readFileSync(resolve(REPO_ROOT, 'src/server/graph-coordinator.ts'), 'utf8')
     const planner = readFileSync(resolve(REPO_ROOT, 'src/server/exec-recon-planner.ts'), 'utf8')

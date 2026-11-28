@@ -728,7 +728,7 @@
     {
       "file": "tests/v7-exec-throughput.test.ts",
       "testName": "Execution wires onProofObligation, onGapValidation, and assignedTargetRoutes into run events and throughput metrics",
-      "assertionLocation": "tests/v7-exec-throughput.test.ts:136:1",
+      "assertionLocation": "tests/v7-exec-throughput.test.ts:135:1",
       "ownerStream": "v7-triage",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
@@ -736,7 +736,7 @@
     {
       "file": "tests/v7-exec-throughput.test.ts",
       "testName": "runChainPlanner buffers 2 waves on Round 1 and never increments dryRounds on Round 1 or 0-completion mid-wave Round 2",
-      "assertionLocation": "tests/v7-exec-throughput.test.ts:277:1",
+      "assertionLocation": "tests/v7-exec-throughput.test.ts:271:1",
       "ownerStream": "v7-triage",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
@@ -1042,7 +1042,7 @@
     {
       "file": "tests/v8-phasea-fastpath.test.ts",
       "testName": "runSourceFirstCodeAudit enforces proportional wall-clock cap (90s), turn cap (8), and semantic sub-timeout (35s)",
-      "assertionLocation": "tests/v8-phasea-fastpath.test.ts:399:1",
+      "assertionLocation": "tests/v8-phasea-fastpath.test.ts:373:1",
       "ownerStream": "v8-triage",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
@@ -1134,7 +1134,7 @@
     {
       "file": "tests/v8-q26-multihop-synthesis.test.ts",
       "testName": "Fix C: workerInvestigationPrompt, KOVO_VERIFY guidance, and multihop-chains.md enforce no-premature-filing, single-origin probe arm, and crypto/async recipe",
-      "assertionLocation": "tests/v8-q26-multihop-synthesis.test.ts:320:1",
+      "assertionLocation": "tests/v8-q26-multihop-synthesis.test.ts:306:1",
       "ownerStream": "v8-triage",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
@@ -1206,7 +1206,7 @@
     {
       "file": "tests/v8-q30-workflow-push.test.ts",
       "testName": "Q30.1: prompts, tool guidance, and multihop-chains.md enforce single-script 3-5 stage workflows and clean-control ordering within strict budgets",
-      "assertionLocation": "tests/v8-q30-workflow-push.test.ts:65:1",
+      "assertionLocation": "tests/v8-q30-workflow-push.test.ts:53:1",
       "ownerStream": "cq-6-agent-contract",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"

@@ -5,7 +5,7 @@
  *     white-box priority without starving runtime/grey-box chains).
  *  3. LLM planner-storm gating (`shouldInvokeLlmPlanner` + live `ExecReconPlanner.runChainPlanner`
  *     saturation deferral & milestone wakeup).
- *  4. Unified `CapabilityLedger` seeding & `planChainRound` ingestion for `code_audit_suspect` & runtime deps.
+ *  4. `code_audit_suspect` conversion into Wave-1 steps & typed `ChainHop` ingestion (World Graph planner input).
  *  5. `RunOrchestrationStateStore` single-call atomic cleanup on `disposeRun` (unit + live `Execution`).
  */
 import assert from 'node:assert/strict'
@@ -35,13 +35,12 @@ import {
   resolveAssignmentBudget,
   resolveWorkerSettlementMs,
   shouldInvokeLlmPlanner,
-  synthesizeRuntimeCompositeWave1Steps,
   type DispatchLaneStep,
 } from '../src/server/exec-dispatch.ts'
 import { Execution } from '../src/server/execution.ts'
 import type { ExecReconPlanner } from '../src/server/exec-recon-planner.ts'
 import type { FrontierBranch } from '../src/server/frontier-scheduler.ts'
-import { deriveChainPrimitives, planChainRound } from '../src/server/graph-coordinator.ts'
+import { extractChainHops } from '../src/server/graph-coordinator.ts'
 import type { ResolvedModelProfile } from '../src/server/model-settings.ts'
 import type { WorkerBackend, WorkerSession } from '../src/server/worker-backend.ts'
 import { makeStore, setupApprovedRun } from './v4-tier-helpers.ts'
@@ -482,10 +481,10 @@ test('ExecReconPlanner.runChainPlanner defers redundant LLM calls when ready que
 })
 
 // ============================================================================
-// 4. Unified CapabilityLedger + planChainRound ingestion
+// 4. code_audit_suspect conversion + typed ChainHop ingestion
 // ============================================================================
 
-test('code_audit_suspects & runtime API dependencies seed CapabilityLedger and compose through planChainRound', async (t) => {
+test('code_audit_suspects convert into multi-hop Wave-1 steps and ingest as typed ChainHop artifacts', async (t) => {
   const { storage } = makeStore(t, 'kovo-o3o5-ledger-')
   const { run } = await setupApprovedRun(storage, { seeds: [ORIGIN_A, ORIGIN_B], tier: 2 })
   const assetA = run.candidates.find(c => c.origin === ORIGIN_A)!
@@ -516,43 +515,27 @@ test('code_audit_suspects & runtime API dependencies seed CapabilityLedger and c
     },
   })
 
-  // 1. convertCodeAuditSuspectsToChainSteps seeds suspects into CapabilityLedger as capability_only nodes.
+  // 1. convertCodeAuditSuspectsToChainSteps emits one targeted step per suspect with sibling leads.
   const wbSteps = convertCodeAuditSuspectsToChainSteps(storage, run, [fSsrf, fWebhook], undefined, {
     maxSteps: CODE_AUDIT_WAVE1_MAX_STEPS,
     promoteMultiHop: true,
   })
-  assert.ok(wbSteps.length >= 1)
-  const ledger = storage.capabilityLedger(run.id)
-  assert.ok(ledger.listCapabilities().length >= 2, 'code_audit_suspects must be seeded into CapabilityLedger')
-  assert.ok(ledger.listCapabilities().every(n => n.promotionStatus === 'capability_only'))
+  assert.equal(wbSteps.length, 2)
+  assert.ok(wbSteps.every(step => step.skills.includes('multihop-chains')), 'multi-hop promotion tags every Wave-1 suspect step')
+  const ssrfStep = wbSteps.find(step => step.dependsOnFactIds[0] === fSsrf.id)
+  assert.ok(ssrfStep)
+  assert.ok(ssrfStep.dependsOnFactIds.includes(fWebhook.id), 'cross-service sibling lead is attached as a parent fact')
 
-  // 2. deriveChainPrimitives + planChainRound ingest code_audit_suspect facts cleanly.
-  const primitives = deriveChainPrimitives({ facts: [fSsrf, fWebhook], findings: [], endpoints: [] })
-  assert.ok(primitives.some(p => p.kind === 'ssrf_internal_reach'))
-  assert.ok(primitives.some(p => p.kind === 'leaked_token'))
-  const planned = planChainRound({
-    primitives,
-    approvedOrigins: [ORIGIN_A, ORIGIN_B],
-    capabilityLedger: ledger,
-    maxHops: 4,
-  })
-  assert.ok(planned.length >= 1, 'planChainRound must compose seeded code_audit_suspect capabilities')
-
-  // 3. synthesizeRuntimeCompositeWave1Steps seeds runtime API-dep edges into CapabilityLedger.
-  const { run: gbRun } = await setupApprovedRun(storage, { seeds: [ORIGIN_A, ORIGIN_B], tier: 2 })
-  const gbSteps = synthesizeRuntimeCompositeWave1Steps(storage, gbRun, {
-    sourceMounted: false,
-    apiDependencies: [{
-      producer: 'POST /oauth/invite/accept',
-      consumer: 'POST /api/v1/billing/export',
-      resourceKey: 'sessionToken',
-      producerOrigin: ORIGIN_A,
-      consumerOrigin: ORIGIN_B,
-    }],
-  })
-  assert.ok(gbSteps.length >= 1)
-  const gbLedger = storage.capabilityLedger(gbRun.id)
-  assert.ok(gbLedger.listCausalEdges().length >= 1, 'runtime API-dep edges must be seeded into CapabilityLedger')
+  // 2. extractChainHops ingests code_audit_suspect facts as opaque typed hops for the World Graph planner.
+  const hops = extractChainHops({ facts: [fSsrf, fWebhook], findings: [], endpoints: [] })
+  const ssrfHop = hops.find(h => h.artifactKind === 'ssrf_redirect_target')
+  assert.ok(ssrfHop)
+  assert.equal(ssrfHop.endpoint, '/api/v1/render')
+  assert.equal(ssrfHop.method, 'POST')
+  const signerHop = hops.find(h => h.artifactKind === 'token_ref')
+  assert.ok(signerHop)
+  assert.equal(signerHop.origin, ORIGIN_B)
+  assert.ok(/^(?:secret|jwt|finding):/.test(signerHop.artifactRef), 'signing hops stay opaque handles')
 })
 
 // ============================================================================

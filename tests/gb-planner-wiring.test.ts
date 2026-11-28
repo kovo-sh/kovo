@@ -3,17 +3,9 @@
  *
  * Proves (Docker-free, real SQLite WAL `Store`, real `Execution`, real `ExecReconPlanner`,
  * real `ExecWorkerRunner`, real `VerifyRpcServer`, synthetic mock Responses LLM server):
- *  1. `ExecReconPlanner.collectRuntimeDiscoveryInput` wires `extractRuntimeCatalogFromFacts` +
- *     `buildRuntimeDiscoveryInput` + `endpointGraphCatalog.apiDependencies` so `spaRoutes`,
- *     `graphqlCatalog`, OpenAPI `security`, and `apiDependencies` flow into `CapabilityLedger`.
- *  2. Incremental post-Phase-A-floor invariant synthesis (`synthesizePostFloorRuntimeInvariants`)
- *     and Wave-1 composite promotion (`synthesizeRuntimeCompositeWave1Steps` when `!sourceMounted`)
- *     are NOT suppressed by pre-floor `invariantsSeededRuns` / `wave1InvariantChainsPromoted`.
- *  3. `dispatchChainRound` and `coordinatorDeps` pass `{ apiDependencies, sourceMounted }` into
- *     `planChainRound` so `graph-coordinator.ts` seeds multi-stage & cross-origin chains in GB.
- *  4. `enqueueHopContinuationOnRotation` lifts `MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS = 1`
+ *  1. `enqueueHopContinuationOnRotation` lifts `MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS = 1`
  *     whenever `hasSealedLedgerCap` (`derivedLedgerHandles.length > 0`).
- *  5. `ExecWorkerRunner` triggers hop-continuation NOT ONLY on `wall_clock_rotated`, but also on
+ *  2. `ExecWorkerRunner` triggers hop-continuation NOT ONLY on `wall_clock_rotated`, but also on
  *     non-confirmed `complete_intent` and `max_turns` (`turn_limit`) exits when
  *     `sessionSealedCapHandles.length > 0`, with dedup preventing infinite loops on identical sets.
  */
@@ -27,18 +19,14 @@ import { test } from 'node:test'
 import {
   MAX_CHAIN_CONTINUATIONS,
   MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS,
-  classifyDispatchLane,
   extractContinuationDepth,
   isGenericWave1BoundaryChainStep,
-  isMultiHopChainStep,
 } from '../src/server/exec-dispatch.ts'
 import { RequestBroker } from '../src/server/broker.ts'
 import { Execution } from '../src/server/execution.ts'
 import type { ExecReconPlanner } from '../src/server/exec-recon-planner.ts'
-import { createGraphCoordinator } from '../src/server/graph-coordinator.ts'
 import { formatDerivedCapabilityHandle } from '../src/server/capability-ledger.ts'
 import { saveModelProfile } from '../src/server/model-settings.ts'
-import { parseOpenApiDoc } from '../src/server/phase0-recon.ts'
 import {
   VERIFY_NONCE_HEADER,
   VERIFY_RPC_HEADER,
@@ -58,9 +46,7 @@ import { makeStore, setupApprovedRun, stopExecution, withEnv } from './v4-tier-h
 process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 process.env.KOVO_ALLOW_LOCAL_MODEL = '1'
 
-const APP_ORIGIN = 'https://portal.example.invalid'
 const API_ORIGIN = 'https://api.example.invalid'
-const IDP_ORIGIN = 'https://auth.example.invalid'
 
 function internals(engine: Execution) {
   return engine as unknown as {
@@ -274,244 +260,7 @@ async function startMockLlmServer(
 }
 
 // ============================================================================
-// 1. Pre-floor runtime catalog wiring + post-Phase-A-floor incremental synthesis
-//    & Wave-1 composite promotion (!sourceMounted)
-// ============================================================================
-
-test('ExecReconPlanner wires Phase-0 runtime catalogs + OpenAPI security + endpointGraphCatalog.apiDependencies and performs incremental post-floor synthesis & Wave-1 composite promotion in !sourceMounted mode', async (t) => {
-  const { storage } = makeStore(t)
-  const { runId, run } = await setupApprovedRun(storage, {
-    seeds: [APP_ORIGIN, API_ORIGIN, IDP_ORIGIN],
-    tier: 2,
-  })
-  const assetApp = run.candidates.find(c => c.origin === APP_ORIGIN)!
-  const reconWorker = storage.makeWorker(run, 'threat_model', assetApp, 'Phase 0', 'Recon', {
-    sourceOrigins: [APP_ORIGIN, API_ORIGIN, IDP_ORIGIN],
-  })
-
-  // Upload OpenAPI spec with security asymmetry + parseOpenApiDoc
-  const openApiDoc = {
-    openapi: '3.0.3',
-    info: { title: 'Synthetic Payments API', version: '1.0.0' },
-    security: [{ bearerAuth: [] }],
-    paths: {
-      '/api/v1/payouts/{id}': {
-        get: { operationId: 'getPayout', responses: { '200': { description: 'ok' } } },
-      },
-      '/api/v1/payouts/batch': {
-        post: { operationId: 'batchExportPayouts', security: [], responses: { '200': { description: 'ok' } } },
-      },
-    },
-  }
-  storage.importProjectSpec({
-    requestId: 'spec-req-1',
-    projectId: run.projectId,
-    name: 'payments-openapi.json',
-    kind: 'openapi',
-    origin: API_ORIGIN,
-    content: JSON.stringify(openApiDoc),
-  })
-  parseOpenApiDoc(JSON.stringify(openApiDoc), API_ORIGIN, storage, runId, run.scopeRevision, new Set(), new Set())
-
-  // Persist Phase-0 runtime_spa_routes + runtime_graphql_catalog summary facts
-  storage.addFact(run, reconWorker, {
-    kind: 'note',
-    origin: APP_ORIGIN,
-    summary: 'Phase-0 SPA bundle routes',
-    data: {
-      subkind: 'runtime_spa_routes',
-      origin: APP_ORIGIN,
-      spaRoutes: [
-        {
-          path: '/admin/payouts',
-          serviceOrigin: APP_ORIGIN,
-          requiredRoles: ['admin'],
-          stateActions: ['approve', 'release'],
-          apiCalls: [{ method: 'POST', path: '/api/v1/payouts/:id/approve', serviceOrigin: API_ORIGIN }],
-        },
-      ],
-    },
-    sourceOrigins: [APP_ORIGIN],
-  })
-  storage.addFact(run, reconWorker, {
-    kind: 'note',
-    origin: API_ORIGIN,
-    summary: 'Phase-0 GraphQL schema catalog',
-    data: {
-      subkind: 'runtime_graphql_catalog',
-      origin: API_ORIGIN,
-      graphqlCatalog: {
-        endpoint: '/graphql',
-        serviceOrigin: API_ORIGIN,
-        fields: [
-          { name: 'payouts', kind: 'query', args: ['tenantId'], returnType: 'Payout', requiresAuth: true },
-          { name: 'batchReleasePayouts', kind: 'mutation', args: ['ids'], returnType: 'Payout', requiresAuth: false },
-        ],
-      },
-    },
-    sourceOrigins: [API_ORIGIN],
-  })
-
-  const engine = new Execution(storage, { backend: stubBackend(), maxDurationMs: 600_000 })
-  t.after(() => engine.stop())
-  const planner = internals(engine).reconPlanner
-  const approvedOrigins = new Set([APP_ORIGIN, API_ORIGIN, IDP_ORIGIN])
-
-  // Pre-floor synthesis (sets invariantsSeededRuns + wave1InvariantChainsPromoted)
-  const preFloor = await planner.seedCapabilityLedgerInvariants(storage.run(runId), {
-    approvedOrigins,
-    promoteWave1Chains: true,
-  })
-  assert.equal(preFloor.mode, 'grey-box')
-  assert.ok(preFloor.seededCount >= 2, `expected pre-floor seeds from OpenAPI/SPA/GraphQL, got ${preFloor.seededCount}`)
-
-  const ledger = storage.capabilityLedger(runId)
-  const preCapIds = new Set(ledger.listCapabilities().map(n => n.capId))
-  assert.ok(
-    ledger.listCapabilities().every(n => n.promotionStatus === 'capability_only'),
-    'pre-floor CapabilityLedger nodes must remain strictly quarantined',
-  )
-
-  // Simulate Phase A floor discovering new multi-persona differential exchanges AND cross-origin API dependencies
-  storage.client.prepare(`
-    INSERT INTO broker_exchanges (id, run_id, assignment_id, scope_revision, origin, final_origin, redirect_origins, method, path_and_query, status, media_type, persona_handle, req_headers, resp_headers, body_preview, body_sha256, duration_ms, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    'ex-floor-1', runId, reconWorker.id, run.scopeRevision, API_ORIGIN, API_ORIGIN, '[]',
-    'GET', '/api/v1/reports/42', 403, 'application/json', 'member_a', '{}', '{}', '', 'e3b0', 5, Date.now(),
-  )
-  storage.client.prepare(`
-    INSERT INTO broker_exchanges (id, run_id, assignment_id, scope_revision, origin, final_origin, redirect_origins, method, path_and_query, status, media_type, persona_handle, req_headers, resp_headers, body_preview, body_sha256, duration_ms, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    'ex-floor-2', runId, reconWorker.id, run.scopeRevision, API_ORIGIN, API_ORIGIN, '[]',
-    'POST', '/api/v1/reports/batch', 200, 'application/json', 'member_a', '{}', '{}', '', 'e3b0', 5, Date.now() + 1,
-  )
-
-  const epToken = storage.upsertEndpoint({
-    runId, scopeRevision: run.scopeRevision, origin: IDP_ORIGIN, method: 'POST', pathTemplate: '/oauth/token',
-    authRequirement: 'none', riskScore: 86, source: 'spa_crawl',
-  })
-  const epWebhook = storage.upsertEndpoint({
-    runId, scopeRevision: run.scopeRevision, origin: APP_ORIGIN, method: 'POST', pathTemplate: '/api/v1/webhooks/dispatch',
-    authRequirement: 'bearerAuth', riskScore: 88, source: 'spa_crawl', sinkKinds: ['webhook_hmac'],
-  })
-  const epAdmin = storage.upsertEndpoint({
-    runId, scopeRevision: run.scopeRevision, origin: API_ORIGIN, method: 'POST', pathTemplate: '/api/v1/exports/finalize',
-    authRequirement: 'role:admin', riskScore: 92, source: 'spa_crawl', sinkKinds: ['async_job'],
-  })
-  storage.recordApiDependency({
-    runId,
-    producerEndpointId: epToken.id,
-    consumerEndpointId: epWebhook.id,
-    resourceKey: 'webhookToken',
-    personaHandle: 'member_a',
-  })
-  storage.recordApiDependency({
-    runId,
-    producerEndpointId: epWebhook.id,
-    consumerEndpointId: epAdmin.id,
-    resourceKey: 'exportJobId',
-    personaHandle: 'member_a',
-  })
-
-  // Post-floor Wave-1 check MUST NOT be suppressed by pre-floor invariantsSeededRuns / wave1InvariantChainsPromoted!
-  const postCreated = planner.ensureWave1InvariantChainSteps(storage.run(runId), approvedOrigins, { postFloor: true })
-  assert.ok(postCreated >= 2, `expected incremental post-floor Wave-1 + composite steps, got ${postCreated}`)
-
-  const postNodes = ledger.listCapabilities()
-  const newPostNodes = postNodes.filter(n => !preCapIds.has(n.capId))
-  assert.ok(newPostNodes.length >= 2, 'post-floor synthesis must add incremental quarantined nodes for floor differentials & apiDependencies')
-
-  const allSteps = storage.listChainSteps(runId, run.goalRevision)
-  const runtimeComposites = allSteps.filter(s => s.title.startsWith('Runtime composite chain ·'))
-  assert.ok(runtimeComposites.length >= 1, 'grey-box (!sourceMounted) post-floor must promote Runtime composite chain Wave-1 step(s)')
-  for (const step of runtimeComposites) {
-    assert.equal(step.status, 'ready')
-    assert.equal(isMultiHopChainStep(step), true)
-    assert.equal(classifyDispatchLane(step), 'chain')
-  }
-  assert.ok(
-    allSteps.some(s => s.hypothesis.includes('/api/v1/reports/batch') || s.hypothesis.includes('exportJobId') || s.hypothesis.includes('webhookToken')),
-    'post-floor steps must reflect newly discovered floor multi-persona differential or apiDependencies',
-  )
-
-  // Calling ensureWave1InvariantChainSteps again with no new data is idempotent.
-  const repeatPost = planner.ensureWave1InvariantChainSteps(storage.run(runId), approvedOrigins, { postFloor: true })
-  assert.equal(repeatPost, 0, 'repeat post-floor check with unchanged discovery state must be idempotent')
-
-  // Contrast: when sourceMounted is true, syncPostFloorRuntimeInvariants must NOT create Runtime composite steps
-  const wbSetup = await setupApprovedRun(storage, { seeds: [APP_ORIGIN, API_ORIGIN], tier: 2 })
-  const wbEngine = new Execution(storage, { backend: stubBackend(), maxDurationMs: 600_000 })
-  t.after(() => wbEngine.stop())
-  const wbPlanner = internals(wbEngine).reconPlanner
-  const wbRes = wbPlanner.syncPostFloorRuntimeInvariants(storage.run(wbSetup.runId), new Set([APP_ORIGIN, API_ORIGIN]), {
-    sourceMounted: true,
-    postFloor: true,
-  })
-  const wbComposites = storage.listChainSteps(wbSetup.runId, wbSetup.run.goalRevision)
-    .filter(s => s.title.startsWith('Runtime composite chain ·'))
-  assert.equal(wbComposites.length, 0, 'Runtime composite steps must NOT be synthesized when sourceMounted is true')
-  assert.ok(wbRes.wave1StepsCreated >= 0)
-})
-
-// ============================================================================
-// 2. dispatchChainRound + coordinatorDeps pass { apiDependencies, sourceMounted }
-// ============================================================================
-
-test('dispatchChainRound and coordinatorDeps forward endpointGraphCatalog apiDependencies and sourceMounted: false to planChainRound', async (t) => {
-  const { storage } = makeStore(t)
-  const { runId, run } = await setupApprovedRun(storage, {
-    seeds: [APP_ORIGIN, API_ORIGIN, IDP_ORIGIN],
-    tier: 2,
-  })
-  const ep1 = storage.upsertEndpoint({
-    runId, scopeRevision: run.scopeRevision, origin: IDP_ORIGIN, method: 'POST', pathTemplate: '/oauth/token',
-    authRequirement: 'none', riskScore: 86, source: 'spa_crawl',
-  })
-  const ep2 = storage.upsertEndpoint({
-    runId, scopeRevision: run.scopeRevision, origin: APP_ORIGIN, method: 'POST', pathTemplate: '/api/v1/exports',
-    authRequirement: 'bearerAuth', riskScore: 88, source: 'spa_crawl',
-  })
-  const ep3 = storage.upsertEndpoint({
-    runId, scopeRevision: run.scopeRevision, origin: API_ORIGIN, method: 'GET', pathTemplate: '/api/v1/exports/:exportId/download',
-    authRequirement: 'bearerAuth', riskScore: 90, source: 'spa_crawl',
-  })
-  const ep4 = storage.upsertEndpoint({
-    runId, scopeRevision: run.scopeRevision, origin: API_ORIGIN, method: 'POST', pathTemplate: '/api/v1/exports/:exportId/approve',
-    authRequirement: 'role:admin', riskScore: 94, source: 'spa_crawl',
-  })
-  storage.recordApiDependency({
-    runId, producerEndpointId: ep2.id, consumerEndpointId: ep3.id, resourceKey: 'exportId',
-  })
-  storage.recordApiDependency({
-    runId, producerEndpointId: ep3.id, consumerEndpointId: ep4.id, resourceKey: 'exportId',
-  })
-  assert.ok(ep1.id)
-
-  const engine = new Execution(storage, { backend: stubBackend(), maxDurationMs: 600_000 })
-  t.after(() => engine.stop())
-  const planner = internals(engine).reconPlanner
-
-  const deps = planner.coordinatorDeps(storage.run(runId))
-  const listedDeps = deps.listApiDependencies?.() ?? []
-  assert.equal(listedDeps.length, 2, 'coordinatorDeps.listApiDependencies must expose persisted api_dependencies')
-  assert.ok(listedDeps.some(d => d.producerOrigin === APP_ORIGIN && d.consumerOrigin === API_ORIGIN && d.resourceKey === 'exportId'))
-
-  const coordinator = createGraphCoordinator({
-    deps,
-    approvedOrigins: [APP_ORIGIN, API_ORIGIN, IDP_ORIGIN],
-  })
-  const enqueued = planner.dispatchChainRound(storage.run(runId), coordinator, 24, new Set())
-  assert.ok(enqueued >= 1, `dispatchChainRound in grey-box (!sourceMounted) mode must enqueue chain hypotheses from apiDependencies, got ${enqueued}`)
-
-  const steps = storage.listChainSteps(runId, run.goalRevision)
-  assert.ok(steps.some(s => isMultiHopChainStep(s) && classifyDispatchLane(s) === 'chain'))
-  assert.ok(steps.some(s => s.sourceOrigins.length >= 2 || s.hypothesis.includes('exportId')))
-})
-
-// ============================================================================
-// 3. Lifting MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS = 1 when hasSealedLedgerCap
+// 1. Lifting MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS = 1 when hasSealedLedgerCap
 // ============================================================================
 
 test('enqueueHopContinuationOnRotation lifts MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS = 1 whenever derivedLedgerHandles.length > 0', async (t) => {
@@ -613,7 +362,7 @@ test('enqueueHopContinuationOnRotation lifts MAX_GENERIC_WAVE1_CHAIN_CONTINUATIO
 })
 
 // ============================================================================
-// 4. ExecWorkerRunner triggers hop-continuation on non-confirmed complete_intent
+// 2. ExecWorkerRunner triggers hop-continuation on non-confirmed complete_intent
 //    and max_turns exits with sessionSealedCapHandles, deduped against loops
 // ============================================================================
 

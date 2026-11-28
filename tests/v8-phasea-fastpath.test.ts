@@ -237,7 +237,7 @@ test('synthesizeInvariants() white-box hypotheses directly seed ready Wave-1 cha
   assert.ok(plan.selectedByLane.chain >= 2, `expected >= 2 Wave-1 chain steps dispatched in 3-slot Wave 1, got ${plan.selectedByLane.chain}`)
 })
 
-test('synthesizeInvariants() grey-box runtime parity also promotes Wave-1 chain steps without mounted source', async (t) => {
+test('seedCapabilityLedgerInvariants() without mounted source seeds no heuristic Wave-1 chain steps (World Graph planner owns no-source planning)', async (t) => {
   const { storage } = makeStore(t)
   const { runId } = await setupApprovedRun(storage, { seeds: [ORIGIN_API], tier: 2 })
   const run = storage.run(runId)
@@ -247,40 +247,14 @@ test('synthesizeInvariants() grey-box runtime parity also promotes Wave-1 chain 
   const planner = internals(execution).reconPlanner
   const res = await planner.seedCapabilityLedgerInvariants(run, {
     mode: 'grey-box',
-    runtime: {
-      personaObservations: [
-        {
-          persona: 'revoked_admin',
-          isRevokedOrDemoted: true,
-          surface: 'http',
-          serviceOrigin: ORIGIN_API,
-          method: 'GET',
-          path: '/api/secrets/:id',
-          status: 401,
-        },
-        {
-          persona: 'revoked_admin',
-          isRevokedOrDemoted: true,
-          surface: 'sse',
-          serviceOrigin: ORIGIN_API,
-          method: 'GET',
-          path: '/sse/secrets/stream',
-          status: 200,
-        },
-      ],
-      openApiOperations: [
-        { method: 'GET', path: '/api/secrets/:id', security: [{ bearerAuth: [] }], serviceOrigin: ORIGIN_API },
-        { method: 'POST', path: '/api/secrets/batch', security: [], serviceOrigin: ORIGIN_API },
-      ],
-    },
     approvedOrigins: new Set([ORIGIN_API]),
   })
 
   assert.equal(res.mode, 'grey-box')
-  assert.ok(res.wave1ChainStepsCreated >= 1, 'grey-box asymmetries must directly promote Wave-1 chain steps')
-  const promoted = storage.listChainSteps(runId, run.goalRevision).filter(s => res.wave1ChainStepIds.includes(s.id))
-  assert.ok(promoted.every(s => s.status === 'ready' && isMultiHopChainStep(s) && classifyDispatchLane(s) === 'chain'))
-  assert.ok(promoted.some(s => s.hypothesis.includes('/api/secrets') || s.hypothesis.includes('/sse/secrets')))
+  assert.equal(res.synthesis.hypotheses.length, 0)
+  assert.equal(res.seededCount, 0)
+  assert.equal(res.wave1ChainStepsCreated, 0)
+  assert.equal(storage.listChainSteps(runId, run.goalRevision).length, 0)
 })
 
 // ============================================================================
