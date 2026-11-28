@@ -727,12 +727,12 @@ test('v7 agent-script-proofs: runAgentScriptProof + persistAgentScriptProof sati
     targetOrigins: [fixture.origin],
     signal: AbortSignal.timeout(20_000),
   })
-  assert.equal(backend.calls, 2, 'runAgentScriptProof must execute two fresh attempts')
+  assert.equal(backend.calls, 1, 'runAgentScriptProof must execute one clean host-signed attempt by default')
   assert.equal(proof.verdict.confirmed, true, proof.verdict.detail)
   assert.ok(proof.receipt, 'impact proof must produce a verified ProofReceipt')
   assert.equal(proof.receipt.verification.confirmed, true)
   assert.equal(proof.vulnClass, 'authorization')
-  assert.equal(proof.transcriptDigests.length, 2)
+  assert.equal(proof.transcriptDigests.length, 1)
 
   // Persist via Execution.persistAgentScriptProof and verify every persisted invariant.
   const execInternal = execution as unknown as {
@@ -934,7 +934,7 @@ test('v7 agent-script-proofs: executeInlineVerification short-circuits receipt-f
   assert.equal(reverify1.verificationTier, 'runtime_confirmed')
   assert.equal(reverify1.replaySpecId, persisted.replaySpecId)
   assert.equal(reverify1.attemptCount, 2)
-  assert.equal(backend.calls - callsBefore1, 2, 'must re-run the persisted script through fresh double-run')
+  assert.equal(backend.calls - callsBefore1, 1, 'must re-run the persisted script through fresh clean host-signed replay')
 
   // (b) Short-circuit via findingId fallback even when a brand-new declarative replaySpecId (no
   //     proof columns) is passed — matching update_proposed_finding / propose_chain_finding.
@@ -951,7 +951,7 @@ test('v7 agent-script-proofs: executeInlineVerification short-circuits receipt-f
   assert.equal(reverify2.status, 'confirmed')
   assert.equal(reverify2.replaySpecId, persisted.replaySpecId, 'must resolve the finding agent script proof row')
   assert.equal(reverify2.attemptCount, 3)
-  assert.equal(backend.calls - callsBefore2, 2)
+  assert.equal(backend.calls - callsBefore2, 1)
 
   // (c) After patching the target, receipt-first re-verification dismisses & demotes the finding cleanly.
   fixture.hardened = true

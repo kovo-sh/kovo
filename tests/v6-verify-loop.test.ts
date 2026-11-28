@@ -278,9 +278,8 @@ runVerification(defineVerification({
   assert.equal(proof.reason, 'confirmed')
   assert.match(proof.transcriptDigest ?? '', /^[a-f0-9]{64}$/)
   assert.equal(proof.failures.length, 0)
-  assert.equal(proof.attempts.length, 2)
+  assert.equal(proof.attempts.length, 1)
   assert.ok(proof.attempts.every(attempt => attempt.oraclePassed && attempt.signaturesValid && attempt.exchangeCount >= 2))
-  assert.notEqual(proof.attempts[0].transcriptDigest, proof.attempts[1].transcriptDigest)
 })
 
 test('forged stdout and fabricated exchange ids never confirm through the tool', async () => {

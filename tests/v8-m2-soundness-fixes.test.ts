@@ -182,14 +182,14 @@ test('Req 1: R4-H-6 rejects mixed-role dual_member acting on admin tenant org_a 
   const abacRes = verifyCompositeReceipt(abacReceipt, { entries: [ctrlB, h1, h2B] }, { signingKey: SIGNING_KEY })
   assert.equal(abacRes.confirmed, true, abacRes.reason)
 
-  // Same receipt with explicit cross_surface_pivot hydration must set isPrivilegedPreSeeded=false
+  // Retired parallel cross_surface_pivot hydrator returns empty object (pivot is verified directly on DAG)
   const idx: HydratableTranscriptIndex = { entriesById: new Map([[ctrl.exchangeId, ctrl], [h1.exchangeId, h1], [h2.exchangeId, h2]]) }
   const hydrated = hydrateV8OracleInput('cross_surface_pivot', {
     preChainControlDenied: 'ex-dm-ctrl',
     hops: [{ surface: 'http', role: 'trigger_write', record: 'ex-dm-h1' }, { surface: 'storage', role: 'terminal_impact', record: 'ex-dm-h2', bindingKind: 'value_binding' }],
     terminalImpact: { kind: 'privileged_read' },
   }, idx, 'sig')
-  assert.equal((hydrated.attackerOriginPersona as { isPrivilegedPreSeeded: boolean }).isPrivilegedPreSeeded, false)
+  assert.deepEqual(hydrated, {})
 })
 
 // ============================================================================

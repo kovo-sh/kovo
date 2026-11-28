@@ -1250,6 +1250,7 @@ async function runGolden(
     },
     openAttempt,
     timeoutMs: 90_000,
+    doubleReplay: true,
   })
   const runtimeMs = performance.now() - started
 

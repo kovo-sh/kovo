@@ -76,6 +76,8 @@ export interface ProveHandlerHost {
   readonly diffDigestKey?: string
   runHttpExchange(args: Record<string, unknown>, nonce: string, stamps?: ProveHttpExchangeStamps): Promise<ProveHttpExchangeResult>
   exchangeViewFromTranscript?(exchangeId: string): ProveHttpExchangeResult | null
+  /** Host-attested clean-session flag for a recorded exchange (`undefined` when the host cannot attest). */
+  exchangeCleanSession?(exchangeId: string): boolean | undefined
   runOob(args: Record<string, unknown>): Promise<unknown>
   runRace(args: Record<string, unknown>, nonce: string): Promise<unknown>
   scrubRecord<T>(value: T): T
@@ -1815,21 +1817,13 @@ export async function handleProveSignedUrlMint(
   const chainId = `signed_url_mint:${detailed.variant ?? (variant === 'auto' ? 'unverified' : variant)}`
   const cwe = detailed.variant === 'unauth_write_mint' ? 'CWE-306' : 'CWE-22'
   const exchangeIds = [control.exchangeId, probe.exchangeId]
-  // R4-C-6: NEVER stamp `replayMode: 'fresh_clean_replay'` without an actual fresh clean replay.
-  const replayMode = 'one_shot_transcript' as const
+  // R4-C-6 / R3-05 review: stamp `fresh_clean_replay` ONLY when host attests cleanSession=true on both arms; else fail closed to `one_shot_transcript`.
+  const hostClean = (id: string) => host.exchangeCleanSession?.(id) === true
+  const replayMode: 'fresh_clean_replay' | 'one_shot_transcript' = hostClean(control.exchangeId) && hostClean(probe.exchangeId) ? 'fresh_clean_replay' : 'one_shot_transcript'
   const recorded = host.transcript.recordCompositeVerification({
-    chainId,
-    terminalVulnClass: 'signed_url_mint',
-    replayMode,
-    hopCount: 1,
-    confirmed,
-    verifiedEdgeCount: confirmed ? 1 : 0,
-    reason,
-    rejectedBy,
-    missingEvidence,
-    exchangeIds,
-    terminalExchangeId: probe.exchangeId,
-    route: probe.pathAndQuery,
+    chainId, terminalVulnClass: 'signed_url_mint', replayMode, hopCount: 1, confirmed,
+    verifiedEdgeCount: confirmed ? 1 : 0, reason, rejectedBy, missingEvidence, exchangeIds,
+    terminalExchangeId: probe.exchangeId, route: probe.pathAndQuery,
   })
   const claim: Extract<VerifyClaim, { kind: 'composite_receipt' }> = {
     kind: 'composite_receipt',

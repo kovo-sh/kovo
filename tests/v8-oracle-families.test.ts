@@ -760,155 +760,33 @@ describe('v8 oracle family 6: cross_surface_pivot', () => {
     },
   })
 
-  test('confirms GraphQL -> browser admin-bot -> HTTP privilege escalation and HTTP -> worker OOB -> OIDC chains', () => {
+  test('retired standalone evaluateCrossSurfacePivot shim fails closed outside CompositeProofReceipt DAG', () => {
+    // Multi-surface pivot outside CompositeProofReceipt DAG fails closed (must route through DAG surfaces.size >= 2)
     const res1 = evaluateCrossSurfacePivot(validBrowserPivot())
-    assert.equal(res1.satisfied, true)
+    assert.equal(res1.satisfied, false)
     assert.equal(res1.family, 'cross_surface_pivot')
-    assert.equal(res1.subRule, 'privilege_escalation')
+    assert.equal(res1.reason, 'cross_surface_pivot_requires_composite_dag')
 
-    // Async worker SSRF + derived crypto signing pivot
-    const res2 = evaluateCrossSurfacePivot({
-      attackerOriginPersona: { actorId: 'member_a', role: 'member', tenantId: 'org_a' },
-      preChainControlDenied: rec({ id: 'pre-ssrf', status: 0, timestampMs: T0 }),
-      controlKind: 'unreachable_internal',
-      hops: [
-        {
-          surface: 'http',
-          role: 'trigger_write',
-          correlationToken: 'job-pdf-42',
-          record: rec({ id: 'w0', surface: 'http', method: 'POST', status: 202, timestampMs: T0 + 100, actorId: 'member_a' }),
-        },
-        {
-          surface: 'async_job',
-          role: 'worker_ssrf_callback',
-          bindingKind: 'async_pivot_binding',
-          correlationToken: 'job-pdf-42',
-          emittedArtifactDigest: 'cap:hop_w1:signing_salt',
-          record: rec({ id: 'w1', surface: 'async_job', status: 200, timestampMs: T0 + 1500, capabilityHandle: 'cap:hop_w1:signing_salt' }),
-        },
-        {
-          surface: 'webhook',
-          role: 'terminal_impact',
-          bindingKind: 'derived_crypto_binding',
-          derivedFromCapabilityId: 'cap:hop_w1:signing_salt',
-          record: rec({ id: 'w2', surface: 'webhook', method: 'POST', status: 200, timestampMs: T0 + 2000, derivedFromCapabilityId: 'cap:hop_w1:signing_salt' }),
-        },
-      ],
-      terminalImpact: {
-        kind: 'internal_secret_exfil',
-        verified: true,
-        impactDigest: 'sha256:signed-settlement-accepted',
-      },
-    })
-    assert.equal(res2.satisfied, true)
-    assert.equal(res2.subRule, 'internal_secret_exfil')
-
-    // OIDC redirect -> token exchange pivot
-    const res3 = evaluateCrossSurfacePivot({
-      attackerOriginPersona: { actorId: 'member_b', role: 'member', tenantId: 'org_b' },
-      preChainControlDenied: rec({ id: 'pre-oidc', status: 403, timestampMs: T0 }),
-      hops: [
-        {
-          surface: 'idp',
-          role: 'oidc_redirect',
-          emittedArtifactDigest: 'sha256:oidc-code-9',
-          record: rec({ id: 'o0', surface: 'idp', status: 302, timestampMs: T0 + 100, actorId: 'member_b' }),
-        },
-        {
-          surface: 'http',
-          role: 'terminal_impact',
-          bindingKind: 'value_binding',
-          consumedArtifactDigest: 'sha256:oidc-code-9',
-          record: rec({ id: 'o1', surface: 'http', method: 'POST', status: 200, timestampMs: T0 + 300 }),
-        },
-      ],
-      terminalImpact: {
-        kind: 'credential_capture',
-        verified: true,
-        impactDigest: 'sha256:delegated-session-token',
-      },
-    })
-    assert.equal(res3.satisfied, true)
-    // State-transition binding across GraphQL write -> HTTP approval with ablation control
-    const stateTransition = evaluateCrossSurfacePivot({
-      attackerOriginPersona: { actorId: 'member_a', role: 'member', tenantId: 'org_a' },
-      preChainControlDenied: rec({ id: 'pre-st', status: 403, timestampMs: T0 }),
-      hops: [
-        {
-          surface: 'graphql',
-          role: 'trigger_write',
-          correlationToken: 'payout-entity-88',
-          record: rec({ id: 'st0', surface: 'graphql', method: 'POST', status: 200, timestampMs: T0 + 100, actorId: 'member_a' }),
-        },
-        {
-          surface: 'http',
-          role: 'terminal_impact',
-          bindingKind: 'state_transition_binding',
-          correlationToken: 'payout-entity-88',
-          ablationControlDenied: rec({ id: 'abl-st', status: 403, timestampMs: T0 + 50 }),
-          record: rec({ id: 'st1', surface: 'http', method: 'POST', status: 200, timestampMs: T0 + 250 }),
-        },
-      ],
-      terminalImpact: {
-        kind: 'privileged_mutation',
-        verified: true,
-        impactDigest: 'sha256:self-approved-payout',
-        postImpactReadback: rec({ id: 'rb-st', status: 200, timestampMs: T0 + 300 }),
-      },
-    })
-    assert.equal(stateTransition.satisfied, true)
-  })
-
-  test('fails closed on single-surface chain, out-of-order timestamps, broken causal binding, privileged shortcut, or missing readback', () => {
-    // Single-surface HTTP-only chain (not a cross-surface pivot)
+    // Single-surface HTTP-only chain fails closed
     const singleSurface = validBrowserPivot()
     singleSurface.hops = singleSurface.hops.map((h) => ({ ...h, surface: 'http' }))
     const singleRes = evaluateCrossSurfacePivot(singleSurface)
     assert.equal(singleRes.satisfied, false)
     assert.equal(singleRes.reason, 'single_surface_not_cross_surface_pivot')
 
-    // Out-of-order timestamps (Hop 2 precedes Hop 1)
-    const badOrder = validBrowserPivot()
-    badOrder.hops = badOrder.hops.map((h, idx) => (idx === 2 ? { ...h, record: { ...h.record, timestampMs: T0 + 200 } } : h))
-    const orderRes = evaluateCrossSurfacePivot(badOrder)
-    assert.equal(orderRes.satisfied, false)
-    assert.equal(orderRes.reason, 'non_monotonic_hop_ordering')
+    // 1-hop chain fails closed
+    const oneHop = validBrowserPivot()
+    oneHop.hops = oneHop.hops.slice(0, 1)
+    const oneHopRes = evaluateCrossSurfacePivot(oneHop)
+    assert.equal(oneHopRes.satisfied, false)
+    assert.equal(oneHopRes.reason, 'invalid_hop_count')
 
-    // Broken value binding (consumed digest never emitted by earlier hop)
-    const brokenLink = validBrowserPivot()
-    brokenLink.hops = brokenLink.hops.map((h, idx) => (idx === 2 ? { ...h, consumedArtifactDigest: 'cap:unobserved:forged' } : h))
-    assert.equal(evaluateCrossSurfacePivot(brokenLink).satisfied, false)
-
-    // Privileged pre-seeded persona shortcut forbidden
-    const shortcut = validBrowserPivot()
-    shortcut.attackerOriginPersona = { actorId: 'owner_a', role: 'owner', isPrivilegedPreSeeded: true }
-    const shortcutRes = evaluateCrossSurfacePivot(shortcut)
-    assert.equal(shortcutRes.satisfied, false)
-    assert.equal(shortcutRes.reason, 'privileged_persona_shortcut_forbidden')
-
-    // Missing post-impact readback on privilege_escalation
-    const noReadback = validBrowserPivot()
-    noReadback.terminalImpact = { kind: 'privilege_escalation', verified: true, impactDigest: 'sha256:x' }
-    assert.equal(evaluateCrossSurfacePivot(noReadback).satisfied, false)
-
-    // Hardened twin: terminal hop returns 403
-    const hardened = validBrowserPivot()
-    hardened.hops = hardened.hops.map((h, idx) => (idx === 2 ? { ...h, record: { ...h.record, status: 403 } } : h))
-    assert.equal(evaluateCrossSurfacePivot(hardened).satisfied, false)
-
-    // State-transition binding missing ablation control fails closed
-    assert.equal(
-      evaluateCrossSurfacePivot({
-        attackerOriginPersona: { actorId: 'member_a', role: 'member', tenantId: 'org_a' },
-        preChainControlDenied: rec({ id: 'pre-st2', status: 403, timestampMs: T0 }),
-        hops: [
-          { surface: 'graphql', role: 'trigger_write', correlationToken: 'ent-1', record: rec({ id: 's0', surface: 'graphql', status: 200, timestampMs: T0 + 10 }) },
-          { surface: 'http', role: 'terminal_impact', bindingKind: 'state_transition_binding', correlationToken: 'ent-1', record: rec({ id: 's1', surface: 'http', status: 200, timestampMs: T0 + 20 }) },
-        ],
-        terminalImpact: { kind: 'privileged_read', verified: true, impactDigest: 'sha256:x' },
-      }).satisfied,
-      false,
-    )
+    // Intermediate stub record on terminal hop fails closed
+    const stubPivot = validBrowserPivot()
+    stubPivot.hops = stubPivot.hops.map((h, idx) => (idx === 2 ? { ...h, record: { ...h.record, method: 'POST', status: 202, json: { jobId: 'j-1', status: 'queued' } } } : h))
+    const stubRes = evaluateCrossSurfacePivot(stubPivot)
+    assert.equal(stubRes.satisfied, false)
+    assert.equal(stubRes.reason, 'terminal_impact_unproven_intermediate_stub')
   })
 })
 

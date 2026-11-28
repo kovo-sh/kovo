@@ -394,7 +394,7 @@ test('Bug 2a: default cross_surface_pivot dispatch succeeds for 4-hop chain with
   assert.equal(verdict.terminalOracleFamily, 'cross_surface_pivot')
 })
 
-test('Bug 2b: default cross_surface_pivot dispatch succeeds for state_transition_binding without explicit oracleInput', () => {
+test('Bug 2b: default cross_surface_pivot dispatch rejects label-only same-origin state_transition_binding chain without explicit oracleInput', () => {
   const entityId = 'ent_pivot_505'
   const exAbl: HostTranscriptEntry = {
     exchangeId: 'gx-abl-ctrl',
@@ -453,8 +453,10 @@ test('Bug 2b: default cross_surface_pivot dispatch succeeds for state_transition
   }
 
   const verdict = verifyCompositeReceipt(receipt, transcript, { signingKey: ORACLE_SIGNING_KEY })
-  assert.equal(verdict.confirmed, true, `expected state_transition cross_surface_pivot to pass, got: ${verdict.reason}`)
-  assert.equal(verdict.terminalOracleFamily, 'cross_surface_pivot')
+  // R3-05 review (Verdict-flip): both hops are plain same-origin HTTP; the `storage` label is worker-declared with
+  // no host-evidenced distinct surface, so the cross_surface_pivot DAG alias must fail closed.
+  assert.equal(verdict.confirmed, false, `expected label-only cross_surface_pivot to fail closed, got: ${verdict.reason}`)
+  assert.match(verdict.reason, /single_host_surface_not_cross_surface_pivot/)
 })
 
 // ============================================================================

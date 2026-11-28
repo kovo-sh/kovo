@@ -297,6 +297,7 @@ test('pathFingerprint and normalizeDynamic handle compound runtime IDs + bare [r
 test('verifyScript still rejects genuine causal disagreements (route, claim type, oracle family) with transcript_mismatch', async () => {
   const runDivergent = async (mode: 'route' | 'oracle_family' | 'claim_kind') => verifyScript({
     candidate: { name: `q34-div-${mode}.ts`, runtime: 'ts', code: '// mock', title: 'Divergent proof' },
+    doubleReplay: true,
     openAttempt: makeOpenAttempt((store, attempt, nonce) => {
       const route = mode === 'route'
         ? (attempt === 1 ? '/api/v1/orders/mh_ord_9_5ed534/settle-race' : '/api/v1/orders/mh_ord_10_7ab912/refund')

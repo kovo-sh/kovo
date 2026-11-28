@@ -25,6 +25,7 @@ export const CAUSAL_EDGE_KINDS = ['value_binding', 'derived_crypto_binding', 'st
 export type CausalEdgeKind = (typeof CAUSAL_EDGE_KINDS)[number]
 export const REPLAY_MODES = ['fresh_clean_replay', 'one_shot_transcript'] as const
 export type ReplayMode = (typeof REPLAY_MODES)[number]
+const INPUT_REPLAY_MODES = ['fresh_clean_replay', 'clean_host_replay', 'one_shot_transcript'] as const
 export const capabilityHandleSchema = z.string().trim().regex(/^cap:[A-Za-z0-9._:-]{1,180}$/)
 export const sha256HexSchema = z.string().trim().regex(/^[0-9a-fA-F]{64}$/)
 
@@ -74,7 +75,7 @@ export type TerminalImpact = z.output<typeof terminalImpactSchema>
 export const compositeProofReceiptSchema = z.object({
   chainId: receiptIdSchema, terminalVulnClass: nonEmpty(64), hops: z.array(hopReceiptSchema).min(1).max(8),
   causalEdges: z.array(causalEdgeBindingSchema).max(28).default([]), terminalImpact: terminalImpactSchema,
-  replayMode: z.enum(REPLAY_MODES).default('fresh_clean_replay'), benchmarkMode: z.boolean().optional(),
+  replayMode: z.enum(INPUT_REPLAY_MODES).default('fresh_clean_replay').transform((m): ReplayMode => (m === 'clean_host_replay' ? 'fresh_clean_replay' : m)), benchmarkMode: z.boolean().optional(),
 })
 export type CompositeProofReceipt = z.output<typeof compositeProofReceiptSchema>
 
@@ -510,11 +511,14 @@ function verifyAttackerProvenance(receipt: CompositeProofReceipt, dag: DagTopolo
 }
 
 function verifyReplayMode(receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, options: CompositeVerifyOptions): { ok: true } | { ok: false; reason: string } {
-  if (receipt.replayMode === 'fresh_clean_replay') {
+  if (receipt.replayMode === 'fresh_clean_replay' || (receipt.replayMode as string) === 'clean_host_replay') {
+    let earliestDagMutTs = Infinity
+    for (const hop of receipt.hops) for (const id of hop.exchangeIds) { const e = idx.entriesById.get(id)!; if (isExecArm(e, hop.hopId === receipt.terminalImpact.terminalHopId) && !stepReadsState(e.step) && isFiniteTs(e.timestampMs) && e.timestampMs < earliestDagMutTs) earliestDagMutTs = e.timestampMs }
     for (const hop of receipt.hops) for (const id of hop.exchangeIds) {
       const e = idx.entriesById.get(id)!; if (!isExecArm(e, hop.hopId === receipt.terminalImpact.terminalHopId)) continue
-      if (e.cleanSession === false) return { ok: false, reason: `Mode A rejected exchange "${id}" marked cleanSession=false.` }
-      if (options.requireCleanSessionFlag && e.cleanSession !== true) return { ok: false, reason: `Mode A requires cleanSession=true on "${id}".` }
+      const afterMut = isFiniteTs(e.timestampMs) && e.timestampMs > earliestDagMutTs
+      if (e.cleanSession === false && !afterMut) return { ok: false, reason: `Clean host replay rejected exchange "${id}" marked cleanSession=false.` }
+      if (options.requireCleanSessionFlag && e.cleanSession !== true && !afterMut) return { ok: false, reason: `Clean host replay requires cleanSession=true on "${id}".` }
     }
     return { ok: true }
   }
@@ -542,7 +546,7 @@ function verifyReplayMode(receipt: CompositeProofReceipt, dag: DagTopology, idx:
 }
 
 // --- Public Verifier & Single-Hop Bridge ------------------------------------
-type DefaultV8Ctx = { termEndpoint: string; termFam: string; hasOob: boolean; hasBrowser: boolean; hasBody: boolean; isStub: boolean; ownTenantOnly: boolean; hasForeignTenantData: boolean; hasVerifiedTermEdge: boolean; upstreamEntries: readonly HostTranscriptEntry[]; capIdx: CapOriginIndex; ctrlRejectReasons: readonly string[] }
+type DefaultV8Ctx = { termEndpoint: string; termFam: string; hasOob: boolean; hasBrowser: boolean; hasBody: boolean; isStub: boolean; ownTenantOnly: boolean; hasForeignTenantData: boolean; hasVerifiedTermEdge: boolean; asyncHopIds: ReadonlySet<string>; upstreamEntries: readonly HostTranscriptEntry[]; capIdx: CapOriginIndex; ctrlRejectReasons: readonly string[] }
 let defaultOracleEvaluator: CompositeOracleEvaluator | null = null
 export function registerDefaultCompositeOracleEvaluator(evaluator: CompositeOracleEvaluator | null): void { defaultOracleEvaluator = evaluator }
 export class UnregisteredOracleEvaluatorError extends Error {
@@ -559,7 +563,17 @@ function dispatchDefaultV8Oracle(
   const family = famRes.family, inferredFam = famRes.inferred ? famRes.family : null; if (!family) return null
   const policy = { signingKey: options.signingKey, strictHostDerivation: true }, evalOracle = resolveOracleEvaluator(options)
   const rejectFam = (reason: string, missingEvidence: string[], rejectedBy = `v8_oracle_${family}`) => ({ ok: false as const, reason, rejectedBy, missingEvidence })
-  if (ti.oracleFamily && !ti.oracleInput && family !== 'dual_tenant_abac') return rejectFam(`v8_oracle_failed (${family}): missing_v8_oracle_input — terminalImpact.oracleFamily requires terminalImpact.oracleInput.`, ['terminalImpact.oracleInput'])
+  if (ti.oracleFamily && !ti.oracleInput && family !== 'dual_tenant_abac' && family !== 'cross_surface_pivot') return rejectFam(`v8_oracle_failed (${family}): missing_v8_oracle_input — terminalImpact.oracleFamily requires terminalImpact.oracleInput.`, ['terminalImpact.oracleInput'])
+  if (family === 'cross_surface_pivot') {
+    if (receipt.hops.length < 2) return rejectFam('v8_oracle_failed (cross_surface_pivot): invalid_hop_count — requires >= 2 hops across distinct surfaces.', ['cross_surface_pivot_requires_2_plus_hops'])
+    if (!terminalCtrl || !termEx) return rejectFam(`v8_oracle_failed (${family}): missing_pivot_control_or_terminal_record`, ['pre_chain_control_denied', TERMINAL_IMPACT_UNPROVEN_HINT])
+    if (new Set(receipt.hops.map(h => h.surface)).size < 2) return rejectFam('v8_oracle_failed (cross_surface_pivot): single_surface_not_cross_surface_pivot', ['single_surface_not_cross_surface_pivot'])
+    // R3-05 review: hop.surface labels are worker-declared; require >= 2 HOST-evidenced surfaces (bound trace/OOB, verified async pivot, GraphQL endpoint, or distinct signed origin).
+    const hostSurfaceOf = (h: HopReceipt): string => { const exs = h.exchangeIds.map(id => idx.entriesById.get(id)).filter((e): e is HostTranscriptEntry => Boolean(e)); return h.browserTraceIds.some(id => idx.tracesById.has(id)) ? 'browser' : h.oobEventIds.some(id => idx.oobById.has(id)) ? 'webhook' : ctx.asyncHopIds.has(h.hopId) ? 'async_job' : exs.some(e => /\/graphql(?:[/?#]|$)/i.test(e.step.pathAndQuery ?? e.step.route ?? '')) ? 'graphql' : `http@${normOrigin(exs.map(e => e.origin).find((o): o is string => typeof o === 'string' && o.length > 0) ?? h.target.origin ?? '')}` }
+    if (new Set(receipt.hops.map(hostSurfaceOf)).size < 2) return rejectFam('v8_oracle_failed (cross_surface_pivot): single_host_surface_not_cross_surface_pivot — hop.surface labels lack host-evidenced distinct surfaces.', ['host_evidenced_distinct_surfaces'])
+    if (!postMutRb && (ctx.isStub || ctx.ownTenantOnly)) return rejectFam(TERMINAL_IMPACT_UNPROVEN_HINT, [TERMINAL_IMPACT_UNPROVEN_HINT], 'terminal_impact_unproven')
+    return ctx.hasVerifiedTermEdge ? { ok: true, family: 'cross_surface_pivot', explicit: false } : rejectFam('v8_oracle_failed (cross_surface_pivot): missing_verified_causal_edge', ['verified_causal_edge'])
+  }
   if (family === 'dual_tenant_abac' && receipt.hops.length < 2) return rejectFam('v8_oracle_failed (dual_tenant_abac): multi_hop_causal_chain_required', ['upstream_causal_hop_or_oracle_input'])
   if (family === 'dual_tenant_abac' && !terminalCtrl) {
     const received = ti.preChainControlExchangeIds.slice(0, 3).map(id => { const c = idx.entriesById.get(id); return c ? `${c.step.method} ${normRouteFam(c.step.route ?? c.step.pathAndQuery, c.entityId) || '/'} (${c.step.status ?? 'null'})` : `${id}(missing)` }).join(', ') || 'none'
@@ -575,21 +589,6 @@ function dispatchDefaultV8Oracle(
   }
   const effInput = (explicitInput && !freeFormDualFallback) ? explicitInput : (family === 'dual_tenant_abac' && !explicitInput ? deriveHostDualTenantRawInput({ entriesById: idx.entriesById, personaRoleLabels: options.personaRoleLabels }, econCtx) : null)
   if (effInput) { const res = evalOracle.evaluate(factLog, { kind: 'v8_family', family, rawInput: effInput, econCtx }, policy); return res.confirmed ? { ok: true, family, explicit: true } : mapFail(res.reason) }
-  if (family === 'cross_surface_pivot') {
-    if (receipt.hops.length < 2) return rejectFam('v8_oracle_failed (cross_surface_pivot): invalid_hop_count — requires >= 2 hops across distinct surfaces.', ['cross_surface_pivot_requires_2_plus_hops'])
-    const rootHop = dag.hopsById.get(dag.roots[0]!)!, rootEx = rootHop.exchangeIds.map(id => idx.entriesById.get(id)!).find(e => isExecArm(e, rootHop.hopId === ti.terminalHopId)) ?? idx.entriesById.get(rootHop.exchangeIds[0]!)
-    if (!terminalCtrl || !rootEx || !termEx) return rejectFam(`v8_oracle_failed (${family}): missing_pivot_control_or_terminal_record`, ['pre_chain_control_denied', TERMINAL_IMPACT_UNPROVEN_HINT])
-    const hops = dag.topoOrder.map((hopId, i) => {
-      const h = dag.hopsById.get(hopId)!, edge = (dag.incomingByHop.get(hopId) ?? [])[0]?.edge
-      const outCorr = receipt.causalEdges.find(e => e.fromHopId === hopId && (e.kind === 'async_pivot_binding' || e.kind === 'state_transition_binding')), outArt = receipt.causalEdges.find(e => e.fromHopId === hopId && (e.kind === 'value_binding' || e.kind === 'derived_crypto_binding'))
-      const ex = (i === dag.topoOrder.length - 1 ? termEx : h.exchangeIds.map(id => idx.entriesById.get(id)!).find(e => isExecArm(e, hopId === ti.terminalHopId))) ?? idx.entriesById.get(h.exchangeIds[0]!)!
-      const corr = (edge?.kind === 'async_pivot_binding' ? edge.correlationId : edge?.kind === 'state_transition_binding' ? edge.entityId : undefined) ?? (outCorr?.kind === 'async_pivot_binding' ? outCorr.correlationId : outCorr?.kind === 'state_transition_binding' ? outCorr.entityId : undefined) ?? ex.correlationIds?.[0] ?? h.entityId
-      const emitted = (outArt?.kind === 'value_binding' ? (outArt.capabilityHandle ?? outArt.valueDigest) : outArt?.kind === 'derived_crypto_binding' ? outArt.sourceCapabilityId : undefined) ?? h.producedCapabilities[0]
-      return { surface: h.surface, role: i === dag.topoOrder.length - 1 ? 'terminal_impact' : h.surface === 'browser' ? 'browser_dom_trace' : h.surface === 'webhook' ? 'oob_callback' : 'trigger_write', record: ex.exchangeId, ...(edge ? { bindingKind: edge.kind } : {}), ...(emitted ? { emittedArtifactDigest: emitted } : {}), ...(corr ? { correlationToken: corr } : {}), ...(edge?.kind === 'value_binding' ? { consumedArtifactDigest: edge.capabilityHandle ?? edge.valueDigest ?? h.consumedCapabilities[0] } : {}), ...(edge?.kind === 'derived_crypto_binding' ? { derivedFromCapabilityId: edge.sourceCapabilityId } : {}), ...(edge?.kind === 'state_transition_binding' && edge.ablationExchangeIds[0] ? { ablationControlDenied: edge.ablationExchangeIds[0] } : {}) }
-    })
-    const res = evalOracle.evaluate(factLog, { kind: 'v8_family', family: 'cross_surface_pivot', rawInput: { preChainControlDenied: terminalCtrl.exchangeId, hops, terminalImpact: { kind: postMutRb ? 'privileged_mutation' : 'privileged_read', ...(postMutRb ? { postImpactReadback: postMutRb.exchangeId } : {}) } } }, policy)
-    return res.confirmed ? { ok: true, family, explicit: false } : mapFail(res.reason)
-  }
   if (ctx.isStub && !postMutRb) return mapFail('terminal_impact_unproven_intermediate_stub')
   if (ctx.ownTenantOnly && !postMutRb && family !== 'temporal_revocation') return mapFail('bled_access_own_tenant_only')
   const ctrlAct = terminalCtrl ? actorOf(terminalCtrl) : null, ctrlLbl = ctrlAct && options.personaRoleLabels?.[ctrlAct] ? `${options.personaRoleLabels[ctrlAct]}; ${terminalCtrl?.actorRoleLabel ?? ''}` : terminalCtrl?.actorRoleLabel
@@ -671,7 +670,7 @@ function verifyTerminalImpactGate(
   })
   const hasCleanDeniedCtrl = Boolean(terminalCtrl), ctrlRejectReasons = hasCleanDeniedCtrl ? [] : diagnoseRejectedTerminalControls(ctrlCandidates, idx.entriesById, termEx, postMutRb, termFam, termRawActor, termAuthd, nonTermExSet, termAblationIds, hasExplicitVerifiedTermEdge, hasForeignTenantData, receipt.hops.length, capIdx, { normRouteFam, matchesNormalizedCtrlPath, matchesBoundTerminalControl: (c, ref) => matchesBoundTerminalControl(c, ref, ctrlCtx), sameCredIdentity, probeTenantOf, isLoginCap })
   if (isStub && terminalCtrl && (terminalCtrl.step.status === 401 || terminalCtrl.step.status === 403) && termEx && !ti.proofReceipt && !isJobOrHandleStub(termEx.step.json, termEx.step.body, termEx.step.status, termEx.step.method, termEx.step.route ?? termEx.step.pathAndQuery, undefined, true)) { isStub = false; ({ ownTenantOnly, hasForeignTenantData, reflectedTenantOnly, crossTenantSatisfied } = analyzeCrossTenantTerminalEvidence(termEx, attackerTenants, false, hasBody, upstreamEntries, hasPostMutation, receipt.hops.length >= 2 && hasExplicitVerifiedTermEdge)) }
-  const v8Default = dispatchDefaultV8Oracle(receipt, dag, idx, factLog, termEx, options, terminalCtrl, postMutRb, { termEndpoint, termFam, hasOob: hasBoundOob, hasBrowser: hasBoundBrowser, hasBody, isStub, ownTenantOnly, hasForeignTenantData, hasVerifiedTermEdge, upstreamEntries, capIdx, ctrlRejectReasons })
+  const v8Default = dispatchDefaultV8Oracle(receipt, dag, idx, factLog, termEx, options, terminalCtrl, postMutRb, { termEndpoint, termFam, hasOob: hasBoundOob, hasBrowser: hasBoundBrowser, hasBody, isStub, ownTenantOnly, hasForeignTenantData, hasVerifiedTermEdge, asyncHopIds: new Set(verifiedEdges.filter(e => e.verified && e.kind === 'async_pivot_binding').map(e => e.toHopId)), upstreamEntries, capIdx, ctrlRejectReasons })
   if (v8Default && !v8Default.ok) return { ...v8Default, ...(terminalVerification ? { terminalVerification } : {}) }
   const okTerm = (fam?: V8OracleFamily | string) => ({ ok: true as const, ...(terminalVerification ? { terminalVerification } : {}), ...(fam ? { terminalOracleFamily: fam } : {}), ...(termEndpoint ? { terminalEndpoint: termEndpoint } : {}) })
   if (contract === 'oob') return (hasBoundOob || hasPollEdge || hasBoundBrowser || Boolean(ti.proofReceipt && terminalVerification?.confirmed)) ? okTerm() : failUnproven(`Class "${receipt.terminalVulnClass}" requires a hop-bound OOB callback, converged poll, or verified proofReceipt.`)

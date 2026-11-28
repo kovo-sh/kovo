@@ -1,0 +1,149 @@
+{
+  "id": "p1-1x-replay-pivot-label-spoof-opus-bypass-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "p1-cross-surface-pivot-alias-worker-labelled-surface-spoof",
+  "description": "R3-05 independent-review FP (p1-1x-replay-kernel, reviewer claude-opus-5-5-high): a 2-hop chain claiming terminalVulnClass cross_surface_pivot where BOTH hops are plain same-origin HTTP exchanges (a member-minted token then an own-tenant export read behind a 403 control). The retired standalone pivot evaluator is now a DAG alias, so the only cross-surface evidence left is the worker-declared hop.surface label. The alias must fail closed unless >= 2 HOST-evidenced distinct surfaces exist (bound OOB event, bound browser trace, GraphQL endpoint, or distinct signed origin), and the standalone registry entry point must fail closed even when the raw oracle input claims webhook -> storage surfaces with verified=true.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/v8-oracle-families.ts",
+      "src/server/v8-oracle-hydrate.ts"
+    ],
+    "classes": [
+      "cross_surface_pivot",
+      "business_logic"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-285",
+    "category": "broken-access-control",
+    "title": "Same-surface HTTP chain relabelled as a cross-surface pivot",
+    "impact": "Relabelling two same-origin HTTP exchanges as webhook/storage surfaces proves no cross-surface pivot; the alias must require host-evidenced distinct surfaces and the standalone evaluator must fail closed outside the CompositeProofReceipt DAG.",
+    "claimedImpact": "other",
+    "claimedBoundary": "other",
+    "vulnClass": "business_logic"
+  },
+  "freeTextLabel": {
+    "title": "Webhook token pivots into storage export download"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member [slug=tenant-a] (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-p1pivot-opus-member-a"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "hop1_ex",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/api/v1/hooks/tokens",
+      "persona": "member_a",
+      "requestJson": {
+        "purpose": "export"
+      },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"token\":\"tok_p1pivot_7781abcd\"}"
+    },
+    {
+      "id": "hop2_ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/exports/exp_31/download",
+      "persona": "member_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"export_scope_required\"}"
+    },
+    {
+      "id": "hop2_prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/exports/exp_31/download",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"export\":{\"id\":\"exp_31\",\"tenantId\":\"tenant-a\",\"rows\":[{\"id\":1,\"amountCents\":1200}]}}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-P1-1X-REPLAY-PIVOT-LABEL-SPOOF-OPUS-BYPASS-FP",
+    "terminalVulnClass": "cross_surface_pivot",
+    "oracleFamily": "cross_surface_pivot",
+    "capabilityToken": "tok_p1pivot_7781abcd",
+    "attackerPersonas": [
+      "member_a"
+    ],
+    "claimedDelta": "Member-minted hook token pivoted into an export download after a 403 member control on the same origin.",
+    "v8OracleInput": {
+      "family": "cross_surface_pivot",
+      "rawInput": {
+        "attackerOriginPersona": {
+          "actorId": "member_a",
+          "role": "member"
+        },
+        "preChainControlDenied": {
+          "id": "hop2_ctl",
+          "hostSignature": "sig-forged-00000000",
+          "timestampMs": 900,
+          "status": 403
+        },
+        "hops": [
+          {
+            "surface": "webhook",
+            "role": "trigger_write",
+            "record": {
+              "id": "hop1_ex",
+              "hostSignature": "sig-forged-00000000",
+              "timestampMs": 1000,
+              "status": 200
+            }
+          },
+          {
+            "surface": "storage",
+            "role": "terminal_impact",
+            "record": {
+              "id": "hop2_prb",
+              "hostSignature": "sig-forged-00000000",
+              "timestampMs": 1100,
+              "status": 200
+            }
+          }
+        ],
+        "terminalImpact": {
+          "kind": "privileged_read",
+          "verified": true,
+          "impactDigest": "sha256:forged"
+        }
+      }
+    }
+  }
+}

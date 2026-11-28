@@ -55,7 +55,7 @@ import type {
 } from './composite-receipt.ts'
 import { HostFactLog, deriveAmbientAuthFromHeaders } from './host-fact-log.ts'
 import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
-import { isReadMethod, resolvePersonaIdentity } from './oracle-invariants.ts'
+import { isReadMethod, resolvePersonaIdentity, routeFamily } from './oracle-invariants.ts'
 import { extractSealMetadataHeaders } from './own-org-terminal-guard.ts'
 import type { ImpactStep, RoleName } from './oracle-invariants.ts'
 import {
@@ -313,6 +313,7 @@ export class VerifyRpcServer {
   private readonly asyncPollRecords = new Map<string, HostAsyncPollRecord>()
   private readonly mutatedSessions = new Set<string>()
   private readonly mutatedSessionEntities = new Set<string>()
+  private readonly mutatedSessionRoutes = new Set<string>()
   private readonly mintedCanaries = new Map<string, { token: string; canaryId: string; runId: string; attemptId: string; mintedAtMs: number }>()
   private readonly sessionOobSubscriptions = new Map<string, { token: string; canaryId: string }>()
   private readonly bufferedOobPromotions: VerifyOobPromotionView[] = []
@@ -1115,11 +1116,8 @@ export class VerifyRpcServer {
     if (typeof args.evidenceRole === 'string' && args.evidenceRole.trim()) {
       prov.evidenceRole = args.evidenceRole.trim().slice(0, 64)
     }
-    if (args.replayAttempt === 'mode_a' || args.replayAttempt === 'ablation_control' || args.replayAttempt === 'primary') {
-      if (args.replayAttempt !== 'ablation_control' || cleanSession) {
-        prov.replayAttempt = args.replayAttempt
-      }
-    }
+    // Host-only replayAttempt stamping (workers can never spoof mode_a or ablation_control).
+    prov.replayAttempt = requestMeta.sessionRole === 'control' && cleanSession ? 'ablation_control' : 'primary'
     // R2-C-3: Bind worker-supplied entityId / correlationIds ONLY against worker-visible scrubbed text (never raw hidden bytes).
     const visibleCombined = `${this.scrub(brokerRequest.pathAndQuery)}\n${this.scrub(brokerRequest.body ?? '')}\n${this.scrub(result.body)}`
     if (typeof args.entityId === 'string' && args.entityId.trim()) {
@@ -1172,18 +1170,19 @@ export class VerifyRpcServer {
   }
 
   private computeControlCleanSession(sessionKey: string, args: Record<string, unknown>, req: BrokerHttpRequest, role?: string | null): { isControlOrAblation: boolean; cleanSession: boolean; entityIds: string[] } {
-    const isControlOrAblation = args.replayAttempt === 'ablation_control' || role === 'control'
+    const isControlOrAblation = role === 'control'
     const entityIds = extractRequestEntityIds(args, req.pathAndQuery, req.body)
-    if (!isControlOrAblation) return { isControlOrAblation, cleanSession: true, entityIds }
+    const routeKey = `${sessionKey}::${routeFamily(req.pathAndQuery)}`
     const cleanSession = entityIds.length > 0
       ? entityIds.every(eid => !this.mutatedSessionEntities.has(`${sessionKey}::${eid}`))
-      : !this.mutatedSessions.has(sessionKey)
+      : (isControlOrAblation ? !this.mutatedSessions.has(sessionKey) : !this.mutatedSessionRoutes.has(routeKey))
     return { isControlOrAblation, cleanSession, entityIds }
   }
 
-  private recordSessionMutation(sessionKey: string, method: string, entityIds: readonly string[], isControlOrAblation: boolean, status: number): void {
+  private recordSessionMutation(sessionKey: string, method: string, entityIds: readonly string[], isControlOrAblation: boolean, status: number, pathAndQuery?: string): void {
     if (isReadMethod(method) || (isControlOrAblation && status >= 400)) return
     this.mutatedSessions.add(sessionKey)
+    if (pathAndQuery) this.mutatedSessionRoutes.add(`${sessionKey}::${routeFamily(pathAndQuery)}`)
     for (const eid of entityIds) this.mutatedSessionEntities.add(`${sessionKey}::${eid}`)
   }
 
@@ -1242,7 +1241,7 @@ export class VerifyRpcServer {
       const result = proto === 'http2'
         ? await this.options.broker.executeHttp2Exchange(reqWithRaw, prep.applied.grant, signal)
         : await this.options.broker.executeHttp(reqWithRaw, prep.applied.grant, signal)
-      this.recordSessionMutation(prep.sessionKey, prep.applied.brokerRequest.method, prep.entityIds, prep.isControlOrAblation, result.status)
+      this.recordSessionMutation(prep.sessionKey, prep.applied.brokerRequest.method, prep.entityIds, prep.isControlOrAblation, result.status, prep.applied.brokerRequest.pathAndQuery)
       // H-9 / R2-C-9 / R3-H-5: Stamp authoritative host auth placement from injection + wire provenance.
       const { authPlacement, stampedReqMeta } = this.stampPlacement(prep.applied, prep.requestMeta, result.wireCredentialProvenance)
       const kernelHeaders = this.kernelSanitizer.sanitizeHttpHeaders(result.respHeaders, 'storage_log')
@@ -1376,7 +1375,7 @@ export class VerifyRpcServer {
       )
       const results = burst.results.map((result, index) => {
         const { itemArgs, prep } = items[index]!
-        this.recordSessionMutation(prep.sessionKey, prep.applied.brokerRequest.method, prep.entityIds, prep.isControlOrAblation, result.status)
+        this.recordSessionMutation(prep.sessionKey, prep.applied.brokerRequest.method, prep.entityIds, prep.isControlOrAblation, result.status, prep.applied.brokerRequest.pathAndQuery)
         const { authPlacement, stampedReqMeta } = this.stampPlacement(prep.applied, prep.requestMeta, result.wireCredentialProvenance)
         const batchedReqMeta = { ...stampedReqMeta, raceBatchId } as typeof stampedReqMeta
         const record = this.transcript.record({
@@ -1931,7 +1930,7 @@ export class VerifyRpcServer {
         const startedAt = this.nextHostTimestampMs()
         let rawResp: { body: string; headers: Record<string, string> } | null = null
         const result = await this.options.broker.executeHttp({ ...applied.brokerRequest, onRawResponse: raw => { rawResp = raw } }, applied.grant, signal)
-        this.recordSessionMutation(sessionKey, applied.brokerRequest.method, entityIds, isControlOrAblation, result.status)
+        this.recordSessionMutation(sessionKey, applied.brokerRequest.method, entityIds, isControlOrAblation, result.status, applied.brokerRequest.pathAndQuery)
         lastBrokerResult = { result, rawResp, startedAt, applied, cryptoAtts, cleanSession }
         // R3-H-2: Evaluate worker predicates strictly on vault-scrubbed worker-visible body & headers.
         return {
@@ -2230,8 +2229,9 @@ export class VerifyRpcServer {
     const chainId = this.scrub(verdict.chainId || (typeof rawObj?.chainId === 'string' ? rawObj.chainId : 'invalid'))
     const terminalVulnClass = this.scrub(verdict.terminalVulnClass || (typeof rawObj?.terminalVulnClass === 'string' ? rawObj.terminalVulnClass : 'unknown'))
     const scrubbedRoute = route ? this.scrub(route) : null
+    const transcriptReplayMode: 'fresh_clean_replay' | 'one_shot_transcript' = verdict.replayMode === 'one_shot_transcript' ? 'one_shot_transcript' : 'fresh_clean_replay'
     const recorded = this.transcript.recordCompositeVerification({
-      chainId, terminalVulnClass, replayMode: verdict.replayMode, hopCount: verdict.hopCount, confirmed: verdict.confirmed,
+      chainId, terminalVulnClass, replayMode: transcriptReplayMode, hopCount: verdict.hopCount, confirmed: verdict.confirmed,
       verifiedEdgeCount: verdict.verifiedEdges.filter(e => e.verified).length, reason: this.scrub(verdict.reason),
       ...(verdict.failedStage ? { failedStage: verdict.failedStage } : {}),
       rejectedBy: hostRejectedBy, missingEvidence: this.scrubRecord(hostMissingEvidence), exchangeIds, terminalExchangeId, route: scrubbedRoute,
@@ -2245,7 +2245,7 @@ export class VerifyRpcServer {
     const claim: Extract<VerifyClaim, { kind: 'composite_receipt' }> = {
       kind: 'composite_receipt', verificationId: recorded.verificationId, chainId, terminalVulnClass,
       ...(cwe ? { cwe } : {}), ...(scrubbedRoute ? { route: scrubbedRoute } : {}), exchangeIds,
-      ...(terminalExchangeId ? { terminalExchangeId } : {}), ...(verdict.replayMode ? { replayMode: verdict.replayMode } : {}),
+      ...(terminalExchangeId ? { terminalExchangeId } : {}), replayMode: transcriptReplayMode,
       hopCount, ...(rawObj ? { compositeReceipt: rawObj } : {}),
       ...(!verdict.confirmed ? { rejectedBy: workerRejectedBy, missingEvidence: workerMissing, reason: workerReason } : {}),
     }
@@ -2264,7 +2264,7 @@ export class VerifyRpcServer {
       canaryBroker: this.options.canary ?? (this.options.grant as Grant & { canaryBroker?: VerifyCanaryBroker }).canaryBroker,
       diffDigestKey: this.compositeSigningKey,
       runHttpExchange: async (args, nonce, stamps) => await this.handleHttp(args, nonce, 'http', stamps) as ProveHttpExchangeResult,
-      exchangeViewFromTranscript: id => this.exchangeViewFromTranscript(id),
+      exchangeViewFromTranscript: id => this.exchangeViewFromTranscript(id), exchangeCleanSession: id => this.exchangeProvenance.get(id)?.cleanSession,
       runOob: args => this.handleOob(args), runRace: (args, nonce) => this.handleRace(args, nonce),
       scrubRecord: value => this.scrubRecord(value),
     }

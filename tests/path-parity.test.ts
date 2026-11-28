@@ -430,7 +430,6 @@ export const FP_RULE_BACKFILL_RATCHET: ReadonlyArray<FpCorpusBackfillRatchetEntr
 export const V8_FP_FAMILY_BACKFILL_RATCHET: ReadonlyArray<FpCorpusBackfillRatchetEntry> = [
   { oracle: 'temporal_revocation', ticket: 'R3-12-FP-CORPUS-BACKFILL', reason: 'Pending V8 FP corpus fixture once tests/parity/corpus/*.json lease is free (covered live in tests/kernel-archetype-matrix.test.ts).', expires: '2026-12-31' },
   { oracle: 'parser_cache_differential', ticket: 'R3-12-FP-CORPUS-BACKFILL', reason: 'Pending V8 FP corpus fixture once tests/parity/corpus/*.json lease is free (covered live in tests/kernel-archetype-matrix.test.ts).', expires: '2026-12-31' },
-  { oracle: 'cross_surface_pivot', ticket: 'R3-12-FP-CORPUS-BACKFILL', reason: 'Pending V8 FP corpus fixture once tests/parity/corpus/*.json lease is free (covered live in tests/kernel-archetype-matrix.test.ts).', expires: '2026-12-31' },
 ]
 
 function loadCorpus(): ParityCase[] {

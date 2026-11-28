@@ -469,6 +469,7 @@ test('verifyScript still rejects genuinely different proof titles or when one fr
   // (a) Different normalized proof titles -> transcript_mismatch
   const titleMismatch = await verifyScript({
     candidate: dummyCandidate,
+    doubleReplay: true,
     openAttempt: makeMockOpenAttempt((transcript, attempt, nonce) => {
       const orderId = attempt === 1 ? 'ord_123' : 'ord_456'
       const ex = recordHttp(transcript, {
@@ -525,6 +526,7 @@ test('verifyScript still rejects genuinely different proof titles or when one fr
   // (b) Run 1 passes, Run 2 fails host composite oracle -> NEVER confirms!
   const oneFails = await verifyScript({
     candidate: dummyCandidate,
+    doubleReplay: true,
     openAttempt: makeMockOpenAttempt((transcript, attempt, nonce) => {
       const orderId = attempt === 1 ? 'ord_123' : 'ord_456'
       const ex = recordHttp(transcript, {

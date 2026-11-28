@@ -444,7 +444,7 @@ export interface ProductSubmittedCompositeProof {
   chainId: string
   terminalVulnClass: string
   hopCount: number
-  replayMode: 'fresh_clean_replay' | 'one_shot_transcript'
+  replayMode: 'fresh_clean_replay' | 'clean_host_replay' | 'one_shot_transcript'
   confirmed: boolean
   attackerProvenanceValid: boolean
   modeBVerified?: boolean
@@ -1166,13 +1166,17 @@ function endpointMatchesTemplate(
   return pathMatchesTemplate(candidate.path, template.path)
 }
 
+function isCleanHostReplayMode(mode: string | undefined): boolean {
+  return mode === 'fresh_clean_replay' || mode === 'clean_host_replay'
+}
+
 function receiptPriority(receipt: ProductSubmittedCompositeProof): number {
-  const modeAConfirmed = receipt.confirmed
+  const cleanConfirmed = receipt.confirmed
     && receipt.attackerProvenanceValid
-    && receipt.replayMode === 'fresh_clean_replay'
-  if (modeAConfirmed) return 3
+    && isCleanHostReplayMode(receipt.replayMode)
+  if (cleanConfirmed) return 3
   if (receipt.confirmed) return 2
-  if (receipt.replayMode === 'fresh_clean_replay') return 1
+  if (isCleanHostReplayMode(receipt.replayMode)) return 1
   return 0
 }
 
@@ -1293,7 +1297,7 @@ function receiptReachesPostEnforcement(
 ): boolean {
   const postTemplates = decoy.postEnforcementEndpoints
   if (!postTemplates?.length) return false
-  if (!receipt.confirmed || !receipt.attackerProvenanceValid || receipt.replayMode !== 'fresh_clean_replay') {
+  if (!receipt.confirmed || !receipt.attackerProvenanceValid || !isCleanHostReplayMode(receipt.replayMode)) {
     return false
   }
   const hops = receipt.receipt?.hops
@@ -1399,7 +1403,7 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
       const set = resolvedChainsByFindingId.get(receipt.findingId) ?? new Set<string>()
       set.add(resolvedAny)
       resolvedChainsByFindingId.set(receipt.findingId, set)
-      if (receipt.confirmed && receipt.attackerProvenanceValid && receipt.replayMode === 'fresh_clean_replay') {
+      if (receipt.confirmed && receipt.attackerProvenanceValid && isCleanHostReplayMode(receipt.replayMode)) {
         const cset = confirmedReceiptChainsByFindingId.get(receipt.findingId) ?? new Set<string>()
         cset.add(resolvedAny)
         confirmedReceiptChainsByFindingId.set(receipt.findingId, cset)
@@ -1432,12 +1436,14 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
     const oracleObserved = oracleObservedByChain.get(expected.chainId) ?? false
 
     const matchedReceipt = receiptByChain.get(expected.chainId)
-    const replayMode = matchedReceipt?.replayMode ?? 'fresh_clean_replay'
+    const replayMode: 'fresh_clean_replay' | 'one_shot_transcript' = matchedReceipt?.replayMode === 'one_shot_transcript'
+      ? 'one_shot_transcript'
+      : 'fresh_clean_replay'
     const compositeReceiptConfirmed = Boolean(
       matchedReceipt
       && matchedReceipt.confirmed
       && matchedReceipt.attackerProvenanceValid
-      && matchedReceipt.replayMode === 'fresh_clean_replay',
+      && isCleanHostReplayMode(matchedReceipt.replayMode),
     )
     const twoSideConfirmed = oracleObserved && compositeReceiptConfirmed && !forbiddenShortcutViolation
 
@@ -1576,7 +1582,7 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
       receipt.findingId
       && receipt.confirmed
       && receipt.attackerProvenanceValid
-      && receipt.replayMode === 'fresh_clean_replay'
+      && isCleanHostReplayMode(receipt.replayMode)
     ) {
       const list = confirmedModeAReceiptsByFindingId.get(receipt.findingId) ?? []
       list.push(receipt)

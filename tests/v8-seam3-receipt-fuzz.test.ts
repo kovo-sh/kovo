@@ -1705,6 +1705,7 @@ test('M17: Dual-replay Run 1 vs Run 2 divergence on route, method, claim kind, o
 
   const runDual = async (spec1: AttemptSpec, spec2: AttemptSpec) => verifyScript({
     candidate: { name: 'dual-fuzz', runtime: 'ts', code: '' },
+    doubleReplay: true,
     openAttempt: async ({ attempt, nonce }) => {
       const spec = attempt === 1 ? spec1 : spec2
       const store = new TranscriptStore()

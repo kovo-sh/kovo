@@ -790,7 +790,7 @@ test('R3-05 MF1: 1-hop forged-webhook guard rejects 403/404 controls, alternate 
     { name: 'query-string signature', cls: 'cross_tenant_write', ctrlStatus: 401, probePath: '/v1/webhooks/billing?sig=abc123', probeHeaders: {} },
     { name: 'body JSON signature field', cls: 'cross_tenant_write', ctrlStatus: 401, probePath: '/v1/webhooks/billing', probeHeaders: {}, probeReqJson: { signature: 'abc123', amountCents: 50000 } },
     { name: 'webhook_forgery class without sig header', cls: 'webhook_forgery', ctrlStatus: 401, probePath: '/v1/webhooks/billing', probeHeaders: {} },
-    { name: 'forged_settlement class with headers object', cls: 'forged_settlement', ctrlStatus: 403, probePath: '/v1/webhooks/billing', probeHeaders: { 'content-type': 'application/json' } },
+    { name: 'stripe-signature header with 403 control', cls: 'cross_tenant_write', ctrlStatus: 403, probePath: '/v1/webhooks/billing', probeHeaders: { 'stripe-signature': 't=1,v1=abc' } },
   ]
 
   for (const v of variants) {

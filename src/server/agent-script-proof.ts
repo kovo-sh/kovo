@@ -136,6 +136,8 @@ export interface AgentScriptProofParams {
   v8Vault?: DerivedCapabilityVault
   /** Host-enforced composite receipt verification options. */
   compositeVerifyOptions?: Omit<CompositeVerifyOptions, 'signingKey'>
+  /** Explicit opt-in to run Attempt 2 and compare cross-attempt fingerprints (default: false — 1x clean host-signed replay). */
+  doubleReplay?: boolean
 }
 
 export type AgentScriptVerifyReason = VerifyReason | RetestFailureReason
@@ -361,6 +363,23 @@ export function buildCompositeVerifyOptionsFromGrant(
   }
 }
 
+function compositeProofsAgreeAcrossAttempts(
+  c1: V8CompositeProofBundle,
+  c2: V8CompositeProofBundle,
+): boolean {
+  const termEntity1 = c1.receipt.hops.find(h => h.hopId === c1.receipt.terminalImpact.terminalHopId)?.entityId
+  const termEntity2 = c2.receipt.hops.find(h => h.hopId === c2.receipt.terminalImpact.terminalHopId)?.entityId
+  const endpoint1 = normalizeCompositeTerminalEndpoint(c1.verification.terminalEndpoint, termEntity1)
+  const endpoint2 = normalizeCompositeTerminalEndpoint(c2.verification.terminalEndpoint, termEntity2)
+  const family1 = (c1.verification.terminalOracleFamily ?? c1.receipt.terminalImpact.oracleFamily ?? '').trim()
+  const family2 = (c2.verification.terminalOracleFamily ?? c2.receipt.terminalImpact.oracleFamily ?? '').trim()
+  return c1.receipt.chainId === c2.receipt.chainId
+    && c1.receipt.terminalVulnClass === c2.receipt.terminalVulnClass
+    && c1.receipt.hops.length === c2.receipt.hops.length
+    && endpoint1 === endpoint2
+    && family1 === family2
+}
+
 export async function runAgentScriptProof(params: AgentScriptProofParams): Promise<AgentScriptProofResult> {
   if (params.runtime !== 'ts') {
     throw new Error(`Unsupported kovo_verify runtime: ${String(params.runtime)}. kovo_verify supports TypeScript only (runtime='ts').`)
@@ -511,11 +530,13 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
     }
   }
 
+  const useDoubleReplay = params.doubleReplay === true
   const verdict = await verifyScript({
     candidate: { name: `agent-proof-${params.runId}.ts`, runtime: 'ts', code },
     openAttempt,
     signal: params.signal,
     fastFailOnAttempt1: true,
+    ...(useDoubleReplay ? { doubleReplay: true } : {}),
   })
   const transcriptDigests = verdict.attempts.map(attempt => attempt.transcriptDigest).filter(Boolean)
 
@@ -533,89 +554,43 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
     meta => !handlesBefore.has(meta.handle) || touchedHandles.has(meta.handle),
   )
 
-  // Multi-hop CompositeProofReceipt path (requires both fresh sessions to verify and agree).
-  const a1 = attempts.get(1)
-  const a2 = attempts.get(2)
-  const r1 = verdict.attempts[0]
-  const r2 = verdict.attempts[1]
+  // Multi-hop CompositeProofReceipt path: confirms from Attempt 1's clean host-signed receipt by default,
+  // or requires both fresh sessions to verify and agree when `doubleReplay: true`.
+  const a1 = attempts.get(1), a2 = attempts.get(2), r1 = verdict.attempts[0], r2 = verdict.attempts[1]
   const confirmedComp1 = a1?.composites.find(c => c.verification.confirmed) ?? null
   const confirmedComp2 = a2?.composites.find(c => c.verification.confirmed) ?? null
-  const sessionsClean = Boolean(
-    r1 && r2
-    && r1.nonce !== r2.nonce
-    && !r1.nonceMismatch && !r2.nonceMismatch
-    && r1.exitCode === 0 && r2.exitCode === 0
-    && r1.signaturesValid && r2.signaturesValid,
-  )
+  const isClean = (r: VerifyVerdict['attempts'][number] | undefined): boolean =>
+    Boolean(r && !r.nonceMismatch && r.exitCode === 0 && r.signaturesValid && r.rejectedBy !== 'server_error')
+  const sessionsClean = useDoubleReplay ? (isClean(r1) && isClean(r2) && r1!.nonce !== r2!.nonce) : isClean(r1)
 
-  if (sessionsClean && confirmedComp1 && confirmedComp2) {
-    const termEntity1 = confirmedComp1.receipt.hops.find(h => h.hopId === confirmedComp1.receipt.terminalImpact.terminalHopId)?.entityId
-    const termEntity2 = confirmedComp2.receipt.hops.find(h => h.hopId === confirmedComp2.receipt.terminalImpact.terminalHopId)?.entityId
-    const endpoint1 = normalizeCompositeTerminalEndpoint(confirmedComp1.verification.terminalEndpoint, termEntity1)
-    const endpoint2 = normalizeCompositeTerminalEndpoint(confirmedComp2.verification.terminalEndpoint, termEntity2)
-    const family1 = (confirmedComp1.verification.terminalOracleFamily ?? confirmedComp1.receipt.terminalImpact.oracleFamily ?? '').trim()
-    const family2 = (confirmedComp2.verification.terminalOracleFamily ?? confirmedComp2.receipt.terminalImpact.oracleFamily ?? '').trim()
-    const agrees = confirmedComp1.receipt.chainId === confirmedComp2.receipt.chainId
-      && confirmedComp1.receipt.terminalVulnClass === confirmedComp2.receipt.terminalVulnClass
-      && confirmedComp1.receipt.hops.length === confirmedComp2.receipt.hops.length
-      && endpoint1 === endpoint2
-      && family1 === family2
-    const chosenCapture = a2 ?? a1!
-    const chosenComposite = confirmedComp2
+  if (sessionsClean && confirmedComp1 && (!useDoubleReplay || confirmedComp2)) {
+    const chosenCapture = (useDoubleReplay ? a2 : a1) ?? a1!
+    const chosenComposite = (useDoubleReplay ? confirmedComp2 : confirmedComp1)!
     const exchanges = factLogToScriptExchanges(chosenCapture.factLog, workerSanitizer)
     const attribution = {
       claimTitle: chosenCapture.title ?? verdict.claimTitle ?? params.title?.trim() ?? `${chosenComposite.receipt.terminalVulnClass} multi-hop chain`,
       severity: chosenCapture.severity,
       description: chosenCapture.description,
     }
-    if (!agrees) {
+    if (useDoubleReplay && confirmedComp2 && !compositeProofsAgreeAcrossAttempts(confirmedComp1, confirmedComp2)) {
       return {
         verdict: {
-          ...verdict,
-          confirmed: false,
-          reason: 'transcript_mismatch',
-          rejectedBy: 'composite_receipt',
+          ...verdict, confirmed: false, reason: 'transcript_mismatch', rejectedBy: 'composite_receipt',
           detail: `Both fresh runs verified CompositeProofReceipt, but they disagreed on chain identity (${confirmedComp1.receipt.chainId}/${confirmedComp1.receipt.terminalVulnClass} vs ${confirmedComp2.receipt.chainId}/${confirmedComp2.receipt.terminalVulnClass}).`,
         },
-        exchanges,
-        receipt: null,
-        compositeReceipt: chosenComposite,
-        vulnClass: null,
-        transcriptDigests,
-        sealedCapabilities,
-        transcriptRecords,
-        hostTranscript,
-        ...attribution,
+        exchanges, receipt: null, compositeReceipt: chosenComposite, vulnClass: null,
+        transcriptDigests, sealedCapabilities, transcriptRecords, hostTranscript, ...attribution,
       }
     }
     const compositeVerdict: VerifyVerdict = {
-      ...verdict,
-      confirmed: true,
-      reason: 'confirmed',
-      rejectedBy: null,
-      missingEvidence: [],
-      disagreements: [],
+      ...verdict, confirmed: true, reason: 'confirmed', rejectedBy: null, missingEvidence: [], disagreements: [],
       claimTitle: attribution.claimTitle,
-      detail: `Both fresh runs confirmed ${chosenComposite.receipt.hops.length}-hop CompositeProofReceipt (${chosenComposite.receipt.chainId}, ${chosenComposite.receipt.terminalVulnClass}, ${chosenComposite.verification.verifiedEdges.length} verified edge(s)).`,
-      attempts: verdict.attempts.map(att => ({
-        ...att,
-        oraclePassed: true,
-        failures: [],
-        rejectedBy: null,
-        missingEvidence: [],
-      })),
+      detail: `${useDoubleReplay ? 'Both fresh runs' : 'Fresh 1x clean host-signed run'} confirmed ${chosenComposite.receipt.hops.length}-hop CompositeProofReceipt (${chosenComposite.receipt.chainId}, ${chosenComposite.receipt.terminalVulnClass}, ${chosenComposite.verification.verifiedEdges.length} verified edge(s)).`,
+      attempts: verdict.attempts.map(att => ({ ...att, oraclePassed: true, failures: [], rejectedBy: null, missingEvidence: [] })),
     }
     return {
-      verdict: compositeVerdict,
-      exchanges,
-      receipt: null,
-      compositeReceipt: chosenComposite,
-      vulnClass: chosenComposite.receipt.terminalVulnClass,
-      transcriptDigests,
-      sealedCapabilities,
-      transcriptRecords,
-      hostTranscript,
-      ...attribution,
+      verdict: compositeVerdict, exchanges, receipt: null, compositeReceipt: chosenComposite,
+      vulnClass: chosenComposite.receipt.terminalVulnClass, transcriptDigests, sealedCapabilities, transcriptRecords, hostTranscript, ...attribution,
     }
   }
 

@@ -231,11 +231,10 @@ test('R4-C-6: two-folder benign presign, host/bucket-only diff, cross-persona, a
   const proof = res.result as { confirmed: boolean; rejectedBy: string; claim: { replayMode?: string } }
   assert.equal(proof.confirmed, false)
   assert.equal(proof.rejectedBy, 'signed_url_no_traversal_input')
-  assert.notEqual(proof.claim.replayMode, 'fresh_clean_replay')
-  assert.equal(proof.claim.replayMode, 'one_shot_transcript')
+  assert.equal(proof.claim.replayMode, 'fresh_clean_replay')
 })
 
-test('R4-C-6: 400 validation-error control rejects Variant B; anonymous 401 same-body control confirms without fresh_clean_replay', async t => {
+test('R4-C-6: 400 validation-error control rejects Variant B; anonymous 401 same-body control confirms with fresh_clean_replay', async t => {
   const origin = 'https://upload.example.test'
   const sasSig = Buffer.from(randomBytes(32)).toString('base64url')
 
@@ -275,7 +274,7 @@ test('R4-C-6: 400 validation-error control rejects Variant B; anonymous 401 same
   assert.equal(ctlBodyMismatch.confirmed, false)
   assert.equal(ctlBodyMismatch.rejectedBy, 'signed_url_control_body_mismatch')
 
-  // Live loopback: 400 control vs 200 public presign -> REJECT; 401 same-body vs 200 -> CONFIRM with one_shot_transcript
+  // Live loopback: 400 control vs 200 public presign -> REJECT; 401 same-body vs 200 -> CONFIRM with fresh_clean_replay
   const srv = await startStubServer(({ body, headers }) => {
     const parsed = JSON.parse(body || '{}') as { filename?: string }
     if (!parsed.filename) return { status: 400, body: JSON.stringify({ error: 'filename_required' }) }
@@ -320,6 +319,8 @@ test('R4-C-6: 400 validation-error control rejects Variant B; anonymous 401 same
   const ok401Proof = ok401Rpc.result as { confirmed: boolean; variant: string; claim: { replayMode?: string } }
   assert.equal(ok401Proof.confirmed, true)
   assert.equal(ok401Proof.variant, 'unauth_write_mint')
+  // R3-05 review: the same RPC session already mutated this mint route (bad400 probe 200 POST), so the host
+  // cannot attest a clean replay and must stamp one_shot_transcript (clean-session stamping is covered in p1-1x-replay-kernel).
   assert.equal(ok401Proof.claim.replayMode, 'one_shot_transcript')
 })
 

@@ -395,8 +395,10 @@ export interface VerifyScriptOptions {
   signal?: AbortSignal
   canary?: VerifyCanaryBroker
   timeoutMs?: number
-  /** Skip Attempt 2 when Attempt 1 already failed with `execution` or `checkpoint` (enabled on live `kovo_verify`). */
+  /** Skip Attempt 2 when Attempt 1 already failed with `execution` or `checkpoint` (used when `doubleReplay: true`). */
   fastFailOnAttempt1?: boolean
+  /** Explicit opt-in to execute Attempt 2 and compare cross-attempt causal fingerprints (default: false — 1x clean host-signed replay). */
+  doubleReplay?: boolean
 }
 
 interface CheckpointTranscriptSummary {
@@ -522,6 +524,48 @@ function describeFingerprint(fingerprint: CausalFingerprint): string {
   return `${fingerprint.kind}|${fingerprint.method}|${fingerprint.path}|${fingerprint.status}|${JSON.stringify(fingerprint.expectation)}|${JSON.stringify(fingerprint.observed)}`
 }
 
+function findUnhandledServerError5xx(
+  transcript: TranscriptStore,
+  claims: readonly VerifyScriptResult['claims'][number][],
+) {
+  const hasInjectionErrorClaim = claims.some(c =>
+    (c.kind === 'impact' && c.impactClass === 'injection')
+    || (c.kind === 'body_contains' && typeof c.vulnClass === 'string' && /sql|inject/i.test(c.vulnClass)),
+  )
+  if (hasInjectionErrorClaim) return null
+  return transcript.list().find(rec =>
+    (rec.op === 'http' || rec.op === 'http2' || rec.op === 'race')
+    && typeof rec.response?.status === 'number'
+    && rec.response.status >= 500
+    && rec.response.status <= 599,
+  ) ?? null
+}
+
+function compareDoubleReplayAttempts(
+  first: { report: VerifyAttemptReport; fingerprints: string[] },
+  second: { report: VerifyAttemptReport; fingerprints: string[] },
+  normFirstTitle: string,
+): { ok: true } | { ok: false; detail: string; disagreements: string[] } {
+  const disagreements: string[] = []
+  if (first.fingerprints.length !== second.fingerprints.length) {
+    disagreements.push(`claim count differs: ${first.fingerprints.length} vs ${second.fingerprints.length}`)
+  }
+  const max = Math.max(first.fingerprints.length, second.fingerprints.length)
+  for (let i = 0; i < max; i += 1) {
+    if (first.fingerprints[i] !== second.fingerprints[i]) {
+      disagreements.push(`claim ${i + 1}: ${first.fingerprints[i] ?? '<missing>'} !== ${second.fingerprints[i] ?? '<missing>'}`)
+    }
+  }
+  if (disagreements.length > 0) {
+    return { ok: false, detail: 'Both runs passed, but their transcripts disagree on the causal artifact.', disagreements }
+  }
+  const normSecondTitle = second.report.title ? normalizeDynamic(second.report.title.slice(0, 1024), second.report.nonce) : ''
+  if (!normSecondTitle || normFirstTitle !== normSecondTitle) {
+    return { ok: false, detail: 'Runs reported different proof titles.', disagreements: [`title: ${String(first.report.title)} vs ${String(second.report.title)}`] }
+  }
+  return { ok: true }
+}
+
 async function runAttempt(
   options: VerifyScriptOptions,
   attempt: 1 | 2,
@@ -643,23 +687,24 @@ async function runAttempt(
       claimedBoundary: classifyBoundaryClaim({ title: safeTitle ?? undefined }),
     })
     const causal = causalFingerprints(session.transcript, oracle.checks, nonce)
-    const missingEvidence = (oracle.missingEvidence ?? []).map(item => redact(item))
-    const repairFeedback = oracle.passed ? [] : [
-      `rejected-by: ${oracle.rejectedBy ?? 'unknown'}`,
+    const serverError5xx = findUnhandledServerError5xx(session.transcript, parsed.claims)
+    const oraclePassed = oracle.passed && !serverError5xx
+    const serverErrorFailures = serverError5xx
+      ? [`HTTP ${serverError5xx.response!.status} server error on ${serverError5xx.exchangeId} (${serverError5xx.request?.method ?? 'HTTP'} ${serverError5xx.request?.pathAndQuery ?? '/'}); verification fails closed on 5xx responses.`]
+      : []
+    const effectiveRejectedBy = oracle.passed && serverError5xx ? 'server_error' : (oracle.rejectedBy ?? null)
+    const missingEvidence = oracle.passed && serverError5xx ? ['non_5xx_clean_response'] : (oracle.missingEvidence ?? []).map(item => redact(item))
+    const repairFeedback = oraclePassed ? [] : [
+      `rejected-by: ${effectiveRejectedBy ?? 'unknown'}`,
       ...missingEvidence.map(item => `missing-evidence: ${item}`),
       ...session.transcript.summaries().slice(0, 16).map(entry =>
         `transcript-role: ${entry.role ?? 'setup'} ${entry.exchangeId} ${entry.method ?? '-'} ${entry.pathAndQuery ?? '-'} -> ${entry.status ?? 'error'}${entry.personaHandle ? ` persona=${entry.personaHandle}` : ''}`),
     ]
     return {
       report: {
-        ...base,
-        title: safeTitle,
-        oraclePassed: oracle.passed,
-        failures: [...oracle.failures, ...repairFeedback].map(item => redact(item)),
-        claimCount: parsed.claims.length,
-        causal,
-        rejectedBy: oracle.rejectedBy ?? null,
-        missingEvidence,
+        ...base, title: safeTitle, oraclePassed, claimCount: parsed.claims.length, causal,
+        failures: [...oracle.failures, ...serverErrorFailures, ...repairFeedback].map(item => redact(item)),
+        rejectedBy: effectiveRejectedBy, missingEvidence,
       },
       fingerprints: causal.map(describeFingerprint),
     }
@@ -702,24 +747,29 @@ async function runAttemptSafe(
 }
 
 /**
- * Run the candidate twice from scratch with fresh nonces/sessions. Confirmation requires:
- *   1. both runs executed and returned claims,
- *   2. both transcript oracles passed (stdout is never evidence),
- *   3. both transcripts' signatures verify,
- *   4. the causal fingerprints agree across runs,
- *   5. the nonces differ and each proof document echoes its own attempt nonce.
+ * Run the candidate in a fresh isolated clean session with a host-minted cryptographic nonce
+ * (1x clean host-signed replay default; pass `doubleReplay: true` to also execute Attempt 2
+ * and require cross-attempt causal fingerprint agreement). Confirmation requires:
+ *   1. clean execution with exitCode 0 (no crash, timeout, or unhandled 5xx),
+ *   2. transcript-backed claims returned and passed by the host transcript oracle (stdout is never evidence),
+ *   3. HMAC-signed transcript signatures verify,
+ *   4. the proof document echoes its freshly minted attempt nonce,
+ *   5. when `doubleReplay: true`, distinct nonces and matching normalized causal fingerprints & titles across both runs.
  */
 export async function verifyScript(options: VerifyScriptOptions): Promise<VerifyVerdict> {
   const aliasHits = detectKovoVerifyScriptAliases(options.candidate.code)
+  const runDoubleReplay = options.doubleReplay === true
   const nonces: [string, string] = [randomBytes(16).toString('hex'), randomBytes(16).toString('hex')]
   const first = await runAttemptSafe(options, 1, nonces[0])
   const fastFailFirst = options.fastFailOnAttempt1 === true
     && (first.report.rejectedBy === 'execution' || first.report.rejectedBy === 'checkpoint')
-  const second = fastFailFirst ? null : await runAttemptSafe(options, 2, nonces[1])
+  const second = (runDoubleReplay && !fastFailFirst) ? await runAttemptSafe(options, 2, nonces[1]) : null
   const attempts = second ? [first.report, second.report] : [first.report]
-  const detailBase = second
-    ? `first=${first.report.oraclePassed ? 'pass' : 'fail'} second=${second.report.oraclePassed ? 'pass' : 'fail'}`
-    : `first=${first.report.oraclePassed ? 'pass' : 'fail'} second=skipped`
+  const detailBase = runDoubleReplay
+    ? (second
+        ? `first=${first.report.oraclePassed ? 'pass' : 'fail'} second=${second.report.oraclePassed ? 'pass' : 'fail'}`
+        : `first=${first.report.oraclePassed ? 'pass' : 'fail'} second=skipped`)
+    : `first=${first.report.oraclePassed ? 'pass' : 'fail'}`
   // The repair contract: name the rejecting validator, the exact missing evidence, and the
   // role-labelled transcript, so the agent can repair in one turn instead of guessing.
   const feedback = (includeScriptDiagnostics = false) => {
@@ -833,56 +883,21 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
       claimTitle: first.report.title,
     })
   }
-  if (!second) {
-    return withFeedback({
-      confirmed: false,
-      reason: 'execution_failed',
-      detail: `Verification run failed on attempt 1 (${detailBase}).`,
-      attempts,
-      disagreements: [],
-      claimTitle: first.report.title,
-    }, true)
-  }
-  const disagreements: string[] = []
-  if (first.fingerprints.length !== second.fingerprints.length) {
-    disagreements.push(`claim count differs: ${first.fingerprints.length} vs ${second.fingerprints.length}`)
-  }
-  const max = Math.max(first.fingerprints.length, second.fingerprints.length)
-  for (let i = 0; i < max; i += 1) {
-    if (first.fingerprints[i] !== second.fingerprints[i]) {
-      disagreements.push(`claim ${i + 1}: ${first.fingerprints[i] ?? '<missing>'} !== ${second.fingerprints[i] ?? '<missing>'}`)
-    }
-  }
-  if (disagreements.length > 0) {
-    return withFeedback({
-      confirmed: false,
-      reason: 'transcript_mismatch',
-      detail: 'Both runs passed, but their transcripts disagree on the causal artifact.',
-      attempts,
-      disagreements,
-      claimTitle: first.report.title,
-    })
-  }
   const normFirstTitle = first.report.title ? normalizeDynamic(first.report.title.slice(0, 1024), first.report.nonce) : ''
-  const normSecondTitle = second.report.title ? normalizeDynamic(second.report.title.slice(0, 1024), second.report.nonce) : ''
-  if (!normFirstTitle || !normSecondTitle || normFirstTitle !== normSecondTitle) {
-    return withFeedback({
-      confirmed: false,
-      reason: 'transcript_mismatch',
-      detail: 'Runs reported different proof titles.',
-      attempts,
-      disagreements: [`title: ${String(first.report.title)} vs ${String(second.report.title)}`],
-      claimTitle: first.report.title,
-    })
+  if (!normFirstTitle) {
+    return withFeedback({ confirmed: false, reason: 'transcript_mismatch', detail: 'Verification run did not report a valid proof title.', attempts, disagreements: [`title: ${String(first.report.title)}`], claimTitle: first.report.title })
   }
-  return withFeedback({
-    confirmed: true,
-    reason: 'confirmed',
-    detail: `Both fresh runs passed the transcript oracle with identical causal artifacts (${detailBase}).`,
-    attempts,
-    disagreements: [],
-    claimTitle: first.report.title,
-  })
+  if (!runDoubleReplay) {
+    return withFeedback({ confirmed: true, reason: 'confirmed', detail: `Fresh 1x clean host-signed replay passed the transcript oracle (${detailBase}).`, attempts, disagreements: [], claimTitle: first.report.title })
+  }
+  if (!second) {
+    return withFeedback({ confirmed: false, reason: 'execution_failed', detail: `Verification run failed on attempt 1 (${detailBase}).`, attempts, disagreements: [], claimTitle: first.report.title }, true)
+  }
+  const cmp = compareDoubleReplayAttempts(first, second, normFirstTitle)
+  if (!cmp.ok) {
+    return withFeedback({ confirmed: false, reason: 'transcript_mismatch', detail: cmp.detail, attempts, disagreements: cmp.disagreements, claimTitle: first.report.title })
+  }
+  return withFeedback({ confirmed: true, reason: 'confirmed', detail: `Both fresh runs passed the transcript oracle with identical causal artifacts (${detailBase}).`, attempts, disagreements: [], claimTitle: first.report.title })
 }
 
 // ---------------------------------------------------------------------------

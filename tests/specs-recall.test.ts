@@ -373,7 +373,7 @@ test('mass assignment: a session-scoped create twin dismisses the same spec', as
 // 3. Credential inventory: masked control vs unentitled full read
 // ---------------------------------------------------------------------------
 
-const apiSecret = 'rbs_ci_0123456789ab'
+const apiSecret = 'sk_ci_0123456789ab'
 
 function tokenFixture(hardened: boolean) {
   const directory: Record<string, Actor> = {
@@ -416,7 +416,7 @@ test('credential inventory: the unentitled full secret confirms against the mask
         persona: 'viewer',
         actor: 'viewer_persona',
         controlPath: '/api/tokens?reveal=0',
-        secretPattern: 'rb[s]_[A-Za-z0-9]+_[0-9a-f]{12}',
+        secretPattern: 'sk_[A-Za-z0-9]+_[0-9a-f]{12}',
       }],
     })
     const [spec] = synthesizeEngineSpecs(hyp, result)
@@ -438,7 +438,7 @@ test('credential inventory: a masked-for-everyone twin dismisses the same spec',
         persona: 'viewer',
         actor: 'viewer_persona',
         controlPath: '/api/tokens?reveal=0',
-        secretPattern: 'rb[s]_[A-Za-z0-9]+_[0-9a-f]{12}',
+        secretPattern: 'sk_[A-Za-z0-9]+_[0-9a-f]{12}',
       }],
     })
     const [spec] = synthesizeEngineSpecs(hyp, result)
@@ -462,7 +462,7 @@ function auditFixture(hardened: boolean) {
     if (url.pathname !== '/api/admin/activity') return json(res, 404, { error: 'not_found' })
     const actor = actorOf(req, directory)
     if (!actor) return json(res, 401, { error: 'unauthorized' })
-    const detail = hardened ? 'rotated secret rbs_[redacted]' : `rotated secret ${apiSecret}`
+    const detail = hardened ? 'rotated secret sk_[redacted]' : `rotated secret ${apiSecret}`
     return json(res, 200, { items: [{ actor: 'system', action: 'rotate_key', detail }] })
   })
 }
@@ -482,7 +482,7 @@ function auditSpec(origin: string) {
   // so no field-bound secret anomaly is emitted). The sensitive-read proof must still be built.
   const result = signal({
     pathAndQuery: hyp.pathAndQuery,
-    anomalies: [{ type: 'unauthorized_access', actor: 'viewer_persona', method: 'GET', status: 200, functionLevel: true }],
+    anomalies: [{ type: 'unauthorized_access', actor: 'viewer_persona', method: 'GET', status: 200, functionLevel: true, secretPattern: 'sk_[A-Za-z0-9]+_[0-9a-f]{12}' }],
   })
   const [spec] = synthesizeEngineSpecs(hyp, result)
   assert.ok(spec, 'a text-tolerant sensitive-read spec is synthesized')

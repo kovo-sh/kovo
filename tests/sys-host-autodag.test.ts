@@ -1001,7 +1001,7 @@ async function startLiveFixture(t: test.TestContext): Promise<{ origin: string; 
     if (url.pathname === '/login' && req.method === 'POST') {
       return json(res, 200, { token: SESSION_TOK }, { 'set-cookie': `sid=${SESSION_TOK}; Path=/; HttpOnly` })
     }
-    if (url.pathname === '/api/v1/jobs' && req.method === 'POST') {
+    if ((url.pathname === '/api/v1/jobs' || url.pathname === '/api/v1/denied-jobs') && req.method === 'POST') {
       if (req.headers.authorization !== `Bearer ${SESSION_TOK}`) return json(res, 401, { error: 'unauth' })
       return json(res, 200, { jobId: JOB_HANDLE })
     }
@@ -1075,7 +1075,7 @@ test('Live SDK: failed prove_composite never poisons ctx.claims; the failure sur
     as: 'member_a', role: 'probe', capability: { handle: sessionCap.handle, target: 'bearer' },
   })
   assert.equal(doomedTerminal.status, 403)
-  const setupJob = await ctx.http_send('/api/v1/jobs', {
+  const setupJob = await ctx.http_send('/api/v1/denied-jobs', {
     as: 'member_a', role: 'setup', method: 'POST', capability: { handle: sessionCap.handle, target: 'bearer' },
   })
   assert.equal(setupJob.status, 200)
@@ -1083,7 +1083,7 @@ test('Live SDK: failed prove_composite never poisons ctx.claims; the failure sur
     chainId: 'sdk-lastfailed-negative',
     terminalVulnClass: 'cross_tenant_read',
     hops: [
-      { hopId: 'hop_1', target: { origin: ctx.targetOrigin, method: 'POST', path: '/api/v1/jobs' } as never, exchangeIds: [setupJob as never], claimedDelta: 'Created job.', producedCapabilities: [] },
+      { hopId: 'hop_1', target: { origin: ctx.targetOrigin, method: 'POST', path: '/api/v1/denied-jobs' } as never, exchangeIds: [setupJob as never], claimedDelta: 'Created job.', producedCapabilities: [] },
       { hopId: 'hop_2', target: { origin: ctx.targetOrigin, method: 'GET', path: '/api/v1/jobs/denied/export' } as never, exchangeIds: [doomedTerminal as never], claimedDelta: 'Denied twin terminal probe.' },
     ],
     edges: [{ kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: sessionCap }],

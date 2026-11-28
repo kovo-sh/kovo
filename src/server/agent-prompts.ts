@@ -870,7 +870,7 @@ export function createCheckpointOnlySessionGuard() {
 
 /**
  * Normalize a verifyScript verdict into the tool contract and downgrade any `confirmed: true`
- * lacking two signature-valid, oracle-passed transcript attempts (script stdout is never evidence).
+ * lacking a signature-valid, oracle-passed transcript attempt (script stdout is never evidence).
  */
 export function summarizeKovoVerifyOutcome(value: unknown): KovoVerifyToolResult {
   const rec = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
@@ -905,10 +905,10 @@ export function summarizeKovoVerifyOutcome(value: unknown): KovoVerifyToolResult
   let reason = typeof rec.reason === 'string' && rec.reason ? rec.reason : (confirmed ? 'confirmed' : 'unconfirmed')
   let detail = typeof rec.detail === 'string' ? rec.detail : ''
   if (confirmed) {
-    const oracleBacked = attempts.length >= 2 && attempts.every(a => a.oraclePassed && a.signaturesValid && a.transcriptDigest.length > 0 && a.failures.length === 0)
+    const oracleBacked = attempts.length >= 1 && attempts.every(a => a.oraclePassed && a.signaturesValid && a.transcriptDigest.length > 0 && a.failures.length === 0)
     if (!oracleBacked) {
       confirmed = false; reason = 'unverified'
-      detail = 'Handler claimed confirmation without two signature-valid, oracle-passed transcript attempts; script stdout is never evidence.'
+      detail = 'Handler claimed confirmation without a signature-valid, oracle-passed transcript attempt; script stdout is never evidence.'
       failures.push(detail)
     }
   }

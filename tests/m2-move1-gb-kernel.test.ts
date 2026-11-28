@@ -487,6 +487,7 @@ test('Req 2: Mode-A terminal endpoint normalization agrees on fresh per-run enti
     assignmentId: 'asg-modea-norm',
     targetOrigins: [liveOrigin],
     signal: AbortSignal.timeout(20_000),
+    doubleReplay: true,
   })
   assert.equal(res.verdict.confirmed, true, `Mode-A fresh-entity chain must confirm instead of transcript_mismatch, got: ${res.verdict.reason}: ${res.verdict.detail}`)
   assert.equal(res.verdict.attempts.length, 2)

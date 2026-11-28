@@ -31,7 +31,6 @@ interface WithVerifier { verifySignature?: SignatureVerifier }
 
 const MIN_SIG_LEN = 8
 const DEFAULT_TOL = 1e-6
-const MAX_PIVOT_HOPS = 8
 const FINALIZED_STATES = new Set(['fulfilled', 'completed', 'captured', 'released', 'settled', 'paid', 'shipped', 'delivered', 'disbursed'])
 const ERROR_ONLY_KEYS = new Set(['error', 'errors', 'message', 'detail', 'code', 'status', 'statusCode', 'ok', 'success'])
 const TENANT_MARKER_KEYS = new Set(['tenant', 'tenantid', 'tenant_id', 'org', 'orgid', 'org_id', 'organizationid', 'organization_id', 'workspaceid', 'workspace_id', 'ownertenant', 'ownertenantid', 'owner_tenant_id', 'merchantid', 'merchant_id'])
@@ -655,7 +654,7 @@ export function evaluateParserCacheDifferential(input: ParserCacheDifferentialIn
   return deny(f, 'unknown_parser_cache_mode')
 }
 
-/* ─────────────────── 6. Cross-Surface Pivot Evaluator ────────────────────── */
+/* ─────────── 6. Cross-Surface Pivot (Backwards-Compat DAG Alias) ─────────── */
 
 export type CrossSurfaceHopRole = 'trigger_write' | 'browser_dom_trace' | 'admin_bot_visit' | 'worker_ssrf_callback' | 'oob_callback' | 'oidc_redirect' | 'token_exchange' | 'terminal_impact'
 export interface CrossSurfaceHop {
@@ -668,67 +667,20 @@ export interface CrossSurfacePivotInput extends WithVerifier {
   preChainControlDenied: HostSignedRecord; controlKind?: 'authz_denied' | 'unreachable_internal'; hops: readonly CrossSurfaceHop[]
   terminalImpact: { kind: 'privileged_read' | 'privileged_mutation' | 'credential_capture' | 'internal_secret_exfil' | 'privilege_escalation'; verified: boolean; impactDigest: string; postImpactReadback?: HostSignedRecord }
 }
-function hopStatusValid(hop: CrossSurfaceHop): boolean {
-  const s = hop.record.status
-  if (typeof s === 'number' && s >= 400) return false
-  if (hop.role === 'oidc_redirect') return isRedirect(s) || isOk(s)
-  if (hop.role === 'terminal_impact') return isOk(s)
-  if (s == null) return (hop.surface === 'browser' || hop.surface === 'async_job' || hop.surface === 'webhook') && Boolean(normStr(hop.emittedArtifactDigest ?? hop.record.artifactDigest) || normStr(hop.correlationToken))
-  return isOk(s) || isRedirect(s)
-}
+/**
+ * @deprecated Cross-surface pivot verification is owned directly by the `CompositeProofReceipt` DAG
+ * (`surfaces.size >= 2` over verified causal edges). Standalone calls outside the DAG fail closed.
+ */
 export function evaluateCrossSurfacePivot(input: CrossSurfacePivotInput): V8OracleDecision {
   const f: V8OracleFamily = 'cross_surface_pivot'
-  if (!input?.attackerOriginPersona || !input.terminalImpact) return deny(f, 'missing_pivot_input')
-  const sub = input.terminalImpact.kind
-  if (!normStr(input.attackerOriginPersona.actorId)) return deny(f, 'missing_attacker_origin_persona', sub)
-  if (input.attackerOriginPersona.isPrivilegedPreSeeded === true) return deny(f, 'privileged_persona_shortcut_forbidden', sub)
-  const ctrlErr = checkRecord(input.preChainControlDenied, 'pre_chain_control', input.verifySignature)
-  if (ctrlErr) return deny(f, ctrlErr, sub)
-  const ctrlStatus = input.preChainControlDenied.status
-  if (!(input.controlKind === 'unreachable_internal' ? (ctrlStatus === 0 || ctrlStatus == null || isDenied(ctrlStatus)) : isDenied(ctrlStatus))) return deny(f, 'pre_chain_control_not_denied', sub)
-  const hops = input.hops
-  if (!Array.isArray(hops) || hops.length < 2 || hops.length > MAX_PIVOT_HOPS) return deny(f, 'invalid_hop_count', sub)
-  const surfaces = new Set<V8SurfaceKind>(), emittedValues = new Set<string>(), emittedHandles = new Set<string>(), correlations = new Set<string>()
-  for (let i = 0; i < hops.length; i++) {
-    const hop = hops[i]
-    if (!hop?.surface) return deny(f, `missing_hop_${i}_surface`, sub)
-    const errRec = checkRecord(hop.record, `hop_${i}`, input.verifySignature)
-    if (errRec) return deny(f, errRec, sub)
-    if (!hopStatusValid(hop)) return deny(f, `hop_${i}_status_failed`, sub)
-    if (i === 0) {
-      const h0Actor = normKey(hop.record.actorId)
-      if (h0Actor && h0Actor !== normKey(input.attackerOriginPersona.actorId)) return deny(f, 'hop_0_actor_mismatch', sub)
-    } else {
-      if (hop.record.timestampMs < hops[i - 1].record.timestampMs) return deny(f, 'non_monotonic_hop_ordering', sub, { hopIndex: i })
-      const kind = hop.bindingKind
-      if (!kind) return deny(f, `missing_hop_${i}_causal_binding`, sub)
-      if (kind === 'value_binding') { const c = normStr(hop.consumedArtifactDigest); if (!c || (!emittedValues.has(c) && !emittedHandles.has(c))) return deny(f, `broken_value_binding_at_hop_${i}`, sub) }
-      else if (kind === 'derived_crypto_binding') { const d = normStr(hop.derivedFromCapabilityId ?? hop.record.derivedFromCapabilityId); if (!d || (!emittedHandles.has(d) && !emittedValues.has(d))) return deny(f, `broken_derived_crypto_binding_at_hop_${i}`, sub) }
-      else if (kind === 'async_pivot_binding') { const t = normStr(hop.correlationToken); if (!t || !correlations.has(t)) return deny(f, `broken_async_pivot_binding_at_hop_${i}`, sub) }
-      else if (kind === 'state_transition_binding') {
-        const t = normStr(hop.correlationToken); if (!t || !correlations.has(t)) return deny(f, `broken_state_transition_binding_at_hop_${i}`, sub)
-        const ablErr = checkRecord(hop.ablationControlDenied, `hop_${i}_ablation_control`, input.verifySignature)
-        if (ablErr) return deny(f, ablErr, sub)
-        if (!isDenied(hop.ablationControlDenied!.status)) return deny(f, `hop_${i}_ablation_control_not_denied`, sub)
-      } else return deny(f, `unknown_binding_kind_at_hop_${i}`, sub)
-    }
-    surfaces.add(hop.surface)
-    const emitted = normStr(hop.emittedArtifactDigest ?? hop.record.artifactDigest); if (emitted) emittedValues.add(emitted)
-    const handle = normStr(hop.record.capabilityHandle); if (handle) emittedHandles.add(handle)
-    const corr = normStr(hop.correlationToken); if (corr) correlations.add(corr)
-  }
-  if (surfaces.size < 2) return deny(f, 'single_surface_not_cross_surface_pivot', sub)
+  const sub = input?.terminalImpact?.kind
+  const hops = Array.isArray(input?.hops) ? input.hops : []
   const lastHop = hops[hops.length - 1]
-  if (input.terminalImpact.verified !== true || !normStr(input.terminalImpact.impactDigest)) return deny(f, 'terminal_impact_unverified', sub)
-  if (!isOk(lastHop.record.status) && lastHop.role !== 'oob_callback' && lastHop.role !== 'worker_ssrf_callback') return deny(f, 'terminal_hop_did_not_succeed', sub)
-  if (input.terminalImpact.kind === 'privileged_mutation' || input.terminalImpact.kind === 'privilege_escalation') {
-    const rb = input.terminalImpact.postImpactReadback, rbErr = checkRecord(rb, 'post_impact_readback', input.verifySignature)
-    if (rbErr) return deny(f, rbErr, sub)
-    if (!isOk(rb!.status)) return deny(f, 'post_impact_readback_failed', sub)
-    if (rb!.timestampMs < lastHop.record.timestampMs) return deny(f, 'post_impact_readback_precedes_terminal_hop', sub)
-    if (stubRec(rb!)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
-  } else if (stubRec(lastHop.record)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
-  return ok(f, sub, 'cross_surface_causal_pivot_confirmed', { attackerActorId: input.attackerOriginPersona.actorId, hopCount: hops.length, surfaces: Array.from(surfaces), impactKind: sub, impactDigest: input.terminalImpact.impactDigest, preChainControlId: input.preChainControlDenied.id, terminalHopId: lastHop.record.id })
+  if (lastHop?.record && stubRec(lastHop.record)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
+  if (hops.length < 2) return deny(f, 'invalid_hop_count', sub)
+  const surfaces = new Set(hops.map(h => h?.surface).filter(Boolean))
+  if (surfaces.size < 2) return deny(f, 'single_surface_not_cross_surface_pivot', sub)
+  return deny(f, 'cross_surface_pivot_requires_composite_dag', sub)
 }
 
 /* ─────────────────────────── Unified Dispatcher ──────────────────────────── */

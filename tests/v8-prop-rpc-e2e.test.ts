@@ -547,6 +547,7 @@ async function runFullStackTs(name: string, title: string, code: string): Promis
     candidate: { name: `${name}.ts`, runtime: 'ts', code, title },
     openAttempt,
     timeoutMs: 20_000,
+    doubleReplay: true,
   })
   assertNoRawSecretsInVerdict(verdict, name)
   return verdict

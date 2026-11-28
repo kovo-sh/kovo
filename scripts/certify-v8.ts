@@ -183,7 +183,7 @@ export interface MultihopChainVerdictInput {
   forbiddenShortcutViolation?: boolean
   compositeReceiptConfirmed?: boolean
   twoSideConfirmed: boolean
-  replayMode?: 'fresh_clean_replay' | 'one_shot_transcript' | string
+  replayMode?: 'fresh_clean_replay' | 'clean_host_replay' | 'one_shot_transcript' | string
   dropReason?: string | null
 }
 
@@ -977,7 +977,11 @@ export function normalizeCell(raw: MultihopCellInput): NormalizedMultihopCell {
     (ch) => ch && ch.forbiddenShortcutViolation === true,
   ).length
   const derivedModeBViolations = chains.filter(
-    (ch) => ch && ch.replayMode === 'one_shot_transcript',
+    (ch) =>
+      ch
+      && ch.replayMode !== undefined
+      && ch.replayMode !== 'fresh_clean_replay'
+      && ch.replayMode !== 'clean_host_replay',
   ).length
   const shortcutViolations = Math.max(
     nonNegNum(raw.shortcutViolations, 0),

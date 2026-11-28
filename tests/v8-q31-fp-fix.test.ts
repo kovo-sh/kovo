@@ -218,6 +218,7 @@ test('structural_diff and body_contains fingerprint structural summaries instead
 test('verifyScript confirms dual fresh runs with dynamic jsonpath/structural_diff/body_contains and fails closed if one run fails', async () => {
   const verdict = await verifyScript({
     candidate: dummyCandidate,
+    doubleReplay: true,
     openAttempt: makeMockOpenAttempt((transcript, attempt, nonce) => {
       const id = attempt === 1 ? 'acc_101' : 'acc_202'
       const balance = attempt === 1 ? 1000 : 2500
@@ -257,6 +258,7 @@ test('verifyScript confirms dual fresh runs with dynamic jsonpath/structural_dif
   // Fail closed if Run 2 fails a host oracle check!
   const oneFails = await verifyScript({
     candidate: dummyCandidate,
+    doubleReplay: true,
     openAttempt: makeMockOpenAttempt((transcript, attempt, nonce) => {
       const ex = recordHttp(transcript, {
         method: 'GET', pathAndQuery: '/api/items/acc_101', status: 200,

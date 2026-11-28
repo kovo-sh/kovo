@@ -46,7 +46,6 @@ const LOW_PRIV_ROLE_SET = new Set(['viewer', 'member', 'guest', 'user', 'editor'
 const MIN_TOKEN_LEN = 3
 const SIG_HEADER_NAMES = new Set(['x-sig', 'x-signature', 'x-hmac-signature', 'x-hub-signature-256', 'x-webhook-signature', 'x-kovo-derivation'])
 const SURFACE_SET = new Set(['http', 'graphql', 'ws', 'sse', 'browser', 'webhook', 'async_job', 'idp', 'cdn', 'storage'])
-const EDGE_KIND_SET = new Set(['value_binding', 'derived_crypto_binding', 'state_transition_binding', 'async_pivot_binding'])
 const DUAL_MODE_SET = new Set(['cross_org_transfer', 'dual_org_cache_bleed', 'batch_partial_authz'])
 const CRED_KIND_SET = new Set(['token', 'session', 'role', 'invite', 'pat', 'async_job', 'webhook_callback'])
 const ECON_EQ_SET = new Set(['over_refund', 'balance_minting', 'underpaid_fulfillment', 'ineligible_discount'])
@@ -55,8 +54,6 @@ const CACHE_PRIMED_MODE_ALIASES = new Set(['cache_poisoning', 'cache_deception',
 const DIFF_KIND_SET = new Set(['duplicate_json_key', 'path_normalization', 'header_normalization', 'hop_by_hop_smuggling', 'content_type_confusion'])
 const IMPACT_KIND_SET = new Set(['read', 'mutation'])
 const PIVOT_CTRL_SET = new Set(['authz_denied', 'unreachable_internal'])
-const PIVOT_ROLE_SET = new Set(['trigger_write', 'browser_dom_trace', 'admin_bot_visit', 'worker_ssrf_callback', 'oob_callback', 'oidc_redirect', 'token_exchange', 'terminal_impact'])
-const PIVOT_IMPACT_SET = new Set(['privileged_read', 'privileged_mutation', 'credential_capture', 'internal_secret_exfil', 'privilege_escalation'])
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 
 function parseExtendedRole(raw: string | null | undefined): 'owner' | 'admin' | 'low' | 'unknown' | null {
@@ -874,87 +871,7 @@ export function hydrateV8OracleInput(
   }
 
   if (family === 'cross_surface_pivot') {
-    hydrateRole('preChainControlDenied', 'preChainControlExchangeId')
-    const ctrlKind = pickEnum(rawInput, 'controlKind', PIVOT_CTRL_SET)
-    if (ctrlKind) out.controlKind = ctrlKind
-    const hydratedHops: Array<Record<string, unknown>> = []
-    if (Array.isArray(rawInput.hops)) {
-      for (const rawHop of rawInput.hops.slice(0, 8)) {
-        if (!rawHop || typeof rawHop !== 'object' || Array.isArray(rawHop)) continue
-        const hIn = rawHop as Record<string, unknown>
-        const hOut: Record<string, unknown> = {}
-        const surf = pickEnum(hIn, 'surface', SURFACE_SET)
-        const role = pickEnum(hIn, 'role', PIVOT_ROLE_SET)
-        const bk = pickEnum(hIn, 'bindingKind', EDGE_KIND_SET)
-        if (surf) hOut.surface = surf
-        if (role) hOut.role = role
-        if (bk) hOut.bindingKind = bk
-        hydrateRoleField(hOut, hIn, 'record', idx, fallbackSig, 'exchangeId')
-        hydrateRoleField(hOut, hIn, 'ablationControlDenied', idx, fallbackSig, 'ablationExchangeId')
-        const rec = isRecObj(hOut.record) ? hOut.record : undefined
-        const entry = rec ? idx.entriesById.get(rec.id) : undefined
-        if (rec) {
-          const allowedEmit = new Set<string>([
-            ...(entry?.emittedCapabilities ?? []),
-            ...(entry?.observedResponseDigests ?? []),
-            ...(rec.artifactDigest ? [rec.artifactDigest] : []),
-          ])
-          const rawEmit = pickStr(hIn, 'emittedArtifactDigest', 256)
-          hOut.emittedArtifactDigest = rawEmit && allowedEmit.has(rawEmit)
-            ? rawEmit
-            : (entry?.emittedCapabilities?.[0] ?? rec.artifactDigest)
-          const allowedConsume = new Set<string>([
-            ...(entry?.consumedCapabilities ?? []),
-            ...(entry?.cryptoAttestations?.map(a => a.derivedFromCapabilityId) ?? []),
-          ])
-          const rawConsume = pickStr(hIn, 'consumedArtifactDigest', 256)
-          if (rawConsume && allowedConsume.has(rawConsume)) hOut.consumedArtifactDigest = rawConsume
-          else if (entry?.consumedCapabilities?.[0]) hOut.consumedArtifactDigest = entry.consumedCapabilities[0]
-          const allowedDerived = new Set<string>([
-            ...(entry?.cryptoAttestations?.map(a => a.derivedFromCapabilityId) ?? []),
-            ...(entry?.consumedCapabilities ?? []),
-          ])
-          const rawDerived = pickStr(hIn, 'derivedFromCapabilityId', 256)
-          if (rawDerived && allowedDerived.has(rawDerived)) hOut.derivedFromCapabilityId = rawDerived
-          else if (entry?.cryptoAttestations?.[0]?.derivedFromCapabilityId) hOut.derivedFromCapabilityId = entry.cryptoAttestations[0].derivedFromCapabilityId
-          const rawCorr = pickStr(hIn, 'correlationToken', 256)
-          if (rawCorr && entryContainsCorrelation(entry, rawCorr)) hOut.correlationToken = rawCorr
-        }
-        hydratedHops.push(hOut)
-      }
-      out.hops = hydratedHops
-    }
-    const firstRec = hydratedHops[0] && isRecObj(hydratedHops[0].record) ? hydratedHops[0].record : undefined
-    const firstEntry = firstRec ? idx.entriesById.get(firstRec.id) : undefined
-    if (firstEntry) {
-      const aId = actorOfEntry(firstEntry)
-      const aRole = roleOfEntry(firstEntry) ?? 'member'
-      out.attackerOriginPersona = {
-        actorId: aId ?? '',
-        role: aRole,
-        tenantId: firstEntry.step.actor.tenant ?? null,
-        isPrivilegedPreSeeded: isPrivilegedActorOrRole(aId, aRole, firstEntry.actorRoleLabel),
-      }
-    }
-    if (rawInput.terminalImpact && typeof rawInput.terminalImpact === 'object' && !Array.isArray(rawInput.terminalImpact)) {
-      const tiIn = rawInput.terminalImpact as Record<string, unknown>
-      const tiOut: Record<string, unknown> = {}
-      const kind = pickEnum(tiIn, 'kind', PIVOT_IMPACT_SET)
-      if (kind) tiOut.kind = kind
-      hydrateRoleField(tiOut, tiIn, 'postImpactReadback', idx, fallbackSig)
-      const lastHop = hydratedHops[hydratedHops.length - 1]
-      const lastRec = lastHop && isRecObj(lastHop.record) ? lastHop.record : undefined
-      const lastRole = typeof lastHop?.role === 'string' ? lastHop.role : ''
-      const rb = isRecObj(tiOut.postImpactReadback) ? tiOut.postImpactReadback : undefined
-      const lastOk = Boolean(lastRec && (is2xx(lastRec.status) || lastRole === 'oob_callback' || lastRole === 'worker_ssrf_callback'))
-      const verified = kind === 'privileged_mutation' || kind === 'privilege_escalation'
-        ? Boolean(lastOk && rb && is2xx(rb.status) && !isHydratedStub(rb))
-        : Boolean(lastOk && lastRec && !isHydratedStub(lastRec))
-      tiOut.verified = verified
-      const hostDigest = rb?.artifactDigest ?? lastRec?.artifactDigest
-      if (hostDigest) tiOut.impactDigest = hostDigest
-      out.terminalImpact = tiOut
-    }
+    // Retired parallel pivot hydrator: cross-surface pivot is verified directly on the CompositeProofReceipt DAG (`surfaces.size >= 2`).
     return out
   }
 

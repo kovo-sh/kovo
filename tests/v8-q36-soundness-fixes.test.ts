@@ -519,6 +519,7 @@ test('Bug 4: verifyScript redacts Bearer/API-key/JWT tokens in parsed.title, cla
   // (b) Diverging titles with raw secrets -> disagreements, claimTitle, and attempts[].title must ALL be redacted
   const diffVerdict = await verifyScript({
     candidate: { name: 'q36-title-diff', runtime: 'ts', code: 'export default async () => {}' },
+    doubleReplay: true,
     openAttempt: async ({ attempt, nonce }) =>
       makeMockSession(
         attempt === 1

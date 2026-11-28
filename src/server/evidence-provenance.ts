@@ -225,7 +225,6 @@ const HOST_DISCLOSURE_SECRET_REGEXES: readonly RegExp[] = Object.freeze([
   /\bsk_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\b/,
   /\bpk_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\b/,
   /\brk_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\b/,
-  /\brbs_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\b/,
   /\bAKIA[0-9A-Z]{16}\b/,
 ])
 

@@ -284,8 +284,9 @@ test('live VerifyRpcServer: splitTarget preserves cap:... signed_url handles (no
   assert.equal(dlRel.status, 200)
   assert.ok(dlRel.consumedCapabilities?.includes(relUrlCap), `Expected consumedCapabilities to include ${relUrlCap}, got ${JSON.stringify(dlRel.consumedCapabilities)}`)
 
-  // Confirm live composite proof using full signed_url chain (p_step_1 -> p_step_2)
-  const chProof = ctx.chain('chain-optd-signed-url-confirm', 'cross_tenant_read')
+  // Confirm live composite proof using full signed_url chain (p_step_1 -> p_step_2) in a fresh clean session
+  const { ctx: proofCtx } = await startFixture(t, 'run-optd-sdk-signed-url-confirm')
+  const chProof = proofCtx.chain('chain-optd-signed-url-confirm', 'cross_tenant_read')
   await chProof.control('GET /files/export/tenant-b/ledger.csv', { as: 'member_a' })
   const s1 = await chProof.step('/api/v1/exports/mint', { hopId: 'p_step_1', method: 'POST', as: 'member_a', jsonBody: { scope: 'tenant-b' } })
   const cap = await chProof.seal(s1, { jsonPath: '$.signedUrl', kind: 'signed_url' })
@@ -581,7 +582,8 @@ test('live VerifyRpcServer: v8-m2-r3-wb regression — NO missing_tenant_scope o
 
   // 2) Exact M2 R3 WB failure shape: unscoped persona (no tenant in roleLabel) + value_binding chain -> MUST NOT synthesize partial dual_org_cache_bleed or fail missing_tenant_scope!
   for (const vulnClass of ['dual_tenant_abac', 'broken_access_control', 'bola', 'cross_tenant_read', 'cross_tenant_export'] as const) {
-    const chM2 = ctx.chain(`chain-m2r3-${vulnClass}`, vulnClass)
+    const { ctx: loopCtx } = await startFixture(t, `run-optd-sdk-m2r3-${vulnClass}`)
+    const chM2 = loopCtx.chain(`chain-m2r3-${vulnClass}`, vulnClass)
     const c = await chM2.control('GET /files/export/tenant-b/ledger.csv', { as: 'member_unscoped' })
     assert.equal(c.status, 403)
     const m1 = await chM2.step('/api/v1/exports/mint', { hopId: `m1_${vulnClass}`, method: 'POST', as: 'member_unscoped', jsonBody: { scope: 'tenant-b' } })
@@ -598,7 +600,8 @@ test('live VerifyRpcServer: v8-m2-r3-wb regression — NO missing_tenant_scope o
 
   // 3) broken_access_control & bola with EXPLICIT oracleFamily: 'dual_tenant_abac' + omitted oracleInput MUST NOT synthesize partial dual_org_cache_bleed or fail missing_tenant_scope
   for (const vulnClass of ['broken_access_control', 'bola'] as const) {
-    const chExp = ctx.chain(`chain-m2r3-explicit-${vulnClass}`, vulnClass)
+    const { ctx: expCtx } = await startFixture(t, `run-optd-sdk-m2r3-exp-${vulnClass}`)
+    const chExp = expCtx.chain(`chain-m2r3-explicit-${vulnClass}`, vulnClass)
     const c = await chExp.control('GET /files/export/tenant-b/ledger.csv', { as: 'dual_member' })
     assert.equal(c.status, 403)
     const m1 = await chExp.step('/api/v1/exports/mint', { hopId: `e1_${vulnClass}`, method: 'POST', as: 'dual_member', jsonBody: { scope: 'tenant-b' } })

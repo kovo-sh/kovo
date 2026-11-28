@@ -4,7 +4,7 @@
  * Pure, deterministic, fail-closed helpers extracted from `v8-oracle-hydrate.ts` to keep
  * shared kernel modules within strict LOC ceilings.
  */
-import { ROLE_RANK, normalizeRole, resolvePersonaIdentity, routeFamily, stepReadsState } from './oracle-invariants.ts'
+import { ROLE_RANK, isReadMethod, normalizeRole, resolvePersonaIdentity, routeFamily, stepReadsState } from './oracle-invariants.ts'
 import { resolveCompositeTerminalContract, type OracleTerminalContractKind } from './oracle-spec.ts'
 export { resolveCompositeTerminalContract }
 import type { HostSignedRecord } from './v8-oracle-families.ts'
@@ -610,11 +610,12 @@ const SIGNED_URL_QUERY_KEY_RE = /^(?:x-)?sign$|^sig(?:\[\]|\d+)$/i
 const FORGED_WEBHOOK_DENIED_STATUSES = new Set([401, 403, 404])
 const FORGED_WEBHOOK_ALWAYS_CLASS_RE = /^(?:webhook_forgery|webhook|forged_signature.*)$/i
 
-export function hasSignedUrlOrHeaderSignature(entry: HydratableEntry | undefined): boolean {
+/** Generic host-side detector for cryptographic signature carriers across headers, query params, and (for non-reads) JSON bodies. */
+function hasSignatureCarrier(entry: HydratableEntry | undefined, includeBody = true): boolean {
   const hdrs = entry?.step.requestHeaders
   if (hdrs && typeof hdrs === 'object') {
     for (const [k, v] of Object.entries(hdrs)) {
-      if (SIG_CARRIER_KEY_RE.test(k.trim()) && typeof v === 'string' && v.trim().length > 0) return true
+      if (SIG_CARRIER_KEY_RE.test(k.trim()) && (!includeBody ? (typeof v === 'string' && v.trim().length > 0) : true)) return true
     }
   }
   const rawPq = entry?.step.pathAndQuery ?? entry?.step.route ?? ''
@@ -622,26 +623,15 @@ export function hasSignedUrlOrHeaderSignature(entry: HydratableEntry | undefined
   if (qIdx >= 0) {
     const query = rawPq.slice(qIdx + 1).split('#', 1)[0] ?? ''
     for (const [k, v] of new URLSearchParams(query).entries()) {
-      if ((SIG_CARRIER_KEY_RE.test(k.trim()) || SIGNED_URL_QUERY_KEY_RE.test(k.trim())) && v.trim().length > 0) return true
+      const key = k.trim()
+      if ((SIG_CARRIER_KEY_RE.test(key) || SIGNED_URL_QUERY_KEY_RE.test(key)) && (!includeBody ? v.trim().length > 0 : true)) return true
     }
   }
-  return false
-}
-
-export function hasWebhookSignatureHeader(entry: HydratableEntry | undefined): boolean {
-  const hdrs = entry?.step.requestHeaders
-  if (hdrs && typeof hdrs === 'object' && Object.keys(hdrs).some(k => SIG_CARRIER_KEY_RE.test(k.trim()))) return true
-  const rawPq = entry?.step.pathAndQuery ?? ''
-  const qIdx = rawPq.indexOf('?')
-  if (qIdx >= 0) {
-    const query = rawPq.slice(qIdx + 1).split('#', 1)[0] ?? ''
-    for (const k of new URLSearchParams(query).keys()) {
-      if (SIG_CARRIER_KEY_RE.test(k.trim())) return true
+  if (includeBody) {
+    const reqBody = entry?.step.requestJson
+    if (reqBody && typeof reqBody === 'object' && !Array.isArray(reqBody)) {
+      if (Object.keys(reqBody as Record<string, unknown>).some(k => SIG_CARRIER_KEY_RE.test(k.trim()))) return true
     }
-  }
-  const reqBody = entry?.step.requestJson
-  if (reqBody && typeof reqBody === 'object' && !Array.isArray(reqBody)) {
-    if (Object.keys(reqBody as Record<string, unknown>).some(k => SIG_CARRIER_KEY_RE.test(k.trim()))) return true
   }
   return false
 }
@@ -662,7 +652,7 @@ export function isControlDeniedAction(
   const eFam = routeFamily(entry.step.route ?? entry.step.pathAndQuery)
   const eActor = actorOfGuardEntry(entry)?.trim().toLowerCase() ?? ''
   if (!eFam) return false
-  const isSigWebhook = hasWebhookSignatureHeader(entry)
+  const isSigWebhook = hasSignatureCarrier(entry, true)
   for (const cid of preChainControlIds) {
     const ctrl = entriesById.get(cid)
     if (!ctrl || ctrl.exchangeId === entry.exchangeId || ctrl.step.arm !== 'control') continue
@@ -800,11 +790,11 @@ export function selectVerifiedPostMutationReadback<T extends HydratableEntry>(
 }
 
 /**
- * R5(b) + R6-nx: Reject 1-hop (`hops < 2`, `verifiedEdges === 0`) forged-signature / webhook
- * POST/PUT receipts AND 1-hop signed-URL/header GET/HEAD receipts whose denied control failed
- * (`401`/`403`/`404`) and whose probe carries a cryptographic signature carrier without proving
- * in-DAG secret/capability provenance (`hops >= 2` with causal edge, `derived_crypto_binding`,
- * or host-attested `cryptoAttestations`).
+ * Generic 1-hop DAG signature-provenance guard: any 1-hop (`hops < 2`, `verifiedEdges === 0`)
+ * terminal exchange carrying a cryptographic signature carrier (header, query param, or body key)
+ * or claiming a signature/webhook forgery class MUST prove in-DAG emitter/crypto provenance
+ * (`hops >= 2` with verified causal edge, `derived_crypto_binding`, or host-attested `cryptoAttestations`)
+ * — otherwise fail closed regardless of HTTP method or domain class label.
  */
 export function evaluateForgedWebhookProvenanceGuard(params: {
   normCls: string
@@ -823,24 +813,22 @@ export function evaluateForgedWebhookProvenanceGuard(params: {
   const term = params.termEx
   if (!term) return null
   const meth = term.step.method.toUpperCase()
-  const isRead = meth === 'GET' || meth === 'HEAD'
+  const isRead = isReadMethod(meth)
   if (isRead && params.hostVerifiedCryptoOracle) return null
-  if (!isRead && (stepReadsState(term.step) || (meth !== 'POST' && meth !== 'PUT'))) return null
   if (params.hasTermDerivedCrypto || (term.cryptoAttestations?.length ?? 0) > 0) return null
-  const hasSigCarrier = isRead ? hasSignedUrlOrHeaderSignature(term) : hasWebhookSignatureHeader(term)
-  const isForgedClass = !isRead && (FORGED_WEBHOOK_ALWAYS_CLASS_RE.test(params.normCls)
-    || (params.normCls === 'forged_settlement' && (hasSigCarrier || term.step.requestHeaders !== undefined || term.step.requestJson !== undefined)))
-  if (!hasSigCarrier && !isForgedClass) return null
+  const hasSigCarrier = hasSignatureCarrier(term, !isRead)
+  const isExplicitSigClass = !isRead && FORGED_WEBHOOK_ALWAYS_CLASS_RE.test(params.normCls)
+  if (!hasSigCarrier && !isExplicitSigClass) return null
   const termFam = routeFamily(term.step.route ?? term.step.pathAndQuery)
   const hasDeniedCtrl = (typeof params.terminalCtrl?.step.status === 'number' && FORGED_WEBHOOK_DENIED_STATUSES.has(params.terminalCtrl.step.status))
     || params.preChainControlIds.some(cid => {
       const c = params.entriesById.get(cid)
       return Boolean(c && c.step.arm === 'control' && typeof c.step.status === 'number' && FORGED_WEBHOOK_DENIED_STATUSES.has(c.step.status) && c.step.method.toUpperCase() === meth && (!termFam || routeFamily(c.step.route ?? c.step.pathAndQuery) === termFam))
     })
-  if (!hasDeniedCtrl) return null
+  if (!hasDeniedCtrl && !hasSigCarrier) return null
   return isRead
-    ? 'signed_url_unproven_capability_provenance: 1-hop signed-URL/header GET/HEAD request with denied control (401/403/404) requires >= 2 hops with a verified causal edge or host-attested derived_crypto_binding proving in-DAG signature/URL provenance.'
-    : 'forged_signature_unproven_secret_provenance: 1-hop forged signature/webhook mutation with denied control (401/403/404) requires >= 2 hops with a verified causal edge or host-attested derived_crypto_binding proving in-DAG secret provenance.'
+    ? 'signed_url_unproven_capability_provenance: 1-hop signature-bearing read requires >= 2 hops with a verified causal edge or host-attested derived_crypto_binding proving in-DAG signature/capability provenance.'
+    : 'forged_signature_unproven_secret_provenance: 1-hop signature-bearing terminal exchange requires >= 2 hops with a verified causal edge or host-attested derived_crypto_binding proving in-DAG emitter/crypto provenance.'
 }
 
 // --- R6-nx: Entity-Less Read State-Transition Edge + Pre-Mutation Control Selection ---

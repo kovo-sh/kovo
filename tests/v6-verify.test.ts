@@ -420,7 +420,7 @@ runVerification(defineVerification({
 }))
 `,
   }
-  const verdict = await verifyScript({ candidate, openAttempt: factory })
+  const verdict = await verifyScript({ candidate, openAttempt: factory, doubleReplay: true })
   assert.equal(verdict.confirmed, true, `${verdict.reason}: ${verdict.detail}`)
   assert.equal(verdict.attempts.length, 2)
   assert.notEqual(verdict.attempts[0].nonce, verdict.attempts[1].nonce, 'attempts must use fresh nonces')
@@ -502,7 +502,7 @@ runVerification(defineVerification({
 }))
 `,
   }
-  const verdict = await verifyScript({ candidate, openAttempt: factory })
+  const verdict = await verifyScript({ candidate, openAttempt: factory, doubleReplay: true })
   bobSeesItem7 = true
   assert.equal(verdict.confirmed, false)
   assert.equal(verdict.reason, 'oracle_failed')

@@ -440,9 +440,8 @@ return ctx.result({ title: 'Cross-tenant item read (CWE-639)', severity: 'high' 
     openAttempt: makeFactory(),
   })
   assert.equal(bareVerdict.confirmed, true, `${bareVerdict.reason}: ${bareVerdict.detail} | stderr=${bareVerdict.stderrPreview ?? ''}`)
-  assert.equal(bareVerdict.attempts.length, 2)
+  assert.equal(bareVerdict.attempts.length, 1)
   assert.equal(bareVerdict.attempts[0]!.oraclePassed, true)
-  assert.equal(bareVerdict.attempts[1]!.oraclePassed, true)
 
   // 2. Bare inline TS body with snake_case keys and omitted return ctx.result(...)
   const bareNoReturnVerdict = await verifyScript({
