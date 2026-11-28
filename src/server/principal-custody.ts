@@ -74,17 +74,25 @@ const normalizeOriginSafe = (raw: string | undefined): string | null => {
   if (!raw) return null
   try { const u = new URL(raw); return u.protocol === 'http:' || u.protocol === 'https:' ? u.origin : null } catch { return null }
 }
-function shannonEntropy(value: string): number {
-  if (!value.length) return 0
-  const counts = new Map<string, number>()
-  for (const ch of value) counts.set(ch, (counts.get(ch) ?? 0) + 1)
-  let h = 0
-  for (const c of counts.values()) { const p = c / value.length; h -= p * Math.log2(p) }
-  return h
-}
-const isHighEntropyCandidate = (rawValue: string, minLen = 8): boolean => {
+function hasTokenEntropy(rawValue: string, minLen = 8, minBits = 1.8): boolean {
   const t = rawValue.trim()
-  return t.length >= minLen && isScrubbableCapabilityValue(t, Math.min(6, minLen)) && (JWT_SHAPE_RE.test(t) || (new Set(t).size >= 4 && shannonEntropy(t) >= 1.8))
+  if (t.length < minLen || !isScrubbableCapabilityValue(t, Math.min(6, minLen))) return false
+  if (JWT_SHAPE_RE.test(t)) return true
+  const bytes = Buffer.from(t, 'utf8')
+  const freq = new Uint32Array(256)
+  let distinct = 0
+  for (let i = 0; i < bytes.length; i += 1) {
+    const b = bytes[i]!
+    if (freq[b] === 0) distinct += 1
+    freq[b] = freq[b]! + 1
+  }
+  if (distinct < 4) return false
+  let bits = 0
+  for (let i = 0; i < 256; i += 1) {
+    const c = freq[i]!
+    if (c > 0) { const p = c / bytes.length; bits -= p * Math.log2(p) }
+  }
+  return bits >= minBits
 }
 function resolvePrivilegeClass(handle: string, roleLabel: string, explicit?: PersonaPrivilege | null, tenantRef?: string | null): PersonaPrivilegeClassification {
   const inferred = classifyPersonaPrivilege(handle, roleLabel, { privilege: explicit, tenantRef }), mapped = explicit ? EXPLICIT_PRIVILEGE_RANK[explicit] : undefined
@@ -213,7 +221,7 @@ function collectResponseCandidates(input: IndexResponseInput): ResponseCandidate
       const pairs: Array<[string, string]> = [...u.searchParams.entries(), ...(u.hash.includes('=') ? [...new URLSearchParams(u.hash.slice(1)).entries()] : [])]
       for (const [k, v] of pairs) {
         const named = TOKEN_QUERY_PARAM_RE.test(k)
-        if (named || (v.length >= 16 && shannonEntropy(v) >= 2.6)) {
+        if (named || hasTokenEntropy(v, 16, 2.6)) {
           out.push({ slot: `query_${sanitizeSlot(k)}`, rawValue: v, kind: JWT_SHAPE_RE.test(v) ? 'jwt' : 'signed_url', carrier: 'query', minEntropyLen: named ? 8 : 16 })
         }
       }
@@ -408,7 +416,7 @@ export class PrincipalCustodyStore {
     const sealed: CapabilityRecord[] = []
     for (const cand of collectResponseCandidates(input)) {
       const trimmed = cand.rawValue.trim()
-      if (!isHighEntropyCandidate(trimmed, cand.minEntropyLen) || state.knownRawValues.has(trimmed)) continue
+      if (!hasTokenEntropy(trimmed, cand.minEntropyLen) || state.knownRawValues.has(trimmed)) continue
       let slot = cand.slot
       if (this.vault.hasEverSealed(`cap:hop_${input.hopReceiptId}:${slot}`)) { state.autoSlotSeq += 1; slot = `${slot.slice(0, 48)}_${state.autoSlotSeq}` }
       const meta = this.vault.seal({
