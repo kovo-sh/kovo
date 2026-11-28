@@ -172,6 +172,7 @@ import {
   type SynthesizerMode,
 } from './invariant-synthesizer.ts'
 import type { LabRunner, LabTargetHandle } from './lab-runner.ts'
+import { decidePlannerAnswer, planWithWorldGraph, type LlmPlannerDecision } from './llm-planner.ts'
 import {
   privateModelProfiles,
   resolveProfilePoolForRole,
@@ -209,6 +210,7 @@ import { runVariantSweepForFinding } from './semantic-audit.ts'
 import type { StaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
 import type { Assignment, ChainStep, Fact, Run, Store } from './store.ts'
 import { extractProgramGraphInWorker, synthesizeInvariantsInWorker } from './untrusted-compute-pool.ts'
+import { collectWorldGraphFromStore, serializeWorldGraph } from './world-graph.ts'
 
 type Active = ExecActiveJob
 type Capture = ExecCapture
@@ -6429,7 +6431,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
   /**
    * Budget, dedupe (`(origin, normalizedRoute, classFamily)` against confirmed & in-flight steps),
-   * sanitize dependencies, and enqueue `parsedPlanner.data.newSteps` while keeping exact dispatch
+   * sanitize dependencies, and enqueue planner `decision.newSteps` while keeping exact dispatch
    * funnel accounting.
    */
   applyPlannerNewSteps(input: {
@@ -6666,6 +6668,47 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     return chainEnqueued + frontierCreated.length
   }
 
+  /** Legacy 10-turn tool-equipped coordinator turn (Cut 1: only with `KOVO_LEGACY_HEURISTIC_PLANNER=1`; Cut 2 deletes it). */
+  private async runLegacyToolPlannerTurn(run: Run, profiles: readonly ResolvedModelProfile[], task: CoordinatorTask, ctx: {
+    coordinator: GraphCoordinator; roundNo: number; activeOrigins: ReadonlySet<string>; dynamicStepBudget: number
+    stepsPreLlm: readonly ChainStep[]; confirmedForPlanner: readonly AlreadyConfirmedRef[]
+    personas: ReadonlyArray<{ handle: string; roleLabel: string }>; openProofGaps: number
+    factIds: ReadonlySet<string>; detLeadFactIds: ReadonlySet<string>; funnel: DispatchFunnelCounts; onEnqueued: () => void
+  }): Promise<{ answer: string; toolDispatched: number }> {
+    let toolDispatched = 0
+    const handlers = coordinatorPlannerHandlers({
+      coordinator: ctx.coordinator,
+      onDispatch: plan => {
+        try {
+          const counts = this.persistDispatchPlan(this.storage.run(run.id), plan, ctx.factIds, ctx.detLeadFactIds)
+          addFunnelCounts(ctx.funnel, counts)
+          toolDispatched += counts.enqueued
+          if (counts.enqueued > 0) ctx.onEnqueued()
+        } catch (err) { this.noteLifecycleWarning(run.id, 'runChainPlanner.legacyToolDispatch', err) }
+      },
+    })
+    const prompt = coordinatorPlannerPrompt({
+      goal: run.goal, roundNo: ctx.roundNo, capabilityTier: run.capabilityTier, approvedOrigins: [...ctx.activeOrigins],
+      budgetRemaining: {
+        usd: Math.max(0, Number((run.budgetUsd - run.spentUsd).toFixed(4))),
+        requests: run.budgetRequests === 0 ? 'unlimited' : Math.max(0, run.budgetRequests - run.spentRequests),
+      },
+      dynamicStepBudget: ctx.dynamicStepBudget,
+      pendingOob: ctx.coordinator.queryFindings({ status: 'pending_oob', limit: 1 }).total,
+      chainSteps: ctx.stepsPreLlm.map(step => ({ id: step.id, title: step.title, status: step.status })),
+      alreadyConfirmed: ctx.confirmedForPlanner.slice(0, 30),
+      personas: ctx.personas.map(persona => ({ handle: persona.handle, roleLabel: persona.roleLabel })),
+      mountedRepos: this.host.projectReposMount(run.projectId).mountedRepos, openProofGaps: ctx.openProofGaps,
+    })
+    const answer = await agentTurn({
+      directory: this.storage.directory, sessionId: `planner-${run.id}-r${ctx.roundNo}`,
+      requestId: `planner:${run.goalRevision}:${ctx.roundNo}`, profiles: resolveProfilePoolForRole('tactical', profiles),
+      scenario: 'chain-planner', roleAffinity: 'tactical', prompt, signal: task.controller.signal, maxTurns: 10, handlers,
+      ...llmRunHooks(this.storage, run.id),
+    })
+    return { answer, toolDispatched }
+  }
+
   async runChainPlanner(run: Run, profiles: readonly ResolvedModelProfile[], task: CoordinatorTask) {
     const fresh = this.storage.run(run.id)
     if (fresh.status === 'complete' || fresh.status === 'failed' || fresh.status === 'stopped') {
@@ -6687,6 +6730,10 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const approvedOrigins = this.host.approvedOriginsSet(updated)
     const activeOrigins = this.activeApprovedOrigins(updated, approvedOrigins)
     const sourceMounted = this.host.projectReposMount(updated.projectId).mountedRepos.length > 0
+    // Track B Cut 1: agentic rounds plan from the World Graph; legacy heuristic synthesizers and the
+    // 10-turn tool planner stay behind `KOVO_LEGACY_HEURISTIC_PLANNER=1` (deterministic $0 floor keeps them).
+    const legacyPlanner = process.env.KOVO_LEGACY_HEURISTIC_PLANNER === '1'
+    const legacyHeuristics = legacyPlanner || profiles.length === 0
 
     // Single-snapshot per-round read cache eliminating 6+ redundant full-table DB scans per round.
     let cachedFacts: Fact[] | null = null
@@ -6807,7 +6854,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     )
     const confirmedBolaSets = buildConfirmedRouteSets(confirmedBolaRefs)
     let bolaAutoSteps = 0
-    if (updated.capabilityTier < 2 || personas.length < 2) {
+    if (legacyHeuristics && (updated.capabilityTier < 2 || personas.length < 2)) {
       for (const origin of activeOrigins) {
         this.emitPreconditionUnmet(updated.id, {
           dedupeKey: `planner_bola:${origin}:${updated.capabilityTier < 2 ? 'tier' : 'persona_count'}`,
@@ -6823,7 +6870,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         })
       }
     }
-    if (updated.capabilityTier >= 2 && personas.length >= 2 && allSteps.length < dynamicStepBudget) {
+    if (legacyHeuristics && updated.capabilityTier >= 2 && personas.length >= 2 && allSteps.length < dynamicStepBudget) {
       const typeGroups = new Map<string, BolaTestQueueItem[]>()
       for (const item of buildBolaTestQueue(allUntaintedFacts, personas, activeOrigins, this.storage.listResourceSamples(run.id))) {
         const remainingVariants = item.variants.filter(v =>
@@ -6886,7 +6933,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
     // Auto-enqueue verification for each new cross-persona or active-HTML second-order surface,
     // skipping routes already confirmed by a host-verified CompositeProofReceipt.
-    const secondOrderAutoSteps = this.queueSecondOrderSurfaceSteps(
+    const secondOrderAutoSteps = !legacyHeuristics ? 0 : this.queueSecondOrderSurfaceSteps(
       updated,
       activeOrigins,
       allUntaintedFacts,
@@ -6964,122 +7011,60 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       return
     }
 
-    // Tool-equipped coordinator session: paginated read tools, explicit dispatch, no snapshot.
-    let toolDispatched = 0
-    const handlers = coordinatorPlannerHandlers({
-      coordinator,
-      onDispatch: plan => {
-        try {
-          const counts = this.persistDispatchPlan(this.storage.run(fresh.id), plan, factIds, detLeadFactIds)
-          addFunnelCounts(funnel, counts)
-          toolDispatched += counts.enqueued
-          if (counts.enqueued > 0) invalidateSteps()
-        } catch { /* additive */ }
-      },
-    })
-    const pendingOob = coordinator.queryFindings({ status: 'pending_oob', limit: 1 }).total
     // v7 precision guard: remember the evidence frontier across rounds. A round that adds no
     // runtime_confirmed finding and no chain primitive is dry; two consecutive dry rounds after the
     // high-priority queue drains end the planner.
-    const evidenceFrontier = prevFrontier ?? {
-      confirmed: confirmedNow,
-      primitives: coordinator.deriveChainPrimitives().length,
+    const evidenceFrontier = prevFrontier ?? { confirmed: confirmedNow, primitives: coordinator.deriveChainPrimitives().length }
+    let toolDispatched = 0
+    let plan: LlmPlannerDecision
+    if (legacyPlanner) {
+      const legacy = await this.runLegacyToolPlannerTurn(updated, profiles, task, {
+        coordinator, roundNo, activeOrigins, dynamicStepBudget, stepsPreLlm, confirmedForPlanner, personas,
+        openProofGaps: openProofGapsPreLlm, factIds, detLeadFactIds, funnel, onEnqueued: invalidateSteps,
+      })
+      toolDispatched = legacy.toolDispatched
+      plan = decidePlannerAnswer(legacy.answer, Number.MAX_SAFE_INTEGER)
+    } else {
+      // Pure-fact World Graph (read-only, bounded) -> one tool-free planner turn or the $0 floor.
+      const worldGraph = collectWorldGraphFromStore(this.storage, updated, {
+        approvedOrigins: [...activeOrigins], confirmedRefs: confirmedForPlanner,
+        programGraph: sourceMounted ? this.coordinatorProgramGraph(getEndpoints()) : null,
+        onWarning: (stage, err) => this.noteLifecycleWarning(run.id, `runChainPlanner.worldGraph.${stage}`, err),
+      })
+      plan = await planWithWorldGraph({
+        ...llmRunHooks(this.storage, run.id), goal: updated.goal, roundNo, snapshot: worldGraph,
+        snapshotJson: serializeWorldGraph(worldGraph, 4096), approvedOrigins: [...activeOrigins], profiles,
+        remainingStepCap: Math.max(0, dynamicStepBudget - stepsPreLlm.length), signal: task.controller.signal,
+      })
     }
-    const prompt = coordinatorPlannerPrompt({
-      goal: updated.goal,
-      roundNo,
-      capabilityTier: updated.capabilityTier,
-      approvedOrigins: [...activeOrigins],
-      budgetRemaining: {
-        usd: Math.max(0, Number((updated.budgetUsd - updated.spentUsd).toFixed(4))),
-        requests: updated.budgetRequests === 0 ? 'unlimited' : Math.max(0, updated.budgetRequests - updated.spentRequests),
-      },
-      dynamicStepBudget,
-      pendingOob,
-      chainSteps: stepsPreLlm.map(step => ({ id: step.id, title: step.title, status: step.status })),
-      alreadyConfirmed: confirmedForPlanner.slice(0, 30),
-      personas: personas.map(persona => ({ handle: persona.handle, roleLabel: persona.roleLabel })),
-      mountedRepos: this.host.projectReposMount(updated.projectId).mountedRepos,
-      openProofGaps: openProofGapsPreLlm,
-    })
-    const answer = await agentTurn({
-      directory: this.storage.directory,
-      sessionId: `planner-${run.id}-r${roundNo}`,
-      requestId: `planner:${updated.goalRevision}:${roundNo}`,
-      profiles: resolveProfilePoolForRole('tactical', profiles),
-      scenario: 'chain-planner',
-      roleAffinity: 'tactical',
-      prompt,
-      signal: task.controller.signal,
-      maxTurns: 10,
-      handlers,
-      ...llmRunHooks(this.storage, run.id),
-    })
     if (!this.host.currentCoordinator(run.id, task)) return
     // Invalidate cached findings/facts/steps after the async LLM session in case workers updated the DB.
     cachedFacts = null
     cachedSteps = null
     cachedFindings = null
 
-    let parsedPlanner: ReturnType<typeof plannerResponseSchema.safeParse> | null = null
-    let plannerParseError: { stage: 'json' | 'schema'; message: string } | null = null
-    try {
-      const parsedJson: unknown = JSON.parse(stripJsonFences(answer))
-      parsedPlanner = plannerResponseSchema.safeParse(parsedJson)
-      if (!parsedPlanner.success) {
-        plannerParseError = {
-          stage: 'schema',
-          message: parsedPlanner.error.issues.slice(0, 4).map(i => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; '),
-        }
-      }
-    } catch (err) {
-      parsedPlanner = null
-      plannerParseError = {
-        stage: 'json',
-        message: err instanceof Error ? err.message.slice(0, 240) : String(err).slice(0, 240),
-      }
-    }
-    if (plannerParseError) {
+    if (plan.parseError) {
       try {
-        this.storage.event(
-          run.id,
-          'planner_parse_failed',
-          `Planner response failed ${plannerParseError.stage} parsing on round ${roundNo}: ${plannerParseError.message}`,
-          {
-            roundNo,
-            stage: plannerParseError.stage,
-            error: plannerParseError.message,
-            rawLength: answer.length,
-            rawPreview: compactText(answer.replace(/\s+/g, ' ').trim(), 160),
-            degradation: true,
-          },
-        )
-      } catch (err) {
-        this.noteLifecycleWarning(run.id, 'planner_parse_failed.event', err, { roundNo })
-      }
+        this.storage.event(run.id, 'planner_parse_failed', `Planner response failed ${plan.parseError.stage} parsing on round ${roundNo}: ${plan.parseError.message}`, {
+          roundNo, stage: plan.parseError.stage, error: plan.parseError.message, rawLength: plan.rawLength,
+          rawPreview: plan.rawPreview, plannerMode: plan.mode, degradation: true,
+        })
+      } catch (err) { this.noteLifecycleWarning(run.id, 'planner_parse_failed.event', err, { roundNo }) }
     }
     const currentRun = this.storage.run(run.id)
     const currentApproved = this.host.approvedOriginsSet(currentRun)
     const existingSteps = this.storage.listChainSteps(run.id, currentRun.goalRevision)
     let addedCount = tierAPlannerSteps + detLeadSteps + chainSteps + bolaAutoSteps + secondOrderAutoSteps + toolDispatched
 
-    if (parsedPlanner?.success) {
-      for (const cancelId of parsedPlanner.data.cancelStepIds) {
-        const target = existingSteps.find(step => step.id === cancelId)
-        if (target && ['pending', 'ready'].includes(target.status)) this.storage.updateChainStep(target.id, { status: 'canceled' })
-      }
-      addedCount += this.applyPlannerNewSteps({
-        run: currentRun,
-        newSteps: parsedPlanner.data.newSteps,
-        approvedOrigins: currentApproved,
-        existingSteps,
-        dynamicStepBudget,
-        factIds,
-        detLeadFactIds,
-        funnel,
-      })
+    for (const cancelId of plan.cancelStepIds) {
+      const target = existingSteps.find(step => step.id === cancelId)
+      if (target && ['pending', 'ready'].includes(target.status)) this.storage.updateChainStep(target.id, { status: 'canceled' })
     }
-
+    funnel.planned += plan.droppedSteps
+    funnel.filteredBudget += plan.droppedSteps
+    addedCount += this.applyPlannerNewSteps({
+      run: currentRun, newSteps: plan.newSteps, approvedOrigins: currentApproved, existingSteps, dynamicStepBudget, factIds, detLeadFactIds, funnel,
+    })
     // Round-1 2-wave pipeline top-up: ensure Wave 1 + Wave 2 stay buffered when uncovered
     // high-risk routes remain so fast workers never sit idle waiting for Round 2.
     if (roundNo === 1 && funnel.enqueued < waveBufferTarget) {
@@ -7198,7 +7183,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       startedAt: latest.createdAt,
       maxDurationMs: this.host.maxDurationMs,
       emptyRounds,
-      coordinatorDone: parsedPlanner?.success ? parsedPlanner.data.done : false,
+      coordinatorDone: plan.done,
       pendingOob: coordinator.queryFindings({ status: 'pending_oob', limit: 1 }).total,
       highPriorityQueueEmpty: queueDrained,
       consecutiveDryRounds: dryRounds,
@@ -7352,7 +7337,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     })
     this.storage.event(run.id, 'planner.round', `Planner round ${roundNo}: added ${addedCount} steps.`, {
       roundNo, addedCount, chainSteps, bolaAutoSteps, secondOrderAutoSteps, detLeadSteps, toolDispatched,
-      done: parsedPlanner?.success === true ? parsedPlanner.data.done : false,
+      done: plan.done, plannerMode: plan.mode, providerCalls: plan.providerCalls, worldGraphBytes: plan.snapshotBytes,
       decision: stopEval.decision, reason: stopEval.decision === 'stop' ? decision.reason : 'continue',
       terminationReason: stopEval.decision === 'stop' ? decision.reason : null,
       deferredStopReason: stopEval.deferred ? decision.reason : null,
@@ -7366,7 +7351,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         filteredAlreadyConfirmed: funnel.filteredAlreadyConfirmed, stopReason: funnel.stopReason,
         coverage: coverageAtStop,
       },
-      summary: parsedPlanner?.success ? parsedPlanner.data.summary.slice(0, 300) : compactText(answer, 300),
+      summary: plan.summary || plan.rawPreview,
     })
   }
 
