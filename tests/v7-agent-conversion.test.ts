@@ -83,7 +83,7 @@ test('graph-coordinator classifies and prioritizes unconfirmed non-floor semanti
   const endpoints: CoordinatorEndpoint[] = [
     { id: 'ep-confirmed', origin, method: 'POST', pathTemplate: '/api/v1/checkout/confirm', riskScore: 95, coveragePct: 100, testedClasses: [] },
     { id: 'ep-race', origin, method: 'POST', pathTemplate: '/api/v1/wallets/:id/redeem', riskScore: 80, coveragePct: 20, testedClasses: ['sqli'] },
-    { id: 'ep-jwt', origin, method: 'GET', pathTemplate: '/api/v1/reports/sales', riskScore: 70, coveragePct: 15, testedClasses: ['authz'] },
+    { id: 'ep-jwt', origin, method: 'GET', pathTemplate: '/api/v1/oauth/tokens', riskScore: 70, coveragePct: 15, testedClasses: ['authz'] },
     { id: 'ep-read', origin, method: 'GET', pathTemplate: '/api/v1/health', riskScore: 50, coveragePct: 10, testedClasses: ['sqli'] },
   ]
 

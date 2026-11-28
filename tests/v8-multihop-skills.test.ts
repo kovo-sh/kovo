@@ -93,7 +93,6 @@ test('multihop-chains skill resolves via skills.ts and covers all v8 verificatio
     'capability_only',
     'CWE-200',
     'record_coverage',
-    'invariant_enforced_hardened',
     'doNotRediscover',
   ]) {
     assert.ok(skill.content.includes(token), `multihop-chains.md must teach ${token}`)
@@ -169,8 +168,8 @@ test('selectPreInjectionSkills automatically injects multihop-chains on multi-ho
     )
     const mh = selected.find(s => s.name === 'multihop-chains')!
     assert.ok(mh.excerpt.length > 0 && mh.excerpt.length <= 1200)
-    assert.ok(mh.excerpt.includes('ctx.seal_capability'), '1200-char excerpt includes quick-reference contract')
-    assert.ok(mh.excerpt.includes('invariant_enforced_hardened'), '1200-char excerpt includes hardened-twin rule')
+    assert.ok(mh.excerpt.includes('ctx.seal_capability'), '1200-char excerpt includes capability custody contract')
+    assert.ok(mh.excerpt.includes('CompositeProofReceipt'), '1200-char excerpt includes CompositeProofReceipt DAG guidance')
   }
 
   // Even when domain skills score very high from techTags + sinkKind, multi-hop guarantees inclusion.

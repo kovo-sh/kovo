@@ -433,7 +433,7 @@ test('inferRuntimeInvariantHypotheses and synthesizeRuntimeCompositeWave1Steps p
   const genericHyp = parity.hypotheses.find(h => h.preconditions.includes('api_dependency:itemId'))
   const asyncHyp = parity.hypotheses.find(h => h.preconditions.includes('edge_kind:await_async'))
   const hmacHyp = parity.hypotheses.find(h => h.preconditions.includes('edge_kind:hmac_sign'))
-  const lifeChainHyp = parity.hypotheses.find(h => h.preconditions.includes('workflow:create_rebind_finalize'))
+  const lifeChainHyp = parity.hypotheses.find(h => h.preconditions.includes('edge_kind:lifecycle_chain') && h.preconditions.includes('multi_hop_dependency'))
 
   assert.ok(asyncHyp && hmacHyp && lifeChainHyp, 'all three priority workflow families must emit hypotheses')
   assert.ok(hmacHyp.score > (genericHyp?.score ?? 0), 'hmac_sign must outrank generic single-hop dependency')

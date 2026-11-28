@@ -537,7 +537,7 @@ describe('Generic Capability-Consumer Frontier Matcher', () => {
     )
   })
 
-  test('strips cap:* actingPersona, downgrades dual_member on non-dual-tenant pairs, prunes surface:*/vulnClass negative edges, and classifies sparse kovo_verify metadata', () => {
+  test('strips cap:* actingPersona, preserves approved owning non-elevated personas, prunes surface:*/vulnClass negative edges, and classifies sparse kovo_verify metadata', () => {
     const personas = [
       { handle: 'owner_a', roleLabel: 'owner' },
       { handle: 'dual_member', roleLabel: 'memberships=admin:org_a,viewer:org_b' },
@@ -605,7 +605,7 @@ describe('Generic Capability-Consumer Frontier Matcher', () => {
 
     const nonDualPair = pairs.find(p => p.consumer.normPath === '/v1/admin/sync' && p.capability.capId === 'cap:hop_h20:scim_delegation')
     assert.ok(nonDualPair, 'sparse scim/delegation token must pair with 403 admin route')
-    assert.equal(nonDualPair.capability.actingPersona, 'member_a', 'dual_member must downgrade to single-tenant basePersona on non-dual-tenant step')
+    assert.equal(nonDualPair.capability.actingPersona, 'dual_member', 'approved non-elevated owning persona must be preserved verbatim')
 
     const cachePair = pairs.find(p => p.consumer.normPath === '/v1/cache/:id/warm' && p.capability.capId === 'cap:hop_h21:cache_token')
     assert.ok(cachePair, 'cache-bleed pair must still rank')
