@@ -45,8 +45,9 @@ export const boardPostsPerSessionLimit = 12
 export const boardPeerMentionsPerTurnLimit = 1
 /** At most two consecutive peer-to-peer hops without intervening evidence. */
 export const boardPeerHopLimit = 2
-export const boardReadDefaultLimit = 20
-export const boardReadMaxLimit = 50
+export const boardReadDefaultLimit = 10
+export const boardReadMaxLimit = 25
+const BOARD_READ_BODY_PREVIEW_CHARS = 360
 /** Bound the number of posts injected per `<board_delta>` (cursor still advances past all). */
 export const boardDeltaMessageLimit = 40
 
@@ -174,19 +175,21 @@ export interface BoardReadArgs {
   kind?: BoardMessageKind
   authorHandle?: string
   limit?: number
+  includeFullBody?: boolean
 }
 
 export interface BoardReadMessage {
   seq: number
   authorHandle: string
   kind: BoardMessageKind
-  mentions: string[]
   body: string
-  refFactIds: string[]
-  refExchangeIds: string[]
-  refFindingIds: string[]
-  refStepId: string | null
-  replyToSeq: number | null
+  truncated?: true
+  mentions?: string[]
+  refFactIds?: string[]
+  refExchangeIds?: string[]
+  refFindingIds?: string[]
+  refStepId?: string
+  replyToSeq?: number
   createdAt: number
 }
 
@@ -316,19 +319,26 @@ function messageInScope(message: BoardMessageRow, approved: Set<string>): boolea
   return message.sourceOrigins.length === 0 || message.sourceOrigins.every(origin => approved.has(origin))
 }
 
-function toReadMessage(message: BoardMessageRow, redactor: (text: string) => string): BoardReadMessage {
-  const body = redactor(stripControl(message.body)).slice(0, boardPostBodyLimit)
+function toReadMessage(
+  message: BoardMessageRow,
+  redactor: (text: string) => string,
+  includeFullBody = false,
+): BoardReadMessage {
+  const full = redactor(stripControl(message.body)).slice(0, boardPostBodyLimit)
+  const truncated = !includeFullBody && full.length > BOARD_READ_BODY_PREVIEW_CHARS
+  const body = truncated ? `${full.slice(0, BOARD_READ_BODY_PREVIEW_CHARS - 1)}…` : full
   return {
     seq: message.seq,
     authorHandle: message.authorHandle,
     kind: message.kind,
-    mentions: [...message.mentions],
     body,
-    refFactIds: [...message.refFactIds],
-    refExchangeIds: [...message.refExchangeIds],
-    refFindingIds: [...message.refFindingIds],
-    refStepId: message.refStepId,
-    replyToSeq: message.replyToSeq,
+    ...(truncated ? { truncated: true as const } : {}),
+    ...(message.mentions.length ? { mentions: [...message.mentions] } : {}),
+    ...(message.refFactIds.length ? { refFactIds: [...message.refFactIds] } : {}),
+    ...(message.refExchangeIds.length ? { refExchangeIds: [...message.refExchangeIds] } : {}),
+    ...(message.refFindingIds.length ? { refFindingIds: [...message.refFindingIds] } : {}),
+    ...(message.refStepId != null ? { refStepId: message.refStepId } : {}),
+    ...(message.replyToSeq != null ? { replyToSeq: message.replyToSeq } : {}),
     createdAt: message.createdAt,
   }
 }
@@ -625,7 +635,7 @@ export function createBoardTools(options: CreateBoardToolsOptions): BoardTools {
       ...(authorHandle ? { authorHandle } : {}),
     }).filter(message => messageInScope(message, approved))
 
-    const messages = rows.slice(0, limit).map(message => toReadMessage(message, redactor))
+    const messages = rows.slice(0, limit).map(message => toReadMessage(message, redactor, args.includeFullBody === true))
     return {
       ok: true,
       messages,

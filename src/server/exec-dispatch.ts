@@ -865,10 +865,10 @@ export interface CoordinatorPlannerSessionDeps {
   onDispatch?: (plan: DispatchPlan) => void
 }
 
-/** Compact coordinator pages (≤25 rows) so a compaction-free planner never bloats context. */
-const COORDINATOR_PAGE_MAX = 25
-const compactLimit = (limit?: number): number =>
-  Math.min(COORDINATOR_PAGE_MAX, Math.max(1, Math.floor(limit ?? COORDINATOR_PAGE_MAX)))
+/** Compact coordinator pages (≤25 rows; default 15 for endpoints) so planners stay context-safe. */
+const COORDINATOR_PAGE_MAX = 25, COORDINATOR_ENDPOINTS_DEFAULT = 15, COORDINATOR_ROUTE_MAX = 140
+const compactLimit = (limit?: number, fallback = COORDINATOR_PAGE_MAX): number =>
+  Math.min(COORDINATOR_PAGE_MAX, Math.max(1, Math.floor(limit ?? fallback)))
 export const compactText = (value: string, max = 160): string =>
   value.length <= max ? value : `${value.slice(0, max - 1)}…`
 export const compactChainTitle = (hypothesis: string): string => {
@@ -888,15 +888,15 @@ export function coordinatorPlannerHandlers(
 ): Pick<WorkerToolHandlers, 'query_endpoints' | 'query_program_graph' | 'query_facts' | 'query_findings' | 'dispatch_investigations'> {
   return {
     query_endpoints: async args => {
-      const page = deps.coordinator.queryEndpoints({ ...args, limit: compactLimit(args.limit) })
+      const page = deps.coordinator.queryEndpoints({ ...args, limit: compactLimit(args.limit, COORDINATOR_ENDPOINTS_DEFAULT) })
       return {
         ...page,
-        items: page.items.map(endpoint => ({
-          id: endpoint.id, method: endpoint.method, route: compactText(endpoint.pathTemplate, 160),
-          origin: endpoint.origin, risk: endpoint.riskScore ?? 0, coverage: endpoint.coveragePct ?? null,
-          tested: endpoint.testedClasses ?? [], sinks: endpoint.sinkKinds ?? [],
-          auth: endpoint.authRequirement ?? null, guard: endpoint.ownershipGuard ?? null,
-          roleExclusive: endpoint.roleExclusive === true,
+        items: page.items.map(ep => ({
+          id: ep.id, method: ep.method, route: compactText(ep.pathTemplate, COORDINATOR_ROUTE_MAX),
+          origin: ep.origin, risk: ep.riskScore ?? 0,
+          ...(ep.coveragePct != null ? { coverage: ep.coveragePct } : {}), ...(ep.roleExclusive === true ? { roleExclusive: true } : {}),
+          ...(ep.testedClasses?.length ? { tested: ep.testedClasses } : {}), ...(ep.sinkKinds?.length ? { sinks: ep.sinkKinds } : {}),
+          ...(ep.authRequirement ? { auth: ep.authRequirement } : {}), ...(ep.ownershipGuard ? { guard: ep.ownershipGuard } : {}),
         })),
       }
     },
