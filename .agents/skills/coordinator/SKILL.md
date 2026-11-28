@@ -6,7 +6,10 @@ description: >-
   strictly focused on orchestration, disjoint file leases, merging, and
   verification — never inline codebase exploration or code edits — and defines
   the exact fallback to delegate to OpenCode when a native worker hits a
-  content-safety filter block.
+  content-safety filter block. Routes standard implementation streams to a
+  pinned Claude Code `opus` army via scripts/dispatch-worker.mjs and
+  security-adjacent streams to Gemini Neon (risk-tiered pre-router, hard
+  no-model-fallback bridge, 3-tier escalation ladder).
 ---
 
 # Swarm Coordinator Skill
@@ -20,9 +23,12 @@ moving — **not** doing hands-on codebase digging or editing yourself.
 ### What the coordinator DOES
 - Decompose goals into parallel streams with **strictly disjoint file leases**
   (one writer per file).
-- Dispatch **native swarm workers** by default (`swarm(action="add")`,
+- Dispatch standard-tier implementation streams to the **Claude Code `opus`
+  army** through `scripts/dispatch-worker.mjs`, and security-adjacent or
+  escalated streams to **native swarm workers** (`swarm(action="add")`,
   `workspace: "share"` for writers, `inherit` for read-only verifiers/auditors;
-  worker names `<= 24` chars).
+  worker names `<= 24` chars) — see
+  [Worker Dispatch & Model Routing](#worker-dispatch--model-routing).
 - Keep briefs concise, neutral, and explicit: objective, exact file lease,
   verification/gate command, and instruction to commit locally without pushing
   and report SHA + summary on the board.
@@ -62,7 +68,7 @@ according to this table:
 | Trivial orchestration check (max **1** call/turn: `git status`/`log`, `scripts/certify-v8.ts`, `scripts/benchmark-multihop.ts`, `scripts/merge-stream.sh`, `scripts/parallel-pulse.sh`, `scripts/worker-source-hash.sh`, `npm run worker:build`, `manage_task`, `uptime`, `df`, `ls`) | **Coordinator (direct)** | Scorecard, merge, branch status, build, or host-health check only. Never chain inline digging after an orchestration check. |
 | Local codebase / benchmark / log forensics (`rg`/`grep`, `read_file` on `src/`/`worker/`/`benchmarks/`, `report.json` reject signatures, `.meta.json` details) | `invoke_subagent(typeName: "research")` | Read-only inspection; returns concise structural summary (files, line numbers, mechanism class, recommended lease split; zero raw bodies/probes). |
 | Live VM / SSH / Docker / DB / network debugging (`ssh`, `docker exec`, `sqlite3`, container logs, port/network probes) | `invoke_subagent(typeName: "self")` | Isolated shell/SSH/Docker/DB investigation; returns a **<=10-line** structured summary of findings and next action. |
-| Code edits / fixes / tests / docs | `swarm(action="add", workspace="share")` | Exclusive disjoint file lease in an isolated worktree; commits locally and reports SHA + summary (use OpenCode fallback below on content-safety block). |
+| Code edits / fixes / tests / docs | `--tier standard`: `node scripts/dispatch-worker.mjs` (Claude Code `opus`); `--tier security-adjacent` or exit `42`: `swarm(action="add", workspace="share")` (Gemini Neon) | Exclusive disjoint file lease in an isolated worktree; commits locally and reports SHA + summary (escalate via the [3-tier ladder](#option-3--hard-no-opus-4-8-fallback-bridge-scriptsdispatch-workermjs); use OpenCode fallback below on content-safety block). |
 
 ### Mechanical Enforcement (`PreToolUse` Hook)
 
@@ -88,11 +94,109 @@ active:
 
 ## Worker Dispatch & Model Routing
 
-When spawning native swarm workers (`swarm(action="add", model=...)`), route by task complexity:
+The swarm runs **Option 1 + Option 2 + Option 3** together: a Gemini Neon
+architect, a pinned Claude Code `opus` implementation army behind a risk-tiered
+pre-router, and a hard no-silent-fallback bridge
+([`scripts/dispatch-worker.mjs`](../../../scripts/dispatch-worker.mjs)) that
+escalates on a preserved worktree.
 
-- **`gemini-4-hydrogen-high`** (or **`gemini-4-hydrogen-medium`** for trivial 1-file copy/test edits): straightforward UI polish, layout/copy fixes, mechanical refactors, unit-test/doc cleanups, and read-only audits (faster turnaround, lower quota burn).
-- **`gemini-4-neon-high`** (or default/inherited model): complex multi-file engine/concurrency fixes, broker/auth security boundaries, and proof-kernel soundness work.
-- Switch a `waiting` worker on quota exhaustion or capacity limits via `swarm(action="model", name="<worker>", model="<model>")`, and use the OpenCode fallback below on content-safety blocks.
+### Option 1 — Neon Architect + Claude Code `opus` Default Implementation Army
+
+- **Coordinator / Architect: Gemini Neon (`gemini-4-neon-high`).** Planning,
+  lease decomposition, verification orchestration, merging, and
+  **security-adjacent implementation** (complex engine/concurrency fixes,
+  broker/auth security boundaries, proof-kernel soundness work).
+- **Default implementation army: local Claude Code CLI** (`claude -p --model
+  opus`, strictly pinned to `claude-opus-5-5`) for standard engineering streams
+  (product, infra, UI, tests, refactors). **Always dispatch it through
+  `scripts/dispatch-worker.mjs`** — never call `claude -p` directly, never pass
+  `--fallback-model`.
+- **Quick native workers: `gemini-4-hydrogen-high`** (or
+  **`gemini-4-hydrogen-medium`** for trivial 1-file copy/test edits) remain
+  available via `swarm(action="add", model=...)` for straightforward UI polish,
+  layout/copy fixes, mechanical refactors, unit-test/doc cleanups, and
+  read-only audits (faster turnaround, lower quota burn).
+- **Symmetric R3-05 cross-family review** (AGENTS.md *Independent kernel review
+  lane*):
+  - Claude-authored confirmation-kernel / high-risk diffs are reviewed by
+    **Gemini Neon** (different model family).
+  - Gemini-authored confirmation-kernel diffs are reviewed by **Claude Code
+    `opus`** in read-only review mode (`--safe-mode --tools "Read,Grep,Glob"`
+    skips the ~26k hook/CLAUDE.md cache overhead and restricts the reviewer to
+    read-only built-in tools):
+    ```bash
+    node scripts/dispatch-worker.mjs --mode review --worktree "$WT" \
+      --prompt-file "$WT/.kovo-scratch/review-brief.md"
+    ```
+  - Never let the author's model family review its own kernel diff; the
+    reviewer still authors the rejecting bypass corpus case and the
+    `Reviewed-by:` trailer.
+- Switch a `waiting` native worker on quota exhaustion or capacity limits via
+  `swarm(action="model", name="<worker>", model="<model>")`, and use the
+  OpenCode fallback below on content-safety blocks.
+
+### Option 2 — Risk-Tiered Pre-Router (`--tier`)
+
+Classify every implementation stream **before** dispatch:
+
+| Tier | Use for | Route |
+| :--- | :------ | :---- |
+| `--tier standard` (default) | Normal product / infra / UI / test / refactor work | Claude Code `opus` (`claude-opus-5-5`) via `scripts/dispatch-worker.mjs` |
+| `--tier security-adjacent` | Security-sensitive verification, probe/oracle internals, confirmation-kernel files, or anything `truth/blueprint.ts`-adjacent | **Pre-routed before calling Claude** (zero wasted tokens / refusal latency): writes `.kovo-handoff.json` and exits `42` -> Gemini Neon worker; escalate to `opencode run -m opencode-go/deepseek-v4.1-flash --auto --archived` if native safety filters block |
+
+```bash
+# security-adjacent: never spawns claude; exit 42 -> spawn Gemini Neon on "$WT"
+node scripts/dispatch-worker.mjs --tier security-adjacent --worktree "$WT" --prompt-file "$BRIEF"
+# security-adjacent straight to the tertiary tier on the same worktree
+node scripts/dispatch-worker.mjs --tier security-adjacent --fallback opencode --worktree "$WT" --prompt-file "$BRIEF"
+```
+
+### Option 3 — Hard No-`opus-4-8`-Fallback Bridge (`scripts/dispatch-worker.mjs`)
+
+Standard dispatch (run as a background task; `--dry-run` prints the JSON plan
+without spawning or writing anything):
+
+```bash
+node scripts/dispatch-worker.mjs --tier standard --mode implement \
+  --worktree "$WT" --prompt-file "$BRIEF" \
+  --expected-model claude-opus-5-5 --fallback handoff
+```
+
+What the bridge guarantees:
+- **Fallback kill-switches always injected** into the `claude` child env:
+  `CLAUDE_CODE_NO_MODEL_FALLBACK=1`, `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1`,
+  `CLAUDE_CODE_DISABLE_MODEL_ACCESS_FALLBACK=1`; `--fallback-model` is never
+  passed; `cwd` is the worker worktree; the prompt goes on stdin.
+- **Mode flags:** `implement` -> `--permission-mode bypassPermissions`;
+  `review` -> `--safe-mode --tools "Read,Grep,Glob"`; both add
+  `--no-session-persistence --model opus --output-format stream-json --verbose`.
+- **Live `stream-json` watchdog** (also accepts a single `json` result) rejects:
+  any silent downgrade (`claude-opus-4-8`, any `sonnet`, any `haiku`, or any
+  other id that is not `claude-opus-5-5` / a dated or `[variant]` suffix of it)
+  on `init`/`assistant` frames, `modelUsage` keys, or `canonicalModel`;
+  `safety_stops > 0`; `is_error`; refusal stops; `usage.fallback_credit != null`;
+  and any non-zero exit (or missing result frame) without a clean result.
+- **On violation:** kills `claude` immediately (`SIGTERM`, then `SIGKILL` after a
+  short grace), leaves the worktree **completely untouched** (no reset/clean),
+  and writes `<worktree>/.kovo-handoff.json` (`reason`, `detectedModels`,
+  `safetyStops`, `fallbackCredit`, `tier`, `worktree`,
+  `nextTier: "gemini-neon"`, `tertiaryTier: "opencode-go/deepseek-v4.1-flash"`).
+  `.kovo-handoff.json` is coordination state — never commit it.
+
+**Exact 3-tier escalation ladder (same preserved worktree throughout):**
+1. **Primary (`--tier standard`):** Claude Code `claude-opus-5-5` via
+   `scripts/dispatch-worker.mjs`. Exit `0` = clean pinned session; review the
+   branch as usual.
+2. **Secondary (exit `42` + `.kovo-handoff.json`):** the Antigravity
+   coordinator spawns a **Gemini Neon** (`gemini-4-neon-high`) worker on the
+   preserved worktree (`swarm(action="add", workspace="share",
+   model="gemini-4-neon-high")`), passing the handoff `reason` and the same
+   file lease. Do not re-dispatch Claude on the same stream.
+3. **Tertiary (`--fallback opencode`, or Gemini Neon hits a native
+   content-safety block):** `opencode run -m opencode-go/deepseek-v4.1-flash
+   --auto --archived` on the exact same worktree (the bridge runs it
+   automatically with `--fallback opencode` and propagates OpenCode's exit
+   code; otherwise follow the OpenCode fallback below).
 
 ## Benchmark Snapshot Isolation
 
@@ -139,11 +243,15 @@ scoped task to **OpenCode** in an isolated git worktree:
    `WaitMsBeforeAsync: 500`, `NotificationTimeoutSeconds: 600` so you are
    notified on completion without polling):
    ```bash
-   cd "$WT" && opencode run --auto --archived --title "<stream>" \
+   cd "$WT" && opencode run -m opencode-go/deepseek-v4.1-flash --auto --archived --title "<stream>" \
      "Task: <concise objective>. Strict file lease (edit ONLY these): <files>. Run <targeted tests> and <repo gate>. Commit cleanly on this branch (do NOT push) and print the commit SHA, changed files, and test summary."
    ```
    - Never include secrets or credentials in the prompt.
    - Keep the task strictly scoped to the same disjoint file lease.
+   - If the worktree already holds a `.kovo-handoff.json` from
+     `scripts/dispatch-worker.mjs`, reuse that preserved worktree as `$WT`
+     instead of creating a new one (skip step 2), and tell OpenCode not to
+     commit `.kovo-handoff.json`.
 4. **Verify, merge, and clean up** once the OpenCode task finishes:
    - Wait until the main checkout is idle (no active `inherit` verifier).
    - Inspect commit SHA and `git diff --stat HEAD..opencode/<stream>` to confirm
@@ -162,7 +270,7 @@ Before issuing tool calls in any turn, verify:
    `manage_task`, `merge-stream.sh`, `uptime`, `df`) in the coordinator thread:
    - Local codebase / benchmark / log forensics -> `invoke_subagent(typeName: "research")`
    - Live VM / SSH / Docker / DB / network debugging -> `invoke_subagent(typeName: "self")` (returns <=10-line summary)
-   - Code edits / fixes -> `swarm(action="add", workspace="share")`
+   - Code edits / fixes -> `scripts/dispatch-worker.mjs` (standard) or `swarm(action="add", workspace="share")` (security-adjacent / exit `42`)
 2. Am I about to `grep`/`rg`, `ssh`, `docker exec`, `sqlite3`, `read_file` on
    `src/`/`worker/`/`benchmarks/`, or print benchmark forensics
    (`topRejectDetails`, finding titles, routes/error signatures,
@@ -174,8 +282,17 @@ Before issuing tool calls in any turn, verify:
 4. Did any worker hit a content-safety block (or genuinely need to inspect
    `truth/blueprint.ts` / raw truth/solver files)? **Keep native workers off
    truth/solver files; kill/salvage any blocked worker and delegate that task to
-   `opencode run --auto`.**
-5. Is any clean, completed branch ready to merge (and is the main checkout
+   `opencode run -m opencode-go/deepseek-v4.1-flash --auto --archived`.**
+5. Is every implementation stream routed through the **risk-tiered
+   pre-router**? `--tier standard` -> `scripts/dispatch-worker.mjs` (Claude Code
+   pinned to `claude-opus-5-5`, never `--fallback-model`);
+   `--tier security-adjacent` -> exit `42` -> Gemini Neon. Did any dispatch exit
+   `42` with a `.kovo-handoff.json`? **Spawn a Gemini Neon worker on that
+   preserved worktree now (tertiary: `opencode run -m
+   opencode-go/deepseek-v4.1-flash --auto --archived`).** Are kernel diffs
+   reviewed cross-family (Claude-authored -> Neon; Gemini-authored -> Claude
+   `opus` `--mode review`)?
+6. Is any clean, completed branch ready to merge (and is the main checkout
    free)? **Merge, gate, and kill the worker now.**
-6. Are all active streams running? **Park with `swarm_wait` or report concisely
+7. Are all active streams running? **Park with `swarm_wait` or report concisely
    to the user.**
