@@ -142,6 +142,7 @@ EXCLUDE_SPECS=(
 
   # playwright-e2e: Real Playwright Chromium browser E2E suites
   "playwright-e2e|tests/e2e-ui-journeys.test.ts|launches real Playwright Chromium browser UI journeys (~27s)"
+  "playwright-e2e|tests/ui-bucket-b1-state-settings.test.ts|launches real Playwright Chromium Desktop Bucket B PR B1 StatePanel/Settings assertions (~45s)"
   "playwright-e2e|tests/ui-polish-foundation.test.ts|launches real Playwright Chromium Foundation/Settings Bucket A geometry/motion assertions (~55s)"
   "playwright-e2e|tests/ui-polish-projects.test.ts|launches real Playwright Chromium Projects/Modals Bucket A geometry/motion assertions (~25s)"
   "playwright-e2e|tests/ui-polish-run-workbench.test.ts|launches real Playwright Chromium Run Workbench Bucket A geometry/motion assertions (~80s)"
