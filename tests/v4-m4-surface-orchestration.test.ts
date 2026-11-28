@@ -869,6 +869,18 @@ test('M4.9 Execution wires LabRunner startLabTarget -> expose origin -> teardown
     async stopAll() { stopAllCalled = true },
   } as unknown as LabRunner
 
+  // Hold the run paused once threat_model finishes (after lab.started + asset.auto_admitted) so an
+  // empty-surface deterministic pass does not auto-complete and tear down the lab handle before
+  // the active-state assertions below.
+  const origEvent = storage.event.bind(storage)
+  storage.event = ((...args: Parameters<typeof storage.event>) => {
+    const res = origEvent(...args)
+    if (args[0] === runId && (args[1] === 'threat_model.saved' || args[1] === 'investigation.started')) {
+      storage.updateRun(runId, { status: 'paused' })
+    }
+    return res
+  }) as typeof storage.event
+
   storage.updateRun(runId, { phase: 'threat_model', status: 'running' })
   const engine = new Execution(storage, { labRunner: mockLabRunner, backend: createLocalJqBackend() })
   await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
@@ -883,7 +895,7 @@ test('M4.9 Execution wires LabRunner startLabTarget -> expose origin -> teardown
       const evDeadline = Date.now() + 3_000
       while (Date.now() < evDeadline) {
         const evs = storage.client.prepare('SELECT kind FROM events WHERE run_id = ?').all(runId) as Array<{ kind: string }>
-        if (evs.some(e => e.kind === 'lab.started')) break
+        if (evs.some(e => e.kind === 'lab.started') && evs.some(e => e.kind === 'threat_model.saved')) break
         await new Promise(r => setTimeout(r, 40))
       }
       assert.equal(startedCalls.length, 1, 'Expected LabRunner.startLabTarget to be invoked once')

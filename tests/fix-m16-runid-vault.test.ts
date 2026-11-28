@@ -626,24 +626,27 @@ test('M-10: aborting Phase A deterministic floor lane does NOT mark agenticLaneC
   assert.equal(engineCalls, 1)
 
   // Abort Phase A mid-flight (e.g. operator paused run)
+  store.updateRun(run.id, { status: 'paused' })
   await priv.abortAgenticLane(run, 'operator paused during Phase A')
 
   // Key must NOT be marked completed after abort!
   assert.equal(priv.agenticLaneJobs.has(run.id), false)
   assert.equal(priv.agenticLaneCompleted.has(key), false, 'aborted Phase A must NOT mark agenticLaneCompleted')
+
+  // Resume Phase A and let it finish cleanly without abort
+  store.updateRun(run.id, { status: 'running' })
+  const resumedRun = store.run(run.id)
   assert.equal(
-    priv.shouldStartDeterministicLane(run, fakeProfiles),
+    priv.shouldStartDeterministicLane(resumedRun, fakeProfiles),
     true,
     'resumed run must still be eligible to start Phase A deterministic floor',
   )
-
-  // Resume Phase A and let it finish cleanly without abort
-  assert.equal(priv.startDeterministicLane(run, fakeProfiles), true)
+  assert.equal(priv.startDeterministicLane(resumedRun, fakeProfiles), true)
   assert.equal(engineCalls, 2)
   const secondPromise = priv.agenticLaneJobs.get(run.id)!.promise
   resolveSecondRun!()
   await secondPromise
 
   assert.equal(priv.agenticLaneCompleted.has(key), true, 'completed Phase A MUST mark agenticLaneCompleted')
-  assert.equal(priv.shouldStartDeterministicLane(run, fakeProfiles), false)
+  assert.equal(priv.shouldStartDeterministicLane(resumedRun, fakeProfiles), false)
 })
