@@ -1,5 +1,6 @@
 import { frameForSessionOrigin, resolveRunPersonas } from './persona-vault.ts'
 import type { MintedPersonaSession } from './persona-vault.ts'
+import { getPrincipalCustodyStore } from './principal-custody.ts'
 import type { NamedSecret } from './redact.ts'
 import type { Store } from './store.ts'
 
@@ -315,6 +316,13 @@ export class IsolatedSessionCache {
         // Guard against race with `disposeRun` while mint was in flight.
         if (this.inFlightByRun.get(input.runId)?.get(key) === task) {
           this.storeEntry(input.runId, key, entry)
+          getPrincipalCustodyStore(input.runId)?.registerIsolatedSession({
+            sessionKey: input.sessionKey,
+            personaHandle: input.personaHandle,
+            origin: input.origin,
+            headers: entry.headers,
+            mintedAt: entry.mintedAt,
+          })
         }
         return entry
       } catch {
@@ -409,8 +417,18 @@ export async function resolveEffectiveBrokerPersonaHeaders(params: {
   const { req, runId, initialOrigin, personaHandle, fallbackHeaders, refreshedHeaders, extraSecrets, isolatedSessions, mintIsolatedSession, raceBurst } = params
   const isolatedKey = resolveIsolatedSessionKey(req, { raceBurst, personaHandle })
   if (refreshedHeaders) {
-    if (isolatedKey && personaHandle) extraSecrets.push(...extractIsolatedSessionSecrets(personaHandle, refreshedHeaders))
-    return { personaHeaders: refreshedHeaders, isolatedKey, isolatedMintedAt: isolatedKey ? Date.now() : 0 }
+    const mintedAt = isolatedKey ? Date.now() : 0
+    if (isolatedKey && personaHandle) {
+      extraSecrets.push(...extractIsolatedSessionSecrets(personaHandle, refreshedHeaders))
+      getPrincipalCustodyStore(runId)?.registerIsolatedSession({
+        sessionKey: isolatedKey,
+        personaHandle,
+        origin: initialOrigin,
+        headers: refreshedHeaders,
+        mintedAt,
+      })
+    }
+    return { personaHeaders: refreshedHeaders, isolatedKey, isolatedMintedAt: mintedAt }
   }
   if (isolatedKey && personaHandle && mintIsolatedSession) {
     const cached = await isolatedSessions.getOrMint({ runId, sessionKey: isolatedKey, personaHandle, origin: initialOrigin }, mintIsolatedSession)

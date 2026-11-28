@@ -16,6 +16,7 @@ import type {
   PersonaStorageSnapshot,
   ResolvedPersona,
 } from './persona-vault.ts'
+import { getPrincipalCustodyStore } from './principal-custody.ts'
 
 export interface ClonedWorkerPersona {
   persona: ResolvedPersona
@@ -93,12 +94,61 @@ function parseCookieHeaderForOrigin(
   }
 }
 
+function bindCloneCustody(
+  runId: string | undefined,
+  assignmentId: string,
+  clonedPersona: ResolvedPersona,
+  clone: PersonaSessionClone,
+): PersonaSessionClone {
+  const effectiveRunId = runId ?? clone.runId
+  const custody = effectiveRunId ? getPrincipalCustodyStore(effectiveRunId) : undefined
+  if (!custody) return clone
+  const headersByOrigin: Record<string, Record<string, string>> = {}
+  for (const origin of clonedPersona.originAllowlist) {
+    const h = clone.headersFor(origin)
+    if (h && Object.keys(h).length) headersByOrigin[origin] = h
+  }
+  custody.registerClonedPersona({
+    assignmentId,
+    persona: clonedPersona,
+    cloneId: clone.id,
+    generation: clone.servedGeneration ?? clone.generation,
+    headersByOrigin,
+  })
+  return {
+    get id() { return clone.id },
+    get handle() { return clone.handle },
+    get runId() { return clone.runId },
+    get generation() { return clone.generation },
+    get servedGeneration() { return clone.servedGeneration },
+    get poolGeneration() { return clone.poolGeneration },
+    syncServedGeneration: () => clone.syncServedGeneration(),
+    isLoggedOut: () => clone.isLoggedOut(),
+    headersFor: origin => clone.headersFor(origin),
+    storageFor: origin => clone.storageFor(origin),
+    cookiesFor: origin => clone.cookiesFor(origin),
+    applySetCookie: (origin, setCookieLines) => {
+      clone.applySetCookie(origin, setCookieLines)
+      getPrincipalCustodyStore(effectiveRunId!)?.recordRotatedCloneCookies({
+        assignmentId,
+        personaHandle: clonedPersona.handle,
+        setCookieLines,
+        generation: clone.servedGeneration ?? clone.generation,
+      })
+    },
+    reportUnauthorized: (gen, opts) => clone.reportUnauthorized(gen, opts),
+    logout: () => clone.logout(),
+    dispose: () => clone.dispose(),
+  }
+}
+
 /** Build a clone-backed persona view, or `null` when the persona cannot be cloned. */
 export function cloneWorkerPersona(
   persona: ResolvedPersona,
   assignmentId: string,
   cloneSession: (handle: string, workerId: string) => PersonaSessionClone | null,
   currentSession?: (handle: string) => MintedPersonaSession | null,
+  runId?: string,
 ): ClonedWorkerPersona | null {
   if (persona.authKind !== 'login' || !persona.session) return null
   const clone = cloneSession(persona.handle, `worker:${assignmentId}`)
@@ -240,8 +290,6 @@ export function cloneWorkerPersona(
     },
   }
   // Drop the shared file path: the clone is the per-worker credential source, not the file.
-  return {
-    persona: { ...persona, sessionPath: undefined, sessionMtimeMs: undefined, sessionIno: undefined, session: live },
-    clone,
-  }
+  const clonedPersona: ResolvedPersona = { ...persona, sessionPath: undefined, sessionMtimeMs: undefined, sessionIno: undefined, session: live }
+  return { persona: clonedPersona, clone: bindCloneCustody(runId, assignmentId, clonedPersona, clone) }
 }
