@@ -1,4 +1,4 @@
-/** General Invariant Synthesizer (v8 Layer 2 — White-Box + Runtime Parity). All capabilities stay quarantined as `capability_only`. */
+/** General Invariant Synthesizer (v8 Layer 2 — White-Box). All capabilities stay quarantined as `capability_only`. */
 import {
   buildLineIndex,
   extractLineRange,
@@ -19,7 +19,6 @@ import {
   deduplicateHypotheses,
   detectLifecyclePatterns,
   inferEntityName,
-  inferRuntimeInvariantHypotheses,
   isPublicOrStaticAssetPath,
   makeHypothesis,
   pushMap,
@@ -31,16 +30,10 @@ import {
   toCapabilityLedgerSeeds,
 } from './invariant-runtime-parity.ts'
 export {
-  buildRuntimeDiscoveryInput,
   classifySurface,
-  extractRuntimeCatalogFromFacts,
   inferEntityName,
-  inferRuntimeInvariantHypotheses,
   scrubLiteralValues,
-  synthesizePostFloorRuntimeInvariants,
   toCapabilityLedgerSeeds,
-  type BuildRuntimeDiscoveryInputParams,
-  type RuntimeCatalogFactsExtract,
 } from './invariant-runtime-parity.ts'
 
 export const ENTITY_LIFECYCLE_SLICE_MAX_BYTES = 1600
@@ -87,7 +80,6 @@ export interface EntityLifecycleSlice { entity: string; patterns: LifecyclePatte
 export interface SemanticBudgetGuard { totalRunBudgetUsd: number; requestedBudgetFraction: number; enforcedBudgetFraction: number; allocatedBudgetUsd: number; estimatedCostUsd: number; slicesCandidateCount: number; slicesIncluded: number; slicesDropped: number; truncatedByBudget: boolean }
 export interface EntityLifecycleSliceOptions { sourceFiles?: readonly SourceFileInput[]; serviceOrigins?: readonly ServiceOriginMapping[]; maxSliceBytes?: number; totalRunBudgetUsd?: number; maxBudgetFraction?: number; estimatedCostPerSliceUsd?: number; maxSlices?: number }
 export interface EntityLifecycleSlicesResult { slices: EntityLifecycleSlice[]; hypotheses: InvariantHypothesis[]; budgetGuard: SemanticBudgetGuard }
-export interface PersonaSurfaceObservation { persona: string; roleLabel?: string; tenantId?: string; isRevokedOrDemoted?: boolean; surface: CapabilitySurface; serviceOrigin?: string; method: string; path: string; status: number; responseHeaders?: Record<string, string>; bodyKeys?: string[]; isBatch?: boolean }
 
 export interface RuntimeOpenApiOperation {
   method: string; path: string; operationId?: string; security?: Array<Record<string, string[]>>
@@ -97,21 +89,13 @@ export interface RuntimeGraphqlField { name: string; kind: 'query' | 'mutation' 
 export interface RuntimeGraphqlCatalog { endpoint?: string; serviceOrigin?: string; fields: readonly RuntimeGraphqlField[] }
 export interface RuntimeSpaRoute { path: string; serviceOrigin?: string; apiCalls?: ReadonlyArray<{ method: string; path: string; surface?: CapabilitySurface; serviceOrigin?: string }>; stateActions?: readonly string[]; requiredRoles?: readonly string[] }
 export interface RuntimeApiDependency { producer: string; consumer: string; resourceKey: string; producerOrigin?: string; consumerOrigin?: string; personaHandle?: string | null; observedTransitions?: readonly string[]; testedBola?: boolean }
-export interface RuntimeDiscoveryInput {
-  mode: 'grey-box' | 'black-box'; personaObservations?: readonly PersonaSurfaceObservation[]; openApiOperations?: readonly RuntimeOpenApiOperation[]
-  graphqlCatalog?: RuntimeGraphqlCatalog; graphqlCatalogs?: readonly RuntimeGraphqlCatalog[]; spaRoutes?: readonly RuntimeSpaRoute[]; apiDependencies?: readonly RuntimeApiDependency[]; maxHypotheses?: number
-}
-export interface RuntimeInvariantParityResult {
-  mode: 'grey-box' | 'black-box'; hypotheses: InvariantHypothesis[]; capabilitySeeds: CapabilitySeedRecord[]
-  stats: { observationsAnalyzed: number; catalogOpsAnalyzed: number; spaRoutesAnalyzed: number; hypothesesEmitted: number; apiDependenciesAnalyzed?: number }
-}
 
 export interface SynthesizeInvariantsInput {
   mode: SynthesizerMode; graph?: ProgramGraph; sourceFiles?: readonly SourceFileInput[]; staticSnapshot?: StaticWorkspaceSnapshot
   services?: readonly MonorepoService[]; serviceOrigins?: readonly ServiceOriginMapping[]; compose?: string; ingress?: string
-  runtime?: Omit<RuntimeDiscoveryInput, 'mode'>; totalRunBudgetUsd?: number; maxBudgetFraction?: number; maxSliceBytes?: number; maxHypotheses?: number
+  totalRunBudgetUsd?: number; maxBudgetFraction?: number; maxSliceBytes?: number; maxHypotheses?: number
 }
-export interface SynthesizeInvariantsResult { mode: SynthesizerMode; guardMatrix?: GuardAsymmetryMatrixResult; trustBoundaries?: TrustBoundaryGraphResult; lifecycleSlices?: EntityLifecycleSlicesResult; runtimeParity?: RuntimeInvariantParityResult; hypotheses: InvariantHypothesis[]; capabilitySeeds: CapabilitySeedRecord[] }
+export interface SynthesizeInvariantsResult { mode: SynthesizerMode; guardMatrix?: GuardAsymmetryMatrixResult; trustBoundaries?: TrustBoundaryGraphResult; lifecycleSlices?: EntityLifecycleSlicesResult; hypotheses: InvariantHypothesis[]; capabilitySeeds: CapabilitySeedRecord[] }
 
 const AUTH_GUARD_RE = /\b(?:auth(?:enticate|orize|Required|Middleware)?|requireAuth|ensureAuth|verify(?:Jwt|Token|Session|Bearer|Pat|Cookie)|jwtAuth|sessionAuth|passport|loginRequired|isAuthenticated|getSession|currentUser|req\.user|ctx\.user)\b/i
 const TENANT_GUARD_RE = /\b(?:tenant|org(?:anization)?|workspace|account|team|project)(?:Scope|Guard|Check|Isolation|Access|Match|Member|Filter|Context)|require(?:Tenant|Org|Workspace|Account)|enforceTenant|scopeBy(?:Tenant|Org|Workspace)|assert(?:Tenant|Org|Workspace)Access|where[^\n]{0,120}(?:tenantId|orgId|workspaceId)\b/i
@@ -740,21 +724,17 @@ export function buildEntityLifecycleSlices(graph: ProgramGraph, options: EntityL
 }
 
 // Unified Orchestrator
-/** Unified Layer-2 synthesizer entry point across `white-box`, `grey-box`, and `black-box` modes. */
+/** Unified Layer-2 synthesizer entry point; only `white-box` mode (ProgramGraph + sources) emits hypotheses. */
 export function synthesizeInvariants(input: SynthesizeInvariantsInput): SynthesizeInvariantsResult {
   const all: InvariantHypothesis[] = [], snap = input.staticSnapshot, graph = input.graph ?? snap?.programGraph
   const sourceFiles = input.sourceFiles ?? (snap ? snapshotSourceFiles(snap) : undefined), compose = input.compose ?? snap?.compose, ingress = input.ingress ?? snap?.ingress
-  let guardMatrix: GuardAsymmetryMatrixResult | undefined, trustBoundaries: TrustBoundaryGraphResult | undefined, lifecycleSlices: EntityLifecycleSlicesResult | undefined, runtimeParity: RuntimeInvariantParityResult | undefined
+  let guardMatrix: GuardAsymmetryMatrixResult | undefined, trustBoundaries: TrustBoundaryGraphResult | undefined, lifecycleSlices: EntityLifecycleSlicesResult | undefined
   if (input.mode === 'white-box' && graph) {
     guardMatrix = buildGuardAsymmetryMatrix(graph, { sourceFiles, serviceOrigins: input.serviceOrigins })
     trustBoundaries = buildTrustBoundaryGraph(graph, { sourceFiles, services: input.services, serviceOrigins: input.serviceOrigins, compose, ingress })
     lifecycleSlices = buildEntityLifecycleSlices(graph, { sourceFiles, serviceOrigins: input.serviceOrigins, maxSliceBytes: input.maxSliceBytes, totalRunBudgetUsd: input.totalRunBudgetUsd, maxBudgetFraction: input.maxBudgetFraction })
     all.push(...guardMatrix.hypotheses, ...trustBoundaries.hypotheses, ...lifecycleSlices.hypotheses)
   }
-  if (input.runtime) {
-    runtimeParity = inferRuntimeInvariantHypotheses({ mode: input.mode === 'black-box' ? 'black-box' : 'grey-box', ...input.runtime })
-    all.push(...runtimeParity.hypotheses)
-  }
   const hypotheses = input.maxHypotheses ? deduplicateHypotheses(all).slice(0, input.maxHypotheses) : deduplicateHypotheses(all)
-  return { mode: input.mode, ...(guardMatrix ? { guardMatrix } : {}), ...(trustBoundaries ? { trustBoundaries } : {}), ...(lifecycleSlices ? { lifecycleSlices } : {}), ...(runtimeParity ? { runtimeParity } : {}), hypotheses, capabilitySeeds: toCapabilityLedgerSeeds(hypotheses) }
+  return { mode: input.mode, ...(guardMatrix ? { guardMatrix } : {}), ...(trustBoundaries ? { trustBoundaries } : {}), ...(lifecycleSlices ? { lifecycleSlices } : {}), hypotheses, capabilitySeeds: toCapabilityLedgerSeeds(hypotheses) }
 }

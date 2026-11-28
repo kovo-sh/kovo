@@ -8,10 +8,11 @@ import type { ReactNode } from 'react'
 import { cn } from '../../lib/cn.ts'
 import { KovoMark } from '../brand/KovoMark.tsx'
 import { KbdGroup } from '../run/display.tsx'
-import { runLabel } from '../run/format.ts'
+import { fmtN, runLabel } from '../run/format.ts'
 import { StatusGlyph } from '../run/glyphs.tsx'
 import { Icon } from '../run/icons.tsx'
 import { runStatusLabel } from '../run/meta.ts'
+import { useTheme } from '../run/theme.ts'
 import { DevicesIcon, DevicesSessionModal } from '../settings/DevicesSessionModal.tsx'
 import {
   formatFullDateTime,
@@ -25,10 +26,9 @@ import type { PoolHealth, ShellWorkspaceData } from './GlobalPalette.tsx'
 export { formatFullDateTime, formatRelativeTime, useNow } from './GlobalPalette.tsx'
 export type { PoolHealth, ShellProjectItem, ShellRecentRun, ShellWorkspaceData } from './GlobalPalette.tsx'
 
-const APPEARANCE_KEY = 'kovo-appearance'
-
 const railItemVariants = cva(
-  'relative flex w-full cursor-pointer select-none items-center gap-[9px] rounded-control border-0 bg-transparent px-2 text-left text-[13px] text-fg-muted transition-colors duration-[var(--d1)] hover:bg-hover hover:text-fg',
+  // pointer-coarse:min-h-10: 40px touch rows; min-height also lets 2-line run rows grow.
+  'relative flex w-full cursor-pointer select-none items-center gap-[9px] rounded-control border-0 bg-transparent px-2 text-left text-[13px] text-fg-muted transition-colors duration-[var(--d1)] hover:bg-hover hover:text-fg pointer-coarse:min-h-10',
   {
     variants: {
       kind: {
@@ -57,52 +57,6 @@ const healthDotVariants = cva('size-[7px] flex-none rounded-full', {
   },
 })
 
-function resolveEffectiveTheme(): 'light' | 'dark' {
-  if (typeof document === 'undefined') return 'light'
-  const a = document.documentElement.dataset.appearance
-  if (a === 'dark' || a === 'light') return a
-  const t = document.documentElement.dataset.theme
-  if (t === 'dark' || t === 'light') return t
-  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
-}
-
-function syncThemeAttributes(mode?: 'light' | 'dark' | 'system') {
-  if (typeof document === 'undefined') return 'light' as const
-  if (mode) {
-    document.documentElement.dataset.appearance = mode
-  }
-  const resolved = resolveEffectiveTheme()
-  if (document.documentElement.dataset.theme !== resolved) {
-    document.documentElement.dataset.theme = resolved
-  }
-  return resolved
-}
-
-export function useShellTheme() {
-  const [theme, setTheme] = useState<'light' | 'dark'>('light')
-
-  useEffect(() => {
-    setTheme(syncThemeAttributes())
-    const mq = window.matchMedia('(prefers-color-scheme: dark)')
-    const onChange = () => setTheme(syncThemeAttributes())
-    mq.addEventListener('change', onChange)
-    const mo = new MutationObserver(onChange)
-    mo.observe(document.documentElement, { attributes: true, attributeFilter: ['data-appearance', 'data-theme'] })
-    return () => {
-      mq.removeEventListener('change', onChange)
-      mo.disconnect()
-    }
-  }, [])
-
-  const toggle = useCallback(() => {
-    const next: 'light' | 'dark' = resolveEffectiveTheme() === 'dark' ? 'light' : 'dark'
-    try { localStorage.setItem(APPEARANCE_KEY, next) } catch { /* ignore */ }
-    setTheme(syncThemeAttributes(next))
-  }, [])
-
-  return { theme, toggle }
-}
-
 interface ShellContextApi {
   openPalette: (prefill?: string) => void
   closePalette: () => void
@@ -110,7 +64,6 @@ interface ShellContextApi {
   openDevices: () => void
   openNewProject: () => void
   registerNewProjectHandler: (fn: (() => void) | null) => void
-  theme: 'light' | 'dark'
   toggleTheme: () => void
   data: ShellWorkspaceData
 }
@@ -140,10 +93,51 @@ function poolHealthTitle(health: PoolHealth): string {
   return 'No enabled model profile configured'
 }
 
+/**
+ * Recent-run meta line: segments are joined only when present (no orphan "·"
+ * for a missing time), the status truncates with an ellipsis, and the
+ * confirmed count is protected on the right in grouped digits.
+ */
+function RecentRunMeta({ relTime, fullTime, startedAt, status, confirmedCount }: {
+  relTime: string
+  fullTime: string
+  startedAt: number
+  status: string
+  confirmedCount: number
+}) {
+  const hasTime = Boolean(relTime) && Number.isFinite(startedAt)
+  const segments = [
+    hasTime
+      ? <time
+          key="time"
+          className="flex-none tabular-nums"
+          dateTime={new Date(startedAt).toISOString()}
+          title={fullTime}
+          suppressHydrationWarning
+        >
+          {relTime}
+        </time>
+      : null,
+    status ? <span key="status" className="min-w-0 truncate" title={status}>{status}</span> : null,
+  ].filter(Boolean)
+  return (
+    <span className="flex min-w-0 gap-1.5 whitespace-nowrap text-[11.5px] leading-4 text-fg-subtle">
+      {segments.flatMap((segment, i) => (i === 0
+        ? [segment]
+        : [<span key={`sep-${i}`} className="flex-none" aria-hidden="true">·</span>, segment]))}
+      {confirmedCount > 0 && (
+        <span className="ml-auto flex-none pl-1.5 tabular-nums" title={`${fmtN(confirmedCount)} confirmed`}>
+          {fmtN(confirmedCount)}
+        </span>
+      )}
+    </span>
+  )
+}
+
 export function AppShell({ data, children }: { data: ShellWorkspaceData; children: ReactNode }) {
   const navigate = useNavigate()
   const pathname = useRouterState({ select: state => state.location.pathname })
-  const { theme, toggle: toggleTheme } = useShellTheme()
+  const { theme, toggle: toggleTheme } = useTheme()
   const now = useNow()
   const [palette, setPalette] = useState<{ open: boolean; prefill: string }>({ open: false, prefill: '' })
   const [helpOpen, setHelpOpen] = useState(false)
@@ -245,6 +239,10 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [palette.open, helpOpen, devicesOpen, navigate, toggleTheme, openNewProject])
 
+  // `theme` is deliberately not part of the context: the boot theme flips it
+  // right after hydration, and a changed provider value would force any
+  // still-dehydrated route boundary to client-render (a recoverable hydration
+  // error on errored routes in dark mode). The shell reads `theme` locally.
   const ctx = useMemo<ShellContextApi>(() => ({
     openPalette,
     closePalette,
@@ -252,10 +250,9 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
     openDevices,
     openNewProject,
     registerNewProjectHandler,
-    theme,
     toggleTheme,
     data,
-  }), [openPalette, closePalette, openHelp, openDevices, openNewProject, registerNewProjectHandler, theme, toggleTheme, data])
+  }), [openPalette, closePalette, openHelp, openDevices, openNewProject, registerNewProjectHandler, toggleTheme, data])
 
   const isProjectsActive = pathname === '/' || pathname.startsWith('/projects/')
   const isSettingsActive = pathname === '/settings' || pathname.startsWith('/settings/')
@@ -284,7 +281,8 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
           </span>
         </button>
 
-        <div className="flex-1 overflow-auto px-2 pb-2">
+        {/* Static fade so a row cut by the footer reads as "more below", not a glitch. */}
+        <div className="flex-1 overflow-auto px-2 pb-2 [mask-image:linear-gradient(to_bottom,black_calc(100%-20px),transparent)]">
           <div className="flex items-center justify-between px-2 pb-1 pt-2.5 text-[11.5px] font-medium tracking-[0.01em] text-fg-subtle">
             <span>Workspace</span>
           </div>
@@ -335,19 +333,13 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
                 </span>
                 <span className="flex min-w-0 flex-1 flex-col gap-0">
                   <span className="truncate text-inherit">{r.projectName}</span>
-                  <span className="flex gap-1.5 overflow-hidden whitespace-nowrap text-[11.5px] leading-4 text-fg-subtle">
-                    <time
-                      className="tabular-nums"
-                      dateTime={new Date(r.startedAt).toISOString()}
-                      title={fullTime}
-                      suppressHydrationWarning
-                    >
-                      {relTime}
-                    </time>
-                    <span aria-hidden="true">·</span>
-                    <span>{runStatusLabel(r.status)}</span>
-                    {r.confirmedCount > 0 && <span className="ml-auto tabular-nums">{r.confirmedCount}</span>}
-                  </span>
+                  <RecentRunMeta
+                    relTime={relTime}
+                    fullTime={fullTime}
+                    startedAt={r.startedAt}
+                    status={runStatusLabel(r.status)}
+                    confirmedCount={r.confirmedCount}
+                  />
                 </span>
               </Link>
             })}
@@ -358,8 +350,10 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
             type="button"
             className={cn(
               'group/sess flex h-8 min-h-8 w-full cursor-pointer items-center gap-2 whitespace-nowrap rounded-control border-0 bg-transparent px-2 text-left text-[12.5px] font-medium leading-none text-fg-muted shadow-none transition-colors duration-[var(--d1)]',
-              'hover:bg-hover hover:text-fg active:bg-press active:text-fg aria-expanded:bg-press aria-expanded:text-fg',
-              '[&_.ico]:text-fg-subtle [&_.ico]:transition-colors hover:[&_.ico]:text-fg-muted aria-expanded:[&_.ico]:text-fg-muted',
+              'hover:bg-hover hover:text-fg active:scale-100 active:bg-press active:text-fg aria-expanded:bg-press aria-expanded:text-fg',
+              // The descendant rule out-specifies the chevron's own classes, so it must
+            // list `translate` too or the hover nudge snaps.
+            '[&_.ico]:text-fg-subtle [&_.ico]:transition-[color,translate] hover:[&_.ico]:text-fg-muted aria-expanded:[&_.ico]:text-fg-muted',
             )}
             onClick={openDevices}
             aria-haspopup="dialog"
@@ -373,7 +367,7 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
             </span>
             <Icon
               name="chevR"
-              className="flex-none text-fg-faint transition-[color,transform] duration-[var(--d1)] ease-kovo group-hover/sess:translate-x-[1px] group-hover/sess:text-fg-subtle"
+              className="flex-none text-fg-faint transition-[color,translate] duration-[var(--d1)] ease-kovo group-hover/sess:translate-x-[1px] group-hover/sess:text-fg-subtle"
             />
           </button>
         </div>
@@ -416,6 +410,7 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
       data={data}
     />
     <GlobalHelpSheet open={helpOpen} onClose={() => setHelpOpen(false)} />
-    {devicesOpen && <DevicesSessionModal onClose={closeDevices} />}
+    {/* Always mounted so Base UI runs the shared enter/exit transition. */}
+    <DevicesSessionModal open={devicesOpen} onClose={closeDevices} />
   </ShellContext.Provider>
 }

@@ -35,10 +35,12 @@
   border: 3px solid transparent;
   background-clip: content-box;
 }
-*::-webkit-scrollbar-thumb:hover {
-  background: var(--line-strong);
-  border: 3px solid transparent;
-  background-clip: content-box;
+@media (hover: hover) and (pointer: fine) {
+  *::-webkit-scrollbar-thumb:hover {
+    background: var(--line-strong);
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
 }
 *::-webkit-scrollbar-corner { background: transparent; }
 
@@ -57,6 +59,11 @@ a { color: inherit; text-decoration: none; }
 button, input, textarea, select { font: inherit; color: inherit; }
 button, [role=checkbox] { cursor: pointer; }
 
+/* No preflight ships, so `divide-*` children keep the UA "medium" left/right
+   border widths and paint stray 3px side rules once `divide-dashed` sets a
+   border style. Zero specificity: explicit border-l/x utilities still win. */
+:where([class*="divide-"]) > * { border-left-width: 0; border-right-width: 0; }
+
 /* Base control defaults kept at (0,0,1) specificity via :where() so Tailwind v4
    utilities override them cleanly on migrated routes without !important. */
 button, select {
@@ -70,13 +77,25 @@ button, select {
   font-weight: 500;
   white-space: nowrap;
 }
-button:where(:hover) { background: var(--sunk); }
+/* Hover only on devices that really hover, so taps never leave a sticky fill. */
+@media (hover: hover) and (pointer: fine) {
+  button:where(:hover) { background: var(--sunk); }
+}
+/* Press feedback for every enabled bare button; (0,0,1) so `scale-*` /
+   `active:scale-*` utilities can opt wide rows out. Reduced motion disables it. */
+button:where(:not(:disabled, [data-disabled]):active) { scale: .97; }
 button:disabled, button[data-disabled] { cursor: default; opacity: .5; }
 button, a, [data-slot=checkbox] {
-  transition: background-color var(--d1), color var(--d1), box-shadow var(--d1), border-color var(--d1);
+  transition:
+    background-color var(--d1) var(--ease),
+    color var(--d1) var(--ease),
+    box-shadow var(--d1) var(--ease),
+    border-color var(--d1) var(--ease),
+    scale var(--d1) var(--ease);
 }
 ::selection { background: var(--accent-soft); }
-:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; border-radius: 4px; }
+/* 3:1 non-text contrast on every surface; the outline follows the control's own radius. */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 input:where(:not([type=checkbox]):not([type=range])),
 textarea {
@@ -118,6 +137,12 @@ code, pre, kbd, .mono {
   font-family: ui-monospace, "SF Mono", "JetBrains Mono", "JetBrainsMono Nerd Font", Menlo, Consolas, monospace;
   font-size: 12px;
   letter-spacing: 0;
+}
+/* Inter's stylistic sets (inherited from :root) and mono ligatures must never
+   reshape code — they render "https://" as "https: //" in JetBrains Mono. */
+code, pre, kbd, samp, .mono, .font-mono {
+  font-feature-settings: normal;
+  font-variant-ligatures: none;
 }
 .num { font-variant-numeric: tabular-nums; }
 .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -193,7 +218,7 @@ button:where([data-slot=dropdown-menu-trigger][data-popup-open]) {
   flex: none;
   width: 15px;
   height: 15px;
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--fg-3); /* WCAG 1.4.11: >= 3:1 on every surface */
   border-radius: 4px;
   background: var(--panel);
   color: var(--accent-fg);
@@ -226,6 +251,27 @@ button:where([data-slot=dropdown-menu-trigger][data-popup-open]) {
 .state[data-status=reproduced], .state[data-status=open], .state[data-status=denied], .state[data-status=tainted] { color: var(--bad); }
 .state[data-status=reproduced] i, .state[data-status=open] i, .state[data-status=denied] i, .state[data-status=tainted] i { background: var(--bad); }
 
+/* Touch devices: 16px fields so iOS Safari never zooms the viewport on focus,
+   and a 44px checkbox hit area (visual size unchanged). */
+@media (pointer: coarse) {
+  input:where(:not([type=checkbox]):not([type=radio]):not([type=range])), textarea, select { font-size: 16px !important; }
+  [data-slot=checkbox]::after { inset: -15px; } /* 15px box + 2×15px = 45px */
+}
+
+/* Theme switches flip every surface in one frame instead of rippling through
+   ~50 colour transitions at mixed durations (see run/theme.ts). */
+.no-transitions *, .no-transitions *::before, .no-transitions *::after { transition: none !important; }
+
+/* Reduced motion is gentler, not zero: durations are kept so overlays still
+   fade, but only non-moving properties transition (scale / translate /
+   transform / size snap), loops stop and spinners breathe instead of turning. */
+@keyframes kovo-breathe { 50% { opacity: .45; } }
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { transition-duration: 0s !important; animation-duration: 0s !important; }
+  *, *::before, *::after {
+    transition-property: opacity, color, background-color, border-color, outline-color, box-shadow, fill, stroke !important;
+    scroll-behavior: auto !important;
+  }
+  .animate-ping, .animate-pulse { animation: none !important; }
+  .animate-spin { animation: kovo-breathe 1.6s ease-in-out infinite !important; }
+  :where(button, a, [role=button], [data-slot=button]):active { scale: none !important; }
 }

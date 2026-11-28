@@ -2,7 +2,7 @@
 import type { ReactNode } from 'react'
 import { assertNever } from '../../server/run-status.ts'
 import { getStepStatusMeta, STEP_STATUS, type ChainStepStatus } from '../../step-status.ts'
-import { RISKL, SEV_COL } from './meta.ts'
+import { RISKL, SEV_COL, stLabel } from './meta.ts'
 import type { CoverageStatus, RiskTier } from './meta.ts'
 import { cn, covTileClass } from './tw.ts'
 
@@ -79,7 +79,8 @@ function renderStepStatusGlyph(status: ChainStepStatus): ReactNode {
 
 /**
  * Status glyph for findings, workers, runs, steps, coverage and approvals.
- * Step statuses derive exhaustively from `STEP_STATUS`; "confirmed" is a quiet outlined check.
+ * Step statuses derive exhaustively from `STEP_STATUS`; "confirmed" is a quiet outlined check,
+ * "fixed" (a verified retest) is the same check drawn in `--ok`.
  */
 export function StatusGlyph({ status }: { status: string | null | undefined }) {
   const stepMeta = getStepStatusMeta(status)
@@ -89,6 +90,8 @@ export function StatusGlyph({ status }: { status: string | null | undefined }) {
   switch (status) {
     case 'confirmed': case 'verified': case 'approved':
       return <Ring stroke="var(--fg-3)" glyph={status}><path d="M4.6 7.1 6.3 8.8 9.5 5.4" fill="none" stroke="var(--fg-2)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></Ring>
+    case 'fixed':
+      return <Ring stroke="var(--ok)" glyph={status}><path d="M4.6 7.1 6.3 8.8 9.5 5.4" fill="none" stroke="var(--ok)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></Ring>
     case 'static_verified':
       return <Ring stroke="var(--fg-3)" dash glyph={status}><path d="M5.4 5.2 3.8 7l1.6 1.8M8.6 5.2 10.2 7 8.6 8.8" fill="none" stroke="var(--fg-2)" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round" /></Ring>
     case 'reported':
@@ -207,5 +210,16 @@ export function LiveDot({ paused, className }: { paused?: boolean; className?: s
       'absolute -inset-1 rounded-full border-[1.5px] motion-reduce:animate-none',
       paused ? 'animate-pulse border-warn opacity-45' : 'animate-ping border-accent opacity-50',
     )} />
+  </span>
+}
+
+/** Worker status glyph; live states render a dot (pulsing only when `pulse`, one per view — A-130). */
+export function LiveGlyph({ status, pulse, dotClassName }: { status: string; pulse?: boolean; dotClassName?: string }) {
+  const paused = status === 'paused' || status === 'waiting_approval'
+  if (status !== 'running' && !paused) return <StatusGlyph status={status} />
+  return <span className="inline-flex items-center justify-center" title={paused ? stLabel(status) : 'Running'}>
+    {pulse
+      ? <LiveDot paused={paused} className={dotClassName} />
+      : <span className={cn('inline-block size-2 flex-none rounded-full', paused ? 'bg-warn' : 'bg-accent', dotClassName)} aria-hidden="true" />}
   </span>
 }

@@ -6,17 +6,17 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import type { CSSProperties, PointerEvent as RPointerEvent } from 'react'
 import { useRun } from '../data.tsx'
 import { clamp, deriveRound0PipelineState, fmtDate, fmtN, fmtRel, firstSentence, host, isRound0ThreatModelWorker, plural } from '../format.ts'
-import { LiveDot, SevGlyph, StatusGlyph } from '../glyphs.tsx'
+import { LiveDot, LiveGlyph, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
 import { PHASE_LABEL, stLabel } from '../meta.ts'
-import { worstSeverity } from '../model.ts'
+import { aggStatus, worstSeverity } from '../model.ts'
 import type { FindingRow, RunEvent, RunModel } from '../model.ts'
 import { DUR, EASE_CSS, ease, reducedMotion, T } from '../motion.tsx'
 import { useTheme } from '../theme.ts'
 import { cn, runIconBtn } from '../tw.ts'
 import { allNodes, bounds, edgePath, hotEdges, isLive, LOD_K, nodeLineage, onCameraRequest, replaySpans, WF } from './workflow-layout.ts'
-import type { WfEdge, WfLayout, WfNode } from './workflow-layout.ts'
+import type { WfEdge, WfHead, WfLayout, WfNode } from './workflow-layout.ts'
 
 interface Cam { x: number; y: number; k: number }
 /** Camera per run, kept across view switches. */
@@ -34,6 +34,8 @@ export interface GraphProps {
   onReport: () => void
   replay: boolean
   onReplayClose: () => void
+  /** Opened from the keyboard (L / palette): render settled, no entrance (A-137). */
+  skipEntrance?: boolean
 }
 
 interface NodeInfo {
@@ -55,11 +57,6 @@ interface NodeInfo {
 }
 
 const titleOf = (n: WfNode) => n.kind === 'worker' ? n.a!.title : n.kind === 'stack' ? n.g!.title : n.kind === 'queue' ? 'Queued chain steps' : 'Report'
-
-function aggStatus(list: readonly { status: string }[]) {
-  const has = (s: string) => list.some(a => a.status === s)
-  return has('paused') || has('waiting_approval') ? 'paused' : has('running') ? 'running' : has('failed') ? 'failed' : 'complete'
-}
 
 function nodeInfo(m: RunModel, L: WfLayout, events: readonly RunEvent[]): Map<string, NodeInfo> {
   const out = new Map<string, NodeInfo>()
@@ -108,16 +105,14 @@ function nodeInfo(m: RunModel, L: WfLayout, events: readonly RunEvent[]): Map<st
   return out
 }
 
-/** Status glyph, or a pulsing dot for running / a breathing amber dot for paused. */
-function LiveGlyph({ status, dotClassName }: { status: string; dotClassName?: string }) {
-  if (status === 'running') return <span className="inline-flex items-center justify-center" title="Running"><LiveDot className={dotClassName} /></span>
-  if (status === 'paused' || status === 'waiting_approval') return <span className="inline-flex items-center justify-center" title={stLabel(status)}><LiveDot paused className={dotClassName} /></span>
-  return <StatusGlyph status={status} />
-}
+/**
+ * Status glyph, or a live dot for running (accent) / paused (amber). Only the selected
+ * node pulses; every other live node shows a static dot so the canvas carries one ping (A-130).
+ */
 /** Live glyph plus the replay variant (shown while the replay frontier passes the node). */
-function Lv({ status }: { status: string }) {
+function Lv({ status, pulse }: { status: string; pulse?: boolean }) {
   return <span className="inline-flex size-3.5 flex-none items-center justify-center">
-    <span className="contents group-data-[rp=live]/node:hidden"><LiveGlyph status={status} /></span>
+    <span className="contents group-data-[rp=live]/node:hidden"><LiveGlyph status={status} pulse={pulse} /></span>
     <span className="hidden group-data-[rp=live]/node:contents"><LiveDot /></span>
   </span>
 }
@@ -142,9 +137,9 @@ function tickBgClass(status: string): string {
   }
 }
 
-const NODE_BASE = 'group/node absolute flex h-[var(--nh)] w-[var(--nw)] cursor-pointer select-none flex-col gap-[3px] rounded-[9px] px-[11px] pb-2 pt-[9px] transition-[opacity,box-shadow,transform] duration-[var(--d2)] ease-kovo group-data-[lod]/wf:justify-center group-data-[lod]/wf:px-3.5 group-data-[lod]/wf:py-2.5 data-[rp=hidden]:pointer-events-none data-[rp=hidden]:scale-[.94] data-[rp=hidden]:opacity-0!'
+const NODE_BASE = 'group/node absolute flex h-[var(--nh)] w-[var(--nw)] cursor-pointer select-none flex-col gap-[3px] rounded-[9px] px-[11px] pb-2 pt-[9px] transition-[opacity,box-shadow,scale] duration-[var(--d2)] ease-kovo group-data-[lod]/wf:justify-center group-data-[lod]/wf:px-3.5 group-data-[lod]/wf:py-2.5 data-[rp=hidden]:pointer-events-none data-[rp=hidden]:scale-[.94] data-[rp=hidden]:opacity-0!'
 const NODE_STACK_LAYERS = "before:content-[''] before:absolute before:inset-x-1.5 before:-bottom-[5px] before:-z-[1] before:h-2 before:rounded-b-[9px] before:bg-panel before:shadow-surface after:content-[''] after:absolute after:inset-x-3 after:-bottom-2.5 after:-z-[2] after:h-2 after:rounded-b-[9px] after:bg-panel after:opacity-70 after:shadow-surface"
-const NODE_TOP = 'flex h-4 min-w-0 items-center gap-1.5 whitespace-nowrap text-[11.5px] group-data-[lod]/wf:hidden'
+const NODE_TOP = 'flex h-4 min-w-0 items-center gap-1.5 whitespace-nowrap text-[11.5px] tabular-nums group-data-[lod]/wf:hidden'
 const NODE_TITLE = 'line-clamp-2 min-h-[34px] text-[12.5px] font-medium leading-[17px] group-data-[lod]/wf:min-h-0 group-data-[lod]/wf:text-[21px] group-data-[lod]/wf:leading-[27px]'
 const NODE_BOT = 'mt-auto flex items-center gap-2 whitespace-nowrap text-[11px] tabular-nums group-data-[lod]/wf:hidden'
 const NODE_BADGE_BASE = 'inline-flex h-[17px] items-center gap-1 rounded-[9px] px-1.5 text-[11px] font-medium shadow-[inset_0_0_0_1px_var(--line-2)]'
@@ -164,7 +159,7 @@ interface NodeFlags {
 
 const NodeCard = memo(function NodeCard({ n, info, flags, reportSub }: { n: WfNode; info?: NodeInfo; flags: NodeFlags; reportSub?: string }) {
   const style: CSSProperties = { left: n.x, top: n.y }
-  const opacityCls = flags.hot ? 'opacity-100' : flags.nomatch ? 'opacity-25' : 'group-data-[focus]/wf:opacity-30'
+  const opacityCls = flags.hot ? 'opacity-100' : flags.nomatch ? 'opacity-25' : 'group-data-[focus]/wf:opacity-40'
   const status = info?.status ?? 'complete'
   const paused = status === 'paused' || status === 'waiting_approval'
   const shadowCls = flags.sel
@@ -218,7 +213,7 @@ const NodeCard = memo(function NodeCard({ n, info, flags, reportSub }: { n: WfNo
     >
       <div className={cn(NODE_TOP, 'text-fg-subtle')}>
         {n.kind === 'stack'
-          ? <Lv status={i.status} />
+          ? <Lv status={i.status} pulse={flags.sel} />
           : <span className={cn(NODE_ICON, 'text-fg-subtle')}><Icon name="queue" /></span>}
         <span
           className="flex-none tabular-nums"
@@ -269,7 +264,7 @@ const NodeCard = memo(function NodeCard({ n, info, flags, reportSub }: { n: WfNo
     aria-label={a.title + ', ' + stLabel(a.status)}
   >
     <div className={cn(NODE_TOP, 'text-fg-subtle')}>
-      <Lv status={a.status} />
+      <Lv status={a.status} pulse={flags.sel} />
       <span className="flex-none font-mono text-[11.5px]" data-wf-id="">{i.idLabel}</span>
       {i.hist
         ? <span className="ml-auto min-w-0 truncate font-sans text-[11px] text-warn">{i.hist}</span>
@@ -292,7 +287,7 @@ const NodeCard = memo(function NodeCard({ n, info, flags, reportSub }: { n: WfNo
         {i.round0.totalHosts > 0 && <span>{i.round0.mappedHosts}/{i.round0.totalHosts} hosts</span>}
         <span>{fmtN(i.round0.reqs)} req</span>
       </> : <>
-        <span>{a.turnsUsed}/{a.maxTurns} turns</span>
+        <span>{fmtN(a.turnsUsed)}/{fmtN(a.maxTurns)} turns</span>
         <span>{fmtN(a.requestsUsed)} req</span>
       </>}
       <span className="flex-1" />
@@ -319,7 +314,42 @@ const Edge = memo(function Edge({ d, e, hot }: { d: string; e: WfEdge; hot: bool
   />
 })
 
-export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand, onReport, replay, onReplayClose }: GraphProps) {
+/** Initial-fit insets: phase-nav pill (top) and the minimap footprint (right / bottom). */
+const CAM_INSET = { top: 44, right: 224, bottom: 148 }
+
+/**
+ * Initial camera (A-136): show the whole graph when it fits at a legible zoom (≥ 0.9);
+ * otherwise frame the live phase (or the largest column) at 0.9–1×, inside the rect
+ * left free by the phase-nav pill and the minimap.
+ */
+function initialCamera(Lc: WfLayout, W: number, H: number): Cam {
+  const b = bounds(Lc)
+  const top = CAM_INSET.top
+  const availW = Math.max(160, W - CAM_INSET.right)
+  const availH = Math.max(120, H - top - CAM_INSET.bottom)
+  const kAll = Math.min(availW / b.w, availH / b.h)
+  if (kAll >= 0.9) {
+    const k = Math.min(1, kAll)
+    return { k, x: (availW - b.w * k) / 2 - b.x * k, y: top - b.y * k }
+  }
+  let head: WfHead | undefined = Lc.heads.find(h => h.live)
+  if (!head) for (const h of Lc.heads) if (!head || h.n > head.n) head = h
+  const fitK = Math.min(availW / ((head?.w ?? b.w) + WF.PAD * 2), availH / b.h)
+  const k = clamp(fitK, 0.9, 1)
+  const fx = head ? head.x - WF.PAD : b.x
+  return { k, x: -fx * k + 16, y: Math.max(top - b.y * k, top + (availH - b.h * k) / 2 - b.y * k) }
+}
+
+/** Session flag: the graph entrance plays once per session (A-137). */
+const GRAPH_SEEN_KEY = 'wf.graph.seen'
+function graphSeen(): boolean {
+  try { return sessionStorage.getItem(GRAPH_SEEN_KEY) === '1' } catch { return false }
+}
+function markGraphSeen() {
+  try { sessionStorage.setItem(GRAPH_SEEN_KEY, '1') } catch { /* storage disabled: entrance simply replays */ }
+}
+
+export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand, onReport, replay, onReplayClose, skipEntrance }: GraphProps) {
   const { model, events, detail } = useRun()
   const runId = detail.run.id
   const { theme } = useTheme()
@@ -352,7 +382,10 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     }
     if (!focusId || !L.byId.has(focusId)) return null
     const { up, down } = nodeLineage(L, focusId)
-    return { nodes: new Set([focusId, ...up, ...down]), edges: hotEdges(L, focusId, up, down) }
+    const nodes = new Set([focusId, ...up, ...down])
+    // An isolated node has no lineage to highlight: dimming everything else would only hide context (A-139).
+    if (nodes.size <= 1) return null
+    return { nodes, edges: hotEdges(L, focusId, up, down) }
   }, [L, focusId, focusSet])
   const hotRef = useRef(focus)
   hotRef.current = focus
@@ -496,19 +529,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     camTo({ k, x: (W - b.w * k) / 2 - b.x * k, y: 44 + (H - b.h * k) / 2 - b.y * k })
   }, [camTo])
 
-  const initialCam = useCallback((): Cam => {
-    const vp = vpRef.current!
-    const W = vp.clientWidth, H = vp.clientHeight
-    const Lc = Lref.current
-    const b = bounds(Lc)
-    const kAll = Math.min(W / b.w, (H - 100) / b.h)
-    if (kAll >= 0.5) { const k = Math.min(1, kAll); return { k, x: (W - b.w * k) / 2 - b.x * k, y: 46 - b.y * k } }
-    const k = clamp((H - 70) / b.h, 0.6, 0.86)
-    // paused / running runs open on the live phase; complete runs on the first column
-    const live = Lc.nodes.find(n => n.kind === 'stack' ? n.members!.some(isLive) : n.a ? isLive(n.a) : false)
-    const fx = live ? live.x - 60 : b.x
-    return { k, x: -fx * k + 16, y: Math.max(46 - b.y * k, (H - 30 - b.h * k) / 2 - b.y * k) }
-  }, [])
+  const initialCam = useCallback((): Cam => initialCamera(Lref.current, vpRef.current!.clientWidth, vpRef.current!.clientHeight), [])
 
   const reveal = useCallback((id: string, center: boolean) => {
     const Lc = Lref.current, n = Lc.byId.get(id), vp = vpRef.current, c = cam.current
@@ -566,60 +587,62 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     cv.querySelectorAll<SVGPathElement>('path[data-e]').forEach(el => edgeEls.set(el.dataset.e!, el))
     const W = L.W || 1
     const rm = reducedMotion()
-    const draw = (el: SVGPathElement, causal: boolean, delay: number) => {
-      if (causal) el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 400, delay, easing: EASE_CSS, fill: 'backwards' })
-      else el.animate([{ strokeDasharray: '1', strokeDashoffset: '1' }, { strokeDasharray: '1', strokeDashoffset: '0' }], { duration: 600, delay, easing: EASE_CSS, fill: 'backwards' })
+    // Edges fade in (opacity only); the stroke draw is reserved for Replay (A-137).
+    const draw = (el: SVGPathElement, _causal: boolean, delay: number) => {
+      el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 150, delay, easing: EASE_CSS, fill: 'backwards' })
     }
-    if (!rm) {
-      if (!prev) {
-        // entering: cards stagger in by column, edges draw in (causal edges fade)
+    if (!prev) {
+      // Entrance settles within 300ms and plays once per session, never on the L shortcut.
+      const skip = rm || skipEntrance || graphSeen()
+      markGraphSeen()
+      if (!skip) {
         for (const n of nodes) {
           els.get(n.id)?.animate([{ opacity: 0, transform: 'translateY(6px)' }, { opacity: 1, transform: 'none' }],
-            { duration: 260, delay: Math.round(n.x / W * 500) + n.row * 14, easing: EASE_CSS, fill: 'backwards' })
-        }
-        L.edges.forEach((e, i) => {
-          const a = L.byId.get(e.from)
-          const el = edgeEls.get(e.key)
-          if (a && el) draw(el, e.kind === 'causal', Math.round(a.x / W * 700) + (i % 7) * 12 + 120)
-        })
-      } else {
-        const moved = new Set<string>()
-        let firstNew: string | null = null
-        const grpIndex = new Map<string, number>()
-        for (const n of nodes) {
-          const el = els.get(n.id)
-          if (!el) continue
-          const p = prev.get(n.id)
-          if (p) {
-            const dx = p.x - n.x, dy = p.y - n.y
-            if (dx || dy) {
-              moved.add(n.id)
-              el.animate([{ transform: `translate(${dx}px,${dy}px)` }, { transform: 'none' }], { duration: 340, easing: EASE_CSS })
-            }
-            continue
-          }
-          moved.add(n.id)
-          // members fly out of their stack; a re-collapsed stack gathers from its first member
-          const gid = n.kind === 'worker' ? L.stacks.of.get(n.id) : undefined
-          const origin = gid && prev.get(gid) ? prev.get(gid)! : n.kind === 'stack' ? prev.get(n.g!.members[0]) : undefined
-          if (origin) {
-            const i = gid ? (grpIndex.set(gid, (grpIndex.get(gid) ?? -1) + 1), grpIndex.get(gid)!) : 0
-            if (gid && i === 0) firstNew = n.id
-            el.animate([{ transform: `translate(${origin.x - n.x}px,${origin.y - n.y}px) scale(.92)`, opacity: 0 }, { transform: 'none', opacity: 1 }],
-              { duration: 360, delay: i * 14, easing: EASE_CSS, fill: 'backwards' })
-          } else {
-            // a new worker arrived over SSE
-            el.animate([{ opacity: 0, transform: 'scale(.94) translateY(6px)' }, { opacity: 1, transform: 'none' }], { duration: 320, easing: EASE_CSS, fill: 'backwards' })
-          }
+            { duration: 180, delay: Math.min(90, Math.round(n.x / W * 90)), easing: EASE_CSS, fill: 'backwards' })
         }
         for (const e of L.edges) {
+          const a = L.byId.get(e.from)
           const el = edgeEls.get(e.key)
-          if (!el) continue
-          if (!prevEdges.current.has(e.key)) draw(el, e.kind === 'causal', moved.has(e.from) || moved.has(e.to) ? 220 : 0)
-          else if (moved.has(e.from) || moved.has(e.to)) el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 260, delay: 200, fill: 'backwards' })
+          if (a && el) draw(el, e.kind === 'causal', Math.min(90, Math.round(a.x / W * 90)))
         }
-        if (firstNew) { const id = firstNew; setTimeout(() => revealRef.current(id, false), T(40)) }
       }
+    } else if (!rm) {
+      const moved = new Set<string>()
+      let firstNew: string | null = null
+      const grpIndex = new Map<string, number>()
+      for (const n of nodes) {
+        const el = els.get(n.id)
+        if (!el) continue
+        const p = prev.get(n.id)
+        if (p) {
+          const dx = p.x - n.x, dy = p.y - n.y
+          if (dx || dy) {
+            moved.add(n.id)
+            el.animate([{ transform: `translate(${dx}px,${dy}px)` }, { transform: 'none' }], { duration: 340, easing: EASE_CSS })
+          }
+          continue
+        }
+        moved.add(n.id)
+        // members fly out of their stack; a re-collapsed stack gathers from its first member
+        const gid = n.kind === 'worker' ? L.stacks.of.get(n.id) : undefined
+        const origin = gid && prev.get(gid) ? prev.get(gid)! : n.kind === 'stack' ? prev.get(n.g!.members[0]) : undefined
+        if (origin) {
+          const i = gid ? (grpIndex.set(gid, (grpIndex.get(gid) ?? -1) + 1), grpIndex.get(gid)!) : 0
+          if (gid && i === 0) firstNew = n.id
+          el.animate([{ transform: `translate(${origin.x - n.x}px,${origin.y - n.y}px) scale(.92)`, opacity: 0 }, { transform: 'none', opacity: 1 }],
+            { duration: 360, delay: i * 14, easing: EASE_CSS, fill: 'backwards' })
+        } else {
+          // a new worker arrived over SSE
+          el.animate([{ opacity: 0, transform: 'scale(.94) translateY(6px)' }, { opacity: 1, transform: 'none' }], { duration: 320, easing: EASE_CSS, fill: 'backwards' })
+        }
+      }
+      for (const e of L.edges) {
+        const el = edgeEls.get(e.key)
+        if (!el) continue
+        if (!prevEdges.current.has(e.key)) draw(el, e.kind === 'causal', moved.has(e.from) || moved.has(e.to) ? 220 : 0)
+        else if (moved.has(e.from) || moved.has(e.to)) el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 260, delay: 200, fill: 'backwards' })
+      }
+      if (firstNew) { const id = firstNew; setTimeout(() => revealRef.current(id, false), T(40)) }
     }
     prevPos.current = new Map(nodes.map(n => [n.id, { x: n.x, y: n.y }]))
     prevEdges.current = new Set(L.edges.map(e => e.key))
@@ -916,7 +939,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
   const svgW = L.W + 200, svgH = L.H + 200
   const zBtn = cn(runIconBtn({ size: 'sm' }), 'px-1.5')
   return <div
-    className="group/wf @container/wf relative flex min-h-0 flex-1 flex-col"
+    className="group/wf @container/wf relative flex min-h-0 flex-1 flex-col [contain:paint]"
     data-focus={focus ? '' : undefined}
     data-lod={lod ? '' : undefined}
     data-replaying={replay ? '' : undefined}
@@ -959,7 +982,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
             </span>
             <span className="h-[3px] overflow-hidden rounded-[2px] bg-line-2">
               <i
-                className={cn('block h-full origin-left transition-transform duration-500 ease-kovo', isCur ? 'bg-accent' : 'bg-fg-subtle')}
+                className={cn('block h-full origin-left transition-transform duration-[var(--d3)] ease-kovo', isCur ? 'bg-accent' : 'bg-fg-subtle')}
                 style={{ transform: `scaleX(${h.n ? h.done / h.n : 0})` }}
               />
             </span>
@@ -1107,7 +1130,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     </div>}
 
     <div
-      className="pointer-events-none fixed z-[80] max-w-[300px] translate-y-0.5 rounded-[7px] bg-raise px-[9px] py-[7px] text-[12px] leading-[17px] text-fg-muted opacity-0 shadow-popover transition-[opacity,transform] duration-[var(--d1)] data-[open]:translate-y-0 data-[open]:opacity-100 [&_b]:font-medium [&_b]:text-fg"
+      className="pointer-events-none fixed z-[80] max-w-[300px] translate-y-0.5 rounded-[7px] bg-raise px-[9px] py-[7px] text-[12px] leading-[17px] text-fg-muted opacity-0 shadow-popover transition-[opacity,translate] duration-[var(--d1)] data-[open]:translate-y-0 data-[open]:opacity-100 [&_b]:font-medium [&_b]:text-fg"
       ref={tipRef}
       role="tooltip"
     >
@@ -1118,4 +1141,3 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
 }
 
 /** Small exported helpers for the inspector. */
-export { aggStatus, LiveGlyph }

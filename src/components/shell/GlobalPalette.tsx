@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { cn } from '../../lib/cn.ts'
 import { Kbd, KbdGroup } from '../run/display.tsx'
-import { host, modKey, runLabel } from '../run/format.ts'
+import { host, modKey, plural, runLabel } from '../run/format.ts'
 import { StatusGlyph } from '../run/glyphs.tsx'
 import { Icon } from '../run/icons.tsx'
 import type { IconName } from '../run/icons.tsx'
@@ -114,6 +114,7 @@ interface GlobalCommand {
   icon: IconName | ReactNode
   right?: string
   rightTitle?: string
+  /** Hosts and other code-like hints opt into mono; status words stay proportional. */
   rightMono?: boolean
   keys?: string[]
   run: () => void
@@ -132,6 +133,17 @@ function Highlight({ text, q }: { text: string; q: string }) {
   if (!toks.length) return <>{text}</>
   const parts = text.split(new RegExp('(' + toks.join('|') + ')', 'gi'))
   return <>{parts.map((p, i) => (i % 2 ? <mark key={i} className="bg-transparent font-medium text-accent">{p}</mark> : p))}</>
+}
+
+/** Neutral server glyph for local-lab projects (a lock would read as "private"). */
+function LabServerIcon() {
+  return (
+    <svg className="ico" viewBox="0 0 16 16" aria-hidden="true">
+      <rect x="2.75" y="2.75" width="10.5" height="4.5" rx="1.25" />
+      <rect x="2.75" y="8.75" width="10.5" height="4.5" rx="1.25" />
+      <path d="M5.25 5h.5M5.25 11h.5" />
+    </svg>
+  )
 }
 
 function poolHealthText(health: PoolHealth): string {
@@ -201,14 +213,15 @@ export function GlobalPalette({
       const primaryHost = seedHosts[0] ?? ''
       const rightHint = primaryHost
         ? (seedHosts.length > 1 ? `${primaryHost} +${seedHosts.length - 1}` : primaryHost)
-        : `${p.runCount} runs`
+        : plural(p.runCount, 'run')
       out.push({
         id: 'proj.' + p.id,
         section: 'Projects',
         label: p.name,
         sub: `${seedHosts.join(' ')} ${p.environment}`,
-        icon: p.environment === 'local-lab' ? 'lock' : 'globe',
+        icon: p.environment === 'local-lab' ? <LabServerIcon /> : 'globe',
         right: rightHint,
+        rightMono: Boolean(primaryHost),
         run: () => { void navigate({ to: '/projects/$projectId', params: { projectId: p.id } }) },
       })
     }
@@ -225,7 +238,6 @@ export function GlobalPalette({
         icon: <StatusGlyph status={r.status} />,
         right: `${rel} · ${runStatusLabel(r.status)}`,
         rightTitle: full,
-        rightMono: false,
         run: () => { void navigate({ to: '/runs/$runId', params: { runId: r.id }, search: {} }) },
       })
     }
@@ -316,8 +328,9 @@ export function GlobalPalette({
   let lastSection = ''
   return <Dialog open={open} onOpenChange={next => { if (!next) onClose() }}>
     <DialogContent
+      instant
       aria-label="Command palette"
-      className="mb-auto mt-[10vh] max-w-[620px] overflow-hidden rounded-2xl border-0 bg-raise p-0 shadow-popover [&_svg]:block [&_svg]:flex-none"
+      className="mb-auto mt-[10vh] max-w-[620px] overflow-hidden rounded-2xl border border-line-2 bg-raise p-0 shadow-popover [&_svg]:block [&_svg]:flex-none"
     >
       <DialogTitle className="sr-only">Command palette</DialogTitle>
       <div className="flex h-[50px] items-center gap-2.5 border-b border-line px-4 text-fg-subtle">
@@ -344,11 +357,15 @@ export function GlobalPalette({
             }
           }}
         />
-        <span className="whitespace-nowrap rounded-[5px] border border-line-2 px-[7px] py-0.5 text-[11.5px] text-fg-subtle">
+        <span
+          className="max-w-[160px] flex-none truncate whitespace-nowrap rounded-[5px] border border-line-2 px-[7px] py-0.5 text-[11.5px] text-fg-subtle max-[480px]:hidden"
+          title={data.workspace.name}
+        >
           {data.workspace.name}
         </span>
       </div>
-      <div className="max-h-[400px] overflow-auto p-1.5" ref={listRef} role="listbox">
+      {/* min-h = max-h: the panel never collapses under the cursor while typing. */}
+      <div className="h-[400px] max-h-[calc(80vh-100px)] overflow-auto p-1.5" ref={listRef} role="listbox">
         {items.length === 0 && (
           <div className="p-7 text-center text-[12.5px] text-fg-subtle">No matches for “{q}”</div>
         )}
@@ -368,7 +385,7 @@ export function GlobalPalette({
               data-active={isCurrent ? 'true' : undefined}
               role="option"
               aria-selected={isCurrent}
-              title={it.title}
+              title={it.title ?? it.label}
               onMouseMove={() => { if (!isCurrent) setIdx(i) }}
               onClick={() => runItem(i)}
             >
@@ -383,8 +400,8 @@ export function GlobalPalette({
                 : it.right
                   ? <span
                       className={cn(
-                        'max-w-[220px] truncate whitespace-nowrap text-[12px] text-fg-subtle',
-                        it.rightMono === false ? 'tabular-nums' : 'font-mono',
+                        'min-w-0 max-w-[40%] truncate whitespace-nowrap text-[12px] text-fg-subtle',
+                        it.rightMono ? 'font-mono' : 'tabular-nums',
                       )}
                       title={it.rightTitle}
                       suppressHydrationWarning
@@ -421,12 +438,18 @@ const GLOBAL_SHORTCUTS: [string, [string, string][]][] = [
 
 export function GlobalHelpSheet({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [mod, setMod] = useState('Ctrl')
+  // Focus lands on the sheet itself, so the first ring is not around Close.
+  const sheetRef = useRef<HTMLDivElement>(null)
   useEffect(() => setMod(modKey()), [])
 
   return <Dialog open={open} onOpenChange={next => { if (!next) onClose() }}>
     <DialogContent
+      instant
+      ref={sheetRef}
+      tabIndex={-1}
+      initialFocus={sheetRef}
       aria-label="Keyboard shortcuts"
-      className="max-h-[76vh] max-w-[540px] overflow-auto rounded-2xl border-0 bg-raise px-5 pb-4 pt-[18px] shadow-popover [&_svg]:block [&_svg]:flex-none"
+      className="max-h-[76vh] max-w-[540px] overflow-auto rounded-2xl border border-line-2 bg-raise px-5 pb-4 pt-[18px] shadow-popover [&_svg]:block [&_svg]:flex-none"
     >
       <div className="mb-1 flex items-center justify-between">
         <DialogTitle className="text-[13.5px] font-semibold text-fg">Keyboard shortcuts</DialogTitle>

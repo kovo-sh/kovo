@@ -38,7 +38,6 @@ import {
   reinvestigationKey,
   resolveAssignmentBudget,
   structuredCoverageKey,
-  synthesizeRuntimeCompositeWave1Steps,
 } from '../src/server/exec-dispatch.ts'
 import type { ExecFloorLane } from '../src/server/exec-floor-lane.ts'
 import type { ExecReconPlanner } from '../src/server/exec-recon-planner.ts'
@@ -680,15 +679,6 @@ test('Q6: FrontierWaveController suppresses pruned Wave-1 branches and preserves
     preconditionCapIds: ['cap:seed_pruned'],
   })
   assert.equal(suppressed.admitted, false, 'FrontierWaveController must suppress dead-end negative-edge branches')
-
-  // Verify synthesizeRuntimeCompositeWave1Steps accepts frontierController without error
-  const emptyComposites = synthesizeRuntimeCompositeWave1Steps(storage, run, {
-    sourceMounted: false,
-    endpoints: [],
-    facts: [],
-    frontierController: controller,
-  })
-  assert.deepEqual(emptyComposites, [])
 
   // (b) Lossless hop continuation from a `rotated_partial` parent step with >14 facts!
   const w1 = storage.makeWorker(run, 'investigation', asset, 'Multi-hop chain', 'Investigate chain', { sourceOrigins: [ORIGIN] })

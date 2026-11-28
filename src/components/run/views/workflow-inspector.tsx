@@ -5,7 +5,7 @@ import type { ReactNode } from 'react'
 import { readGraphDigest, readWorkerSessionAction } from '../../../actions.ts'
 import type { WorkerSessionData } from '../../../server/worker-session-reader.ts'
 import { useRun, useRunModel } from '../data.tsx'
-import { Disclosure, EmptyState, HostLabel, LinkRow, Props, Section, Tag } from '../display.tsx'
+import { Disclosure, EmptyState, FindingTitle, HostLabel, InlineError, LinkRow, Props, Section, Tag } from '../display.tsx'
 import {
   deriveRound0PipelineState,
   fmtAgo,
@@ -20,9 +20,10 @@ import {
   sharedApex,
 } from '../format.ts'
 import type { Round0HostSignal, Round0PipelineState, Round0PipelineStep, Round0StageKey, Round0StepStatus } from '../format.ts'
-import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
+import { LiveGlyph, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { normFStatus, PHASE_LABEL, prettyCat, stLabel } from '../meta.ts'
+import { aggStatus } from '../model.ts'
 import type { Assignment, ChainStep, Fact, FindingRow } from '../model.ts'
 import { Meter } from '../motion.tsx'
 import { useLinks, useNav, useViewState } from '../nav.tsx'
@@ -30,7 +31,6 @@ import { ExchangeLink, PaneBody, PaneFooter, PaneHeader } from '../pane.tsx'
 import type { InspectorProps } from '../pane.tsx'
 import { useToast } from '../toast.tsx'
 import { cn, runBtn, runIconBtn, RW } from '../tw.ts'
-import { aggStatus, LiveGlyph } from './workflow-graph.tsx'
 import { isLive, nodeLineage, QUEUE_ID, queuedSteps, requestCamera, setExpanded, useExpanded, useWorkflowLayout } from './workflow-layout.ts'
 import type { WfLayout } from './workflow-layout.ts'
 
@@ -45,7 +45,35 @@ const WF_LOAD = 'my-3.5 flex items-center gap-2 text-[12.5px] text-fg-subtle'
 const WF_NONE = 'my-3 text-[12.5px] text-fg-subtle'
 const WF_MORE = 'my-1 mb-2! text-[12px]! text-fg-subtle!'
 const WF_PRE_JSON = cn(RW.pre, 'my-1.5 mb-1 max-h-[260px] text-[11.5px] leading-[17px]')
-const WF_ORIGINS = 'rw-wrap font-mono text-[11.5px] whitespace-normal break-all'
+const WF_ORIGINS = 'rw-wrap min-w-0 font-mono text-[11.5px] whitespace-normal [overflow-wrap:anywhere]'
+
+/** Comma-joined origin hosts that wrap between hosts, never inside one; an over-long host ellipsizes. */
+function OriginList({ origins, max = 6, title }: { origins: readonly string[]; max?: number; title?: string }) {
+  const shown = origins.slice(0, max)
+  return <span className={WF_ORIGINS} title={title}>
+    {shown.map((o, i) => <span key={o + i}>
+      <span className="inline-block max-w-full truncate whitespace-nowrap align-bottom" title={o}>{host(o)}</span>
+      {i < shown.length - 1 ? ', ' : ''}
+    </span>)}
+    {origins.length > max && <span className="whitespace-nowrap text-fg-subtle">{' +' + fmtN(origins.length - max)}</span>}
+  </span>
+}
+
+/** Failed worker reason, surfaced under the title (clamped, expandable). */
+function FailureCallout({ text }: { text: string }) {
+  const [full, setFull] = useState(false)
+  const long = text.length > 220 || text.split('\n').length > 3
+  return <div
+    role="alert"
+    data-worker-failure=""
+    className="mb-3 rounded-[7px] bg-danger-soft px-2.5 py-2 text-[12.5px] leading-[19px] text-fg shadow-[inset_0_0_0_1px_color-mix(in_oklch,var(--danger)_35%,transparent)]"
+  >
+    <p className={cn('m-0 whitespace-pre-wrap [overflow-wrap:anywhere]', !full && 'line-clamp-3')}>{text}</p>
+    {long && <button type="button" className={cn(runBtn({ variant: 'link' }), 'mt-1 text-[12px]')} aria-expanded={full} onClick={() => setFull(f => !f)}>
+      {full ? 'Show less' : 'Show full error'}
+    </button>}
+  </div>
+}
 const WF_TG = 'inline-flex size-3.5 items-center justify-center'
 const WF_CTX = 'flex flex-col divide-y divide-dashed divide-line'
 const WF_CTX_ITEM = 'grid grid-cols-[18px_minmax(0,1fr)] gap-2 py-[7px] text-[12px] leading-[18px]'
@@ -54,7 +82,7 @@ function FindingRows({ list, max = 10 }: { list: readonly FindingRow[]; max?: nu
   const links = useLinks()
   return <>
     {list.slice(0, max).map(f => <LinkRow key={f.id} glyph={<span className="inline-flex gap-1.5"><SevGlyph sev={f.severity} /><StatusGlyph status={normFStatus(f.status)} /></span>}
-      right={<span className="font-mono text-[12px]">{host(f.origin)}</span>} trailing={null} onClick={() => links.finding(f.id)}>{f.title}</LinkRow>)}
+      right={f.origin ? <span className="font-mono text-[12px]" title={f.origin}><HostLabel host={host(f.origin)} quiet max={28} /></span> : null} trailing={null} onClick={() => links.finding(f.id)}><FindingTitle title={f.title} /></LinkRow>)}
     {list.length > max && <p className={WF_MORE}>+{list.length - max} more</p>}
   </>
 }
@@ -108,9 +136,10 @@ function FactItem({ f }: { f: Fact }) {
 
 // ---------------------------------------------------------------- worker session (transcript)
 
-type SessionState = { data?: WorkerSessionData; loading: boolean; error?: boolean }
-function useWorkerSession(runId: string, a: Assignment | undefined) {
+type SessionState = { data?: WorkerSessionData; loading: boolean; error?: boolean; retry?: () => void }
+function useWorkerSession(runId: string, a: Assignment | undefined): SessionState {
   const [s, setS] = useState<SessionState>({ loading: true })
+  const [reload, setReload] = useState(0)
   useEffect(() => {
     if (!a) return
     let live = true
@@ -119,8 +148,8 @@ function useWorkerSession(runId: string, a: Assignment | undefined) {
       .then(data => { if (live) setS({ data, loading: false }) }, () => { if (live) setS({ loading: false, error: true }) })
     return () => { live = false }
     // re-read as a live worker takes turns
-  }, [runId, a?.id, a?.turnsUsed, a?.status])
-  return s
+  }, [runId, a?.id, a?.turnsUsed, a?.status, reload])
+  return { ...s, retry: () => setReload(n => n + 1) }
 }
 
 function Transcript({ a, s }: { a: Assignment; s: SessionState }) {
@@ -131,7 +160,7 @@ function Transcript({ a, s }: { a: Assignment; s: SessionState }) {
   if (!turns.length) {
     const msgs = model.detail.messages.filter(m => m.threadId === a.id && m.content.trim() !== (a.outcome ?? '').trim())
     if (msgs.length) {
-      return <div className="flex flex-col pt-1">{msgs.map(m => <div key={m.id} className="border-b border-line pb-2.5 pt-3 last:border-b-0">
+      return <div className="flex flex-col pt-1">{s.error && <InlineError className="mt-2" title="The session transcript could not be read." onRetry={s.retry} />}{msgs.map(m => <div key={m.id} className="border-b border-line pb-2.5 pt-3 last:border-b-0">
         <div className="mb-1.5 flex items-center gap-2 text-[11.5px] text-fg-subtle">
           <span className="font-semibold capitalize text-fg-muted">{m.role}</span>
           <span className="flex-1" />
@@ -140,7 +169,12 @@ function Transcript({ a, s }: { a: Assignment; s: SessionState }) {
         <p className="m-0 mb-2 whitespace-pre-wrap break-words text-[12.5px] leading-[19px] text-fg">{m.content}</p>
       </div>)}</div>
     }
-    return <p className={WF_NONE}>{s.error ? 'The session transcript could not be read.' : a.status === 'queued' ? 'This worker has not taken a turn yet.' : 'No durable session transcript was recorded for this worker.'}</p>
+    if (s.error) return <InlineError className="my-3" title="The session transcript could not be read." onRetry={s.retry} />
+    return <p className={WF_NONE}>{a.status === 'queued'
+      ? 'This worker has not taken a turn yet.'
+      : a.turnsUsed > 0
+        ? `${plural(a.turnsUsed, 'turn')} ran, but no durable transcript was recorded.`
+        : 'No durable session transcript was recorded for this worker.'}</p>
   }
   return <div className="flex flex-col pt-1">
     {turns.map(t => <div key={t.turn} className="border-b border-line pb-2.5 pt-3 last:border-b-0">
@@ -165,15 +199,14 @@ function Transcript({ a, s }: { a: Assignment; s: SessionState }) {
                 : 'bg-sunk shadow-[inset_0_0_0_1px_var(--line)]',
           )}
         >
-          <div className="flex items-center gap-1.5 text-[11.5px] text-fg-subtle">
-            <Icon name={tc.status === 'finding' ? 'findings' : tc.status === 'error' ? 'alert' : 'node'} size={12} />
-            <span className="font-mono text-[11.5px] font-medium text-fg">{tc.name}</span>
+          <div className="flex min-w-0 items-center gap-1.5 text-[11.5px] text-fg-subtle" data-tool-head="">
+            <Icon name={tc.status === 'finding' ? 'findings' : tc.status === 'error' ? 'alert' : 'node'} size={12} className="flex-none" />
+            <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] font-medium text-fg" title={tc.name}>{tc.name}</span>
             <span className={cn(
-              'text-[11px]',
+              'flex-none text-[11px]',
               tc.status === 'error' ? 'text-danger' : tc.status === 'finding' ? 'font-medium text-fg' : tc.status === 'pending' ? 'text-warn' : 'text-fg-subtle',
             )}>{tc.status}</span>
-            <span className="flex-1" />
-            {tc.durationMs != null && <span className="tabular-nums">{fmtN(tc.durationMs)} ms</span>}
+            {tc.durationMs != null && <span className="flex-none tabular-nums">{fmtN(tc.durationMs)} ms</span>}
           </div>
           {tc.argsPreview && <div className="my-1 mb-0.5 line-clamp-3 break-all font-mono text-[11px] leading-4 text-fg-muted">{tc.argsPreview}</div>}
           {tc.resultPreview && <>
@@ -535,7 +568,8 @@ export function WorkerInspector({ sel }: InspectorProps) {
   const grp = L.stacks.of.get(a.id)
   const g = grp ? L.stacks.groups.get(grp) : undefined
   const hist = L.history.get(a.id)
-  const nTurns = session.data ? session.data.turns.length : a.turnsUsed
+  const nTurns = session.data ? session.data.turns.length : null
+  const failure = a.status === 'failed' && a.outcome ? a.outcome : null
   const nArts = session.data?.artifacts.length ?? 0
   const reqCount = round0 ? round0.counts.requests : a.requestsUsed
   return <>
@@ -554,13 +588,14 @@ export function WorkerInspector({ sel }: InspectorProps) {
         {hist && <Tag tone="warn">{hist}</Tag>}
       </div>
       <h2 className={WF_H2}>{a.title}</h2>
+      {failure && <FailureCallout text={failure} />}
       <Props rows={[
         round0
           ? ['Stage', <span className="inline-flex min-w-0 items-center gap-1.5">
               <Tag tone={isLive(a) ? 'accent' : 'solid'} className="tabular-nums">{round0.stageBadge}</Tag>
               {round0.counts.totalHosts > 0 && <span className="text-[11.5px] text-fg-subtle tabular-nums">{round0.counts.mappedHosts}/{round0.counts.totalHosts} hosts</span>}
             </span>]
-          : ['Turns', <><Meter id="wf.turns" value={pct} warn={isLive(a) && pct > 0.8} />{a.turnsUsed} of {a.maxTurns}</>],
+          : ['Turns', <><Meter id={'wf.turns.' + a.id} value={pct} warn={isLive(a) && pct > 0.8} /><span className="tabular-nums">{fmtN(a.turnsUsed)} of {fmtN(a.maxTurns)}</span></>],
         ['Requests', <>{fmtN(reqCount)}{exs.length > 0 && <span className="text-fg-subtle">· {exs.length} in the loaded window</span>}</>],
         ...(a.sourceOrigins.length ? [[
           'Origins',
@@ -568,7 +603,7 @@ export function WorkerInspector({ sel }: InspectorProps) {
             ? <span className="truncate font-mono text-[11.5px]" title={a.sourceOrigins.join('\n')}>
                 {host(a.sourceOrigins[0])} <span className="text-fg-subtle">+{a.sourceOrigins.length - 1} more</span>
               </span>
-            : <span className={WF_ORIGINS} title={a.sourceOrigins.join('\n')}>{a.sourceOrigins.slice(0, 6).map(host).join(', ')}{a.sourceOrigins.length > 6 ? ' +' + (a.sourceOrigins.length - 6) : ''}</span>,
+            : <OriginList origins={a.sourceOrigins} title={a.sourceOrigins.join('\n')} />,
         ] as [ReactNode, ReactNode]] : []),
         ['Started', <>{fmtDate(a.createdAt)} <span className="font-mono text-[12px] text-fg-subtle">{fmtRel(a.createdAt, model.base)}</span></>],
         ['Lineage', <>{lin.up.size} upstream · {[...lin.down].filter(x => x !== 'report').length} downstream</>],
@@ -592,7 +627,7 @@ export function WorkerInspector({ sel }: InspectorProps) {
       >
         {([
           ['summary', 'Summary', null],
-          ['transcript', 'Transcript', nTurns],
+          ['transcript', 'Transcript', nTurns ?? '—'],
           ['evidence', 'Evidence', facts.length + exs.length + nArts],
         ] as const).map(([k, label, ct]) => {
           const on = tab === k
@@ -608,7 +643,7 @@ export function WorkerInspector({ sel }: InspectorProps) {
             onClick={() => setTab(k)}
           >
             {label}
-            {ct !== null && <span className="font-normal text-fg-subtle tabular-nums">{ct}</span>}
+            {ct !== null && <span className={cn('font-normal tabular-nums', ct === '—' ? 'text-fg-faint' : 'text-fg-subtle')}>{typeof ct === 'number' ? fmtN(ct) : ct}</span>}
           </button>
         })}
       </div>
@@ -618,7 +653,7 @@ export function WorkerInspector({ sel }: InspectorProps) {
         {a.objective && <Section title="Objective"><p>{a.objective}</p></Section>}
         {step?.hypothesis && step.hypothesis !== a.objective && <Section title="Hypothesis"><p>{step.hypothesis}</p>
           {step.skills.length > 0 && <div className="mb-2.5 flex flex-wrap gap-[5px]">{step.skills.map(s => <Tag key={s} mono>{s}</Tag>)}</div>}</Section>}
-        {a.outcome && <Section title="Outcome"><p className="text-fg!">{a.outcome}</p></Section>}
+        {a.outcome && !failure && <Section title="Outcome"><p className="text-fg!">{a.outcome}</p></Section>}
         {ups.length > 0 && <Section title="Upstream" right={ups.length}>{ups.slice(0, 8).map(w => <LineageRow key={w} L={L} id={rid} other={w} />)}</Section>}
         {downs.length > 0 && <Section title="Downstream" right={downs.length}>{downs.slice(0, 8).map(w => <LineageRow key={w} L={L} id={rid} other={w} />)}</Section>}
         {fs.length > 0 && <Section title="Findings" right={fs.length}><FindingRows list={fs} /></Section>}
@@ -748,7 +783,7 @@ export function StepInspector({ sel }: InspectorProps) {
       <h2 className={WF_H2}>{s.title}</h2>
       <Props rows={[
         ['Planned', <>{fmtDate(s.createdAt)} <span className="font-mono text-[12px] text-fg-subtle">{fmtRel(s.createdAt, model.base)}</span></>],
-        ...(s.sourceOrigins.length ? [['Origins', <span className={WF_ORIGINS}>{s.sourceOrigins.slice(0, 6).map(host).join(', ')}</span>] as [ReactNode, ReactNode]] : []),
+        ...(s.sourceOrigins.length ? [['Origins', <OriginList origins={s.sourceOrigins} />] as [ReactNode, ReactNode]] : []),
         ['Scope', 'Revision ' + s.scopeRevision],
       ]} />
       <Section title="Hypothesis"><p>{s.hypothesis}</p>{s.skills.length > 0 && <div className="mb-2.5 flex flex-wrap gap-[5px]">{s.skills.map(k => <Tag key={k} mono>{k}</Tag>)}</div>}</Section>

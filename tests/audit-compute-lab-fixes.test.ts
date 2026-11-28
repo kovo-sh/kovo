@@ -6,7 +6,7 @@
  *         Phase-0 / snapshot / JS / HTML / OpenAPI / ProgramGraph async entrypoints route through it.
  *   - H4: ContainerSupervisor.recoverAll() skips mid-boot runs (inFlightBootIds), inspects active/
  *         orphaned SQLite & persisted container refs before wiping, and exposes recoverOnStartup().
- *   - M-3a: ExecReconPlanner.clearRunState() evicts all 18 per-run Maps/Sets and
+ *   - M-3a: ExecReconPlanner.clearRunState() evicts all 14 per-run Maps/Sets and
  *           enqueueHopContinuationOnRotation() hoists paged listFacts() past 500 facts.
  */
 import assert from 'node:assert/strict'
@@ -668,7 +668,7 @@ test('M-3a: ExecReconPlanner.clearRunState() evicts all per-run maps and continu
   assert.equal(dedupResult.reason, 'duplicate_sealed_handles', 'must find checkpoint fact beyond 500 facts')
   assert.ok(listFactsCalls <= 2, `expected hoisted paging (<=2 calls for 551 facts), got ${listFactsCalls}`)
 
-  // 2. Populate all 18 per-run Maps/Sets on planner for run1 AND run2, then verify clearRunState(run1.id)
+  // 2. Populate all 14 per-run Maps/Sets on planner for run1 AND run2, then verify clearRunState(run1.id)
   planner.frontierControllerFor(run1.id)
   planner.frontierControllerFor(run2.id)
   const priv = planner as unknown as {
@@ -680,10 +680,6 @@ test('M-3a: ExecReconPlanner.clearRunState() evicts all per-run maps and continu
     persistedStepCheckpoints: Map<string, unknown>
     invariantsSeededRuns: Set<string>
     wave1InvariantChainsPromoted: Set<string>
-    seededHypothesisIdsByRun: Map<string, Set<string>>
-    runtimeSynthesisWatermark: Map<string, string>
-    postFloorInvariantsSyncedRuns: Set<string>
-    runtimeCompositeSeededRuns: Set<string>
     emittedSealedHandleSets: Map<string, Set<string>>
     plannerSeenCausalEdges: Map<string, Set<string>>
     detLeadStepKeys: Set<string>
@@ -698,10 +694,6 @@ test('M-3a: ExecReconPlanner.clearRunState() evicts all per-run maps and continu
   priv.plannerEvidenceFrontier.set(run1.id, { confirmed: 0, primitives: 0 })
   priv.invariantsSeededRuns.add(run1.id)
   priv.wave1InvariantChainsPromoted.add(run1.id)
-  priv.seededHypothesisIdsByRun.set(run1.id, new Set(['h1']))
-  priv.runtimeSynthesisWatermark.set(run1.id, 'wm1')
-  priv.postFloorInvariantsSyncedRuns.add(run1.id)
-  priv.runtimeCompositeSeededRuns.add(run1.id)
   priv.emittedSealedHandleSets.set(`${run1.id}:${rootStep.id}`, new Set(['sig1']))
   priv.plannerSeenCausalEdges.set(run1.id, new Set(['edge1']))
   priv.detLeadStepKeys.add(`${run1.id}\0GET /a|authz`)
@@ -725,10 +717,6 @@ test('M-3a: ExecReconPlanner.clearRunState() evicts all per-run maps and continu
   assert.equal(priv.persistedStepCheckpoints.has('step-run1'), false)
   assert.equal(priv.invariantsSeededRuns.has(run1.id), false)
   assert.equal(priv.wave1InvariantChainsPromoted.has(run1.id), false)
-  assert.equal(priv.seededHypothesisIdsByRun.has(run1.id), false)
-  assert.equal(priv.runtimeSynthesisWatermark.has(run1.id), false)
-  assert.equal(priv.postFloorInvariantsSyncedRuns.has(run1.id), false)
-  assert.equal(priv.runtimeCompositeSeededRuns.has(run1.id), false)
   assert.equal(priv.emittedSealedHandleSets.has(`${run1.id}:${rootStep.id}`), false)
   assert.equal(priv.plannerSeenCausalEdges.has(run1.id), false)
   assert.equal(priv.detLeadStepKeys.has(`${run1.id}\0GET /a|authz`), false)

@@ -12,7 +12,7 @@ export { cn }
  * so ghost / link / primary / ink buttons never inherit legacy chrome.
  */
 export const runBtn = cva(
-  'inline-flex cursor-pointer items-center justify-center whitespace-nowrap border-0 font-sans font-medium transition-[background-color,color,box-shadow,transform,filter] duration-[var(--d1)] ease-kovo active:scale-[.98] disabled:cursor-default disabled:opacity-50 disabled:active:scale-100',
+  'inline-flex cursor-pointer items-center justify-center whitespace-nowrap border-0 font-sans font-medium transition-[background-color,color,box-shadow,scale,filter] duration-[var(--d1)] ease-kovo active:scale-[.98] disabled:cursor-default disabled:opacity-50 disabled:active:scale-100',
   {
     variants: {
       variant: {
@@ -125,12 +125,12 @@ export const RW = {
   toolbar: 'flex h-[42px] flex-none min-w-0 items-center gap-1.5 border-b border-line pl-[18px] pr-3',
   list: 'relative min-h-0 flex-1 overflow-auto outline-none',
   ghead: 'sticky top-0 z-[2] flex h-8 cursor-pointer select-none items-center gap-2 border-b border-line bg-sunk px-[18px] text-[12.5px] font-medium text-fg-muted',
-  row: 'relative flex h-9 cursor-default scroll-mt-[34px] scroll-mb-1 items-center gap-2.5 border-b border-line border-l-2 border-l-transparent pl-4 pr-[18px] transition-colors duration-[var(--d1)] [contain-intrinsic-size:auto_36px] [content-visibility:auto] hover:bg-hover',
+  row: 'relative flex h-9 cursor-default scroll-mt-[34px] scroll-mb-1 items-center gap-2.5 border-b border-line border-l-2 border-l-transparent pl-4 pr-[18px] [contain-intrinsic-size:auto_36px] [content-visibility:auto] hover:bg-hover',
   rowCur: 'bg-sel border-l-sel-line hover:bg-sel',
   listnote: 'flex items-center gap-2 px-[18px] pb-10 pt-3.5 text-[12px] text-fg-subtle',
   strip: 'flex flex-none items-center gap-4 overflow-hidden whitespace-nowrap border-b border-line px-[18px] py-2.5 text-[12px] text-fg-muted',
   detail: 'px-[18px] pb-10 pt-4',
-  pre: 'm-0 mb-2.5 max-h-[320px] overflow-auto whitespace-pre-wrap break-all rounded-lg border border-line bg-sunk px-3 py-2.5 font-mono text-[12px] leading-[18px] text-fg-muted',
+  pre: 'm-0 mb-2.5 max-h-[320px] overflow-auto whitespace-pre-wrap [overflow-wrap:anywhere] rounded-lg border border-line bg-sunk px-3 py-2.5 font-mono text-[12px] leading-[18px] text-fg-muted',
   hdrs: 'mb-3 w-full border-collapse',
   cmp: 'mb-2.5 overflow-hidden rounded-lg border border-line',
   olist: '-mt-0.5 mb-2.5 overflow-hidden rounded-lg border border-line',
@@ -140,7 +140,7 @@ export const RW = {
   fieldInput: 'h-7 min-w-0 rounded-control border-0 bg-panel px-[9px] text-[12.5px] text-fg shadow-hairline outline-none transition-shadow duration-[var(--d1)] focus:shadow-[0_0_0_1px_var(--accent-line),0_0_0_3px_var(--accent-soft)]',
   fieldTextarea: 'h-auto min-w-0 resize-y rounded-control border-0 bg-panel px-[9px] py-[7px] text-[12.5px] leading-[19px] text-fg shadow-hairline outline-none transition-shadow duration-[var(--d1)] focus:shadow-[0_0_0_1px_var(--accent-line),0_0_0_3px_var(--accent-soft)]',
   rawInput: 'h-full! min-w-0 flex-1 rounded-none! border-0! bg-transparent! p-0! text-[12.5px] text-fg shadow-none! outline-none! placeholder:text-fg-subtle focus:shadow-none!',
-  ddMenu: 'absolute right-0 top-8 z-20 w-[300px] origin-top-right rounded-card bg-raise px-2.5 pb-3 pt-1.5 shadow-popover',
+  ddMenu: 'absolute right-0 top-8 z-20 w-[300px] origin-top-right rounded-card bg-raise px-2.5 pb-3 pt-1.5 shadow-[0_0_0_1px_var(--line-2),var(--shadow-pop)]',
   ddSec: 'flex items-center px-0.5 pb-1.5 pt-2 text-[11.5px] font-medium text-fg-subtle',
   menuSep: 'my-[5px] mx-0.5 h-px bg-line',
   chip: 'inline-flex h-6 cursor-pointer items-center gap-1.5 rounded-control border-0 bg-transparent px-2 text-[12px] font-normal text-fg-muted shadow-[inset_0_0_0_1px_var(--line-2)] transition-[background-color,color] duration-[var(--d1)] hover:bg-hover hover:text-fg',

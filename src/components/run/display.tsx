@@ -1,12 +1,12 @@
 // Shared display components for the Run workspace (Tailwind CSS v4 + Base UI).
 import { Collapsible as CollapsiblePrimitive } from '@base-ui/react/collapsible'
 import { cva } from 'class-variance-authority'
-import { useEffect, useState } from 'react'
+import { Fragment, isValidElement, useEffect, useState } from 'react'
 import type { CSSProperties, ReactNode } from 'react'
 import { modKey } from './format.ts'
 import { Icon } from './icons.tsx'
 import type { IconName } from './icons.tsx'
-import { cn } from './tw.ts'
+import { cn, runBtn } from './tw.ts'
 
 /** Keyboard key cap. `<Kbd>mod</Kbd>` renders ⌘ on macOS and Ctrl elsewhere. */
 export function Kbd({ children, style, className, inverted }: {
@@ -39,7 +39,7 @@ export function KbdGroup({ keys, style, className }: { keys: string[]; style?: C
 }
 
 const tagVariants = cva(
-  'inline-flex h-5 max-w-full items-center gap-[5px] truncate whitespace-nowrap rounded-[10px] px-[7px] text-[11.5px] leading-none',
+  'inline-flex h-5 max-w-full items-center gap-[5px] truncate whitespace-nowrap rounded-[10px] px-[7px] text-[11.5px] leading-none tabular-nums',
   {
     variants: {
       tone: {
@@ -65,7 +65,8 @@ export function Tag({ children, tone, icon, title, className, mono }: {
   mono?: boolean
 }) {
   return <span className={cn(tagVariants({ tone: tone ?? 'default' }), mono && 'font-mono text-[11.5px]', className)} title={title}>
-    {icon && <Icon name={icon} />}{children}
+    {icon && <Icon name={icon} className="flex-none" />}
+    {typeof children === 'string' || typeof children === 'number' ? <span className="min-w-0 truncate">{children}</span> : children}
   </span>
 }
 
@@ -123,6 +124,11 @@ export function HostLabel({ host, apex, max = 20, quiet, className }: {
 }
 
 /** Clickable cross-link row used in inspectors ("Found by", "On the surface map", …). */
+/** A finding title, or an honest italic placeholder when the row has none (never a blank strip). */
+export function FindingTitle({ title }: { title: string | null | undefined }) {
+  return title ? <>{title}</> : <span className="italic text-fg-subtle">Untitled finding</span>
+}
+
 export function LinkRow({ icon, glyph, children, sub, right, trailing = 'ext', onClick, title, className }: {
   icon?: IconName
   glyph?: ReactNode
@@ -146,12 +152,12 @@ export function LinkRow({ icon, glyph, children, sub, right, trailing = 'ext', o
     onClick={onClick}
     onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick?.() } }}
   >
-    {glyph ? <span className={cn('inline-flex size-3.5 flex-none items-center justify-center', sub && 'mt-[3px]')}>{glyph}</span> : icon ? <Icon name={icon} /> : null}
+    {glyph ? <span className={cn('inline-flex h-3.5 min-w-3.5 flex-none items-center justify-center', sub && 'mt-[3px]')}>{glyph}</span> : icon ? <Icon name={icon} /> : null}
     <span className={cn('min-w-0 flex-1', sub ? 'whitespace-normal' : 'truncate')}>
       {children}
       {sub && <>{' '}<small className="mt-px line-clamp-2 block text-[11.5px] leading-4 text-fg-subtle">{sub}</small></>}
     </span>
-    {right != null && <>{' '}<span className="flex-none text-[11.5px] text-fg-subtle">{right}</span></>}
+    {right != null && <>{' '}<span className="min-w-0 max-w-[45%] flex-none truncate text-[11.5px] tabular-nums text-fg-subtle">{right}</span></>}
     {trailing && <Icon name={trailing} />}
   </div>
 }
@@ -208,7 +214,7 @@ export function Section({ title, right, children, className }: {
   return <div className={cn('rw-sec border-t border-line pb-0.5 pt-3 [&_p]:m-0 [&_p]:mb-2.5 [&_p]:break-words [&_p]:text-[12.5px] [&_p]:leading-[19px] [&_p]:text-fg-muted', className)}>
     <h4 className="m-0 mb-1.5 flex items-center gap-1.5 text-[11.5px] font-medium text-fg-subtle">
       {title}
-      {right != null && <>{' '}<span className="ml-auto font-normal">{right}</span></>}
+      {right != null && <>{' '}<span className="ml-auto font-normal tabular-nums">{right}</span></>}
     </h4>
     {children}
   </div>
@@ -227,12 +233,33 @@ export function Disclosure({ title, right, defaultOpen = false, children }: {
     >
       <Icon name="chev" className="-rotate-90 text-fg-subtle transition-transform duration-[var(--d2)] ease-kovo group-data-[panel-open]:rotate-0 group-data-[panel-open]:text-fg-muted" />
       <span>{title}</span>
-      {right != null && <span className="ml-auto text-[11.5px] font-normal text-fg-subtle">{right}</span>}
+      {right != null && <span className="ml-auto text-[11.5px] font-normal tabular-nums text-fg-subtle">{right}</span>}
     </CollapsiblePrimitive.Trigger>
     <CollapsiblePrimitive.Panel className="pb-2 pt-0.5 [&>.rw-sec:first-child]:border-t-0 [&>.rw-sec:first-child]:pt-1">
       {children}
     </CollapsiblePrimitive.Panel>
   </CollapsiblePrimitive.Root>
+}
+
+/** Text-like text for a Props value tooltip: strings, numbers, or a single element whose child is text. */
+function propTitle(v: ReactNode): string | undefined {
+  if (typeof v === 'string' || typeof v === 'number') return String(v)
+  if (isValidElement<{ children?: unknown; title?: unknown }>(v)) {
+    const { children, title } = v.props
+    if (typeof title === 'string') return title
+    if (typeof children === 'string' || typeof children === 'number') return String(children)
+  }
+  return undefined
+}
+
+/**
+ * One Props value. Text and single elements sit in a `min-w-0 truncate` wrapper so
+ * `text-overflow` applies (the flex parent cannot ellipsize its children). Fragments
+ * (glyph + label + icon rows) stay direct flex children so their gap/alignment hold.
+ */
+function PropValue({ v, wrap }: { v: ReactNode; wrap?: boolean }) {
+  if (isValidElement(v) && v.type === Fragment) return <>{v}</>
+  return <span className={cn('min-w-0', wrap ? 'break-words' : 'truncate has-[.rw-wrap]:whitespace-normal')} title={propTitle(v)}>{v}</span>
 }
 
 /** Key/value property grid for inspectors. */
@@ -253,8 +280,29 @@ export function Props({ rows, className, wrap }: {
         )}
         onClick={onClick}
       >
-        {v}
+        <PropValue v={v} wrap={wrap} />
       </span>{' '}
     </div>)}
+  </div>
+}
+
+/**
+ * Inline load-failure callout: danger-tinted, alert icon, optional Retry.
+ * Distinct from EmptyState so a failed read never reads as "nothing here".
+ */
+export function InlineError({ title, onRetry, retryLabel = 'Retry', className }: {
+  title: ReactNode
+  onRetry?: () => void
+  retryLabel?: string
+  className?: string
+}) {
+  return <div
+    role="alert"
+    data-inline-error=""
+    className={cn('flex min-w-0 items-start gap-2 rounded-[7px] bg-danger-soft px-2.5 py-2 text-[12px] leading-[18px] text-fg shadow-[inset_0_0_0_1px_color-mix(in_oklch,var(--danger)_35%,transparent)]', className)}
+  >
+    <Icon name="alert" className="mt-0.5 flex-none text-danger" />
+    <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{title}</span>
+    {onRetry && <button type="button" className={cn(runBtn({ variant: 'ghost', size: 'sm' }), '-my-0.5 flex-none')} onClick={onRetry}>{retryLabel}</button>}
   </div>
 }

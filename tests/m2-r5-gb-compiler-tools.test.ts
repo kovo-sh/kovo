@@ -12,18 +12,11 @@ import {
   buildExploiterUserPrompt,
 } from '../src/server/exploiter-tools.ts'
 import {
-  materializeGreyBoxDataflowWave1Steps,
-  synthesizeGreyBoxDataflowGraph,
-  synthesizeGreyBoxDataflowStepsFromStore,
-} from '../src/server/gb-dataflow-synthesizer.ts'
-import {
   compileTraceToKovoVerifyScript,
   type RecordedRequestExchange,
 } from '../src/server/trace-proof-compiler.ts'
 import { canonicalNonAuthQuery } from '../src/server/v8-oracle-hydrate.ts'
-import { makeStore, setupApprovedRun } from './v4-tier-helpers.ts'
 
-const AUTH_ORIGIN = 'https://auth.m2r5-lab.example'
 const API_ORIGIN = 'https://api.m2r5-lab.example'
 const EDGE_ORIGIN = 'https://files.m2r5-lab.example'
 
@@ -69,165 +62,6 @@ function loadCompiledScript(script: string): (ctx: Record<string, unknown>) => P
   new Script(`(function(){ ${rewritten} })`)
   return (new Function(rewritten) as () => (ctx: Record<string, unknown>) => Promise<unknown>)()
 }
-
-describe('M2 R5: gb-dataflow-synthesizer fixes', () => {
-  test('2xx/3xx SQL filter prevents late 400/401/403/404 probe floods from crowding out early 2xx capability exchanges', async t => {
-    const { storage } = makeStore(t, 'kovo-m2r5-gb-sql-')
-    const { runId, run } = await setupApprovedRun(storage, {
-      seeds: [AUTH_ORIGIN, API_ORIGIN, EDGE_ORIGIN],
-      tier: 2,
-    })
-    const assetAuth = run.candidates.find(c => c.origin === AUTH_ORIGIN)!
-    const worker = storage.makeWorker(run, 'threat_model', assetAuth, 'Phase 0', 'Recon', {
-      sourceOrigins: [AUTH_ORIGIN, API_ORIGIN, EDGE_ORIGIN],
-    })
-    storage.upsertEndpoint({ runId, scopeRevision: run.scopeRevision, origin: AUTH_ORIGIN, method: 'POST', pathTemplate: '/oauth/grants', riskScore: 80, source: 'openapi' })
-    const epRedeem = storage.upsertEndpoint({ runId, scopeRevision: run.scopeRevision, origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/grants/redeem', riskScore: 85, source: 'openapi' })
-    storage.upsertEndpointParam({ runId, endpointId: epRedeem.id, name: 'grant_code', location: 'json', inferredType: 'string', source: 'openapi' })
-    storage.upsertEndpoint({ runId, scopeRevision: run.scopeRevision, origin: EDGE_ORIGIN, method: 'GET', pathTemplate: '/v1/artifacts/:id/download', riskScore: 90, source: 'openapi' })
-
-    const insertEx = storage.client.prepare(`
-      INSERT INTO broker_exchanges (id, run_id, assignment_id, scope_revision, origin, final_origin, redirect_origins, method, path_and_query, status, media_type, persona_handle, req_headers, resp_headers, body_preview, body_sha256, duration_ms, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `)
-    const baseTs = Date.now() - 100_000
-    // Early 2xx capability-producing exchanges
-    insertEx.run(
-      'early-200-1', runId, worker.id, run.scopeRevision, AUTH_ORIGIN, AUTH_ORIGIN, '[]',
-      'POST', '/oauth/grants', 201, 'application/json', 'member_low', '{}', '{}',
-      JSON.stringify({ grant_code: 'grt_early_998877' }), 'h1', 3, baseTs,
-    )
-    insertEx.run(
-      'early-200-2', runId, worker.id, run.scopeRevision, API_ORIGIN, API_ORIGIN, '[]',
-      'POST', '/v1/grants/redeem', 200, 'application/json', 'member_low', '{}', '{}',
-      JSON.stringify({ download_url: `${EDGE_ORIGIN}/v1/artifacts/art_12/download?sig=abc` }), 'h2', 3, baseTs + 10,
-    )
-    // Flood 320 late 400/403/404 probe rows (well past LIMIT 250)
-    for (let i = 0; i < 320; i += 1) {
-      const status = i % 3 === 0 ? 404 : i % 3 === 1 ? 400 : 403
-      insertEx.run(
-        `noise-4xx-${i}`, runId, worker.id, run.scopeRevision, API_ORIGIN, API_ORIGIN, '[]',
-        'GET', `/v1/probe/miss-${i}`, status, 'application/json', 'member_low', '{}', '{}',
-        '{"error":"not_found"}', `hn-${i}`, 2, baseTs + 1000 + i,
-      )
-    }
-
-    const drafts = synthesizeGreyBoxDataflowStepsFromStore(storage, storage.run(runId), {
-      activeOrigins: new Set([AUTH_ORIGIN, API_ORIGIN, EDGE_ORIGIN]),
-      sourceMounted: false,
-      maxSteps: 6,
-    })
-    assert.ok(drafts.length >= 1, 'must synthesize live chain despite 320 later 4xx probe rows')
-    assert.equal(drafts[0]!.fromLive, true, 'top draft must be backed by early live 2xx exchanges')
-    assert.ok(drafts[0]!.hypothesis.includes('[dataflow_source=live]'))
-    assert.ok(drafts[0]!.hypothesis.includes('grant_code') && drafts[0]!.hypothesis.includes('download_url'))
-  })
-
-  test('post-floor live re-synthesis is not starved by pre-floor spec guesses and deprioritizes spec guesses below live chains', async t => {
-    const { storage } = makeStore(t, 'kovo-m2r5-gb-postfloor-')
-    const { runId, run } = await setupApprovedRun(storage, {
-      seeds: [AUTH_ORIGIN, API_ORIGIN, EDGE_ORIGIN],
-      tier: 2,
-    })
-    const activeOrigins = new Set([AUTH_ORIGIN, API_ORIGIN, EDGE_ORIGIN])
-    const assetAuth = run.candidates.find(c => c.origin === AUTH_ORIGIN)!
-    const worker = storage.makeWorker(run, 'threat_model', assetAuth, 'Phase 0', 'Recon', {
-      sourceOrigins: [AUTH_ORIGIN, API_ORIGIN, EDGE_ORIGIN],
-    })
-
-    // Seed 6 pre-floor spec-only GB dataflow steps (filling maxSteps = 6 completely!)
-    for (let i = 0; i < 6; i += 1) {
-      const s = storage.addChainStep(run, {
-        title: `GB dataflow chain (2-hop) · spec-guess-${i} (entity_id)`,
-        hypothesis: `[chain_hops=2] [lane=chain] [dataflow_source=spec] Spec guess ${i}`,
-        category: 'broken-access-control',
-        priority: 80,
-        targetAssetIds: [assetAuth.id],
-        skills: ['multihop-chains'],
-        sourceOrigins: [AUTH_ORIGIN, API_ORIGIN],
-      })
-      storage.updateChainStep(s.id, { status: 'ready' })
-    }
-
-    // Now Phase-A floor discovers real endpoints + live 2xx exchange + api_dependency
-    const ep1 = storage.upsertEndpoint({ runId, scopeRevision: run.scopeRevision, origin: AUTH_ORIGIN, method: 'POST', pathTemplate: '/oauth/invites', riskScore: 82, source: 'openapi' })
-    const ep2 = storage.upsertEndpoint({ runId, scopeRevision: run.scopeRevision, origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/tokens/exchange', riskScore: 86, source: 'openapi' })
-    storage.upsertEndpoint({ runId, scopeRevision: run.scopeRevision, origin: EDGE_ORIGIN, method: 'POST', pathTemplate: '/v1/vault/:id/revoke', authRequirement: 'bearer', riskScore: 92, source: 'openapi' })
-    storage.recordApiDependency({ runId, producerEndpointId: ep1.id, consumerEndpointId: ep2.id, resourceKey: 'invite_token' })
-    storage.client.prepare(`
-      INSERT INTO broker_exchanges (id, run_id, assignment_id, scope_revision, origin, final_origin, redirect_origins, method, path_and_query, status, media_type, persona_handle, req_headers, resp_headers, body_preview, body_sha256, duration_ms, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      'live-ex-1', runId, worker.id, run.scopeRevision, API_ORIGIN, API_ORIGIN, '[]',
-      'POST', '/v1/tokens/exchange', 200, 'application/json', 'member_a', '{}', '{}',
-      JSON.stringify({ access_token: 'tok_live_123456' }), 'hlive1', 5, Date.now(),
-    )
-
-    const created = materializeGreyBoxDataflowWave1Steps(storage, storage.run(runId), {
-      activeOrigins,
-      sourceMounted: false,
-      maxSteps: 6,
-    })
-    assert.ok(created.length >= 1, 'post-floor live synthesis must get dedicated slots despite 6 pre-floor spec guesses')
-    assert.ok(created.every(s => s.hypothesis.includes('[dataflow_source=live]')))
-    assert.ok(created[0]!.priority >= 88, 'live-observed chain must outrank spec guesses (<= 84)')
-
-    // Idempotent repeat call creates 0 duplicate steps
-    const repeat = materializeGreyBoxDataflowWave1Steps(storage, storage.run(runId), {
-      activeOrigins,
-      sourceMounted: false,
-      maxSteps: 6,
-    })
-    assert.equal(repeat.length, 0)
-
-    // Graph ranking strictly puts fromLive=true ahead of fromLive=false spec guesses
-    const graph = synthesizeGreyBoxDataflowGraph({
-      approvedOrigins: [AUTH_ORIGIN, API_ORIGIN, EDGE_ORIGIN],
-      endpoints: [
-        { id: 'spec1', origin: AUTH_ORIGIN, method: 'POST', pathTemplate: '/oauth/token', riskScore: 99 },
-        { id: 'spec2', origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/admin/settings/sync', authRequirement: 'bearer', riskScore: 99 },
-        { id: 'spec3', origin: EDGE_ORIGIN, method: 'POST', pathTemplate: '/v1/secrets/:id/revoke', authRequirement: 'bearer', riskScore: 99 },
-        { id: 'live1', origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/reports', riskScore: 70 },
-        { id: 'live2', origin: EDGE_ORIGIN, method: 'GET', pathTemplate: '/v1/reports/:id/download', riskScore: 72 },
-      ],
-      brokerExchanges: [
-        { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/reports', status: 201, personaHandle: 'member_a', bodyPreview: JSON.stringify({ download_url: `${EDGE_ORIGIN}/v1/reports/rep_1/download` }) },
-      ],
-      personas: [{ handle: 'member_a', roleLabel: 'member' }],
-    })
-    assert.equal(graph.chains.length, 1, 'must emit only live-observed chains without fabricating speculative spec-only guesses')
-    assert.equal(graph.chains[0]!.fromLive, true, 'live-observed chain must rank #1')
-  })
-
-  test('prefers lowest-privilege non-admin/non-owner/non-bot/non-service/non-dual persona as chain base persona', () => {
-    const res = synthesizeGreyBoxDataflowGraph({
-      approvedOrigins: [AUTH_ORIGIN, API_ORIGIN],
-      endpoints: [
-        { id: 'ep1', origin: AUTH_ORIGIN, method: 'POST', pathTemplate: '/oauth/invites', riskScore: 80 },
-        { id: 'ep2', origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/invites/redeem', riskScore: 85 },
-      ],
-      endpointParams: [
-        { endpointId: 'ep2', name: 'invite_token', location: 'body', inferredType: 'string' },
-      ],
-      brokerExchanges: [
-        { origin: AUTH_ORIGIN, method: 'POST', pathAndQuery: '/oauth/invites', status: 201, personaHandle: 'owner_a', bodyPreview: JSON.stringify({ invite_token: 'inv_123456' }) },
-        { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/invites/redeem', status: 200, personaHandle: 'ci_bot', bodyPreview: JSON.stringify({ ok: true }) },
-      ],
-      personas: [
-        { handle: 'owner_a', roleLabel: 'owner' },
-        { handle: 'admin_a', roleLabel: 'admin' },
-        { handle: 'ci_bot', roleLabel: 'bot' },
-        { handle: 'svc_sync', roleLabel: 'service' },
-        { handle: 'dual_member', roleLabel: 'member [org_a], member [org_b]' },
-        { handle: 'viewer_c', roleLabel: 'viewer' },
-      ],
-    })
-    assert.ok(res.chains.length >= 1)
-    const hyp = res.chains[0]!.step.hypothesis
-    assert.match(hyp, /Base persona:\s*viewer_c\b/, 'base persona must select lowest-privilege viewer_c over owner/admin/bot/service/dual')
-    assert.match(hyp, /Relevant personas:\s*viewer_c\b/, 'relevant personas must list lowest-privilege persona first')
-  })
-})
 
 describe('M2 R5: trace-proof-compiler fixes', () => {
   test('bindLeafValue always returns sealed handle expression and never sends %5Bredacted%3Acap under Layer-1 redaction', async () => {

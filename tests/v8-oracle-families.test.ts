@@ -557,6 +557,10 @@ describe('v8 oracle family 4: cryptographic_scope_replay', () => {
     sourceScope: 'sandbox:webhook',
     targetTenant: 'org_alpha',
     targetScope: 'prod:settlement',
+    // Request-signature digest bindings (host crypto attestations / request signature carriers), never response digests.
+    tamperedSignatureDigest: 'sha256:tampered-sig',
+    signatureDigest: 'sha256:valid-sig-beta',
+    replayedSignatureDigest: 'sha256:valid-sig-beta',
   })
 
   test('confirms 3-arm cross-tenant / cross-scope cryptographic replay', () => {
@@ -585,10 +589,21 @@ describe('v8 oracle family 4: cryptographic_scope_replay', () => {
     sameScope.targetScope = sameScope.sourceScope
     assert.equal(evaluateCryptographicScopeReplay(sameScope).satisfied, false)
 
-    // Replayed digest does not match source issued signature
+    // Replayed request-signature digest does not match source issued signature
     const diffSig = baseInput()
-    diffSig.replayedAcceptance = { ...diffSig.replayedAcceptance, artifactDigest: 'sha256:different-sig' }
-    assert.equal(evaluateCryptographicScopeReplay(diffSig).satisfied, false)
+    diffSig.replayedSignatureDigest = 'sha256:different-sig'
+    const diffSigRes = evaluateCryptographicScopeReplay(diffSig)
+    assert.equal(diffSigRes.satisfied, false)
+    assert.equal(diffSigRes.reason, 'replayed_signature_digest_mismatch')
+
+    // Response artifact digests alone never stand in for the request-signature digest binding (audit C-2)
+    const responseOnly = baseInput()
+    delete responseOnly.tamperedSignatureDigest
+    delete responseOnly.signatureDigest
+    delete responseOnly.replayedSignatureDigest
+    const responseOnlyRes = evaluateCryptographicScopeReplay(responseOnly)
+    assert.equal(responseOnlyRes.satisfied, false)
+    assert.equal(responseOnlyRes.reason, 'missing_signature_digest_binding')
   })
 })
 

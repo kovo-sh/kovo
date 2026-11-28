@@ -8,8 +8,8 @@ import { reviewPatchProposalAction, triageFindingAction } from '../../../actions
 import type { OperatorSeverityOverride, OperatorTriageStatus, PatchProposalReviewStatus } from '../../../actions-triage.ts'
 import { callerCompatibilityLabels, dynamicRetestLabels, patchStatusLabels } from '../../../report-summary.ts'
 import { useRun, useRunModel } from '../data.tsx'
-import { Disclosure, EmptyState, LinkRow, Props, Section, Tag } from '../display.tsx'
-import { cap, fmtDate, host, plural } from '../format.ts'
+import { Disclosure, EmptyState, FindingTitle, HostLabel, LinkRow, Props, Section, Tag } from '../display.tsx'
+import { cap, fmtDate, host, operatorErrorCopy, plural } from '../format.ts'
 import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { covCat, normFStatus, prettyCat, SEV_LABEL, stLabel } from '../meta.ts'
@@ -35,7 +35,8 @@ export function canGeneratePatch(f: Pick<FindingRow, 'status' | 'codeLocations'>
 
 const TIER_L: Record<string, string> = { runtime_confirmed: 'Runtime confirmed', static_verified: 'Static advisory', baseline_confirmed: 'Baseline confirmed' }
 const RETEST_L: Record<string, string> = { reproduced: 'Still reproducible', fixed: 'Verified fixed', inconclusive: 'Inconclusive' }
-const RETEST_ST: Record<string, string> = { reproduced: 'failed', fixed: 'confirmed', inconclusive: 'inconclusive' }
+const RETEST_ST: Record<string, string> = { reproduced: 'failed', fixed: 'fixed', inconclusive: 'inconclusive' }
+const RETEST_TONE: Record<string, string> = { reproduced: 'text-danger', fixed: 'text-ok' }
 
 const PATCH_BROKE_HOP_FALLBACK_RE = /\bpatchBrokeHopId\s*[:=]\s*["']?([A-Za-z0-9._:-]{1,128})["']?/i
 const EXCHANGES_PAGE_SIZE = 12
@@ -315,7 +316,7 @@ export function CompositeProofDagCard({
         <Icon name="chain" className="text-fg-muted" />
         {title ? title : 'Multi-hop proof DAG'}
       </span>
-      <span className="font-mono text-[11px] text-fg-subtle">{summary.chainId}</span>
+      <span className="min-w-0 max-w-full truncate font-mono text-[11px] text-fg-subtle" title={summary.chainId}>{summary.chainId}</span>
       <Tag tone={summary.confirmed === true ? 'accent' : summary.confirmed === false ? 'warn' : undefined}>
         <StatusGlyph status={summary.confirmed === true ? 'confirmed' : summary.confirmed === false ? 'inconclusive' : 'pending'} />
         {oracleLabel}
@@ -335,14 +336,14 @@ export function CompositeProofDagCard({
             {incoming.length > 0 ? incoming.map((edge, eIdx) => (
               <span
                 key={`${edge.fromHopId}-${edge.toHopId}-${edge.kind}-${eIdx}`}
-                className="inline-flex flex-wrap items-center gap-1 rounded bg-panel px-1.5 py-0.5 font-mono text-[10.5px] text-fg-muted shadow-[inset_0_0_0_1px_var(--line)]"
+                className="inline-flex min-w-0 max-w-full flex-wrap items-center gap-1 rounded bg-panel px-1.5 py-0.5 font-mono text-[10.5px] text-fg-muted shadow-[inset_0_0_0_1px_var(--line)]"
               >
-                <span>{edge.fromHopId}</span>
-                <span>--[{EDGE_KIND_LABEL[edge.kind] ?? edge.kind}]--&gt;</span>
+                <span className="min-w-0 max-w-full truncate" title={edge.fromHopId}>{edge.fromHopId}</span>
+                <span className="min-w-0 max-w-full [overflow-wrap:anywhere]">--[{EDGE_KIND_LABEL[edge.kind] ?? edge.kind}]--&gt;</span>
                 {edge.capabilityHandles.map(capHandle => (
-                  <span key={capHandle} className="rounded bg-sunk px-1 text-fg">{capHandle}</span>
+                  <span key={capHandle} className="min-w-0 max-w-full truncate rounded bg-sunk px-1 text-fg" title={capHandle}>{capHandle}</span>
                 ))}
-                {edge.detail && <span className="font-sans text-fg-subtle">{edge.detail}</span>}
+                {edge.detail && <span className="min-w-0 max-w-full break-words font-sans text-fg-subtle [overflow-wrap:anywhere]">{edge.detail}</span>}
                 {edge.verified === true && <span className="font-sans text-fg-muted" title="Edge verified">✓</span>}
                 {edge.verified === false && <span className="font-sans text-warn" title="Edge unverified">!</span>}
               </span>
@@ -358,24 +359,24 @@ export function CompositeProofDagCard({
             )}
           >
             <div className="flex flex-wrap items-center gap-1.5">
-              <span className="font-medium text-fg">Hop {hop.order}</span>
-              <span className="font-mono text-[11px] text-fg-subtle">{hop.hopId}</span>
+              <span className="font-medium tabular-nums text-fg">Hop {hop.order}</span>
+              <span className="min-w-0 max-w-full truncate font-mono text-[11px] text-fg-subtle" title={hop.hopId}>{hop.hopId}</span>
               <Tag>{hop.surface}</Tag>
               {hop.actor && <Tag>actor: {hop.actor}</Tag>}
               {hop.isTerminal && <Tag tone="accent">Terminal</Tag>}
               {hop.patchBrokeHere && <Tag tone="warn">Patch broke here</Tag>}
             </div>
-            {targetDisplay && <div className="mt-1 break-all font-mono text-[11.5px] text-fg-muted">{targetDisplay}</div>}
-            {hop.claimedDelta && <div className="mt-0.5 text-fg-subtle">{hop.claimedDelta}</div>}
+            {targetDisplay && <div className="mt-1 font-mono [overflow-wrap:anywhere] text-[11.5px] text-fg-muted">{targetDisplay}</div>}
+            {hop.claimedDelta && <div className="mt-0.5 break-words text-fg-subtle [overflow-wrap:anywhere]">{hop.claimedDelta}</div>}
             {(hop.producedCapabilities.length > 0 || hop.consumedCapabilities.length > 0) && (
               <div className="mt-1.5 flex flex-wrap items-center gap-1 text-[11px]">
                 {hop.consumedCapabilities.map(h => (
-                  <span key={`in:${h}`} className="rounded bg-sunk px-1.5 py-0.5 font-mono text-[10.5px] text-fg-subtle" title="Consumed capability">
+                  <span key={`in:${h}`} className="max-w-full truncate rounded bg-sunk px-1.5 py-0.5 font-mono text-[10.5px] text-fg-subtle" title={`Consumed capability: ${h}`}>
                     in {h}
                   </span>
                 ))}
                 {hop.producedCapabilities.map(h => (
-                  <span key={`out:${h}`} className="rounded bg-sunk px-1.5 py-0.5 font-mono text-[10.5px] text-fg" title="Produced capability">
+                  <span key={`out:${h}`} className="max-w-full truncate rounded bg-sunk px-1.5 py-0.5 font-mono text-[10.5px] text-fg" title={`Produced capability: ${h}`}>
                     out {h}
                   </span>
                 ))}
@@ -388,14 +389,67 @@ export function CompositeProofDagCard({
 
     {(summary.claimedImpact || summary.verificationReason) && (
       <div className="mt-2 rounded-[6px] bg-panel px-2.5 py-1.5 text-[11.5px] leading-[17px] text-fg-muted shadow-[inset_0_0_0_1px_var(--line)]">
-        {summary.claimedImpact && <div><b className="font-medium text-fg">Terminal impact ({summary.terminalHopId}):</b> {summary.claimedImpact}</div>}
-        {summary.verificationReason && <div className="mt-0.5 text-fg-subtle">{summary.verificationReason}</div>}
+        {summary.claimedImpact && <div className="[overflow-wrap:anywhere]"><b className="font-medium text-fg">Terminal impact ({summary.terminalHopId}):</b> {summary.claimedImpact}</div>}
+        {summary.verificationReason && <div className="mt-0.5 text-fg-subtle [overflow-wrap:anywhere]">{summary.verificationReason}</div>}
       </div>
     )}
   </div>
 }
 
-const text = (v: unknown) => v == null ? '' : typeof v === 'string' ? v : JSON.stringify(v)
+/** Pre-block text: strings verbatim, structured values pretty-printed (never one compact JSON line). */
+const text = (v: unknown) => v == null ? '' : typeof v === 'string' ? v : JSON.stringify(v, null, 2)
+
+/** Expected/Observed table cell: strings inline, structured receipts as an indented block, empty as "—". */
+function ObservedValue({ value }: { value: unknown }) {
+  if (value == null || value === '') return <span className="font-sans text-fg-subtle">—</span>
+  if (typeof value !== 'object') return <>{String(value)}</>
+  const pretty = JSON.stringify(value, (_k, v: unknown) => v === null ? undefined : v, 2)
+  if (!pretty || pretty === '{}' || pretty === '[]') return <span className="font-sans text-fg-subtle">—</span>
+  return <pre data-slot="observed-receipt" className={cn(RW.pre, 'm-0 max-h-40 rounded-none border-0 bg-transparent p-0 text-fg')}>{pretty}</pre>
+}
+
+/** Prose with paired backticks rendered as inline code spans (plain React text nodes, no HTML injection). */
+function ProseWithCode({ children }: { children: string }) {
+  const parts = children.split(/`([^`]+)`/)
+  return <>{parts.map((part, i) => i % 2 === 1
+    ? <code key={i} className="rounded-[4px] bg-sunk px-1 font-mono text-[11.5px] text-fg">{part}</code>
+    : part)}</>
+}
+
+/** Unified-diff block: add/remove lines tinted, lines never broken mid-token (scrolls horizontally instead). */
+function DiffBlock({ diff }: { diff: string }) {
+  return <pre data-slot="patch-diff" className={cn(RW.pre, 'mt-1.5 max-h-[240px] overflow-x-auto whitespace-pre break-normal [overflow-wrap:normal] px-0')}>
+    <div className="w-max min-w-full">
+      {diff.split('\n').map((l, i) => <div
+        key={i}
+        className={cn('px-3', l[0] === '+' && !l.startsWith('+++') ? 'bg-ok-soft' : l[0] === '-' && !l.startsWith('---') ? 'bg-danger-soft' : '')}
+      >{l || ' '}</div>)}
+    </div>
+  </pre>
+}
+
+/** 12px spinner for in-flight actions; static under reduced motion. */
+function BusySpinner() {
+  return <svg className="block flex-none motion-safe:animate-spin motion-safe:[animation-duration:800ms]" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true" data-slot="busy-spinner">
+    <circle cx="6" cy="6" r="4.5" fill="none" stroke="currentColor" strokeOpacity=".25" strokeWidth="1.5" />
+    <path d="M6 1.5A4.5 4.5 0 0 1 10.5 6" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+  </svg>
+}
+
+/** Inline Verify Fix failure under the action row (replaces the far-away toast-only failure). */
+function VerifyFixError({ reason, onRetry }: { reason: string; onRetry: () => void }) {
+  return <div
+    role="alert"
+    data-testid="verify-fix-error"
+    className="mb-2.5 flex items-start gap-2 rounded-[7px] bg-warn-soft px-2.5 py-2 text-[12px] leading-[17px] text-fg-muted shadow-[inset_0_0_0_1px_var(--warn-line)]"
+  >
+    <Icon name="alert" className="mt-0.5 flex-none text-warn" />
+    <p className="m-0! min-w-0 flex-1 break-words text-[12px]! leading-[17px]! text-fg-muted!">
+      <b className="font-medium text-fg">Couldn&rsquo;t queue Verify Fix</b> — {reason}
+    </p>
+    <button type="button" className={cn(runBtn({ variant: 'ghost', size: 'sm' }), 'flex-none')} onClick={onRetry}>Retry</button>
+  </div>
+}
 
 const SEVERITY_OVERRIDE_OPTIONS: readonly { value: OperatorSeverityOverride; label: string }[] = [
   { value: 'critical', label: 'Critical' },
@@ -533,7 +587,7 @@ function TriageBar({ runId, f }: { runId: string; f: FindingWithTriage }) {
         },
       })
       await refresh()
-      toast.show('Triage saved', { icon: 'check', sub: f.title })
+      toast.show('Triage saved', { icon: 'check', sub: f.title || 'Untitled finding' })
     } catch (e) {
       toast.show(e instanceof Error ? e.message : 'Kovo could not save triage.', { tone: 'error' })
     } finally {
@@ -544,7 +598,7 @@ function TriageBar({ runId, f }: { runId: string; f: FindingWithTriage }) {
   return <div data-slot="finding-triage-bar" className="mb-4 rounded-[7px] bg-sunk px-2.5 py-2 shadow-[inset_0_0_0_1px_var(--line)]">
     <div className="mb-1.5 flex items-center justify-between gap-2">
       <span className="text-[11.5px] font-medium text-fg-subtle">Triage</span>
-      {triage?.updatedAt ? <span className="text-[11px] text-fg-subtle">Updated {fmtDate(triage.updatedAt)}</span> : null}
+      {triage?.updatedAt ? <span className="text-[11px] text-fg-subtle">Updated <span className="num">{fmtDate(triage.updatedAt)}</span></span> : null}
     </div>
     <div className="flex flex-wrap items-center gap-1.5">
       <select
@@ -563,7 +617,7 @@ function TriageBar({ runId, f }: { runId: string; f: FindingWithTriage }) {
         disabled={saving}
         onChange={e => setSeverityOverride((e.target.value || null) as OperatorSeverityOverride | null)}
       >
-        <option value="">Severity: Machine ({SEV_LABEL[f.severity] ?? f.severity})</option>
+        <option value="">{f.severity ? `Severity: Machine (${SEV_LABEL[f.severity] ?? f.severity})` : 'Severity: Machine (unrated)'}</option>
         {SEVERITY_OVERRIDE_OPTIONS.map(opt => <option key={opt.value} value={opt.value}>Override: {opt.label}</option>)}
       </select>
       <button
@@ -587,12 +641,36 @@ function TriageBar({ runId, f }: { runId: string; f: FindingWithTriage }) {
   </div>
 }
 
+/**
+ * Verify Fix button: reads busy (spinner, full opacity, progress cursor) rather than disabled while
+ * a retest is in flight, and reserves the longest label's width so the swap never shifts layout.
+ */
+function VerifyFixButton({ busy, disabled, onClick }: { busy: boolean; disabled: boolean; onClick: () => void }) {
+  return <button
+    type="button"
+    data-testid="verify-fix"
+    className={cn(runBtn(), 'min-w-[118px]', busy && 'disabled:cursor-progress disabled:opacity-100')}
+    disabled={disabled}
+    aria-busy={busy || undefined}
+    onClick={onClick}
+    title="Re-run automated replay after shipping a fix"
+  >
+    {busy ? <BusySpinner /> : <Icon name="replay" />}
+    <span className="grid">
+      <span aria-hidden="true" className="invisible col-start-1 row-start-1">Verifying fix…</span>
+      <span className="col-start-1 row-start-1">{busy ? 'Verifying fix…' : 'Verify Fix'}</span>
+    </span>
+  </button>
+}
+
 /** Primary action row inside Beat 3 ("How to fix & verify"): Copy as cURL + immediate Verify Fix + Generate verified patch + retest & patch history. */
 function FixVerifyActions({ f, primaryExchangeId }: { f: FindingRow; primaryExchangeId?: string }) {
   const { detail, send, pending, refresh } = useRun()
   const toast = useToast()
   const [verifying, setVerifying] = useState(false)
+  const [verifyError, setVerifyError] = useState<string | null>(null)
   const [patching, setPatching] = useState(false)
+  useEffect(() => { setVerifyError(null) }, [f.id])
   const replay = detail.replaySpecs.find(r => (f.replaySpecId && r.id === f.replaySpecId) || r.findingId === f.id)
   const retests = detail.retestRuns.filter(r => r.findingId === f.id).slice().sort((a, b) => b.createdAt - a.createdAt)
   const patches = (detail.patchProposals ?? []).filter(p => p.findingId === f.id)
@@ -603,11 +681,13 @@ function FixVerifyActions({ f, primaryExchangeId }: { f: FindingRow; primaryExch
 
   const runVerifyFix = async () => {
     setVerifying(true)
+    setVerifyError(null)
     try {
       await send({ action: 'retest_finding', findingId: f.id })
-      toast.show('Verify Fix queued', { icon: 'replay', sub: f.title })
-    } catch {
-      // Error toast is already surfaced by `send`.
+      toast.show('Verify Fix queued', { icon: 'replay', sub: f.title || 'Untitled finding' })
+    } catch (e) {
+      // `send` also raises the global toast; the inline row keeps the failure next to the button.
+      setVerifyError(operatorErrorCopy(e))
     } finally {
       setVerifying(false)
     }
@@ -618,9 +698,9 @@ function FixVerifyActions({ f, primaryExchangeId }: { f: FindingRow; primaryExch
     try {
       await generatePatchAction({ data: { runId: detail.run.id, findingId: f.id, repo: f.codeLocations?.[0]?.repo } })
       await refresh()
-      toast.show('Verified patch generated', { icon: 'check', sub: f.title })
+      toast.show('Verified patch generated', { icon: 'check', sub: f.title || 'Untitled finding' })
     } catch (e) {
-      toast.show(e instanceof Error ? e.message : 'Kovo could not generate a verified patch.', { tone: 'error' })
+      toast.show(e instanceof Error ? operatorErrorCopy(e) : 'Kovo could not generate a verified patch.', { tone: 'error' })
     } finally {
       setPatching(false)
     }
@@ -629,20 +709,19 @@ function FixVerifyActions({ f, primaryExchangeId }: { f: FindingRow; primaryExch
   return <>
     {(primaryExchangeId || canRetest || canPatch) && <div className="mb-2.5 mt-2 flex flex-wrap items-center gap-2">
       <CopyCurlButton exchangeId={primaryExchangeId} />
-      {canRetest && <button type="button" className={runBtn()} disabled={active || verifying || pending > 0} onClick={() => void runVerifyFix()} title="Re-run automated replay after shipping a fix">
-        <Icon name="replay" />{active || verifying ? 'Verifying fix…' : 'Verify Fix'}
-      </button>}
+      {canRetest && <VerifyFixButton busy={active || verifying} disabled={active || verifying || pending > 0} onClick={() => void runVerifyFix()} />}
       {canPatch && <button type="button" className={runBtn()} disabled={patching} onClick={() => void runGeneratePatch()} title="Generate and verify a code patch for this finding">
         <Icon name="edit" />{patching ? 'Generating patch…' : 'Generate verified patch'}
       </button>}
     </div>}
+    {verifyError && <VerifyFixError reason={verifyError} onRetry={() => void runVerifyFix()} />}
     {retests.length > 0 && <div className="divide-y divide-dashed divide-line">
-      {retests.map(r => <div key={r.id} className="grid grid-cols-[14px_minmax(0,1fr)] gap-2 py-1.5 text-[12px] leading-[18px] text-fg-muted">
+      {retests.map(r => <div key={r.id} data-slot="retest-row" data-verdict={r.verdict} className="grid grid-cols-[14px_minmax(0,1fr)] gap-2 py-1.5 text-[12px] leading-[18px] text-fg-muted">
         <StatusGlyph status={RETEST_ST[r.verdict] ?? r.verdict} />
         <div className="min-w-0">
-          <b className="font-medium text-fg">{RETEST_L[r.verdict] ?? cap(r.verdict)}</b>{' '}
-          <span className="text-fg-subtle">· {fmtDate(r.createdAt)}</span>
-          <div className="text-fg-subtle">{r.summary}</div>
+          <b className={cn('font-medium', RETEST_TONE[r.verdict] ?? 'text-fg')}>{RETEST_L[r.verdict] ?? cap(r.verdict)}</b>{' '}
+          <span className="text-fg-subtle">· <span className="num">{fmtDate(r.createdAt)}</span></span>
+          {r.summary && <div className="break-words text-fg-subtle [overflow-wrap:anywhere]">{r.summary}</div>}
         </div>
       </div>)}
     </div>}
@@ -653,11 +732,35 @@ function FixVerifyActions({ f, primaryExchangeId }: { f: FindingRow; primaryExch
           <Tag>{callerCompatibilityLabels[p.callerCompatibility]}</Tag>
           <Tag>{dynamicRetestLabels[p.dynamicRetestVerdict]}</Tag>
         </div>
-        {p.status === 'approved' && p.diff.trim() && <pre className={cn(RW.pre, 'mt-1.5 max-h-[240px]')}>{p.diff}</pre>}
+        {p.status === 'approved' && p.diff.trim() && <DiffBlock diff={p.diff} />}
         <PatchProposalReview runId={detail.run.id} proposal={p} onReviewed={refresh} compact />
       </div>)}
     </div>}
   </>
+}
+
+/** Pane-header sub: "High · host" with no dangling separator; "Unrated" when both are empty. */
+function findingSub(f: Pick<FindingRow, 'severity' | 'origin'>): string {
+  return [f.severity ? (SEV_LABEL[f.severity] ?? f.severity) : '', f.origin ? host(f.origin) : ''].filter(Boolean).join(' · ') || 'Unrated'
+}
+
+/** Inspector property rows; values that can be long carry titles and truncate or wrap as chips. */
+function findingPropRows(
+  f: FindingRow,
+  spans: readonly string[],
+  on: { origin: () => void; category?: () => void },
+): [ReactNode, ReactNode, (() => void)?][] {
+  const rows: [ReactNode, ReactNode, (() => void)?][] = []
+  if (f.origin) rows.push(['Origin', <HostLabel host={host(f.origin)} max={36} className="font-mono text-[12px]" />, on.origin])
+  rows.push(['Category', prettyCat(f.category), on.category])
+  if (f.cwe) rows.push(['Weakness', <span className="font-mono text-[12px]" title={f.cwe}>{f.cwe}</span>])
+  if (f.verificationTier) rows.push(['Verified', TIER_L[f.verificationTier] ?? cap(f.verificationTier)])
+  if (spans.length > 1) {
+    rows.push(['Spans', <span className="rw-wrap flex min-w-0 flex-wrap gap-1 py-0.5" data-slot="finding-spans">
+      {spans.map(o => host(o)).map((h, i) => <Tag key={i + h} mono title={h} className="max-w-full"><span className="min-w-0 truncate">{h}</span></Tag>)}
+    </span>])
+  }
+  return rows
 }
 
 export function FindingInspector({ sel }: InspectorProps) {
@@ -711,25 +814,23 @@ export function FindingInspector({ sel }: InspectorProps) {
   const bannerCls = 'mb-3 flex items-center gap-2 rounded-[7px] bg-sunk px-2.5 py-2 text-[12px] text-fg-muted shadow-[inset_0_0_0_1px_var(--line)]'
 
   return <>
-    <PaneHeader title="Finding" sub={<span title={`Finding ${f.id}`}>{SEV_LABEL[f.severity] ?? f.severity} · {host(f.origin)}</span>} />
+    <PaneHeader title="Finding" sub={<span title={`Finding ${f.id}`}>{findingSub(f)}</span>} />
     <div className="flex min-h-0 flex-1 flex-col">
-      <PaneBody><div className={cn(RW.detail, 'pb-6')}>
+      <PaneBody><div className={cn(RW.detail, 'pb-6 [overflow-wrap:anywhere]')}>
         {superseded && <div className={bannerCls}><Icon name="alert" /><span>Superseded by a newer finding.</span>
           <button type="button" className={cn(runBtn({ variant: 'ghost' }), 'ml-auto')} onClick={() => links.finding(superseded.id)}>Open<Icon name="arrowR" /></button></div>}
         <div className="mb-2.5 flex flex-wrap gap-1.5">
-          <Tag><SevGlyph sev={f.severity} />{SEV_LABEL[f.severity] ?? f.severity}</Tag>
+          <Tag><SevGlyph sev={f.severity} />{f.severity ? (SEV_LABEL[f.severity] ?? f.severity) : 'Unrated'}</Tag>
           <Tag tone={st === 'confirmed' ? 'accent' : st === 'static_verified' ? 'solid' : undefined}><StatusGlyph status={st} />{stLabel(st)}</Tag>
+          {st === 'confirmed' && !replay && !evs.length && !exIds.length && <Tag tone="warn">No receipt attached</Tag>}
           {triage && triage.status !== 'open' && triageMeta && <Tag tone={triageMeta.tone}>Triage: {triageMeta.short}</Tag>}
           {triage?.severityOverride && <Tag>Override: {SEV_LABEL[triage.severityOverride] ?? triage.severityOverride}</Tag>}
         </div>
-        <h2 className="m-0 mb-3 break-words text-[15px] font-semibold leading-[22px] tracking-[-0.012em] text-fg">{f.title}</h2>
-        <Props rows={[
-          ['Origin', <span className="font-mono text-[12px]">{host(f.origin)}</span>, () => links.host(f.origin)],
-          ['Category', <span>{prettyCat(f.category)}</span>, cat ? () => links.cell(f.origin, cat) : undefined],
-          ...(f.cwe ? [['Weakness', <span className="font-mono text-[12px]">{f.cwe}</span>] as [string, ReactNode]] : []),
-          ...(f.verificationTier ? [['Verified', TIER_L[f.verificationTier] ?? cap(f.verificationTier)] as [string, ReactNode]] : []),
-          ...(spans.length > 1 ? [['Spans', <span className="rw-wrap break-all whitespace-normal font-mono text-[11.5px]">{spans.map(host).join(', ')}</span>] as [string, ReactNode]] : []),
-        ]} />
+        <h2 className="m-0 mb-3 break-words text-[15px] font-semibold leading-[22px] tracking-[-0.012em] text-fg"><FindingTitle title={f.title} /></h2>
+        <Props rows={findingPropRows(f, spans, {
+          origin: () => links.host(f.origin),
+          category: cat ? () => links.cell(f.origin, cat) : undefined,
+        })} />
         <TriageBar runId={model.detail.run.id} f={f as FindingWithTriage} />
 
         {(f.reason || (f.check && (f.check.expected || obs !== undefined))) && <Section title="What happened">
@@ -737,12 +838,12 @@ export function FindingInspector({ sel }: InspectorProps) {
           {f.check && (f.check.expected || obs !== undefined) && <div className={cn(RW.cmp, 'divide-y divide-line')}>
             <div className="grid grid-cols-[72px_1fr] text-[12px] leading-[18px]">
               <span className="min-w-0 border-r border-line bg-sunk px-2.5 py-[7px] text-fg-subtle">Expected</span>
-              <span className="min-w-0 px-2.5 py-[7px] text-fg-muted">{f.check.expected || '—'}</span>
+              <span className="min-w-0 break-words px-2.5 py-[7px] text-fg-muted [overflow-wrap:anywhere]">{f.check.expected || '—'}</span>
             </div>
             <div className="grid grid-cols-[72px_1fr] text-[12px] leading-[18px]">
               <span className="min-w-0 border-r border-line bg-sunk px-2.5 py-[7px] text-fg-subtle">Observed</span>
-              <span className="min-w-0 break-words px-2.5 py-[7px] font-mono text-[12px] text-fg">
-                {obs == null ? <span className="font-sans text-fg-subtle">No observation</span> : text(obs)}
+              <span className="min-w-0 break-words px-2.5 py-[7px] font-mono text-[12px] text-fg [overflow-wrap:anywhere]">
+                <ObservedValue value={obs} />
               </span>
             </div>
           </div>}
@@ -755,8 +856,9 @@ export function FindingInspector({ sel }: InspectorProps) {
         </Section>}
 
         {(f.remediation || f.recheck || codeLocs.length > 0 || primaryExchangeId || canVerifyFix(f) || canGeneratePatch(f) || hasPatches) && <Section title="How to fix & verify">
-          {f.remediation && <p>{f.remediation}</p>}
-          {f.recheck && <p><b className="font-medium text-fg">Recheck.</b> {f.recheck}</p>}
+          {f.remediation && <p><ProseWithCode>{f.remediation}</ProseWithCode></p>}
+          {f.recheck && <p><b className="font-medium text-fg">Recheck.</b> <ProseWithCode>{f.recheck}</ProseWithCode></p>}
+          {!f.remediation && !f.recheck && !codeLocs.length && <p className="text-fg-subtle!">No remediation guidance was recorded for this finding.</p>}
           <CodeLocations codeLocs={codeLocs} />
           <FixVerifyActions f={f} primaryExchangeId={primaryExchangeId} />
         </Section>}
@@ -768,7 +870,7 @@ export function FindingInspector({ sel }: InspectorProps) {
           ]} />
           {f.verification && <Section title="Verification"><p>{f.verification}</p></Section>}
           {replay && <Section title="Automated replay" right={replay.verifiedInline ? 'Verified inline' : plural(replay.attemptCount, 'attempt')}>
-            <p title={`Replay spec ${replay.id}`}>Automated replay over {replay.sourceOrigins.map(host).join(', ')}. Re-sends the recorded HTTP requests directly and compares control vs. variant responses.</p>
+            <p title={`Replay spec ${replay.id}`}>Automated replay over {(replay.sourceOrigins ?? []).map(host).filter(Boolean).join(', ') || 'the recorded origins'}. Re-sends the recorded HTTP requests directly and compares control vs. variant responses.</p>
             {diff != null && <pre className={RW.pre}>{text(diff)}</pre>}
           </Section>}
           {f.counterevidence && <Section title="Counterevidence"><p>{f.counterevidence}</p></Section>}
@@ -780,7 +882,7 @@ export function FindingInspector({ sel }: InspectorProps) {
           <FoundBy workers={workers} />
           {cat && <OnSurface origin={f.origin} category={cat} />}
           {exIds.length > 0 && <Section title="Exchanges" right={<span className="tabular-nums">{exIds.length}</span>}>
-            {visibleExIds.map(id => <ExchangeLink key={id} id={id} />)}
+            {visibleExIds.map(id => <ExchangeLink key={id} id={id} showHost={model.exchangeById.get(id)?.origin !== f.origin} />)}
             {exIds.length > EXCHANGES_PAGE_SIZE && (
               <button
                 type="button"

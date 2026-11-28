@@ -31,10 +31,7 @@ import {
   finalizeHopCheckpointBrief,
   type HopCheckpointBrief,
 } from '../src/server/capability-ledger.ts'
-import {
-  chainHopFactPayload,
-  isMultiHopChainStep,
-} from '../src/server/exec-dispatch.ts'
+import { isMultiHopChainStep } from '../src/server/exec-dispatch.ts'
 import {
   isPersistentWorkflowContinuationStep,
   sortPersonasLowPrivFirst,
@@ -557,25 +554,21 @@ test('Move3.3: low-privilege-first persona ordering beats alphabetical admin-fir
   const { reconPlanner } = internals(engine)
 
   const worker = storage.makeWorker(run, 'investigation', asset, 'Seed', 'Seed', { sourceOrigins: [ORIGIN] })
-  const hopPayload = chainHopFactPayload({
-    hopId: 'hop-move3-1',
-    roundNo: 1,
-    hopIndex: 1,
-    artifactKind: 'leaked_id',
-    artifactRef: 'order_123',
-    origin: ORIGIN,
-    endpoint: '/api/orders/123',
-    method: 'GET',
-    verified: true,
-    evidenceIds: [],
-    factIds: [],
+  // Persisted typed `chain_hop` fact (shape produced by workers / earlier rounds).
+  const hop = {
+    hopId: 'hop-move3-1', roundNo: 1, hopIndex: 1, artifactKind: 'leaked_id', artifactRef: 'order_123',
+    origin: ORIGIN, endpoint: '/api/orders/123', method: 'GET', verified: true, evidenceIds: [], factIds: [],
     summary: 'Observed order_123 at GET /api/orders/123',
-  })
+  }
   const hopFact = storage.addFact(run, worker, {
     kind: 'note',
     origin: ORIGIN,
-    summary: hopPayload.summary,
-    data: hopPayload.data,
+    summary: `ChainHop r${hop.roundNo} (${hop.artifactKind}): ${hop.artifactRef} at ${hop.method} ${hop.endpoint}`,
+    data: {
+      kind: 'chain_hop', subkind: 'chain_hop', roundNo: hop.roundNo, hopId: hop.hopId,
+      artifactKind: hop.artifactKind, artifactRef: hop.artifactRef, verified: hop.verified,
+      endpoint: hop.endpoint, method: hop.method, hop,
+    },
     sourceOrigins: [ORIGIN],
   })
   const step = storage.addChainStep(run, {

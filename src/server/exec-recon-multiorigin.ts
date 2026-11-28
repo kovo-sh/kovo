@@ -1,9 +1,6 @@
 import type { ThreatModelSummary } from '../domain.ts'
 import type { HostTier } from './agent-session.ts'
-import { materializeGreyBoxDataflowWave1Steps, synthesizeGreyBoxDataflowStepsFromStore } from './gb-dataflow-synthesizer.ts'
 import type { ChainStep, Run, Store } from './store.ts'
-
-export { materializeGreyBoxDataflowWave1Steps }
 
 export interface Wave1OriginFallbackEndpoint {
   origin: string
@@ -60,7 +57,6 @@ export interface Wave1UncoveredFallbackInput {
   classifyTier: (origin: string, tags?: readonly string[]) => HostTier
   storage?: Store
   run?: Run
-  activeOrigins?: ReadonlySet<string>
 }
 
 export interface Wave1UncoveredFallbackResult {
@@ -345,7 +341,6 @@ function parseOriginHostLabel(origin: string): string {
 }
 
 const STEP_ROUTE_TOKEN_RE = /(?:^|[\s(`"'[\]:,])(\/[A-Za-z0-9._~:@!$&'*+,;=%/?#-]+)/g
-const GB_DATAFLOW_TITLE_PREFIX = 'GB dataflow chain ('
 
 function extractStepRouteSegmentLists(text: string): string[][] {
   const out: string[][] = []
@@ -375,19 +370,6 @@ function stepMatchesOriginEndpoints(stepText: string, originEndpointSegs: readon
     }
   }
   return false
-}
-
-function runHasLive2xxExchanges(storage: Store | undefined, run: Run | undefined): boolean {
-  if (!storage || !run) return false
-  try {
-    const row = storage.client
-      .prepare('SELECT 1 AS ok FROM broker_exchanges WHERE run_id = ? AND status >= 200 AND status < 400 LIMIT 1')
-      .get(run.id) as { ok?: number } | undefined
-    return Boolean(row?.ok)
-  } catch (err) {
-    void err
-    return false
-  }
 }
 
 function collectDiscoveredEndpointsByOrigin(
@@ -527,18 +509,6 @@ export function buildWave1UncoveredOriginFallbackSteps(
     input,
     reachableOriginSet,
   )
-  const hasLive2xx = runHasLive2xxExchanges(input.storage, input.run)
-
-  let gbDataflowSteps: Wave1SeededStepDraft[] = []
-  if (!sourceMounted && input.storage && input.run) {
-    const existingSeedTitles = new Set(seededSteps.map(s => s.title.trim().toLowerCase()))
-    gbDataflowSteps = synthesizeGreyBoxDataflowStepsFromStore(input.storage, input.run, {
-      activeOrigins: input.activeOrigins ?? reachableOriginSet,
-      sourceMounted,
-      maxSteps: hasLive2xx ? 6 : 2,
-    }).filter(s => !existingSeedTitles.has(s.title.trim().toLowerCase()))
-  }
-  const combinedSeededSteps: Wave1SeededStepDraft[] = [...gbDataflowSteps, ...seededSteps]
 
   const makeFallbackStep = (entry: ThreatModelSummary, idx: number): Wave1SeededStepDraft => {
     const tier = finalHostTiers[entry.origin] ?? classifyTier(entry.origin, entry.surfaceTags)
@@ -576,16 +546,11 @@ export function buildWave1UncoveredOriginFallbackSteps(
   }
 
   const coveredPrimaryOrigins = new Set<string>()
-  const isSpecOnlyGbGuess = (title: string | undefined, fromPreFloorGbBatch: boolean): boolean =>
-    Boolean(title?.startsWith(GB_DATAFLOW_TITLE_PREFIX)) && (fromPreFloorGbBatch || !hasLive2xx)
-
   const recordStepCoverage = (
     stepOrigins: readonly string[],
     title: string | undefined,
     hypothesis: string | undefined,
-    fromPreFloorGbBatch: boolean,
   ): void => {
-    if (isSpecOnlyGbGuess(title, fromPreFloorGbBatch)) return
     const text = `${title ?? ''} ${hypothesis ?? ''}`.trim()
     const primary = stepOrigins.find(o => reachableOriginSet.has(o))
     for (const origin of stepOrigins) {
@@ -601,19 +566,16 @@ export function buildWave1UncoveredOriginFallbackSteps(
 
   for (const step of existingSteps) {
     if (step.status === 'canceled' || step.status === 'tainted') continue
-    recordStepCoverage(step.sourceOrigins, step.title, step.hypothesis, false)
-  }
-  for (const step of gbDataflowSteps) {
-    recordStepCoverage(step.origins, step.title, step.hypothesis, !hasLive2xx)
+    recordStepCoverage(step.sourceOrigins, step.title, step.hypothesis)
   }
   for (const step of seededSteps) {
-    recordStepCoverage(step.origins, step.title, step.hypothesis, false)
+    recordStepCoverage(step.origins, step.title, step.hypothesis)
   }
 
   const hasDiscoveredSurface = (origin: string): boolean =>
     discoveredEndpointOrigins.has(origin) || (endpointsByOrigin.get(origin)?.length ?? 0) > 0
 
-  if (!combinedSeededSteps.length && (!sourceMounted || codeAuditStepsCreated === 0)) {
+  if (!seededSteps.length && (!sourceMounted || codeAuditStepsCreated === 0)) {
     const topHosts = reachableFinalEntries.slice(0, Math.min(8, reachableFinalEntries.length))
     const built = topHosts.map((entry, idx) => makeFallbackStep(entry, idx))
     const uncoveredCount = topHosts.filter(e => hasDiscoveredSurface(e.origin) && !coveredPrimaryOrigins.has(e.origin)).length
@@ -624,12 +586,12 @@ export function buildWave1UncoveredOriginFallbackSteps(
     .filter(entry => hasDiscoveredSurface(entry.origin) && !coveredPrimaryOrigins.has(entry.origin))
     .slice(0, 8)
   if (!uncoveredEntries.length) {
-    return { seededSteps: combinedSeededSteps, uncoveredAddedCount: gbDataflowSteps.length }
+    return { seededSteps: [...seededSteps], uncoveredAddedCount: 0 }
   }
   const appended = uncoveredEntries.map((entry, idx) => makeFallbackStep(entry, idx))
   return {
-    seededSteps: [...combinedSeededSteps, ...appended],
-    uncoveredAddedCount: gbDataflowSteps.length + appended.length,
+    seededSteps: [...seededSteps, ...appended],
+    uncoveredAddedCount: appended.length,
   }
 }
 

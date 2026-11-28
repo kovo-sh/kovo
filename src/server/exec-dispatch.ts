@@ -17,7 +17,6 @@ import {
   type CodeAuditSuspectData,
   type HostTier,
   type PersonaResourceQueueItem,
-  type WorkerToolHandlers,
 } from './agent-session.ts'
 import type { AgentTrace } from './agent-trace.ts'
 import type { Grant } from './broker.ts'
@@ -61,25 +60,11 @@ import {
 import {
   decideNext,
   extractChainHops,
-  formatChainHopsBrief,
-  planCompositeWorkflows,
   type ChainHop,
-  type ChainHypothesis,
-  type CompositeWorkflowNode,
-  type CompositeWorkflowRole,
   type CoordinatorFact,
-  type DispatchPlan,
-  type DispatchStepInput,
-  type GraphCoordinator,
-  type PlannedCompositeWorkflow,
   type SchedulerDecision,
 } from './graph-coordinator.ts'
 import type { LabTargetHandle } from './lab-runner.ts'
-import {
-  classifyRuntimeDependencyEdgeKind,
-  filterGhostSurfaceProbeEndpoints,
-  inferEntityName,
-} from './invariant-runtime-parity.ts'
 import { selectRankedProbeTargets, type Phase0ProbePlanSummary } from './probe-plan.ts'
 import type { ServiceOriginMapping } from './program-graph.ts'
 import { resolveRunSafetyBudgets, type RunSafetyBudgets } from './run-safety-budgets.ts'
@@ -98,7 +83,6 @@ import { dedupeCodeAuditSuspects } from './semantic-audit.ts'
 import {
   isOpaqueResourceId,
   type ChainStep,
-  type EndpointRow,
   type Fact,
   type ResourceSampleRow,
   type Run,
@@ -539,58 +523,6 @@ export function shouldInvokeLlmPlanner(input: LlmPlannerGateInput): LlmPlannerGa
   return { invokeLlm: false, reason: 'queue_saturated_deferred' }
 }
 
-/**
- * Serialize a typed `ChainHop` artifact into a store `fact` payload for cross-round persistence.
- * Strictly non-secret: token references stay opaque handles (`secret:<factId>` / `jwt:<factId>`).
- */
-export function chainHopFactPayload(hop: ChainHop): {
-  summary: string
-  data: Record<string, unknown>
-} {
-  const endpointPart = hop.endpoint ? ` at ${hop.method ? `${hop.method} ` : ''}${hop.endpoint}` : ''
-  const statePart = hop.stateBefore || hop.stateAfter
-    ? ` [${hop.stateBefore ?? '*'}→${hop.stateAfter ?? '*'}]`
-    : ''
-  return {
-    summary: `ChainHop r${hop.roundNo} (${hop.artifactKind}): ${hop.artifactRef}${endpointPart}${statePart}`.slice(0, 220),
-    data: {
-      kind: 'chain_hop',
-      subkind: 'chain_hop',
-      roundNo: hop.roundNo,
-      hopId: hop.hopId,
-      artifactKind: hop.artifactKind,
-      artifactRef: hop.artifactRef,
-      verified: hop.verified,
-      ...(hop.endpoint ? { endpoint: hop.endpoint } : {}),
-      ...(hop.method ? { method: hop.method } : {}),
-      ...(hop.persona ? { persona: hop.persona } : {}),
-      ...(hop.targetPersona ? { targetPersona: hop.targetPersona } : {}),
-      ...(hop.stateBefore ? { stateBefore: hop.stateBefore } : {}),
-      ...(hop.stateAfter ? { stateAfter: hop.stateAfter } : {}),
-      ...(hop.parentHopId ? { parentHopId: hop.parentHopId } : {}),
-      hop: {
-        hopId: hop.hopId,
-        roundNo: hop.roundNo,
-        hopIndex: hop.hopIndex,
-        artifactKind: hop.artifactKind,
-        artifactRef: hop.artifactRef,
-        origin: hop.origin,
-        ...(hop.endpoint ? { endpoint: hop.endpoint } : {}),
-        ...(hop.method ? { method: hop.method } : {}),
-        ...(hop.persona ? { persona: hop.persona } : {}),
-        ...(hop.targetPersona ? { targetPersona: hop.targetPersona } : {}),
-        ...(hop.stateBefore ? { stateBefore: hop.stateBefore } : {}),
-        ...(hop.stateAfter ? { stateAfter: hop.stateAfter } : {}),
-        verified: hop.verified,
-        evidenceIds: hop.evidenceIds.slice(0, 8),
-        factIds: hop.factIds.slice(0, 8),
-        ...(hop.parentHopId ? { parentHopId: hop.parentHopId } : {}),
-        summary: hop.summary.slice(0, 160),
-      },
-    },
-  }
-}
-
 /** Rehydrate typed `ChainHop` artifacts from untainted parent/store facts. */
 export function readChainHopsFromFacts(
   facts: readonly Pick<CoordinatorFact, 'id' | 'origin' | 'kind' | 'summary' | 'data' | 'tainted' | 'evidenceIds' | 'createdAt'>[],
@@ -635,34 +567,6 @@ export function formatHopCheckpointForAssignment(
     bytes = Buffer.byteLength(json, 'utf8')
   }
   return { brief: clone, json, bytes }
-}
-
-/** Map chained hypotheses onto validated dispatch inputs with typed `ChainHop`, EVI & v8 checkpoint briefs. */
-export function chainHypothesisDispatchSteps(hypotheses: readonly ChainHypothesis[]): DispatchStepInput[] {
-  return hypotheses.map(hypothesis => {
-    const eviTag = typeof hypothesis.evi === 'number' && Number.isFinite(hypothesis.evi) && hypothesis.evi > 0
-      ? `[lane=chain] [evi=${hypothesis.evi.toFixed(2)}] `
-      : '[lane=chain] '
-    const hopBlock = hypothesis.chainHops?.length
-      ? ` [chain_hops=${formatChainHopsBrief(hypothesis.chainHops, 420)}]`
-      : ''
-    const baseText = `${eviTag}${hypothesis.title} — ${hypothesis.rationale}`
-    const maxBase = Math.max(200, 1200 - hopBlock.length)
-    const checkpoint = hypothesis.hops >= 2 && hypothesis.checkpointBrief
-      ? formatHopCheckpointForAssignment(hypothesis.checkpointBrief, MAX_CHECKPOINT_BRIEF_BYTES)
-      : null
-    return {
-      hypothesis: `${baseText.slice(0, maxBase)}${hopBlock}`,
-      origins: hypothesis.chainOrigins,
-      capabilities: hypothesis.capabilities,
-      parentEvidenceIds: hypothesis.parentEvidenceIds,
-      ...(hypothesis.probeClasses.length ? { probeClass: hypothesis.probeClasses[0] } : {}),
-      skills: [...new Set([...hypothesis.primitiveKinds.map(kind => `chain:${kind}`), 'chain-primitives', ...hypothesis.probeClasses])],
-      priority: Math.round(hypothesis.confidence * 100),
-      ...(hypothesis.chainHops?.length ? { chainHops: hypothesis.chainHops } : {}),
-      ...(checkpoint ? { checkpointBrief: checkpoint.brief, checkpointJson: checkpoint.json } : {}),
-    }
-  })
 }
 
 export interface FrontierWaveControllerOptions extends FrontierSchedulerOptions {
@@ -859,75 +763,11 @@ export class FrontierWaveController {
   }
 }
 
-export interface CoordinatorPlannerSessionDeps {
-  coordinator: GraphCoordinator
-  /** Persist validated hypotheses as chain steps. The tool never performs HTTP. */
-  onDispatch?: (plan: DispatchPlan) => void
-}
-
-/** Compact coordinator pages (≤25 rows; default 15 for endpoints) so planners stay context-safe. */
-const COORDINATOR_PAGE_MAX = 25, COORDINATOR_ENDPOINTS_DEFAULT = 15, COORDINATOR_ROUTE_MAX = 140
-const compactLimit = (limit?: number, fallback = COORDINATOR_PAGE_MAX): number =>
-  Math.min(COORDINATOR_PAGE_MAX, Math.max(1, Math.floor(limit ?? fallback)))
 export const compactText = (value: string, max = 160): string =>
   value.length <= max ? value : `${value.slice(0, max - 1)}…`
 export const compactChainTitle = (hypothesis: string): string => {
   const head = hypothesis.split(' — ')[0] ?? hypothesis
   return compactText(head.trim() || 'Chain hypothesis', 160)
-}
-const compactPrimitiveTag = (data: Record<string, unknown> | undefined): string | null => {
-  for (const candidate of [data?.subkind, data?.probeClass, data?.kind]) {
-    if (typeof candidate === 'string' && candidate.trim()) return compactText(candidate.trim(), 48)
-  }
-  return null
-}
-
-/** Map the coordinator's five tools onto agent-session handlers (registered only when supplied). */
-export function coordinatorPlannerHandlers(
-  deps: CoordinatorPlannerSessionDeps,
-): Pick<WorkerToolHandlers, 'query_endpoints' | 'query_program_graph' | 'query_facts' | 'query_findings' | 'dispatch_investigations'> {
-  return {
-    query_endpoints: async args => {
-      const page = deps.coordinator.queryEndpoints({ ...args, limit: compactLimit(args.limit, COORDINATOR_ENDPOINTS_DEFAULT) })
-      return {
-        ...page,
-        items: page.items.map(ep => ({
-          id: ep.id, method: ep.method, route: compactText(ep.pathTemplate, COORDINATOR_ROUTE_MAX),
-          origin: ep.origin, risk: ep.riskScore ?? 0,
-          ...(ep.coveragePct != null ? { coverage: ep.coveragePct } : {}), ...(ep.roleExclusive === true ? { roleExclusive: true } : {}),
-          ...(ep.testedClasses?.length ? { tested: ep.testedClasses } : {}), ...(ep.sinkKinds?.length ? { sinks: ep.sinkKinds } : {}),
-          ...(ep.authRequirement ? { auth: ep.authRequirement } : {}), ...(ep.ownershipGuard ? { guard: ep.ownershipGuard } : {}),
-        })),
-      }
-    },
-    query_program_graph: async args => {
-      const page = deps.coordinator.queryProgramGraph({ ...args, limit: compactLimit(args.limit) })
-      return { ...page, items: page.items.slice(0, COORDINATOR_PAGE_MAX) }
-    },
-    query_facts: async args => {
-      // `origin:'*'` spans every approved origin (cross-host chaining never loses its evidence).
-      const origin = args.origin?.trim() === '*' ? undefined : args.origin
-      const page = deps.coordinator.queryFacts({ ...args, origin, limit: compactLimit(args.limit) })
-      return {
-        ...page,
-        items: page.items.map(fact => ({
-          id: fact.id, kind: fact.kind, origin: fact.origin,
-          primitiveTag: compactPrimitiveTag(fact.data),
-          summary: compactText(fact.summary),
-          evidenceIds: fact.evidenceIds ?? [],
-        })),
-      }
-    },
-    query_findings: async args => {
-      const page = deps.coordinator.queryFindings({ ...args, limit: compactLimit(args.limit) })
-      return { ...page, items: page.items.map(item => ({ ...item, title: compactText(item.title, 160), reason: item.reason ? compactText(item.reason, 160) : undefined })) }
-    },
-    dispatch_investigations: async args => {
-      const plan = deps.coordinator.dispatchInvestigations(args.steps, { maxSteps: args.maxSteps })
-      if (plan.plan.length) deps.onDispatch?.(plan)
-      return plan
-    },
-  }
 }
 
 export function computeDynamicStepBudget(storage: Store, runId: string): number {
@@ -1019,15 +859,6 @@ export const DISPATCH_FUNNEL_COUNT_KEYS: readonly DispatchFunnelCountKey[] = [
   'planned', 'filteredAlreadyConfirmed', 'filteredCap', 'filteredDep',
   'filteredDedupe', 'filteredNoAsset', 'filteredBudget', 'enqueued',
 ]
-
-/** Accumulate one source's funnel counts into the round total (structured objects only). */
-export function addFunnelCounts(
-  target: DispatchFunnelCounts,
-  delta: Partial<Record<DispatchFunnelCountKey, number>>,
-): DispatchFunnelCounts {
-  for (const key of DISPATCH_FUNNEL_COUNT_KEYS) target[key] += Math.max(0, delta[key] ?? 0)
-  return target
-}
 
 export function emptyDispatchFunnel(roundNo = 0): DispatchFunnelCounts {
   return {
@@ -2761,10 +2592,6 @@ export const MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS = 1
 export const CODE_AUDIT_WAVE1_MAX_STEPS = 6
 /** Maximum distinct sibling code-audit suspects attached to each Wave-1 multi-hop step. */
 export const MAX_CODE_AUDIT_SIBLING_LEADS = 4
-/** Maximum composite multi-service chain steps synthesized from complementary code-audit sinks. */
-export const MAX_SYNTHESIZED_CODE_AUDIT_COMPOSITE_STEPS = 2
-/** Maximum generic cross-origin composite Wave-1 chain steps synthesized from runtime facts/specs when `!sourceMounted`. */
-export const MAX_SYNTHESIZED_RUNTIME_COMPOSITE_STEPS = 2
 
 const SEALED_HOP_CAP_HANDLE_RE = /\bcap:hop_(?!synth:)[A-Za-z0-9._-]+:[A-Za-z0-9._-]+/
 const SOURCE_AUDIT_ORIGIN_TEXT_RE = /\b(?:source[- ]first code audit|source audit verify|semantic audit|code_audit_suspect|code_audit|source_audit|semantic_audit)\b/i
@@ -4577,10 +4404,15 @@ function inferSinkKindFromFactText(text: string): string {
   return 'api_route'
 }
 
-type CodeAuditChainRole = CompositeWorkflowRole
+type CodeAuditChainRole =
+  | 'outbound_fetch' | 'signing_webhook' | 'info_disclosure' | 'auth_session' | 'privileged_mutation'
+  | 'async_worker' | 'cache_permission' | 'request_parsing'
 
-interface NormalizedCodeAuditSuspect extends CompositeWorkflowNode {
+interface NormalizedCodeAuditSuspect {
   fact: Fact
+  serviceScope: string
+  sinkKind: string
+  roles: ReadonlySet<CodeAuditChainRole>
   asset: Run['candidates'][number]
   explicitSuspect: boolean
   routeOrAction: string
@@ -4596,7 +4428,6 @@ interface NormalizedCodeAuditSuspect extends CompositeWorkflowNode {
   host: string
 }
 
-const COMPOSITE_CODE_AUDIT_TITLE_PREFIX = 'Source audit composite chain ·'
 const CODE_AUDIT_SIBLING_BLOCK_MAX_CHARS = 680
 
 function inferServiceScopeFromSuspect(fileLoc: string, endpointHint: string, origin: string): string {
@@ -4727,34 +4558,6 @@ function formatCrossServiceSiblingLeadsBlock(siblings: readonly NormalizedCodeAu
   return parts.length ? `${prefix}${parts.join(' | ')}` : ''
 }
 
-/** Shared composite workflow hypothesis builder for white-box & grey-box causal composites. */
-function buildCompositeWorkflowHypothesis(input: {
-  hops: readonly { endpoint: string; loc: string; cue: string; roles: ReadonlySet<CompositeWorkflowRole> }[]
-  tags?: readonly string[]
-  siblingBlock?: string
-}): { hopSequence: string; hypothesis: string } {
-  const hopEntries = input.hops.map((h, idx) =>
-    `Hop ${idx + 1} / Stage ${idx + 1} (${h.endpoint}, ${h.loc}): ${h.cue}`,
-  )
-  const compRoles = new Set(input.hops.flatMap(h => [...h.roles]))
-  const helperHint = compRoles.has('signing_webhook')
-    ? 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign'
-    : compRoles.has('async_worker') || compRoles.has('cache_permission')
-      ? 'ctx.seal_capability + ctx.await_async'
-      : 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign/ctx.await_async'
-  const intermediatePivotStage = input.hops.length === 2 ? [`Stage 3 (pivot via ${helperHint})`] : []
-  const terminalStage = 'Terminal Verification (denied control BEFORE Stage 1 -> final readback/state change -> ctx.prove_composite)'
-  const hopSequence = [...hopEntries, ...intermediatePivotStage, terminalStage].join(' -> ')
-  const stageCount = Math.min(5, Math.max(3, input.hops.length + (input.hops.length === 2 ? 2 : 1)))
-  const tagPrefix = [`[chain_hops=${stageCount}]`, '[lane=chain]', ...(input.tags ?? [])].join(' ')
-  const parts = [
-    `${tagPrefix} Composite workflow (${stageCount} stages): ${hopSequence}.`,
-    'Verify ALL stages in ONE kovo_verify script from ONE low-priv persona (never use a target-tenant persona on the probe arm): run clean denied control BEFORE Stage 1, seal via ctx.seal_capability, use ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst, and confirm via ctx.prove_composite (fresh_clean_replay) — never stop at an intermediate info-disclosure, job creation, cache prime, or token/link stub.',
-  ]
-  if (input.siblingBlock) parts.push(input.siblingBlock)
-  return { hopSequence, hypothesis: parts.join(' ') }
-}
-
 export function convertCodeAuditSuspectsToChainSteps(
   storage: Store,
   run: Run,
@@ -4813,11 +4616,6 @@ export function convertCodeAuditSuspectsToChainSteps(
     })
 
     normalized.push({
-      id: fact.id,
-      origin: fact.origin,
-      endpoint: endpointHint || routeOrAction || compactSuspectCue(fact.summary, 36),
-      summary: fact.summary,
-      factId: fact.id,
       fact,
       asset,
       explicitSuspect,
@@ -4838,68 +4636,8 @@ export function convertCodeAuditSuspectsToChainSteps(
     })
   }
 
-  // 1. Delegate multi-service composite synthesis + CapabilityLedger seeding to graph-coordinator.ts.
-  if (promoteMultiHop && normalized.length >= 2 && maxSteps > 0) {
-    const composites: PlannedCompositeWorkflow<NormalizedCodeAuditSuspect>[] = planCompositeWorkflows(normalized, {
-      maxComposites: Math.min(MAX_SYNTHESIZED_CODE_AUDIT_COMPOSITE_STEPS, maxSteps),
-      mode: 'whitebox',
-      ledger: storage.capabilityLedger(run.id),
-    })
-    for (const comp of composites) {
-      if (created.length >= maxSteps || totalSteps >= hardChainStepsCeiling) break
-      const title = `${COMPOSITE_CODE_AUDIT_TITLE_PREFIX} ${comp.label} (${comp.hops[0]!.host})`
-      if (existingTitles.has(title.toLowerCase())) continue
-
-      const hopFactIds = comp.hops.map(h => h.fact.id)
-      const remainingSiblings = selectCrossServiceSiblingLeads(
-        comp.hops[comp.hops.length - 1]!,
-        normalized,
-        new Set(hopFactIds),
-        Math.max(0, MAX_CODE_AUDIT_SIBLING_LEADS - Math.max(0, hopFactIds.length - 1)),
-      )
-      const { hopSequence, hypothesis } = buildCompositeWorkflowHypothesis({
-        hops: comp.hops.map(h => ({
-          endpoint: h.endpoint,
-          loc: h.fileLoc || h.host,
-          cue: compactSuspectCue(h.hypothesisBody, 48),
-          roles: h.roles,
-        })),
-        siblingBlock: formatCrossServiceSiblingLeadsBlock(remainingSiblings),
-      })
-      const dependsOnFactIds = [
-        ...new Set([...hopFactIds, ...remainingSiblings.map(s => s.fact.id)]),
-      ].slice(0, MAX_CODE_AUDIT_SIBLING_LEADS + 1)
-      const sourceOrigins = [...new Set(comp.hops.map(h => h.fact.origin))]
-      const targetAssetIds = [...new Set(comp.hops.map(h => h.asset.id))]
-      const skills = [...new Set(['source-first-audit', 'multihop-chains', 'chain-primitives', ...comp.hops.flatMap(h => h.mappedSkills)])]
-      const specialistProfile = routeStepToSpecialist({
-        title,
-        hypothesis: hopSequence,
-        category: comp.category,
-        skills,
-        endpoint: comp.hops[0]!.endpointHint,
-        sinkKind: comp.hops[0]!.sinkKind,
-      })
-
-      const step = storage.addChainStep(run, {
-        title,
-        hypothesis,
-        category: comp.category,
-        priority: comp.priority,
-        targetAssetIds,
-        skills,
-        dependsOnFactIds,
-        sourceOrigins,
-        specialistProfile,
-      })
-      existingTitles.add(title.toLowerCase())
-      created.push(step)
-      totalSteps += 1
-    }
-  }
-
-  // 2. Emit individual targeted steps for the remaining budget, enriching each Wave-1 multi-hop
-  //    step with a compact Cross-Service Sibling Leads block + sibling dependsOnFactIds.
+  // Emit individual targeted steps, enriching each Wave-1 multi-hop step with a compact
+  // Cross-Service Sibling Leads block + sibling dependsOnFactIds.
   for (const item of normalized) {
     if (created.length >= maxSteps) break
     if (totalSteps >= hardChainStepsCeiling) break
@@ -4954,440 +4692,6 @@ export function convertCodeAuditSuspectsToChainSteps(
     })
     existingTitles.add(title.toLowerCase())
     coveredFactIds.add(item.fact.id)
-    created.push(step)
-    totalSteps += 1
-  }
-
-  return created
-}
-
-const COMPOSITE_RUNTIME_TITLE_PREFIX = 'Runtime composite chain ·'
-
-export interface RuntimeCompositeApiDependencyInput {
-  producer: string
-  consumer: string
-  resourceKey: string
-  producerOrigin?: string
-  consumerOrigin?: string
-  personaHandle?: string | null
-}
-
-export interface SynthesizeRuntimeCompositeWave1Options {
-  /** Only synthesize runtime grey-box composites when repository source is NOT mounted. */
-  sourceMounted: boolean
-  facts?: readonly Fact[]
-  endpoints?: readonly Pick<EndpointRow, 'id' | 'origin' | 'method' | 'pathTemplate' | 'authRequirement' | 'riskScore' | 'source' | 'sinkKinds'>[]
-  apiDependencies?: readonly RuntimeCompositeApiDependencyInput[]
-  specs?: ReadonlyArray<{ kind: string; origin?: string | null; content: string }>
-  hostTiers?: Record<string, HostTier>
-  maxSteps?: number
-  /** Single-authority FrontierWaveController through which Wave-1 composite branches are admitted. */
-  frontierController?: FrontierWaveController | null
-}
-
-interface NormalizedRuntimeHopCandidate extends CompositeWorkflowNode {
-  key: string
-  host: string
-  asset: Run['candidates'][number]
-  cue: string
-  mappedSkills: string[]
-  isCrown: boolean
-  priorityScore: number
-}
-
-/**
- * Grey-box counterpart to WB's `convertCodeAuditSuspectsToChainSteps` composite synthesis:
- * when `!sourceMounted`, synthesize up to `MAX_SYNTHESIZED_RUNTIME_COMPOSITE_STEPS` (default 2)
- * generic cross-origin / producer->consumer composite Wave-1 `ChainStep`s from persisted runtime
- * facts, endpoints, API dependencies, and OpenAPI/GraphQL specs (matching WB's `Composite workflow
- * (3-5 stages)` dispatch shape without any source-code dependence or benchmark literals).
- */
-export function synthesizeRuntimeCompositeWave1Steps(
-  storage: Store,
-  run: Run,
-  options: SynthesizeRuntimeCompositeWave1Options,
-): ChainStep[] {
-  if (options.sourceMounted) return []
-  const maxSteps = Math.max(0, Math.min(
-    options.maxSteps !== undefined ? Math.floor(options.maxSteps) : MAX_SYNTHESIZED_RUNTIME_COMPOSITE_STEPS,
-    MAX_SYNTHESIZED_RUNTIME_COMPOSITE_STEPS,
-  ))
-  if (maxSteps <= 0) return []
-
-  const assetByOrigin = new Map<string, Run['candidates'][number]>()
-  for (const cand of run.candidates) {
-    if (run.approved.includes(cand.id) && !assetByOrigin.has(cand.origin)) {
-      assetByOrigin.set(cand.origin, cand)
-    }
-  }
-  if (assetByOrigin.size === 0) return []
-
-  const existingSteps = storage.listChainSteps(run.id, run.goalRevision)
-  const existingTitles = new Set(existingSteps.map(s => s.title.trim().toLowerCase()))
-  const existingRuntimeComposites = existingSteps.filter(s =>
-    s.title.startsWith(COMPOSITE_RUNTIME_TITLE_PREFIX),
-  ).length
-  const remainingCompositeBudget = Math.max(0, maxSteps - existingRuntimeComposites)
-  let totalSteps = existingSteps.length
-  if (remainingCompositeBudget <= 0 || totalSteps >= hardChainStepsCeiling) return []
-
-  const candidates: NormalizedRuntimeHopCandidate[] = []
-  const seenKeys = new Set<string>()
-  const hostOfOrigin = (origin: string): string => {
-    try { return new URL(origin).hostname.toLowerCase() } catch { return origin.toLowerCase() }
-  }
-
-  const pushCandidate = (input: {
-    origin: string
-    endpoint: string
-    cue: string
-    sinkKind?: string
-    factId?: string
-    resourceKey?: string
-    isApiDep?: boolean
-    extraText?: string
-    baseScore?: number
-  }): void => {
-    const asset = assetByOrigin.get(input.origin)
-    if (!asset) return
-    const endpoint = input.endpoint.trim()
-    if (!endpoint) return
-    const host = hostOfOrigin(input.origin)
-    const combinedText = `${endpoint} ${input.cue} ${input.extraText ?? ''}`
-    const sinkKind = input.sinkKind?.trim() || inferSinkKindFromFactText(combinedText)
-    const roles = classifyCodeAuditChainRoles({ sinkKind, text: combinedText })
-    const key = `${input.origin}|${endpoint.toLowerCase()}|${sinkKind}`
-    if (seenKeys.has(key)) return
-    seenKeys.add(key)
-    const mapped = sinkCategoryAndSkills(sinkKind)
-    const isCrown = (options.hostTiers?.[input.origin] ?? classifyHostTier(input.origin)) === 'crown_jewel'
-    candidates.push({
-      id: key,
-      key,
-      origin: input.origin,
-      host,
-      asset,
-      serviceScope: inferServiceScopeFromSuspect('', endpoint, input.origin),
-      endpoint,
-      sinkKind,
-      summary: compactSuspectCue(input.cue, 76),
-      cue: compactSuspectCue(input.cue, 76),
-      mappedSkills: mapped.skills,
-      roles,
-      ...(input.factId ? { factId: input.factId } : {}),
-      ...(input.resourceKey ? { resourceKey: input.resourceKey } : {}),
-      ...(input.isApiDep ? { isApiDep: true } : {}),
-      isCrown,
-      priorityScore: (input.baseScore ?? 50) + (isCrown ? 12 : 0) + roles.size * 6 + (input.isApiDep ? 14 : 0),
-    })
-  }
-
-  // 1. Collect from runtime API dependencies (highest-signal producer -> consumer links + typed edge families).
-  const depPairs: Array<{ prod: NormalizedRuntimeHopCandidate; cons: NormalizedRuntimeHopCandidate; resourceKey: string }> = []
-  const defaultOrigin = [...assetByOrigin.keys()][0]!
-  const factApiDeps: Array<RuntimeCompositeApiDependencyInput & { observedTransitions?: readonly string[] }> = []
-  for (const fact of options.facts ?? []) {
-    if (fact.tainted || !assetByOrigin.has(fact.origin)) continue
-    const data = (fact.data ?? {}) as Record<string, unknown>
-    if (data.subkind === 'runtime_api_dependencies' && Array.isArray(data.apiDependencies)) {
-      for (const raw of data.apiDependencies.slice(0, 24)) {
-        if (!raw || typeof raw !== 'object') continue
-        const d = raw as Partial<RuntimeCompositeApiDependencyInput> & { observedTransitions?: readonly string[] }
-        if (typeof d.producer === 'string' && typeof d.consumer === 'string' && typeof d.resourceKey === 'string') {
-          factApiDeps.push({ producer: d.producer, consumer: d.consumer, resourceKey: d.resourceKey, ...(d.producerOrigin ? { producerOrigin: d.producerOrigin } : {}), ...(d.consumerOrigin ? { consumerOrigin: d.consumerOrigin } : {}), ...(d.personaHandle !== undefined ? { personaHandle: d.personaHandle } : {}), ...(Array.isArray(d.observedTransitions) ? { observedTransitions: d.observedTransitions } : {}) })
-        }
-      }
-    }
-  }
-  const mergedApiDeps: Array<RuntimeCompositeApiDependencyInput & { observedTransitions?: readonly string[] }> = [
-    ...(options.apiDependencies ?? []),
-    ...factApiDeps,
-  ]
-  const seenDepEdge = new Set<string>()
-  const edgePriority = (k: string): number => (k === 'hmac_sign' ? 4 : k === 'await_async' ? 3 : k === 'lifecycle_chain' ? 2 : k === 'signed_url' ? 1 : 0)
-  const prioritizedDeps = [...mergedApiDeps]
-    .filter(d => {
-      const k = `${d.producerOrigin ?? ''}|${d.producer}|${d.consumerOrigin ?? ''}|${d.consumer}|${d.resourceKey}`
-      if (seenDepEdge.has(k)) return false
-      seenDepEdge.add(k)
-      return true
-    })
-    .sort((a, b) => edgePriority(classifyRuntimeDependencyEdgeKind(b)) - edgePriority(classifyRuntimeDependencyEdgeKind(a)))
-  for (const dep of prioritizedDeps.slice(0, 40)) {
-    const prodOrigin = dep.producerOrigin && assetByOrigin.has(dep.producerOrigin) ? dep.producerOrigin : defaultOrigin
-    const consOrigin = dep.consumerOrigin && assetByOrigin.has(dep.consumerOrigin) ? dep.consumerOrigin : prodOrigin
-    const edgeKind = classifyRuntimeDependencyEdgeKind(dep)
-    const meta = edgeKind === 'hmac_sign'
-      ? { sink: 'webhook', pCue: `Signing producer ${dep.producer} yields "${dep.resourceKey}" (seal signing material)`, cCue: `Webhook consumer ${dep.consumer} validates "${dep.resourceKey}" (forge via ctx.hmac_sign)`, extra: `webhook hmac x-signature signing secret callback ${dep.resourceKey}`, pScore: 88, cScore: 90 }
-      : edgeKind === 'await_async'
-        ? { sink: 'api_route', pCue: `Async producer ${dep.producer} emits "${dep.resourceKey}" (202/async handle; ctx.await_async)`, cCue: `Async poll consumer ${dep.consumer} reads "${dep.resourceKey}" (verify cross-tenant readback)`, extra: `async_worker queue job export poll await_async ${dep.resourceKey}`, pScore: 86, cScore: 88 }
-        : edgeKind === 'lifecycle_chain'
-          ? { sink: 'api_route', pCue: `Lifecycle create/rebind ${dep.producer} yields "${dep.resourceKey}"`, cCue: `Lifecycle rebind/finalize ${dep.consumer} mutates "${dep.resourceKey}" (verify state invariants)`, extra: `state machine lifecycle approve transfer settle export mutation ${dep.resourceKey}`, pScore: 84, cScore: 86 }
-          : edgeKind === 'signed_url'
-            ? { sink: 'upload_storage', pCue: `Signed artifact producer ${dep.producer} yields "${dep.resourceKey}"`, cCue: `Signed URL consumer ${dep.consumer} redeems "${dep.resourceKey}"`, extra: `signed url download export artifact storage ${dep.resourceKey}`, pScore: 82, cScore: 84 }
-            : { sink: undefined, pCue: `Producer ${dep.producer} yields resource "${dep.resourceKey}"`, cCue: `Consumer ${dep.consumer} acts on resource "${dep.resourceKey}"`, extra: `resource ${dep.resourceKey} cross-tenant mutation`, pScore: 76, cScore: 78 }
-    const prodBefore = candidates.length
-    pushCandidate({
-      origin: prodOrigin,
-      endpoint: dep.producer,
-      cue: meta.pCue,
-      ...(meta.sink ? { sinkKind: meta.sink } : {}),
-      resourceKey: dep.resourceKey,
-      isApiDep: true,
-      extraText: `producer ${meta.extra}`,
-      baseScore: meta.pScore,
-    })
-    const prodCand = candidates.find(c => c.origin === prodOrigin && c.endpoint === dep.producer.trim())
-      ?? (candidates.length > prodBefore ? candidates[candidates.length - 1] : undefined)
-    const consBefore = candidates.length
-    pushCandidate({
-      origin: consOrigin,
-      endpoint: dep.consumer,
-      cue: meta.cCue,
-      ...(meta.sink ? { sinkKind: meta.sink } : {}),
-      resourceKey: dep.resourceKey,
-      isApiDep: true,
-      extraText: `consumer ${meta.extra}`,
-      baseScore: meta.cScore,
-    })
-    const consCand = candidates.find(c => c.origin === consOrigin && c.endpoint === dep.consumer.trim())
-      ?? (candidates.length > consBefore ? candidates[candidates.length - 1] : undefined)
-    if (prodCand && consCand && prodCand.key !== consCand.key) {
-      depPairs.push({ prod: prodCand, cons: consCand, resourceKey: dep.resourceKey })
-    }
-  }
-
-  // 2. Collect from non-tainted runtime facts (Phase-0 catalogs, persona resources, det leads, notes).
-  for (const fact of options.facts ?? []) {
-    if (fact.tainted || !assetByOrigin.has(fact.origin)) continue
-    const data = (fact.data ?? {}) as Record<string, unknown>
-    const subkind = typeof data.subkind === 'string' ? data.subkind : ''
-    if (subkind === 'runtime_spa_routes' && Array.isArray(data.spaRoutes)) {
-      for (const raw of data.spaRoutes.slice(0, 12)) {
-        if (!raw || typeof raw !== 'object') continue
-        const route = raw as { path?: string; serviceOrigin?: string; apiCalls?: Array<{ method?: string; path?: string; serviceOrigin?: string }>; requiredRoles?: string[]; stateActions?: string[] }
-        const target = route.apiCalls?.[0]
-        const targetOrigin = target?.serviceOrigin && assetByOrigin.has(target.serviceOrigin)
-          ? target.serviceOrigin
-          : route.serviceOrigin && assetByOrigin.has(route.serviceOrigin)
-            ? route.serviceOrigin
-            : fact.origin
-        const epLabel = target?.path ? `${(target.method ?? 'GET').toUpperCase()} ${target.path}` : (route.path ?? '')
-        if (!epLabel) continue
-        pushCandidate({
-          origin: targetOrigin,
-          endpoint: epLabel,
-          cue: `SPA route ${route.path ?? epLabel} invokes ${epLabel}${route.requiredRoles?.length ? ` (client roles: ${route.requiredRoles.join(',')})` : ''}`,
-          factId: fact.id,
-          extraText: `${(route.stateActions ?? []).join(' ')} ${(route.requiredRoles ?? []).join(' ')}`,
-          baseScore: 72,
-        })
-      }
-      continue
-    }
-    if (subkind === 'runtime_graphql_catalog') {
-      const cat = data.graphqlCatalog as { endpoint?: string; serviceOrigin?: string; fields?: Array<{ name?: string; kind?: string; requiredRole?: string }> } | undefined
-      const gqlOrigin = cat?.serviceOrigin && assetByOrigin.has(cat.serviceOrigin) ? cat.serviceOrigin : fact.origin
-      const mut = cat?.fields?.find(f => f.kind === 'mutation') ?? cat?.fields?.[0]
-      if (mut?.name) {
-        pushCandidate({
-          origin: gqlOrigin,
-          endpoint: `${(mut.kind ?? 'mutation').toUpperCase()} ${cat?.endpoint ?? '/graphql'}#${mut.name}`,
-          cue: `GraphQL ${mut.kind ?? 'operation'} ${mut.name} at ${cat?.endpoint ?? '/graphql'}`,
-          factId: fact.id,
-          extraText: `${mut.name} ${mut.requiredRole ?? ''} mutation batch graphql`,
-          baseScore: 72,
-        })
-      }
-      continue
-    }
-    const routeFromData = typeof data.endpoint === 'string' && data.endpoint.trim()
-      ? `${typeof data.method === 'string' ? `${data.method.toUpperCase()} ` : ''}${data.endpoint.trim()}`
-      : typeof data.path === 'string' && data.path.trim()
-        ? `${typeof data.method === 'string' ? `${data.method.toUpperCase()} ` : ''}${data.path.trim()}`
-        : templatesMentionedInText(fact.summary)[0] ?? ''
-    if (!routeFromData) continue
-    pushCandidate({
-      origin: fact.origin,
-      endpoint: routeFromData,
-      cue: fact.summary,
-      factId: fact.id,
-      extraText: `${fact.kind} ${subkind} ${typeof data.field === 'string' ? data.field : ''}`,
-      baseScore: fact.kind === 'auth' || fact.kind === 'policy_gap' || fact.kind === 'object_ref' || subkind === 'det_lead' ? 74 : 62,
-    })
-  }
-
-  // 3. Collect from persisted endpoints (filtering 404/405-only surface_probe ghosts + prioritizing lifecycle chains).
-  const rawEndpoints = options.endpoints ?? storage.listEndpoints(run.id, { limit: 200 })
-  let runExchanges: Array<{ origin: string; method: string; pathAndQuery: string; status: number }> = []
-  try {
-    runExchanges = storage.client.prepare(
-      'SELECT origin, method, path_and_query AS pathAndQuery, status FROM broker_exchanges WHERE run_id = ? ORDER BY created_at DESC LIMIT 400',
-    ).all(run.id) as typeof runExchanges
-  } catch { /* best-effort ghost probe filter */ }
-  const evidencedKeys = new Set<string>()
-  for (const spec of (options.specs ?? []).slice(0, 6)) {
-    if (spec.kind !== 'openapi') continue
-    const so = spec.origin && assetByOrigin.has(spec.origin) ? spec.origin : defaultOrigin
-    try {
-      const p = JSON.parse(spec.content) as { paths?: Record<string, Record<string, unknown>> }
-      for (const pk of Object.keys(p.paths ?? {})) evidencedKeys.add(`${so}|${pk.replace(/\/+$/, '').toLowerCase() || '/'}`)
-    } catch { /* ignore */ }
-  }
-  for (const f of options.facts ?? []) {
-    if (f.tainted) continue
-    const d = (f.data ?? {}) as Record<string, unknown>
-    if (d.subkind === 'runtime_spa_routes' && Array.isArray(d.spaRoutes)) {
-      for (const r of d.spaRoutes as Array<{ serviceOrigin?: string; apiCalls?: Array<{ path?: string; serviceOrigin?: string }> }>) {
-        for (const c of r?.apiCalls ?? []) if (typeof c?.path === 'string') evidencedKeys.add(`${c.serviceOrigin ?? r.serviceOrigin ?? f.origin}|${c.path.split(/[?#]/, 1)[0]!.replace(/\/+$/, '').toLowerCase() || '/'}`)
-      }
-    }
-  }
-  const endpoints = filterGhostSurfaceProbeEndpoints(rawEndpoints, runExchanges, evidencedKeys)
-  const collectionMutators = new Map<string, { root?: NormalizedRuntimeHopCandidate; member?: NormalizedRuntimeHopCandidate; subs: NormalizedRuntimeHopCandidate[] }>()
-  for (const ep of endpoints) {
-    if (!assetByOrigin.has(ep.origin) || ep.pathTemplate === '/' || /^\/(?:health|healthz|ready|metrics|favicon)/i.test(ep.pathTemplate)) continue
-    const method = ep.method.toUpperCase(), label = `${method} ${ep.pathTemplate}`
-    const authHint = ep.authRequirement ? `auth=${ep.authRequirement}` : 'auth=unspecified', before = candidates.length
-    pushCandidate({
-      origin: ep.origin, endpoint: label, cue: `Discovered ${label} (${authHint}) on ${hostOfOrigin(ep.origin)}`,
-      sinkKind: ep.sinkKinds?.[0], extraText: `${authHint} ${(ep.sinkKinds ?? []).join(' ')}`, baseScore: ep.riskScore ?? 55,
-    })
-    const cand = candidates.find(c => c.origin === ep.origin && c.endpoint === label) ?? (candidates.length > before ? candidates[candidates.length - 1] : undefined)
-    if (!cand || !/^(?:POST|PUT|PATCH|DELETE)$/.test(method)) continue
-    const ent = inferEntityName(ep.pathTemplate)
-    if (!ent || ent === 'resource') continue
-    const parts = ep.pathTemplate.split('/').filter(Boolean).filter((s, i) => !(i < 2 && /^(?:api|v\d+)$/i.test(s)))
-    const paramIdx = parts.findIndex(s => /^[:{]/.test(s)), g = collectionMutators.get(`${ep.origin}|${ent}`) ?? { subs: [] }
-    if (paramIdx < 0 && parts.length === 1) { if (!g.root || method === 'POST') g.root = cand }
-    else if (paramIdx === parts.length - 1) { if (!g.member) g.member = cand }
-    else if (!g.subs.some(s => s.key === cand.key)) g.subs.push(cand)
-    collectionMutators.set(`${ep.origin}|${ent}`, g)
-  }
-  for (const [ek, g] of collectionMutators) {
-    const rk = `${ek.split('|')[1] ?? 'entity'}Id`, seq = [g.root, g.member, ...g.subs.slice(0, 2)].filter((c): c is NormalizedRuntimeHopCandidate => Boolean(c))
-    for (let i = 0; i + 1 < seq.length; i += 1) {
-      const prod = seq[i]!, cons = seq[i + 1]!
-      if (prod.key !== cons.key && !depPairs.some(p => p.prod.key === prod.key && p.cons.key === cons.key)) depPairs.push({ prod, cons, resourceKey: rk })
-    }
-  }
-
-  // 4. Collect from JSON OpenAPI specs when endpoints/facts are sparse.
-  for (const spec of (options.specs ?? []).slice(0, 6)) {
-    if (spec.kind !== 'openapi') continue
-    const specOrigin = spec.origin && assetByOrigin.has(spec.origin) ? spec.origin : defaultOrigin
-    try {
-      const parsed = JSON.parse(spec.content) as {
-        security?: Array<Record<string, string[]>>
-        paths?: Record<string, Record<string, { operationId?: string; summary?: string; security?: Array<Record<string, string[]>> }>>
-      }
-      for (const [pathKey, methods] of Object.entries(parsed.paths ?? {})) {
-        if (!methods || typeof methods !== 'object') continue
-        for (const [method, op] of Object.entries(methods)) {
-          if (!/^(?:get|post|put|patch|delete)$/i.test(method)) continue
-          const label = `${method.toUpperCase()} ${pathKey}`
-          const sec = Array.isArray(op?.security) ? op.security : parsed.security
-          const authText = Array.isArray(sec) && sec.length === 0 ? 'unauthenticated public' : ''
-          pushCandidate({
-            origin: specOrigin,
-            endpoint: label,
-            cue: op?.summary || `OpenAPI ${op?.operationId ?? label} on ${hostOfOrigin(specOrigin)}`,
-            extraText: `${op?.operationId ?? ''} ${authText}`,
-            baseScore: 60,
-          })
-        }
-      }
-    } catch { /* ignore non-JSON spec */ }
-  }
-
-  if (candidates.length < 2) return []
-
-  const composites = planCompositeWorkflows(candidates, {
-    maxComposites: maxSteps,
-    mode: 'runtime',
-    depPairs,
-    ledger: storage.capabilityLedger(run.id),
-  })
-
-  const created: ChainStep[] = []
-  for (const comp of composites) {
-    if (created.length >= remainingCompositeBudget || totalSteps >= hardChainStepsCeiling) break
-    const sourceOrigins = [...new Set(comp.hops.map(h => h.origin))]
-    const distinctHosts = [...new Set(comp.hops.map(h => h.host))]
-    const hostSuffix = distinctHosts.length >= 2
-      ? `${distinctHosts[0]} -> ${distinctHosts[1]}`
-      : distinctHosts[0]!
-    const title = `${COMPOSITE_RUNTIME_TITLE_PREFIX} ${comp.label} (${hostSuffix})`.slice(0, 180)
-    if (existingTitles.has(title.toLowerCase())) continue
-
-    const isCrossOrigin = sourceOrigins.length >= 2
-    const hasDep = Boolean(comp.resourceKey || comp.hops.some(h => h.isApiDep))
-    const extraTags: string[] = []
-    if (comp.resourceKey) extraTags.push(`api_dependency:${comp.resourceKey}`)
-    if (isCrossOrigin) extraTags.push(`cross_origin_edge:${sourceOrigins[0]}->${sourceOrigins[1]}`)
-    const { hopSequence, hypothesis } = buildCompositeWorkflowHypothesis({
-      hops: comp.hops.map(h => ({
-        endpoint: h.endpoint,
-        loc: h.origin,
-        cue: compactSuspectCue(h.cue, 54),
-        roles: h.roles,
-      })),
-      tags: extraTags,
-    })
-
-    const skills = [
-      ...new Set([
-        'multihop-chains',
-        'chain-primitives',
-        'runtime-composite-chain',
-        ...(isCrossOrigin ? ['cross-origin-chain'] : []),
-        ...(hasDep ? ['api-dependency'] : []),
-        ...comp.hops.flatMap(h => h.mappedSkills),
-      ]),
-    ]
-    const targetAssetIds = [...new Set(comp.hops.map(h => h.asset.id))]
-    const dependsOnFactIds = [
-      ...new Set(comp.hops.map(h => h.factId).filter((id): id is string => Boolean(id))),
-    ].slice(0, MAX_CODE_AUDIT_SIBLING_LEADS + 1)
-    const specialistProfile = routeStepToSpecialist({
-      title,
-      hypothesis: hopSequence,
-      category: comp.category,
-      skills,
-      endpoint: comp.hops[0]!.endpoint,
-      sinkKind: comp.hops[0]!.sinkKind,
-    })
-
-    const firstHop = comp.hops[0]!
-    if (options.frontierController) {
-      const firstEndpointParts = firstHop.endpoint.trim().split(/\s+/)
-      const firstMethod = firstEndpointParts.length >= 2 ? firstEndpointParts[0]! : 'GET'
-      const firstPath = firstEndpointParts.length >= 2 ? firstEndpointParts.slice(1).join(' ') : firstHop.endpoint
-      const admission = options.frontierController.admitStepBranch({
-        branchKey: `wave1:composite:${sourceOrigins[0] ?? 'unknown'}:${firstPath}:${comp.category}`.slice(0, 140),
-        depth: Math.max(1, Math.min(MAX_CHAIN_DEPTH, comp.hops.length)),
-        origin: firstHop.origin,
-        endpoint: firstPath,
-        method: firstMethod,
-        hypothesisClass: comp.category,
-        goalSummary: title,
-        waveNo: Math.max(1, run.roundNo || 1),
-      })
-      if (!admission.admitted) continue
-    }
-
-    const step = storage.addChainStep(run, {
-      title,
-      hypothesis,
-      category: comp.category,
-      priority: comp.priority,
-      targetAssetIds,
-      skills,
-      dependsOnFactIds,
-      sourceOrigins,
-      specialistProfile,
-    })
-    existingTitles.add(title.toLowerCase())
     created.push(step)
     totalSteps += 1
   }
@@ -5649,10 +4953,6 @@ export interface RunOrchestrationState {
   frontierDispatcher?: FrontierDispatcher
   invariantsSeeded: boolean
   wave1InvariantChainsPromoted: boolean
-  seededHypothesisIds?: Set<string>
-  runtimeSynthesisWatermark?: string
-  postFloorInvariantsSynced: boolean
-  runtimeCompositeSeeded: boolean
   plannerSeenCausalEdges?: Set<string>
   quarantinedOrigins?: Map<string, QuarantinedOriginRecord>
   repoOriginMappings?: ServiceOriginMapping[]
@@ -5719,8 +5019,6 @@ export function createRunOrchestrationState(runId: string): RunOrchestrationStat
     plannerDirty: false,
     invariantsSeeded: false,
     wave1InvariantChainsPromoted: false,
-    postFloorInvariantsSynced: false,
-    runtimeCompositeSeeded: false,
     startedLabRun: false,
     agenticLaneStopping: false,
     verificationDraining: false,

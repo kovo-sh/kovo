@@ -11,8 +11,8 @@
  *     non-authz classes, different origins, or hop-continuations/trials.
  *  3. Flat `src/<service>*` service-stem bucket splitting (`selectBalancedRepoSourceCandidates`),
  *     route-verified per-origin Wave-1 coverage floor at `>= whiteBoxCapPriority` that is NOT
- *     satisfied merely by listing an origin without probing routes on it, and pre-floor
- *     `GB dataflow chain (...)` spec-guess capping/non-coverage (`buildWave1UncoveredOriginFallbackSteps`).
+ *     satisfied merely by listing an origin without probing routes on it, and per-origin grey-box
+ *     fallback seeding with recorded API dependencies (`buildWave1UncoveredOriginFallbackSteps`).
  */
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
@@ -576,7 +576,7 @@ describe('2. Multi-origin / multi-hop / authz-alias confirmed-step dedup suppres
   })
 })
 
-describe('3. Flat src/<service>* branch splitting, route-verified Wave-1 floor & pre-floor GB spec-guess guard', () => {
+describe('3. Flat src/<service>* branch splitting, route-verified Wave-1 floor & per-origin grey-box fallback', () => {
   test('selectBalancedRepoSourceCandidates splits flat src/<stem>.ts files by service stem while keeping nested service subdirs grouped', () => {
     const candidates: Array<{ full: string; relPath: string; depth: number }> = []
     // 30 flat files under src/service-a* (would starve service-b & service-c if collapsed to "src")
@@ -692,7 +692,7 @@ describe('3. Flat src/<service>* branch splitting, route-verified Wave-1 floor &
     assert.equal(resCovered.uncoveredAddedCount, 0, 'all 3 origins have route-verified coverage so no extra fallback steps should be added')
   })
 
-  test('pre-floor GB dataflow spec guesses (0 live 2xx exchanges) are capped <= 2 and do NOT suppress per-origin uncovered fallback steps', async (t) => {
+  test('store-backed grey-box runs with recorded API dependencies (0 live 2xx exchanges) still seed per-origin uncovered fallback steps', async (t) => {
     const origins = [AUTH_ORIGIN, API_ORIGIN, EDGE_ORIGIN]
     const { storage } = makeStore(t, 'kovo-m2-r5-prefloor-gb-')
     const { runId, run } = await setupApprovedRun(storage, { seeds: origins, tier: 2 })
@@ -754,16 +754,13 @@ describe('3. Flat src/<service>* branch splitting, route-verified Wave-1 floor &
       classifyTier: classifyHostTier,
       storage,
       run: storage.run(runId),
-      activeOrigins: new Set(origins),
     })
 
-    const gbGuessSteps = res.seededSteps.filter(s => s.title.startsWith('GB dataflow chain ('))
     const originFallbackSteps = res.seededSteps.filter(s => s.title.startsWith('Surface & chain investigation'))
-    assert.ok(gbGuessSteps.length <= 2, `pre-floor GB spec guesses must be capped <= 2, got ${gbGuessSteps.length}`)
     assert.deepEqual(
       new Set(originFallbackSteps.map(s => s.origins[0])),
       new Set(origins),
-      'pre-floor GB spec guesses must NOT suppress per-origin uncovered fallback steps for any active origin',
+      'store-backed producer/consumer dependencies must NOT suppress per-origin uncovered fallback steps for any active origin',
     )
     for (const step of originFallbackSteps) {
       assert.ok(

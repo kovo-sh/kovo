@@ -174,7 +174,8 @@ test('entryMatchesEntity tolerates case variants and correlationIds without host
 
 test('LOC ceilings hold for the leased files', () => {
   const loc = (rel: string) => readFileSync(join(REPO_ROOT, rel), 'utf8').split('\n').length
-  assert.ok(loc('src/server/v8-oracle-families.ts') <= 750)
+  // A2: v8-oracle-families.ts hosts the 5 universal Tier-1 primitives + invariants absorbed from the retired own-org guard.
+  assert.ok(loc('src/server/v8-oracle-families.ts') <= 1400)
   assert.ok(loc('src/server/composite-receipt.ts') <= 750)
   assert.ok(loc('src/server/verify-rpc.ts') <= 2300)
 })

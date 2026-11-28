@@ -528,7 +528,7 @@ function QRow({ it, sec, cur, count = 1, motion: m, now, onSelect, onAct, onAsk 
       {meta.map((x, i) => <span key={i} className="inline-flex items-center gap-2">{i > 0 && <span className="text-fg-faint">·</span>}{x}</span>)}
     </span>
     {sec !== 'done' && <span className={cn(
-      'pointer-events-none absolute right-3 top-1/2 flex -translate-y-1/2 translate-x-1 gap-1 bg-gradient-to-r from-transparent pl-6 opacity-0 transition-[opacity,transform] duration-[var(--d1)] ease-kovo',
+      'pointer-events-none absolute right-3 top-1/2 flex -translate-y-1/2 translate-x-1 gap-1 bg-gradient-to-r from-transparent pl-6 opacity-0 transition-[opacity,translate] duration-[var(--d1)] ease-kovo motion-reduce:transition-[opacity]',
       cur ? 'via-[var(--row-s)] to-[var(--row-s)]' : 'via-[var(--row-h)] to-[var(--row-h)]',
       stamping
         ? 'opacity-0!'
@@ -555,7 +555,7 @@ function QRow({ it, sec, cur, count = 1, motion: m, now, onSelect, onAct, onAsk 
         <Icon name="chat" />
       </button>
     </span>}
-    {A && <span className={cn(runStamp({ tone: A.tone }), 'absolute right-4 top-1/2 z-[2] h-6 -translate-y-1/2 transition-[opacity,transform] duration-[var(--d2)] ease-spring')}>
+    {A && <span className={cn(runStamp({ tone: A.tone }), 'absolute right-4 top-1/2 z-[2] h-6 -translate-y-1/2 transition-[opacity,scale,translate] duration-[var(--d2)] ease-spring starting:scale-[.96] starting:opacity-0 motion-reduce:transition-[opacity]')}>
       <Icon name={A.icon} />{A.label}
     </span>}
   </div>

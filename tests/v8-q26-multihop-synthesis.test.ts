@@ -10,12 +10,8 @@
  *     - Attaches compact bounded "Cross-Service Sibling Leads" context blocks (up to 4 other
  *       distinct suspects with route, file:line, and sinkKind) and links their IDs in
  *       `dependsOnFactIds` (primary suspect at index 0, bounded <= 5 total fact IDs).
- *     - Synthesizes up to 2 composite multi-service chain steps when complementary sink categories
- *       coexist (outbound-fetch/SSRF + internal signing/webhook; info-disclosure + auth/session +
- *       privileged mutation), ordered at top priority ahead of single-suspect steps while staying
- *       bounded to `CODE_AUDIT_WAVE1_MAX_STEPS = 6`.
- *     - Synthesizes 0 composites for homogeneous single-category batches and remains idempotent
- *       across repeated invocations.
+ *     - Emits one targeted multi-hop step per suspect (no heuristic composite synthesis), bounded
+ *       to `CODE_AUDIT_WAVE1_MAX_STEPS = 6`, and remains idempotent across repeated invocations.
  *     - Keeps `buildAssignmentBriefPacket` bounded <= 4 KB (`ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE`).
  *  3. Fix C (`workerInvestigationPrompt`, `KOVO_VERIFY_*`, `src/skills/multihop-chains.md`):
  *     - Instructs multi-hop workers never to stop at intermediate single-hop disclosures/handles
@@ -49,7 +45,6 @@ import { compositeProofReceiptSchema } from '../src/server/composite-receipt.ts'
 import {
   CODE_AUDIT_WAVE1_MAX_STEPS,
   MAX_CODE_AUDIT_SIBLING_LEADS,
-  MAX_SYNTHESIZED_CODE_AUDIT_COMPOSITE_STEPS,
   chainLaneDispatchRank,
   classifyDispatchLane,
   convertCodeAuditSuspectsToChainSteps,
@@ -102,12 +97,11 @@ test('Fix A: codeAuditPrompt and code-auditor instructions prioritize 3-5 hop cr
 })
 
 // ============================================================================
-// 2. Fix B: Sibling Leads + Composite Multi-Service Chain Synthesis in Wave 1
+// 2. Fix B: Cross-Service Sibling Leads on Wave-1 multi-hop suspect steps
 // ============================================================================
 
-test('Fix B: convertCodeAuditSuspectsToChainSteps synthesizes up to 2 composite chains and attaches bounded Cross-Service Sibling Leads', async (t) => {
+test('Fix B: convertCodeAuditSuspectsToChainSteps emits bounded per-suspect multi-hop steps with Cross-Service Sibling Leads', async (t) => {
   assert.equal(MAX_CODE_AUDIT_SIBLING_LEADS, 4)
-  assert.equal(MAX_SYNTHESIZED_CODE_AUDIT_COMPOSITE_STEPS, 2)
 
   const { storage } = makeStore(t)
   const { run } = await setupApprovedRun(storage, { seeds: [ORIGIN], tier: 2 })
@@ -213,21 +207,12 @@ test('Fix B: convertCodeAuditSuspectsToChainSteps synthesizes up to 2 composite 
 
   assert.equal(steps.length, CODE_AUDIT_WAVE1_MAX_STEPS, 'total promoted steps must stay bounded to 6')
 
-  const composites = steps.filter(s => s.title.startsWith('Source audit composite chain ·'))
-  const individuals = steps.filter(s => !s.title.startsWith('Source audit composite chain ·'))
-  assert.equal(composites.length, 2, 'must synthesize 2 complementary composite multi-service chains')
-  assert.equal(individuals.length, 4, 'remaining 4 Wave-1 slots must hold top individual suspect steps')
+  // No heuristic composite synthesis: every Wave-1 slot holds one targeted suspect step.
+  assert.equal(steps.filter(s => s.title.startsWith('Source audit composite chain ·')).length, 0)
+  assert.ok(steps.every(s => s.title.startsWith('Source audit verify ·')))
+  const individuals = steps
 
-  // Both composites link distinct cross-service suspects generically (zero hardcoded archetype titles)
-  assert.match(composites[0]!.title, /Cross-Service .* Chain/i)
-  assert.match(composites[0]!.hypothesis, /Hop 1 .* -> Hop 2 /)
-  assert.ok(composites[0]!.dependsOnFactIds.length >= 2)
-
-  assert.match(composites[1]!.title, /Cross-Service .* Chain/i)
-  assert.match(composites[1]!.hypothesis, /Hop 1 .* -> Hop 2 /)
-  assert.ok(composites[1]!.dependsOnFactIds.length >= 2)
-
-  // Every step dispatches at top Rank 0 in the chain lane, and composites outrank individuals!
+  // Every step dispatches at top Rank 0 in the chain lane.
   for (const step of steps) {
     assert.equal(isMultiHopChainStep(step), true)
     assert.equal(classifyDispatchLane(step), 'chain')
@@ -248,10 +233,11 @@ test('Fix B: convertCodeAuditSuspectsToChainSteps synthesizes up to 2 composite 
     assert.ok(step.hypothesis.length < 2200, `step hypothesis must remain compact (got ${step.hypothesis.length} chars)`)
   }
 
-  // Wave-1 round-robin dispatch places synthesized composite chains FIRST!
+  // Wave-1 round-robin dispatch fills every slot with promoted multi-hop suspect steps.
   const dispatchPlan = planRoundRobinDispatch(steps, 3)
-  assert.equal(dispatchPlan.ordered[0]!.id, composites[0]!.id)
-  assert.equal(dispatchPlan.ordered[1]!.id, composites[1]!.id)
+  const promotedIds = new Set(steps.map(s => s.id))
+  assert.equal(dispatchPlan.ordered.length, 3)
+  assert.ok(dispatchPlan.ordered.every(s => promotedIds.has(s.id)))
 
   // Idempotency: re-running on the same suspect batch creates 0 duplicate steps!
   const rerun = convertCodeAuditSuspectsToChainSteps(storage, run, suspects, undefined, {
@@ -260,7 +246,7 @@ test('Fix B: convertCodeAuditSuspectsToChainSteps synthesizes up to 2 composite 
   })
   assert.equal(rerun.length, 0, 're-running convertCodeAuditSuspectsToChainSteps must be idempotent')
 
-  // Assignment brief stays strictly <= 4 KB even for a multi-hop composite step with 5 linked facts.
+  // Assignment brief stays strictly <= 4 KB even for a multi-hop step with 5 linked facts.
   const briefPacket = buildAssignmentBriefPacket({
     missionKind: 'multihop_chain',
     origin: ORIGIN,
@@ -277,7 +263,7 @@ test('Fix B: convertCodeAuditSuspectsToChainSteps synthesizes up to 2 composite 
   assert.ok(briefPacket.bytes <= ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE)
 })
 
-test('Fix B: homogeneous single-category suspects synthesize 0 composites while still linking compact sibling leads', async (t) => {
+test('Fix B: homogeneous single-category suspects still link compact sibling leads', async (t) => {
   const { storage } = makeStore(t)
   const { run } = await setupApprovedRun(storage, { seeds: [ORIGIN], tier: 2 })
   const asset = run.candidates.find(c => run.approved.includes(c.id))!

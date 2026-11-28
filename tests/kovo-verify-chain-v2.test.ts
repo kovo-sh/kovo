@@ -27,7 +27,7 @@ import {
   VERIFY_RPC_TOKEN_ENV,
   VerifyRpcServer,
 } from '../src/server/verify-rpc.ts'
-import { VerifyContext } from '../worker/kovo_verify/kovo_verify.ts'
+import { VerifyContext, accessDifferential, causalDag, wireFramingAndCacheDifferential } from '../worker/kovo_verify/kovo_verify.ts'
 
 process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
@@ -333,53 +333,57 @@ test('live VerifyRpcServer: ch.race() + economic_conservation auto-synthesizes o
   assert.equal(proved.confirmed, true, `Expected live economic_conservation with auto-synthesized oracleInput to confirm: ${JSON.stringify(proved)}`)
 })
 
-test('oracleInput auto-synthesis covers all oracleFamily variants without overriding caller fields', async t => {
+test('A2: explicit universal-primitive helpers build role-named oracleInput (no positional hop guessing) and pass caller fields through', async t => {
   const { ctx } = await startFixture(t, 'run-chain-v2-oracle-families')
 
-  // 1) cryptographic_scope_replay
+  // 1) cryptographic_scope_replay -> access_differential helper; bare oracleFamily never guesses hops[0]/hops[1]
   const cCrypto = ctx.chain('c-crypto', 'cryptographic_scope_replay')
   cCrypto.control('ex-tampered')
   cCrypto.recordHop({ hopId: 'hop_1', target: 'POST /api/issue', exchangeIds: ['ex-issue'], claimedDelta: 'Issued signed token.' })
   cCrypto.recordHop({ hopId: 'hop_2', target: 'GET /api/replay', exchangeIds: ['ex-replay'], claimedDelta: 'Replayed across scope.' })
-  const rCrypto = cCrypto.build({ oracleFamily: 'cryptographic_scope_replay' })
+  assert.equal(cCrypto.build({ oracleFamily: 'cryptographic_scope_replay' }).terminalImpact.oracleInput, undefined)
+  const rCrypto = cCrypto.build({ ...accessDifferential({ control: 'ex-tampered', issuance: 'ex-issue', variant: 'ex-replay' }) })
+  assert.equal(rCrypto.terminalImpact.oracleFamily, 'cryptographic_scope_replay')
   assert.deepEqual(rCrypto.terminalImpact.oracleInput, {
     tamperedSignatureControlExchangeId: 'ex-tampered',
     sourceValidIssuanceExchangeId: 'ex-issue',
     replayedAcceptanceExchangeId: 'ex-replay',
   })
-  // Respects explicit caller override
+  // Explicit caller oracleInput is passed through verbatim (no positional fill of the other slots)
   const rCryptoOv = cCrypto.build({ oracleFamily: 'cryptographic_scope_replay', oracleInput: { replayedAcceptanceExchangeId: 'ex-custom' } })
-  assert.equal(rCryptoOv.terminalImpact.oracleInput?.replayedAcceptanceExchangeId, 'ex-custom')
-  assert.equal(rCryptoOv.terminalImpact.oracleInput?.tamperedSignatureControlExchangeId, 'ex-tampered')
+  assert.deepEqual(rCryptoOv.terminalImpact.oracleInput, { replayedAcceptanceExchangeId: 'ex-custom' })
 
-  // 2) temporal_revocation (3 hops + control)
+  // 2) temporal_revocation -> access_differential helper (time boundary)
   const cTemp = ctx.chain('c-temp', 'temporal_revocation')
   cTemp.control('ex-primary-denied')
   cTemp.recordHop({ hopId: 'hop_1', target: 'GET /api/me', exchangeIds: ['ex-pre'], claimedDelta: 'Pre-revocation baseline.' })
   cTemp.recordHop({ hopId: 'hop_2', target: 'POST /api/logout', exchangeIds: ['ex-revoke'], claimedDelta: 'Revoked token.' })
   cTemp.recordHop({ hopId: 'hop_3', target: 'GET /api/alt', exchangeIds: ['ex-secondary'], claimedDelta: 'Secondary accepted.' })
-  const rTemp = cTemp.build({ oracleFamily: 'temporal_revocation' })
-  assert.deepEqual(rTemp.terminalImpact.oracleInput, {
+  assert.equal(cTemp.build({ oracleFamily: 'temporal_revocation' }).terminalImpact.oracleInput, undefined)
+  assert.deepEqual(cTemp.build({ ...accessDifferential({ baseline: 'ex-pre', revocation: 'ex-revoke', control: 'ex-primary-denied', variant: 'ex-secondary' }) }).terminalImpact.oracleInput, {
     preRevocationBaselineExchangeId: 'ex-pre',
     revocationEventExchangeId: 'ex-revoke',
     primaryDeniedCheckExchangeId: 'ex-primary-denied',
     secondarySuccessExchangeId: 'ex-secondary',
   })
 
-  // 3) parser_cache_differential (parser_differential vs cache_primed — never mixes conflicting keys)
+  // 3) parser_cache_differential -> wire_framing_and_cache_differential helper (parser vs cache priming never mix)
   const cParser = ctx.chain('c-parser', 'parser_cache_differential')
   cParser.control('ex-clean-ctrl')
   cParser.recordHop({ hopId: 'hop_1', target: 'GET /api/prime', exchangeIds: ['ex-prime'], claimedDelta: 'Primed.' })
   cParser.recordHop({ hopId: 'hop_2', target: 'GET /api/probe', exchangeIds: ['ex-probe'], claimedDelta: 'Probed.' })
   cParser.readback('ex-rb')
-  const rDiff = cParser.build({ oracleFamily: 'parser_cache_differential' })
-  assert.deepEqual(rDiff.terminalImpact.oracleInput, {
+  assert.equal(cParser.build({ oracleFamily: 'parser_cache_differential' }).terminalImpact.oracleInput, undefined)
+  assert.deepEqual(cParser.build({ ...wireFramingAndCacheDifferential({ control: 'ex-clean-ctrl', variant: 'ex-probe', readback: 'ex-rb', property: 'header_normalization', differentialFeature: 'x-forwarded-host' }) }).terminalImpact.oracleInput, {
+    mode: 'parser_differential',
+    differentialKind: 'header_normalization',
+    differentialFeature: 'x-forwarded-host',
+    impactKind: 'mutation',
     cleanControlExchangeId: 'ex-clean-ctrl',
     differentialProbeExchangeId: 'ex-probe',
     postMutationReadbackExchangeId: 'ex-rb',
   })
-  const rCache = cParser.build({ oracleFamily: 'parser_cache_differential', oracleInput: { mode: 'cache_primed', cacheKey: 'k1' } })
-  assert.deepEqual(rCache.terminalImpact.oracleInput, {
+  assert.deepEqual(cParser.build({ ...wireFramingAndCacheDifferential({ control: 'ex-clean-ctrl', prime: 'ex-prime', variant: 'ex-probe', cacheKey: 'k1' }) }).terminalImpact.oracleInput, {
     mode: 'cache_primed',
     cacheKey: 'k1',
     cleanControlExchangeId: 'ex-clean-ctrl',
@@ -387,34 +391,27 @@ test('oracleInput auto-synthesis covers all oracleFamily variants without overri
     attackerProbeExchangeId: 'ex-probe',
   })
 
-  // 4) cross_surface_pivot
+  // 4) cross_surface_pivot -> causal_dag: the chain DAG itself is the evidence; no synthesized pivot oracleInput
   const cPivot = ctx.chain('c-pivot', 'cross_surface_pivot')
   cPivot.control('ex-pivot-ctrl')
   cPivot.recordHop({ hopId: 'hop_1', surface: 'http', target: 'POST /api/trigger', exchangeIds: ['ex-h1'], producedCapabilities: ['cap:hop_1:s1'], claimedDelta: 'Triggered pivot.' })
   cPivot.recordHop({ hopId: 'hop_2', surface: 'storage', target: 'GET /api/blob', exchangeIds: ['ex-h2'], consumedCapabilities: ['cap:hop_1:s1'], claimedDelta: 'Read foreign storage.' })
-  const rPivot = cPivot.build({ oracleFamily: 'cross_surface_pivot' })
-  assert.equal(rPivot.terminalImpact.oracleInput?.preChainControlDenied, 'ex-pivot-ctrl')
-  assert.deepEqual(rPivot.terminalImpact.oracleInput?.hops, [
-    { surface: 'http', role: 'trigger_write', record: 'ex-h1' },
-    { surface: 'storage', role: 'terminal_impact', record: 'ex-h2', bindingKind: 'value_binding' },
-  ])
-  assert.deepEqual(rPivot.terminalImpact.oracleInput?.terminalImpact, { kind: 'privileged_read' })
+  assert.equal(cPivot.build({ oracleFamily: 'cross_surface_pivot' }).terminalImpact.oracleInput, undefined)
+  assert.deepEqual(causalDag(), { primitive: 'causal_dag', oracleInput: {} })
 
-  // 5) dual_tenant_abac: leaves oracleInput undefined when mode omitted (host derives it), fills refs when mode given
+  // 5) dual_tenant_abac: mode-only caller input passes through verbatim; explicit cache-bleed helper names every slot
   const cDual = ctx.chain('c-dual', 'dual_tenant_abac')
   cDual.control('ex-dual-ctrl')
   cDual.recordHop({ hopId: 'hop_1', target: 'GET /api/prime', exchangeIds: ['ex-d1'], claimedDelta: 'Primed.' })
   cDual.recordHop({ hopId: 'hop_2', target: 'GET /api/bled', exchangeIds: ['ex-d2'], claimedDelta: 'Bled.' })
   assert.equal(cDual.build({ oracleFamily: 'dual_tenant_abac' }).terminalImpact.oracleInput, undefined)
-  assert.deepEqual(
-    cDual.build({ oracleFamily: 'dual_tenant_abac', oracleInput: { mode: 'dual_org_cache_bleed' } }).terminalImpact.oracleInput,
-    {
-      mode: 'dual_org_cache_bleed',
-      baselineDeniedControlExchangeId: 'ex-dual-ctrl',
-      primeActionExchangeId: 'ex-d1',
-      bledAccessExchangeId: 'ex-d2',
-    },
-  )
+  assert.deepEqual(cDual.build({ oracleFamily: 'dual_tenant_abac', oracleInput: { mode: 'dual_org_cache_bleed' } }).terminalImpact.oracleInput, { mode: 'dual_org_cache_bleed' })
+  assert.deepEqual(cDual.build({ ...wireFramingAndCacheDifferential({ control: 'ex-dual-ctrl', prime: 'ex-d1', variant: 'ex-d2', dualTenant: true }) }).terminalImpact.oracleInput, {
+    mode: 'dual_org_cache_bleed',
+    baselineDeniedControlExchangeId: 'ex-dual-ctrl',
+    primeActionExchangeId: 'ex-d1',
+    bledAccessExchangeId: 'ex-d2',
+  })
 
   // 6) economic_conservation via oracleFamily (non-race sequential steps)
   const cEconSeq = ctx.chain('c-econ-seq', 'ledger_overcredit')

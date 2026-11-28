@@ -113,13 +113,14 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 
   return <ToastContext.Provider value={api}>
     {children}
-    <div className="pointer-events-none fixed bottom-5 left-1/2 z-[60] flex -translate-x-1/2 flex-col items-center gap-2" role="status" aria-live="polite">
+    <div className="pointer-events-none fixed bottom-5 left-1/2 z-[60] flex -translate-x-1/2 flex-col items-center gap-2" role="status" aria-live="polite" data-testid="toast-region">
       {items.map(t => <div
         key={t.id}
+        data-tone={t.tone ?? 'default'}
         className={cn(
-          'pointer-events-auto relative flex min-w-[280px] max-w-[520px] items-center gap-2.5 overflow-hidden rounded-[9px] py-2 pl-3 pr-3 text-[12.5px] shadow-[0_10px_30px_-10px_rgba(0,0,0,.4)] transition-[opacity,transform] duration-[var(--d2)] ease-kovo',
-          t.tone === 'error' ? 'bg-danger text-white' : 'bg-fg text-panel',
-          t.out ? 'translate-y-2 opacity-0' : 'translate-y-0 opacity-100',
+          'pointer-events-auto relative flex min-w-[280px] max-w-[520px] items-center gap-2.5 overflow-hidden rounded-[9px] py-2 pl-3 pr-3 text-[12.5px] shadow-[0_10px_30px_-10px_rgba(0,0,0,.4)] transition-[opacity,translate] duration-[var(--d2)] ease-kovo starting:translate-y-2 starting:opacity-0 motion-reduce:translate-y-0 motion-reduce:starting:translate-y-0',
+          t.tone === 'error' ? 'bg-danger text-white dark:bg-[color-mix(in_oklch,var(--danger)_80%,black)]' : 'bg-fg text-panel',
+          t.out ? 'translate-y-2 opacity-0 duration-[var(--d1)]' : 'translate-y-0 opacity-100',
         )}
       >
         {t.icon && <span className="flex opacity-80"><Icon name={t.icon} /></span>}
