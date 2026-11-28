@@ -18,7 +18,6 @@ import {
   SPECIALIST_COMMON_TOOLS,
   SPECIALIST_PROFILES,
   buildWorkerTools,
-  coordinatorPlannerPrompt,
   filterHandlersForSpecialist,
   proofToolHandlerNames,
   summarizeKovoVerifyOutcome,
@@ -31,6 +30,7 @@ import { buildAssignmentBrief } from '../src/server/assignment-brief.ts'
 import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'
 import { agentProofAttribution } from '../src/server/exec-verify.ts'
+import { buildWorldGraphSnapshot } from '../src/server/world-graph.ts'
 import type { ResolvedPersona } from '../src/server/persona-vault.ts'
 import {
   buildAgentScriptReceipt,
@@ -741,7 +741,7 @@ test('kovo_verify tool accepts code/source aliases, returns 1-line JSON example 
   assert.match(text3, /stop retrying malformed calls/)
 })
 
-test('planner prompt and worker assignment brief explicitly mark floor-confirmed routes as DO NOT RE-PROVE without 10-item truncation', () => {
+test('World Graph planner snapshot and worker assignment brief mark floor-confirmed routes as DO NOT RE-PROVE without 10-item truncation', () => {
   const confirmed = Array.from({ length: 14 }, (_, i) => ({
     origin: 'http://127.0.0.1:4101',
     method: 'GET',
@@ -750,21 +750,21 @@ test('planner prompt and worker assignment brief explicitly mark floor-confirmed
     probeClass: 'broken-access-control',
   }))
 
-  const plannerJson = JSON.parse(coordinatorPlannerPrompt({
-    goal: 'Test unconfirmed routes',
-    roundNo: 1,
-    capabilityTier: 2,
+  // The World Graph planner input marks every floor-confirmed template confirmed (no 10-item cap)
+  // and ranks the remaining unconfirmed surface first.
+  const snapshot = buildWorldGraphSnapshot({
+    runId: 'run-confirmed-refs',
     approvedOrigins: ['http://127.0.0.1:4101'],
-    budgetRemaining: { usd: 2, requests: 'unlimited' },
-    dynamicStepBudget: 12,
-    pendingOob: 0,
-    chainSteps: [],
-    alreadyConfirmed: confirmed,
-  })) as { alreadyConfirmedByFloor?: { directive: string; items: Array<{ path: string }> } }
-
-  assert.ok(plannerJson.alreadyConfirmedByFloor)
-  assert.match(plannerJson.alreadyConfirmedByFloor.directive, /ALREADY CONFIRMED BY FLOOR — DO NOT RE-PROVE/)
-  assert.equal(plannerJson.alreadyConfirmedByFloor.items.length, 14, 'must not truncate 14 floor hits at 10')
+    endpoints: [
+      ...confirmed.map(ref => ({ origin: ref.origin, method: ref.method, pathTemplate: ref.path })),
+      { origin: 'http://127.0.0.1:4101', method: 'POST', pathTemplate: '/api/v2/unconfirmed-action' },
+    ],
+    exchanges: [],
+    confirmedRefs: confirmed,
+  })
+  const confirmedGroups = snapshot.groups.filter(group => group.confirmed)
+  assert.equal(confirmedGroups.reduce((sum, group) => sum + group.endpointCount, 0), 14, 'must not truncate 14 floor hits at 10')
+  assert.equal(snapshot.groups[0]?.confirmed, false, 'unconfirmed surfaces must lead the planner snapshot')
 
   const brief = JSON.parse(buildAssignmentBrief({
     missionKind: 'class_scan',

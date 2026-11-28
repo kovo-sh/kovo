@@ -10,7 +10,6 @@ import {
   buildConsolidatedExploiterToolset,
   buildExploiterUserPrompt,
 } from '../src/server/exploiter-tools.ts'
-import { synthesizeGreyBoxDataflowGraph } from '../src/server/gb-dataflow-synthesizer.ts'
 import {
   extractSiblingVerbCandidates,
   probeSiblingVerbCandidates,
@@ -25,8 +24,6 @@ import {
 } from './v4-tier-helpers.ts'
 
 const API_ORIGIN = 'https://api.m2r7-lab.example'
-const EDGE_ORIGIN = 'https://edge.m2r7-lab.example'
-const AUTH_ORIGIN = 'https://auth.m2r7-lab.example'
 
 function extractText(res: { output?: Array<{ type: string; text?: string }> }): string {
   return (res.output ?? []).map(p => p.text ?? '').join('\n')
@@ -181,72 +178,6 @@ describe('M2 R7 Fix 1: revoked_stale persona ranking and active low-priv primacy
     assert.equal(userPrompt.revokedStalePersonas?.personas[0]?.revokedStale, true)
     assert.match(userPrompt.revokedStalePersonas?.instruction ?? '', /ONLY for stale-session \/ revocation-bypass checks/i)
     assert.deepEqual(userPrompt.elevatedReferencePersonas?.personas.map(p => p.handle), ['owner_a'])
-  })
-
-  test('gb-dataflow-synthesizer never chooses revoked_or_demoted as basePersona and selects active low-priv personas by rank/config order', () => {
-    const personas = [
-      { handle: 'owner_a', roleLabel: 'owner' },
-      { handle: 'revoked_or_demoted', roleLabel: 'revoked member' },
-      { handle: 'dual_actor', roleLabel: 'memberships=admin:org_a,viewer:org_b' },
-      { handle: 'viewer_z', roleLabel: 'viewer' },
-      { handle: 'member_a', roleLabel: 'member' },
-    ]
-
-    // Picks active non-revoked low-priv persona (viewer_z, configured before member_a)
-    const regularRes = synthesizeGreyBoxDataflowGraph({
-      approvedOrigins: [AUTH_ORIGIN, API_ORIGIN],
-      endpoints: [
-        { id: 'r1', origin: AUTH_ORIGIN, method: 'POST', pathTemplate: '/oauth/invites', riskScore: 80 },
-        { id: 'r2', origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/invites/redeem', riskScore: 85 },
-      ],
-      endpointParams: [
-        { endpointId: 'r2', name: 'invite_token', location: 'body', inferredType: 'string' },
-      ],
-      brokerExchanges: [
-        { origin: AUTH_ORIGIN, method: 'POST', pathAndQuery: '/oauth/invites', status: 201, personaHandle: 'revoked_or_demoted', bodyPreview: JSON.stringify({ invite_token: 'inv_1' }) },
-      ],
-      personas,
-    })
-    assert.ok(regularRes.chains.length >= 1)
-    assert.match(regularRes.chains[0]!.step.hypothesis, /Base persona:\s*viewer_z\b/)
-    assert.doesNotMatch(regularRes.chains[0]!.step.hypothesis, /Base persona:\s*revoked_or_demoted\b/)
-
-    // When only owner_a + revoked_or_demoted exist (no active low-priv), never picks revoked_or_demoted or owner_a
-    const noActiveLowRes = synthesizeGreyBoxDataflowGraph({
-      approvedOrigins: [AUTH_ORIGIN, API_ORIGIN],
-      endpoints: [
-        { id: 'n1', origin: AUTH_ORIGIN, method: 'POST', pathTemplate: '/oauth/invites', riskScore: 80 },
-        { id: 'n2', origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/invites/redeem', riskScore: 85 },
-      ],
-      endpointParams: [
-        { endpointId: 'n2', name: 'invite_token', location: 'body', inferredType: 'string' },
-      ],
-      brokerExchanges: [
-        { origin: AUTH_ORIGIN, method: 'POST', pathAndQuery: '/oauth/invites', status: 201, personaHandle: 'revoked_or_demoted', bodyPreview: JSON.stringify({ invite_token: 'inv_2' }) },
-      ],
-      personas: [
-        { handle: 'owner_a', roleLabel: 'owner' },
-        { handle: 'revoked_or_demoted', roleLabel: 'revoked member' },
-      ],
-    })
-    assert.ok(noActiveLowRes.chains.length >= 1)
-    assert.doesNotMatch(noActiveLowRes.chains[0]!.step.hypothesis, /Base persona:/)
-
-    // Cache chain also skips revoked_or_demoted in favor of active low-priv persona
-    const cacheRes = synthesizeGreyBoxDataflowGraph({
-      approvedOrigins: [API_ORIGIN, EDGE_ORIGIN],
-      endpoints: [
-        { id: 'c1', origin: API_ORIGIN, method: 'POST', pathTemplate: '/v1/cache/prime', riskScore: 80 },
-        { id: 'c2', origin: EDGE_ORIGIN, method: 'GET', pathTemplate: '/v1/cache/:id/export', riskScore: 86 },
-      ],
-      brokerExchanges: [
-        { origin: API_ORIGIN, method: 'POST', pathAndQuery: '/v1/cache/prime', status: 200, personaHandle: 'revoked_or_demoted', bodyPreview: JSON.stringify({ cache_id: 'c_1' }) },
-      ],
-      personas,
-    })
-    assert.ok(cacheRes.chains.length >= 1)
-    assert.match(cacheRes.chains[0]!.step.hypothesis, /Base persona:\s*viewer_z\b/)
-    assert.doesNotMatch(cacheRes.chains[0]!.step.hypothesis, /Base persona:\s*revoked_or_demoted\b/)
   })
 
   test('phase0-sibling-verbs skips revoked_or_demoted and admin, selecting active low-priv persona in configured order', async (t: TestContext) => {

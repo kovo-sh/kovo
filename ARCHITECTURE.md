@@ -163,7 +163,10 @@ pure primitives in `frontier-scheduler.ts`:
 - 2-strike dead-end pruning and negative-edge memoization (target: ≤5% re-probe waste).
 
 Chain hypotheses and route sweeps run **interleaved** within the same wave
-(`chainHypothesisDispatchSteps`, `plannerWaveDispatchCap`). When a specialist reaches its wall-clock
+(`plannerWaveDispatchCap`). Planner rounds read a bounded pure-fact World Graph
+(`collectWorldGraphFromStore`, `serializeWorldGraph`) and take one tool-free planner decision
+(`planWithWorldGraph`, `$0` deterministic floor without model profiles) — the single authoritative
+planner path; typed `ChainHop` artifacts (`extractChainHops`) are mirrored into `CapabilityLedger`. When a specialist reaches its wall-clock
 settlement (`wallClockSettlementMs`, `settlementDue` in `agent-prompts.ts`), the host exports a
 canonical **`v8.hop_checkpoint.v1`** brief (`CapabilityLedger` → `finalizeHopCheckpointBrief`,
 ≤2 KB, opaque handles only, `nextGoal`, `targetHop`). The next assignment is seeded with
@@ -207,13 +210,15 @@ slices only (see `AGENTS.md`).
 | File | LOC | Role | Key symbols |
 |---|---:|---|---|
 | `src/server/execution.ts` | 4363 | Run lifecycle, phase sequencing, budgets, finalize | `Execution`, `execution`, `ExecutionCheckpoint`, `resolvePhaseAFloorWallClockMs`, `settleCodeAuditSuspects`, `promoteSemanticAuditSuspects` |
-| `src/server/exec-dispatch.ts` | 3596 | Scheduling policy, probe selection, frontier wave control | `FrontierWaveController`, `evaluateDispatchStop`, `planMultiTrialExpansion`, `coordinatorSchedulerDecision`, `selectProbeCandidates`, `resolvePhaseRequestBudgets`, `formatHopCheckpointForAssignment`, `chainHypothesisDispatchSteps` |
+| `src/server/exec-dispatch.ts` | 3596 | Scheduling policy, probe selection, frontier wave control | `FrontierWaveController`, `evaluateDispatchStop`, `planMultiTrialExpansion`, `coordinatorSchedulerDecision`, `selectProbeCandidates`, `resolvePhaseRequestBudgets`, `formatHopCheckpointForAssignment` |
 | `src/server/exec-floor-lane.ts` | 1383 | Phase A deterministic floor lane | `ExecFloorLane`, `ExecFloorLaneHost` |
 | `src/server/exec-worker-runner.ts` | 1834 | One specialist assignment: container, tools, brokered transport | `ExecWorkerRunner`, `ExecWorkerHost`, `ExecBrokeredTransportContext` |
 | `src/server/exec-verify.ts` | 2769 | Bridges agent submissions to the proof kernel | `ExecVerifier`, `runAgentScriptProof`, `syncVerifyArtifactsToLedger`, `extractAgentProofTarget` |
 | `src/server/exec-recon-planner.ts` | 3730 | Phase 0 → lane/step planning, hop-checkpoint parsing | — |
 | `src/server/frontier-scheduler.ts` | 725 | Pure beam/EVI/quotas/termination | `selectNextWaveAssignments`, `evaluateWaveProgress`, `DEAD_END_STRIKE_LIMIT` |
-| `src/server/graph-coordinator.ts` | 2087 | Coordinator query surface + chain primitives | `queryEndpoints`, `queryFindings`, `queryProgramGraph`, `ChainHop` |
+| `src/server/graph-coordinator.ts` | 762 | Typed chain hops, dispatch-plan validation, scheduler guard | `extractChainHops`, `dispatchInvestigations`, `decideNext`, `ChainHop` |
+| `src/server/world-graph.ts` | 375 | Read-only bounded World Graph snapshot for the planner | `collectWorldGraphFromStore`, `serializeWorldGraph` |
+| `src/server/llm-planner.ts` | 258 | Single-turn closed-loop planner + `$0` floor | `planWithWorldGraph` |
 | `src/server/agent-session.ts` | 3766 | Host-side model loop + worker tool surface | `runAgentSession`, `buildWorkerTools`, `SpecSubmissionTracker`, `PARALLEL_READ_ONLY_TOOLS` |
 | `src/server/agent-prompts.ts` | 3075 | Turn/wall-clock budgets, settlement, proof-gap vocabulary | `wallClockSettlementMs`, `SPEC_PROOF_GAP_CODES`, `NEGATIVE_EDGE_PROOF_GAP_CODES` |
 
@@ -232,8 +237,9 @@ flowchart TD
   exec-dispatch --> agent-session
   exec-dispatch --> frontier-scheduler
   exec-dispatch --> graph-coordinator
-  graph-coordinator --> frontier-scheduler
-  graph-coordinator --> capability-ledger
+  exec-recon-planner --> world-graph
+  exec-recon-planner --> llm-planner
+  exec-recon-planner --> graph-coordinator
   frontier-scheduler --> capability-ledger
   agent-session --> agent-prompts
   exec-verify --> verify-rpc

@@ -25,7 +25,6 @@ import { settleOrReport, settleOrReportAsync } from './run-disposers.ts'
 import {
   agentTurn,
   classifyHostTier,
-  coordinatorPlannerPrompt,
   coordinatorPrompt,
   detLeadsFromParentFacts,
   routeStepToSpecialist,
@@ -48,11 +47,10 @@ import {
   type PublicObservation,
 } from './broker.ts'
 import { CapabilityLedger, DERIVED_CAPABILITY_HANDLE_RE, computeArtifactDigest, finalizeHopCheckpointBrief, formatDerivedCapabilityHandle, sanitizeCheckpointHandleRef, sanitizeCheckpointText, type AddCapabilityInput, type CapabilityKind, type CapabilitySurface, type HopCheckpointBrief, type HopWorkflowNotebook } from './capability-ledger.ts'
-import { buildHopRuntimeObservationIndex, hasAgenticSealedCapabilities, inspectChainHopRuntimeObservation, materializeCapabilityConsumerFrontierSteps, type FrontierLlmMode } from './capability-consumer-frontier.ts'
 import { extractCoverageEvidenceMetadata, normalizeOriginForCoverage } from './coverage-category.ts'
 import { extractSpecDedupeFields, normalizeEndpointTemplate } from './dedupe.ts'
 import { normalizeRouteTemplate } from './route-template.ts'
-import { buildWave1UncoveredOriginFallbackSteps, canonicalPlannerDedupeFamily, classifyRepoDirTier, materializeGreyBoxDataflowWave1Steps, resolveWave1MultiOriginFallback, selectBalancedRepoSourceCandidates } from './exec-recon-multiorigin.ts'
+import { buildWave1UncoveredOriginFallbackSteps, canonicalPlannerDedupeFamily, classifyRepoDirTier, resolveWave1MultiOriginFallback, selectBalancedRepoSourceCandidates } from './exec-recon-multiorigin.ts'
 import { meetsBaseline, type EvidenceReview } from './evidence-checks.ts'
 import {
   CHAIN_CONTINUATION_SKILL_PREFIX,
@@ -69,11 +67,8 @@ import {
   TIER_A_STEP_PRIORITY,
   WHITEBOX_BLACKBOX_CAP_PRIORITY,
   WHITEBOX_TIER_A_MAX_SEEDED_STEPS,
-  addFunnelCounts,
   applyCrownJewelStepBudget,
   buildBolaTestQueue,
-  chainHopFactPayload,
-  chainHypothesisDispatchSteps,
   classifyHostHeuristic,
   collectAllPages,
   compactChainTitle,
@@ -81,7 +76,6 @@ import {
   computeDynamicStepBudget,
   computeHostTiers,
   confirmedCategoryFamily,
-  coordinatorPlannerHandlers,
   coordinatorSchedulerDecision,
   detLeadCategory,
   detLeadEvidenceGate,
@@ -116,7 +110,6 @@ import {
   stripJsonFences,
   structuredCoverageKey,
   structuredCoverageRouteMethodKey,
-  synthesizeRuntimeCompositeWave1Steps,
   templatesMentionedInText,
   threatModelResponseSchema,
   type BolaTestQueueItem,
@@ -128,7 +121,6 @@ import {
   type QuarantineObservedExchange,
   type QuarantinedOriginRecord,
   type ReinvestigationGuard,
-  type RuntimeCompositeApiDependencyInput,
   type StructuredStepTarget,
 } from './exec-dispatch.ts'
 import {
@@ -146,33 +138,26 @@ import {
   type VerifiedHopReceiptEvent,
 } from './frontier-scheduler.ts'
 import {
-  createGraphCoordinator,
+  dispatchInvestigations,
+  extractChainHops,
   formatChainHopsBrief,
+  isPendingOobFinding,
   type ChainHop,
-  type CoordinatorApiDependency,
-  type CoordinatorDeps,
   type CoordinatorEndpoint,
-  type CoordinatorProgramGraph,
+  type CoordinatorFinding,
   type DispatchPlan,
-  type GraphCoordinator,
 } from './graph-coordinator.ts'
 import {
-  buildRuntimeDiscoveryInput,
   classifySurface,
-  extractRuntimeCatalogFromFacts,
-  inferRuntimeInvariantHypotheses,
-  synthesizePostFloorRuntimeInvariants,
   toCapabilityLedgerSeeds,
   type CapabilitySeedRecord,
   type InvariantHypothesis,
-  type RuntimeApiDependency,
-  type RuntimeDiscoveryInput,
   type SourceFileInput,
   type SynthesizeInvariantsResult,
   type SynthesizerMode,
 } from './invariant-synthesizer.ts'
 import type { LabRunner, LabTargetHandle } from './lab-runner.ts'
-import { decidePlannerAnswer, planWithWorldGraph, type LlmPlannerDecision } from './llm-planner.ts'
+import { planWithWorldGraph, type LlmPlannerDecision } from './llm-planner.ts'
 import {
   privateModelProfiles,
   resolveProfilePoolForRole,
@@ -210,7 +195,7 @@ import { runVariantSweepForFinding } from './semantic-audit.ts'
 import type { StaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
 import type { Assignment, ChainStep, Fact, Run, Store } from './store.ts'
 import { extractProgramGraphInWorker, synthesizeInvariantsInWorker } from './untrusted-compute-pool.ts'
-import { collectWorldGraphFromStore, serializeWorldGraph } from './world-graph.ts'
+import { collectWorldGraphFromStore, serializeWorldGraph, type WorldGraphProgramGraphInput } from './world-graph.ts'
 
 type Active = ExecActiveJob
 type Capture = ExecCapture
@@ -754,7 +739,6 @@ export interface SeedCapabilityLedgerInvariantsOptions {
   reposDir?: string
   mountedRepos?: readonly string[]
   specs?: ReturnType<Store['listProjectSpecsFull']>
-  runtime?: Omit<RuntimeDiscoveryInput, 'mode'>
   approvedOrigins?: ReadonlySet<string>
   maxHypotheses?: number
   /** Promote high-signal cross-surface / cross-service / lifecycle hypotheses into Wave 1 `chain` steps (default true when tier > 0). */
@@ -1885,10 +1869,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   private get frontierControllers() { return this.runState.mapView('frontierController') }
   private get invariantsSeededRuns() { return this.runState.setView('invariantsSeeded') }
   private get wave1InvariantChainsPromoted() { return this.runState.setView('wave1InvariantChainsPromoted') }
-  private get seededHypothesisIdsByRun() { return this.runState.mapView('seededHypothesisIds') }
-  private get runtimeSynthesisWatermark() { return this.runState.mapView('runtimeSynthesisWatermark') }
-  private get postFloorInvariantsSyncedRuns() { return this.runState.setView('postFloorInvariantsSynced') }
-  private get runtimeCompositeSeededRuns() { return this.runState.setView('runtimeCompositeSeeded') }
   private get emittedSealedHandleSets() { return this.runState.prefixedMapView<Set<string>, 'emittedSealedHandleSets'>('emittedSealedHandleSets', ':') }
   private get plannerSeenCausalEdges() { return this.runState.mapView('plannerSeenCausalEdges') }
   private get quarantinedOriginsByRun() { return this.runState.mapView('quarantinedOrigins') }
@@ -1985,10 +1965,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       state.frontierDispatcher = undefined
       state.invariantsSeeded = false
       state.wave1InvariantChainsPromoted = false
-      state.seededHypothesisIds = undefined
-      state.runtimeSynthesisWatermark = undefined
-      state.postFloorInvariantsSynced = false
-      state.runtimeCompositeSeeded = false
       state.plannerSeenCausalEdges = undefined
       state.quarantinedOrigins = undefined
       state.repoOriginMappings = undefined
@@ -2703,8 +2679,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       )
     }
 
-    const runtimeInput: Omit<RuntimeDiscoveryInput, 'mode'> =
-      options.runtime ?? this.collectRuntimeDiscoveryInput(run, approvedOrigins, specs)
     const { repoOriginMappings, resolvedServiceOrigins } = this.resolveInvariantOriginMappings(run, {
       approvedOrigins,
       mountedRepos,
@@ -2727,7 +2701,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         serviceOrigins: resolvedServiceOrigins.length ? resolvedServiceOrigins : options.serviceOrigins,
         compose,
         ingress,
-        runtime: runtimeInput,
         totalRunBudgetUsd: run.budgetUsd,
         maxHypotheses: options.maxHypotheses ?? 64,
       }, { signal: options.signal })
@@ -2744,7 +2717,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       sourceFiles,
       compose,
       ingress,
-      runtime: runtimeInput,
       precomputedSynthesis,
       precomputedRepoOriginMappings: repoOriginMappings,
     })
@@ -2834,8 +2806,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   /**
    * Pure in-memory / SQLite finalization for `seedCapabilityLedgerInvariants` (zero filesystem
    * I/O, zero synchronous `ProgramGraph` extraction or white-box `synthesizeInvariants`). Shared
-   * by async white-box worker seeding and the synchronous grey-box/black-box fast path in
-   * `ensureWave1InvariantChainSteps`.
+   * by async white-box worker seeding and the synchronous no-source fast path in
+   * `ensureWave1InvariantChainSteps` (which seeds nothing without a ProgramGraph).
    */
   private finalizeCapabilityLedgerInvariants(
     run: Run,
@@ -2850,12 +2822,10 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       precomputedRepoOriginMappings?: readonly RepoOriginAffinityMapping[]
     },
   ): SeedCapabilityLedgerInvariantsResult {
-    const { approvedOrigins, specs, mode, graph } = input
+    const { approvedOrigins, mode, graph } = input
     // Never silently default unmapped multi-origin seeds to approvedList[0].
     const defaultOrigin = approvedOrigins.size === 1 ? ([...approvedOrigins][0] ?? 'unknown') : 'unmapped'
 
-    // Build grey-box / black-box runtime parity input from persisted endpoints, specs, and exchanges.
-    const runtimeInput: Omit<RuntimeDiscoveryInput, 'mode'> = input.runtime ?? this.collectRuntimeDiscoveryInput(run, approvedOrigins, specs)
     const mountedRepos = input.mountedRepos ?? this.host.projectReposMount(run.projectId).mountedRepos
     const repoOriginMappings = input.precomputedRepoOriginMappings
       ?? this.resolveInvariantOriginMappings(run, {
@@ -2868,22 +2838,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         ingress: input.ingress,
       }).repoOriginMappings
 
-    let synthesis: SynthesizeInvariantsResult
-    if (input.precomputedSynthesis) {
-      synthesis = input.precomputedSynthesis
-    } else {
-      const parity = inferRuntimeInvariantHypotheses({
-        mode: mode === 'black-box' ? 'black-box' : 'grey-box',
-        ...runtimeInput,
-        maxHypotheses: input.maxHypotheses ?? 64,
-      })
-      synthesis = {
-        mode: parity.mode,
-        runtimeParity: parity,
-        hypotheses: parity.hypotheses,
-        capabilitySeeds: toCapabilityLedgerSeeds(parity.hypotheses),
-      }
-    }
+    // Only worker-isolated white-box synthesis yields hypotheses; no-source runs plan from the World Graph.
+    const synthesis: SynthesizeInvariantsResult = input.precomputedSynthesis ?? { mode, hypotheses: [], capabilitySeeds: [] }
 
     const seeds = synthesis.capabilitySeeds.length > 0
       ? synthesis.capabilitySeeds
@@ -2908,12 +2864,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       }
     }
     this.invariantsSeededRuns.add(run.id)
-    const seededIds = this.seededHypothesisIdsByRun.get(run.id) ?? new Set<string>()
-    for (const h of synthesis.hypotheses) seededIds.add(h.id)
-    this.seededHypothesisIdsByRun.set(run.id, seededIds)
-    if (!input.runtime) {
-      this.runtimeSynthesisWatermark.set(run.id, this.computeRuntimeSynthesisWatermark(run.id))
-    }
 
     const shouldPromote = input.promoteWave1Chains !== false && run.capabilityTier > 0
     const wave1ChainStepIds = shouldPromote
@@ -2941,7 +2891,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           guardAsymmetries: synthesis.guardMatrix?.hypotheses.length ?? 0,
           trustBoundaries: synthesis.trustBoundaries?.hypotheses.length ?? 0,
           lifecycleSlices: synthesis.lifecycleSlices?.slices.length ?? 0,
-          runtimeHypotheses: synthesis.runtimeParity?.hypotheses.length ?? 0,
         },
       )
     } catch { /* telemetry is best-effort */ }
@@ -2966,7 +2915,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     options: {
       approvedOrigins: ReadonlySet<string>
       promoteWave1Chains?: boolean
-      postFloor?: boolean
     },
   ): void {
     if (this.invariantsSeededRuns.has(run.id) || this.invariantsSeedingInFlight.has(run.id)) return
@@ -2979,7 +2927,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           promoteWave1Chains: options.promoteWave1Chains ?? true,
           signal,
         })
-        if (options.postFloor) this.postFloorInvariantsSyncedRuns.add(run.id)
       } catch {
         // Additive Layer-2 synthesis must never crash background dispatch ticks.
       } finally {
@@ -3404,355 +3351,52 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   }
 
   /**
-   * Ensure Wave-1 invariant chain steps are promoted before Phase B's first dispatch tick, and
-   * incrementally synthesize new grey-box/runtime invariants & Wave-1 composites after Phase A
-   * floor settles without letting pre-floor runs suppress post-floor differentials.
+   * Ensure white-box Wave-1 invariant chain steps are promoted before Phase B's first dispatch
+   * tick. Mounted repos seed asynchronously off the host event loop; runs without source mark the
+   * run seeded with an empty synthesis (the World Graph planner owns no-source planning).
    */
-  ensureWave1InvariantChainSteps(
-    run: Run,
-    approvedOrigins: ReadonlySet<string>,
-    options: { postFloor?: boolean } = {},
-  ): number {
-    if (run.capabilityTier <= 0) return 0
-    const sourceMounted = this.host.projectReposMount(run.projectId).mountedRepos.length > 0
-    if (!this.invariantsSeededRuns.has(run.id)) {
-      if (sourceMounted) {
-        // White-box mounted repo: never run synchronous disk walk or ProgramGraph extraction on the host event loop.
-        this.scheduleAsyncInvariantSeeding(run, {
-          approvedOrigins,
-          promoteWave1Chains: true,
-          postFloor: options.postFloor,
-        })
-        return 0
-      }
-      // Grey-box / black-box (no mounted repo): pure in-memory/SQLite runtime parity (zero fs, zero ProgramGraph).
-      const specs = this.storage.listProjectSpecsFull(run.projectId)
-      const hasGreyBoxContext = run.approvedPersonaIds.length > 0 || specs.length > 0
-      const res = this.finalizeCapabilityLedgerInvariants(run, {
-        approvedOrigins,
-        specs,
-        mode: hasGreyBoxContext ? 'grey-box' : 'black-box',
-        sourceFiles: [],
-        promoteWave1Chains: true,
-      })
-      const compositeCount = this.promoteRuntimeCompositeWave1Steps(run, approvedOrigins)
-      if (options.postFloor) this.postFloorInvariantsSyncedRuns.add(run.id)
-      return res.wave1ChainStepsCreated + compositeCount
+  ensureWave1InvariantChainSteps(run: Run, approvedOrigins: ReadonlySet<string>): number {
+    if (run.capabilityTier <= 0 || this.invariantsSeededRuns.has(run.id)) return 0
+    if (this.host.projectReposMount(run.projectId).mountedRepos.length > 0) {
+      // White-box mounted repo: never run synchronous disk walk or ProgramGraph extraction on the host event loop.
+      this.scheduleAsyncInvariantSeeding(run, { approvedOrigins, promoteWave1Chains: true })
+      return 0
     }
-    return this.syncPostFloorRuntimeInvariants(run, approvedOrigins, {
-      sourceMounted,
-      postFloor: options.postFloor,
-    }).wave1StepsCreated
-  }
-
-  private computeRuntimeSynthesisWatermark(runId: string): string {
-    const countOf = (table: 'endpoints' | 'facts' | 'broker_exchanges' | 'api_dependencies'): number => {
-      try {
-        const row = this.storage.client.prepare(`SELECT COUNT(*) AS cnt FROM ${table} WHERE run_id = ?`).get(runId) as { cnt?: number } | undefined
-        return Number(row?.cnt ?? 0)
-      } catch {
-        return 0
-      }
-    }
-    let graphDeps = 0
-    try { graphDeps = this.host.endpointGraphCatalog(runId).apiDependencies.length } catch { /* ignore */ }
-    return `${countOf('endpoints')}|${countOf('facts')}|${countOf('broker_exchanges')}|${countOf('api_dependencies')}|${graphDeps}`
-  }
-
-  private collectRuntimeDiscoveryBundle(
-    run: Run,
-    approvedOrigins: ReadonlySet<string>,
-    specs: ReturnType<Store['listProjectSpecsFull']>,
-  ) {
-    const endpoints = this.storage.listEndpoints(run.id, { limit: 200 })
-      .filter(ep => approvedOrigins.size === 0 || approvedOrigins.has(ep.origin))
-    const originByRouteKey = new Map<string, string>()
-    for (const ep of endpoints) {
-      const routeKey = `${ep.method.toUpperCase()} ${ep.pathTemplate}`
-      if (!originByRouteKey.has(routeKey)) originByRouteKey.set(routeKey, ep.origin)
-    }
-    const facts = this.pageAll((offset, limit) =>
-      this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
-      .filter(fact => approvedOrigins.size === 0 || approvedOrigins.has(fact.origin))
-    const { catalogFacts, allApiDeps, extraApiDeps } = this.mergeGraphApiDependencies(run.id, approvedOrigins, originByRouteKey, facts)
-
-    let brokerExchanges: Array<{
-      origin: string; method: string; pathAndQuery: string; status: number
-      personaHandle: string | null; respHeadersJson: string | null
-    }> = []
-    try {
-      const rows = this.storage.client.prepare(`
-        SELECT origin, method, path_and_query AS pathAndQuery, status, persona_handle AS personaHandle, resp_headers AS respHeadersJson
-        FROM broker_exchanges
-        WHERE run_id = ?
-        ORDER BY created_at DESC
-        LIMIT 120
-      `).all(run.id) as typeof brokerExchanges
-      brokerExchanges = rows.filter(row => approvedOrigins.size === 0 || approvedOrigins.has(row.origin))
-    } catch { /* best-effort runtime observation scan */ }
-
-    return { endpoints, facts, catalogFacts, allApiDeps, extraApiDeps, brokerExchanges, specs }
-  }
-
-  private collectRuntimeDiscoveryInput(
-    run: Run,
-    approvedOrigins: ReadonlySet<string>,
-    specs: ReturnType<Store['listProjectSpecsFull']>,
-  ): Omit<RuntimeDiscoveryInput, 'mode'> {
-    const bundle = this.collectRuntimeDiscoveryBundle(run, approvedOrigins, specs)
-    return buildRuntimeDiscoveryInput({
-      approvedOrigins,
-      endpoints: bundle.endpoints,
-      specs: bundle.specs,
-      facts: bundle.facts,
-      brokerExchanges: bundle.brokerExchanges,
-      apiDependencies: bundle.extraApiDeps,
-    })
-  }
-
-  private promoteRuntimeCompositeWave1Steps(
-    run: Run,
-    approvedOrigins: ReadonlySet<string>,
-    bundle?: ReturnType<ExecReconPlanner['collectRuntimeDiscoveryBundle']>,
-  ): number {
-    if (run.capabilityTier <= 0) return 0
-    const activeOrigins = this.activeApprovedOrigins(run, approvedOrigins)
-    if (!activeOrigins.size) return 0
-    const specs = bundle?.specs ?? this.storage.listProjectSpecsFull(run.projectId)
-    const resolvedBundle = bundle ?? this.collectRuntimeDiscoveryBundle(run, activeOrigins, specs)
-    const approvedAssets = run.candidates.filter(c => activeOrigins.has(c.origin) && run.approved.includes(c.id))
-    const hostTiers = computeHostTiers([...activeOrigins], approvedAssets.map(classifyHostHeuristic))
-    const apiDependencies: RuntimeCompositeApiDependencyInput[] = resolvedBundle.allApiDeps
-      .filter(d => (!d.producerOrigin || activeOrigins.has(d.producerOrigin)) && (!d.consumerOrigin || activeOrigins.has(d.consumerOrigin)))
-      .map(d => ({
-        producer: d.producer,
-        consumer: d.consumer,
-        resourceKey: d.resourceKey,
-        ...(d.producerOrigin ? { producerOrigin: d.producerOrigin } : {}),
-        ...(d.consumerOrigin ? { consumerOrigin: d.consumerOrigin } : {}),
-        ...(d.personaHandle !== undefined ? { personaHandle: d.personaHandle } : {}),
-      }))
-    const frontierController = this.frontierControllerFor(run.id)
-    const compositeCreated = synthesizeRuntimeCompositeWave1Steps(this.storage, run, {
-      sourceMounted: false,
-      facts: resolvedBundle.facts.filter(f => activeOrigins.has(f.origin)),
-      endpoints: resolvedBundle.endpoints.filter(ep => activeOrigins.has(ep.origin)),
-      apiDependencies, specs: resolvedBundle.specs, hostTiers, frontierController,
-    })
-    const dataflowCreated = materializeGreyBoxDataflowWave1Steps(this.storage, run, {
-      activeOrigins, sourceMounted: false, maxSteps: 6, llmMode: privateModelProfiles(this.storage).length > 0 ? 'agentic' : 'deterministic-no-llm', routeStep: routeStepToSpecialist,
-    })
-    const created = [...dataflowCreated, ...compositeCreated]
-    for (const step of created) {
-      const origin = step.sourceOrigins[0] ?? [...approvedOrigins][0] ?? ''
-      const depEndpoint = resolvedBundle.endpoints.find(ep => step.sourceOrigins.includes(ep.origin) && step.hypothesis.includes(ep.pathTemplate))
-      if (origin) {
-        this.registerStepTargets(run.id, step.id, [{
-          origin: depEndpoint?.origin ?? origin,
-          method: depEndpoint?.method?.toUpperCase() ?? 'ANY',
-          route: depEndpoint?.pathTemplate ?? '/',
-          vulnClass: step.category,
-        }])
-      }
-    }
-    this.runtimeCompositeSeededRuns.add(run.id)
-    return created.length
-  }
-
-  /**
-   * Incrementally run `synthesizePostFloorRuntimeInvariants` + `synthesizeRuntimeCompositeWave1Steps`
-   * after Phase A floor settles or whenever new runtime facts/exchanges/dependencies arrive.
-   */
-  syncPostFloorRuntimeInvariants(
-    run: Run,
-    approvedOrigins: ReadonlySet<string>,
-    options: { sourceMounted?: boolean; postFloor?: boolean } = {},
-  ): { seededCount: number; wave1StepsCreated: number } {
-    if (run.capabilityTier <= 0) return { seededCount: 0, wave1StepsCreated: 0 }
-    const sourceMounted = options.sourceMounted ?? this.host.projectReposMount(run.projectId).mountedRepos.length > 0
-    const watermark = this.computeRuntimeSynthesisWatermark(run.id)
-    const forcePostFloor = Boolean(options.postFloor) && !this.postFloorInvariantsSyncedRuns.has(run.id)
-    const needsComposite = !sourceMounted && !this.runtimeCompositeSeededRuns.has(run.id)
-    if (!forcePostFloor && !needsComposite && this.runtimeSynthesisWatermark.get(run.id) === watermark) {
-      return { seededCount: 0, wave1StepsCreated: 0 }
-    }
-
     const specs = this.storage.listProjectSpecsFull(run.projectId)
-    const bundle = this.collectRuntimeDiscoveryBundle(run, approvedOrigins, specs)
-    const ledger = this.storage.capabilityLedger(run.id)
-    const existingHypIds = new Set<string>(this.seededHypothesisIdsByRun.get(run.id) ?? [])
-    for (const node of ledger.listCapabilities()) {
-      const hypId = node.metadata?.hypothesisId
-      if (typeof hypId === 'string' && hypId) existingHypIds.add(hypId)
-    }
-    for (const step of this.storage.listChainSteps(run.id, run.goalRevision)) {
-      const m = /\[inv_hyp=([^\]]+)\]/.exec(step.hypothesis)
-      if (m?.[1]) existingHypIds.add(m[1])
-    }
-
-    const mode: 'grey-box' | 'black-box' = run.approvedPersonaIds.length > 0 || specs.length > 0 ? 'grey-box' : 'black-box'
-    const res = synthesizePostFloorRuntimeInvariants({
-      mode,
+    const hasGreyBoxContext = run.approvedPersonaIds.length > 0 || specs.length > 0
+    return this.finalizeCapabilityLedgerInvariants(run, {
       approvedOrigins,
-      endpoints: bundle.endpoints,
-      specs: bundle.specs,
-      facts: bundle.facts,
-      brokerExchanges: bundle.brokerExchanges,
-      apiDependencies: bundle.extraApiDeps,
-      existingHypothesisIds: existingHypIds,
-      maxHypotheses: 64,
-    })
-
-    const defaultOrigin = approvedOrigins.size === 1 ? ([...approvedOrigins][0] ?? 'unknown') : 'unmapped'
-    const capIdByHypothesisId = new Map<string, string>()
-    let seededCount = 0
-    for (const seed of res.capabilitySeeds) {
-      const input = seedRecordToLedgerInput(seed, defaultOrigin)
-      capIdByHypothesisId.set(seed.metadata.hypothesisId, input.capId)
-      if (ledger.getCapability(input.capId)) continue
-      try {
-        ledger.addCapability(input)
-        seededCount += 1
-      } catch { /* fail-closed ledger validation */ }
-    }
-    for (const hyp of res.hypotheses) existingHypIds.add(hyp.id)
-    this.seededHypothesisIdsByRun.set(run.id, existingHypIds)
-
-    let wave1InvariantCreated = 0
-    if (res.newHypotheses.length > 0) {
-      const createdIds = this.promoteInvariantHypothesesToWave1ChainSteps(run, {
-        mode: res.mode,
-        runtimeParity: res.runtimeParity,
-        hypotheses: res.newHypotheses,
-        capabilitySeeds: res.capabilitySeeds,
-      }, {
-        approvedOrigins,
-        capIdByHypothesisId,
-        maxSteps: 6,
-      })
-      wave1InvariantCreated = createdIds.length
-    }
-
-    let compositeCreated = 0
-    if (!sourceMounted) {
-      compositeCreated = this.promoteRuntimeCompositeWave1Steps(run, approvedOrigins, bundle)
-    }
-
-    this.runtimeSynthesisWatermark.set(run.id, watermark)
-    if (options.postFloor) this.postFloorInvariantsSyncedRuns.add(run.id)
-    const wave1StepsCreated = wave1InvariantCreated + compositeCreated
-    if (seededCount > 0 || wave1StepsCreated > 0) {
-      try {
-        this.storage.event(
-          run.id,
-          'invariants.post_floor_synthesized',
-          `Post-floor synthesis (${mode}) added ${seededCount} new capability seed(s) and ${wave1StepsCreated} Wave-1 chain step(s).`,
-          {
-            mode,
-            newHypotheses: res.newHypotheses.length,
-            seededCount,
-            wave1InvariantCreated,
-            compositeCreated,
-          },
-        )
-      } catch { /* telemetry is best-effort */ }
-    }
-    return { seededCount, wave1StepsCreated }
-  }
-
-  private collectCoordinatorApiDependencies(run: Run): CoordinatorApiDependency[] {
-    const approvedOrigins = this.host.approvedOriginsSet(run)
-    const endpoints = this.storage.listEndpoints(run.id, { limit: 200 })
-      .filter(ep => approvedOrigins.size === 0 || approvedOrigins.has(ep.origin))
-    const originByRouteKey = new Map<string, string>()
-    for (const ep of endpoints) {
-      const key = `${ep.method.toUpperCase()} ${ep.pathTemplate}`
-      if (!originByRouteKey.has(key)) originByRouteKey.set(key, ep.origin)
-    }
-    const facts = this.pageAll((offset, limit) =>
-      this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
-      .filter(fact => approvedOrigins.size === 0 || approvedOrigins.has(fact.origin))
-    return this.mergeGraphApiDependencies(run.id, approvedOrigins, originByRouteKey, facts).allApiDeps
-  }
-
-  private mergeGraphApiDependencies(
-    runId: string,
-    approvedOrigins: ReadonlySet<string>,
-    originByRouteKey: ReadonlyMap<string, string>,
-    facts: readonly Fact[],
-  ): { catalogFacts: ReturnType<typeof extractRuntimeCatalogFromFacts>; allApiDeps: RuntimeApiDependency[]; extraApiDeps: RuntimeApiDependency[] } {
-    const catalogFacts = extractRuntimeCatalogFromFacts(facts, approvedOrigins)
-    const seenDeps = new Set<string>()
-    const allApiDeps: RuntimeApiDependency[] = []
-    const extraApiDeps: RuntimeApiDependency[] = []
-    const depKey = (d: Pick<RuntimeApiDependency, 'producer' | 'consumer' | 'resourceKey' | 'producerOrigin' | 'consumerOrigin'>) =>
-      `${d.producerOrigin ?? ''}|${d.producer}|${d.consumerOrigin ?? ''}|${d.consumer}|${d.resourceKey}`
-
-    for (const d of catalogFacts.apiDependencies) {
-      const key = depKey(d)
-      if (seenDeps.has(key)) continue
-      seenDeps.add(key)
-      allApiDeps.push(d)
-    }
-
-    let rawGraphDeps: unknown[] = []
-    try { rawGraphDeps = this.host.endpointGraphCatalog(runId).apiDependencies } catch { /* ignore */ }
-    for (const raw of rawGraphDeps) {
-      if (!raw || typeof raw !== 'object') continue
-      const d = raw as Partial<RuntimeApiDependency>
-      if (typeof d.producer !== 'string' || typeof d.consumer !== 'string' || typeof d.resourceKey !== 'string') continue
-      const producerOrigin = d.producerOrigin ?? originByRouteKey.get(d.producer)
-      const consumerOrigin = d.consumerOrigin ?? originByRouteKey.get(d.consumer)
-      if (approvedOrigins.size > 0 && ((producerOrigin && !approvedOrigins.has(producerOrigin)) || (consumerOrigin && !approvedOrigins.has(consumerOrigin)))) {
-        continue
-      }
-      const normalized: RuntimeApiDependency = {
-        producer: d.producer,
-        consumer: d.consumer,
-        resourceKey: d.resourceKey,
-        ...(producerOrigin ? { producerOrigin } : {}),
-        ...(consumerOrigin ? { consumerOrigin } : {}),
-        ...(d.personaHandle !== undefined ? { personaHandle: d.personaHandle } : {}),
-        ...(Array.isArray(d.observedTransitions) ? { observedTransitions: d.observedTransitions } : {}),
-        ...(typeof d.testedBola === 'boolean' ? { testedBola: d.testedBola } : {}),
-      }
-      const key = depKey(normalized)
-      if (seenDeps.has(key)) continue
-      seenDeps.add(key)
-      allApiDeps.push(normalized)
-      extraApiDeps.push(normalized)
-    }
-    return { catalogFacts, allApiDeps, extraApiDeps }
+      specs,
+      mode: hasGreyBoxContext ? 'grey-box' : 'black-box',
+      sourceFiles: [],
+      promoteWave1Chains: true,
+    }).wave1ChainStepsCreated
   }
 
   /** Sync extracted typed ChainHops into CapabilityLedger as quarantined capability_only nodes. */
-  private syncChainHopsToLedger(run: Run, ledger: CapabilityLedger, hops: readonly ChainHop[], llmMode: FrontierLlmMode, existingFacts?: readonly Fact[]): void {
-    const obsIndex = buildHopRuntimeObservationIndex(this.storage, run.id, llmMode, existingFacts)
+  private syncChainHopsToLedger(ledger: CapabilityLedger, hops: readonly ChainHop[]): void {
     for (const hop of hops.slice(0, 32)) {
       const slot = hop.hopId.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[^A-Za-z0-9]+/, '').slice(0, 56) || 'hop'
       const capId = formatDerivedCapabilityHandle(`r${hop.roundNo}`, slot)
       if (ledger.getCapability(capId)) continue
-      const obs = inspectChainHopRuntimeObservation(hop, llmMode, obsIndex)
+      // Opaque `secret:<factId>`-style hop refs never trip raw-secret metadata guards.
+      const safeHopId = sanitizeCheckpointText(hop.hopId.replace(/(?:^|:)(?:secret|jwt|token|key|password|passwd|credential):/gi, ':ref_'), 120)
       const surface: CapabilitySurface = hop.artifactKind === 'stored_write_handle' ? 'browser'
         : hop.artifactKind === 'ssrf_redirect_target' ? 'webhook'
         : hop.artifactKind === 'workflow_state_handle' ? 'async_job'
         : classifySurface(hop.endpoint ?? '/', hop.method ?? 'GET')
       try {
         ledger.addCapability({
-          capId,
-          kind: obs.kindOverride ?? hopKindToCapabilityKind(hop.artifactKind), promotionStatus: 'capability_only',
-          provenance: hop.verified ? 'derived_hop' : 'runtime_discovery',
-          tenantScope: obs.runtimeObserved ? 'runtime_observed' : 'unscoped_hypothesis',
+          capId, kind: hopKindToCapabilityKind(hop.artifactKind), promotionStatus: 'capability_only',
+          provenance: hop.verified ? 'derived_hop' : 'runtime_discovery', tenantScope: 'unscoped_hypothesis',
           actorPersona: hop.persona ?? 'attacker', serviceOrigin: hop.origin, surface,
-          parentHopReceiptIds: hop.verified ? [obs.safeHopId] : [],
+          parentHopReceiptIds: hop.verified ? [safeHopId] : [],
           artifactDigest: computeArtifactDigest(`${hop.hopId}|${hop.origin}|${hop.artifactRef}`),
           artifactSummary: sanitizeCheckpointText(hop.summary, 220),
           metadata: {
-            hopId: obs.safeHopId, roundNo: hop.roundNo, ...(obs.runtimeObserved ? { runtimeObserved: true } : {}),
-            ...(obs.exchangeId ? { exchangeId: obs.exchangeId } : {}),
+            hopId: safeHopId, roundNo: hop.roundNo,
             ...(hop.endpoint ? { endpoint: hop.endpoint } : {}), ...(hop.method ? { method: hop.method } : {}),
             ...(hop.factIds[0] ? { factId: hop.factIds[0] } : {}),
-            ...(obs.fieldName ? { fieldName: obs.fieldName } : {}), ...(obs.secretKind ? { secretKind: obs.secretKind } : {}), ...(obs.label ? { label: obs.label } : {}),
           },
         })
       } catch { /* ignore invalid/duplicate/secret-rejected hop mirrors */ }
@@ -4474,7 +4118,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         classifyTier: classifyHostTier,
         storage: this.storage,
         run: freshRun,
-        activeOrigins,
       })
       seededSteps = fallbackResult.seededSteps
       const uncoveredFallbackSlots = fallbackResult.uncoveredAddedCount
@@ -5680,15 +5323,14 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   }
 
 
-  // --- v6 Phase 4: tool-equipped Graph Coordinator planner ---
+  // --- Planner read projections (World Graph program-graph view + coordinator findings) ---
 
   /**
-   * Lossless Program Graph view assembled from persisted endpoint code locations and sink tags.
-   * The full AST graph is not persisted, but every AST-derived route keeps its `codeLocation`, so
-   * sink paths and middleware diffs remain queryable without the old snapshot.
+   * World Graph program-graph view assembled from persisted endpoint code locations and sink tags.
+   * The full AST graph is not persisted, but every AST-derived route keeps its `codeLocation`.
    */
-  coordinatorProgramGraph(endpoints: readonly CoordinatorEndpoint[]): CoordinatorProgramGraph | null {
-    const routes: CoordinatorProgramGraph['routes'][number][] = []
+  coordinatorProgramGraph(endpoints: readonly CoordinatorEndpoint[]): WorldGraphProgramGraphInput | null {
+    const routes: Array<{ id: string; method: string; path: string; file: string; line: number; handler: string; guards: string[] }> = []
     const nodes: Array<{ id: string; kind: string; symbol: string; file: string; line: number; sinkKind?: string }> = []
     const edges: Array<{ fromId: string; toId: string }> = []
     for (const endpoint of endpoints) {
@@ -5711,7 +5353,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   }
 
 
-  private listCoordinatorFindings(runId: string): ReturnType<CoordinatorDeps['listFindings']> {
+  private listCoordinatorFindings(runId: string): CoordinatorFinding[] {
     return this.storage.db.select().from(findings).where(eq(findings.runId, runId)).all()
       .map(row => ({
         id: row.id, origin: row.finding.origin, title: row.finding.title, status: row.finding.status,
@@ -5726,38 +5368,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         exchangeIds: row.finding.exchangeIds ?? [],
       }))
   }
-
-  /** Untruncated, paginated data access for the coordinator (optionally backed by a single-round snapshot cache). */
-  coordinatorDeps(
-    run: Run,
-    roundSnapshot?: {
-      getEndpoints: () => CoordinatorEndpoint[]
-      getFacts: () => Fact[]
-      getFindings: () => ReturnType<CoordinatorDeps['listFindings']>
-      getApiDependencies: () => CoordinatorApiDependency[]
-    },
-  ): CoordinatorDeps {
-    const endpoints = (): CoordinatorEndpoint[] => roundSnapshot
-      ? roundSnapshot.getEndpoints()
-      : this.pageAll((offset, limit) => this.storage.listEndpoints(run.id, { limit, offset }))
-    return {
-      listEndpoints: endpoints,
-      listFacts: () => roundSnapshot
-        ? roundSnapshot.getFacts()
-        : this.pageAll((offset, limit) => this.storage.listFacts(run.id, { includeTainted: false, limit, offset })),
-      listApiDependencies: () => roundSnapshot
-        ? roundSnapshot.getApiDependencies()
-        : this.collectCoordinatorApiDependencies(run),
-      listFindings: () => roundSnapshot ? roundSnapshot.getFindings() : this.listCoordinatorFindings(run.id),
-      programGraph: () => this.coordinatorProgramGraph(endpoints()),
-      // No persisted commit-signal table in v6; git hotspots remain empty rather than fabricated.
-      commitSignals: () => [],
-      approvedOrigins: () => [...this.host.approvedOriginsSet(run)],
-      capabilityLedger: () => this.storage.capabilityLedger(run.id),
-      frontierScheduler: () => this.frontierControllerFor(run.id).scheduler,
-    }
-  }
-
 
   pageAll<T>(fetchPage: (offset: number, limit: number) => readonly T[], pageSize = 500): T[] {
     return collectAllPages(fetchPage, pageSize)
@@ -6294,30 +5904,23 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
     const beforeIds = new Set(existingSteps.map(s => s.id))
     const stepBudgetUsd = Math.max(0.05, Number(Math.max(0, run.budgetUsd - run.spentUsd).toFixed(4)))
-    const plan: DispatchPlan = {
-      dispatched: false,
-      totalBudgetUsd: stepBudgetUsd,
-      budgetUsd: stepBudgetUsd,
+    // Validate through the one authoritative dispatch primitive (origin/evidence/budget checks, no HTTP).
+    const plan = dispatchInvestigations([{
+      hypothesis,
+      origins,
+      capabilities: ['http'],
       parentEvidenceIds: parentFactIds,
-      plan: [{
-        id: `cont_${step.id.slice(0, 12)}_d${nextDepth}`,
-        hypothesis,
-        origins,
-        capabilities: ['http'],
-        parentEvidenceIds: parentFactIds,
-        skills,
-        priority: hasSealedLedgerCap
-          ? Math.min(100, Math.max(step.priority, 95))
-          : isGenericWave1
-            ? Math.min(step.priority, 88)
-            : Math.min(step.priority, 90),
-        budgetUsd: stepBudgetUsd,
-        ...(primaryCapId ? { checkpointCapId: primaryCapId } : {}),
-        checkpointBrief: finalizedBrief.brief,
-        checkpointJson: finalizedBrief.checkpointJson,
-      }],
-      rejected: [],
-    }
+      skills,
+      priority: hasSealedLedgerCap
+        ? Math.min(100, Math.max(step.priority, 95))
+        : isGenericWave1
+          ? Math.min(step.priority, 88)
+          : Math.min(step.priority, 90),
+      budgetUsd: stepBudgetUsd,
+      ...(primaryCapId ? { checkpointCapId: primaryCapId } : {}),
+      checkpointBrief: finalizedBrief.brief,
+      checkpointJson: finalizedBrief.checkpointJson,
+    }], { budgetUsd: stepBudgetUsd, maxSteps: 1, requireParentEvidence: false })
     const counts = this.persistDispatchPlan(run, plan, liveFactIds, new Set(), {
       dependsOnStepIds: [step.id],
       preservePriority: true,
@@ -6552,163 +6155,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     return enqueued
   }
 
-  /**
-   * Persist newly discovered typed `ChainHop` artifacts as structured `chain_hop` facts so follow-on
-   * coordinator rounds and assignment briefs consume typed hop handles instead of prompt soup.
-   * Idempotent by `hopId`.
-   */
-  persistChainHopFacts(run: Run, hops: readonly ChainHop[], existingFacts: readonly Fact[]): Map<string, string> {
-    const hopFactById = new Map<string, string>()
-    for (const fact of existingFacts) {
-      if (fact.tainted) continue
-      const hopId = typeof fact.data?.hopId === 'string' ? fact.data.hopId : ''
-      if ((fact.data?.subkind === 'chain_hop' || fact.data?.kind === 'chain_hop') && hopId) {
-        hopFactById.set(hopId, fact.id)
-      }
-    }
-    const workers = this.storage.workerList(run.id)
-    const anchorWorker = workers.find(w => w.phase === 'investigation') ?? workers[0]
-    if (!anchorWorker) return hopFactById
-    for (const hop of hops.slice(0, 32)) {
-      if (hopFactById.has(hop.hopId)) continue
-      try {
-        const payload = chainHopFactPayload(hop)
-        const created = this.storage.addFact(run, anchorWorker, {
-          kind: 'note',
-          origin: hop.origin,
-          summary: payload.summary,
-          data: payload.data,
-          evidenceIds: hop.evidenceIds,
-        })
-        hopFactById.set(hop.hopId, created.id)
-      } catch { /* best-effort additive persistence */ }
-    }
-    return hopFactById
-  }
-
-  /**
-   * Explicit chaining round: extract & persist typed `ChainHop` artifacts across rounds, sync them
-   * into `CapabilityLedger`, plan depth 1..6 causal frontier hypotheses via `FrontierScheduler`,
-   * and dispatch each with typed hop inputs + <= 2 KB hop-checkpoint briefs + parent evidence.
-   */
-  dispatchChainRound(
-    run: Run,
-    coordinator: GraphCoordinator,
-    budget: number,
-    factIds: ReadonlySet<string>,
-    funnel?: DispatchFunnelCounts,
-    snapshot?: {
-      existingSteps?: readonly ChainStep[]
-      existingFacts?: readonly Fact[]
-      apiDependencies?: readonly CoordinatorApiDependency[]
-      sourceMounted?: boolean
-      hops?: readonly ChainHop[]
-      llmMode?: FrontierLlmMode
-    },
-  ): number {
-    const existing = snapshot?.existingSteps ?? this.storage.listChainSteps(run.id, run.goalRevision)
-    const remaining = Math.max(0, budget - existing.length)
-    if (remaining <= 0) return 0
-    const roundNo = Math.max(1, run.roundNo || 1)
-    const hops = snapshot?.hops ?? coordinator.extractChainHops(roundNo)
-    const ledger = this.storage.capabilityLedger(run.id)
-    const controller = this.frontierControllerFor(run.id)
-    const llmMode: FrontierLlmMode = snapshot?.llmMode ?? (privateModelProfiles(this.storage).length > 0 ? 'agentic' : 'deterministic-no-llm')
-    this.syncChainHopsToLedger(run, ledger, hops, llmMode, snapshot?.existingFacts)
-    const sourceMounted = snapshot?.sourceMounted ?? (this.host.projectReposMount(run.projectId).mountedRepos.length > 0)
-    const apiDependencies = snapshot?.apiDependencies ?? this.collectCoordinatorApiDependencies(run)
-    const hypotheses = coordinator.planChainRound({
-      hops,
-      apiDependencies,
-      sourceMounted,
-      maxHops: 6,
-      limit: Math.min(12, remaining),
-      capabilityLedger: ledger,
-      frontierScheduler: controller.scheduler,
-      waveNo: roundNo,
-    })
-    let chainEnqueued = 0
-    if (hypotheses.length) {
-      const existingFacts = snapshot?.existingFacts ?? this.pageAll((offset, limit) =>
-        this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
-      const hopFactById = this.persistChainHopFacts(run, hops, existingFacts)
-      const liveFactIds = new Set<string>([...factIds, ...hopFactById.values()])
-      const enrichedHypotheses = hypotheses.map(hypothesis => {
-        const hopFactIds = (hypothesis.chainHops ?? [])
-          .map(hop => hopFactById.get(hop.hopId))
-          .filter((id): id is string => Boolean(id))
-        return hopFactIds.length
-          ? { ...hypothesis, parentEvidenceIds: [...new Set([...hypothesis.parentEvidenceIds, ...hopFactIds])] }
-          : hypothesis
-      })
-      const plan = coordinator.dispatchInvestigations(chainHypothesisDispatchSteps(enrichedHypotheses), { maxSteps: remaining })
-      const counts = this.persistDispatchPlan(run, plan, liveFactIds)
-      if (funnel) addFunnelCounts(funnel, counts)
-      chainEnqueued = counts.enqueued
-      this.storage.event(run.id, 'chain.round', `Chain round dispatched ${counts.enqueued} hypothesis(es) with ${hops.length} typed hop artifact(s).`, {
-        hypotheses: hypotheses.length, dispatched: counts.enqueued, rejected: plan.rejected.length,
-        crossOrigin: hypotheses.filter(hypothesis => hypothesis.scope === 'cross_origin').length,
-        primitives: [...new Set(hypotheses.flatMap(hypothesis => hypothesis.primitiveKinds))],
-        chainHopCount: hops.length, hopArtifactKinds: [...new Set(hops.map(hop => hop.artifactKind))],
-        maxChainHops: hypotheses.reduce((max, h) => Math.max(max, h.hops), 0),
-      })
-    }
-    const frontierLimit = Math.min(6, Math.max(0, remaining - chainEnqueued))
-    const frontierCreated = frontierLimit > 0 && llmMode !== 'deterministic-no-llm' && hasAgenticSealedCapabilities(ledger, { llmMode })
-      ? materializeCapabilityConsumerFrontierSteps(this.storage, run, {
-        activeOrigins: this.activeApprovedOrigins(run, this.host.approvedOriginsSet(run)),
-        llmMode, maxSteps: frontierLimit, existingSteps: chainEnqueued > 0 ? this.storage.listChainSteps(run.id, run.goalRevision) : existing,
-        existingFacts: snapshot?.existingFacts, confirmedRefs: this.alreadyConfirmedRefs(run, 100), routeStep: routeStepToSpecialist,
-      }) : []
-    for (const step of frontierCreated) {
-      const m = /->\s*consumer\s+(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(https?:\/\/[^\s/]+)(\/[^\s[\]]+)/i.exec(step.hypothesis)
-      if (m?.[1] && m?.[2] && m?.[3]) this.registerStepTargets(run.id, step.id, [{ origin: m[2], method: m[1].toUpperCase(), route: m[3], vulnClass: step.category }])
-    }
-    if (frontierCreated.length && funnel) { funnel.planned += frontierCreated.length; funnel.enqueued += frontierCreated.length }
-    return chainEnqueued + frontierCreated.length
-  }
-
-  /** Legacy 10-turn tool-equipped coordinator turn (Cut 1: only with `KOVO_LEGACY_HEURISTIC_PLANNER=1`; Cut 2 deletes it). */
-  private async runLegacyToolPlannerTurn(run: Run, profiles: readonly ResolvedModelProfile[], task: CoordinatorTask, ctx: {
-    coordinator: GraphCoordinator; roundNo: number; activeOrigins: ReadonlySet<string>; dynamicStepBudget: number
-    stepsPreLlm: readonly ChainStep[]; confirmedForPlanner: readonly AlreadyConfirmedRef[]
-    personas: ReadonlyArray<{ handle: string; roleLabel: string }>; openProofGaps: number
-    factIds: ReadonlySet<string>; detLeadFactIds: ReadonlySet<string>; funnel: DispatchFunnelCounts; onEnqueued: () => void
-  }): Promise<{ answer: string; toolDispatched: number }> {
-    let toolDispatched = 0
-    const handlers = coordinatorPlannerHandlers({
-      coordinator: ctx.coordinator,
-      onDispatch: plan => {
-        try {
-          const counts = this.persistDispatchPlan(this.storage.run(run.id), plan, ctx.factIds, ctx.detLeadFactIds)
-          addFunnelCounts(ctx.funnel, counts)
-          toolDispatched += counts.enqueued
-          if (counts.enqueued > 0) ctx.onEnqueued()
-        } catch (err) { this.noteLifecycleWarning(run.id, 'runChainPlanner.legacyToolDispatch', err) }
-      },
-    })
-    const prompt = coordinatorPlannerPrompt({
-      goal: run.goal, roundNo: ctx.roundNo, capabilityTier: run.capabilityTier, approvedOrigins: [...ctx.activeOrigins],
-      budgetRemaining: {
-        usd: Math.max(0, Number((run.budgetUsd - run.spentUsd).toFixed(4))),
-        requests: run.budgetRequests === 0 ? 'unlimited' : Math.max(0, run.budgetRequests - run.spentRequests),
-      },
-      dynamicStepBudget: ctx.dynamicStepBudget,
-      pendingOob: ctx.coordinator.queryFindings({ status: 'pending_oob', limit: 1 }).total,
-      chainSteps: ctx.stepsPreLlm.map(step => ({ id: step.id, title: step.title, status: step.status })),
-      alreadyConfirmed: ctx.confirmedForPlanner.slice(0, 30),
-      personas: ctx.personas.map(persona => ({ handle: persona.handle, roleLabel: persona.roleLabel })),
-      mountedRepos: this.host.projectReposMount(run.projectId).mountedRepos, openProofGaps: ctx.openProofGaps,
-    })
-    const answer = await agentTurn({
-      directory: this.storage.directory, sessionId: `planner-${run.id}-r${ctx.roundNo}`,
-      requestId: `planner:${run.goalRevision}:${ctx.roundNo}`, profiles: resolveProfilePoolForRole('tactical', profiles),
-      scenario: 'chain-planner', roleAffinity: 'tactical', prompt, signal: task.controller.signal, maxTurns: 10, handlers,
-      ...llmRunHooks(this.storage, run.id),
-    })
-    return { answer, toolDispatched }
-  }
-
   async runChainPlanner(run: Run, profiles: readonly ResolvedModelProfile[], task: CoordinatorTask) {
     const fresh = this.storage.run(run.id)
     if (fresh.status === 'complete' || fresh.status === 'failed' || fresh.status === 'stopped') {
@@ -6730,26 +6176,25 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const approvedOrigins = this.host.approvedOriginsSet(updated)
     const activeOrigins = this.activeApprovedOrigins(updated, approvedOrigins)
     const sourceMounted = this.host.projectReposMount(updated.projectId).mountedRepos.length > 0
-    // Track B Cut 1: agentic rounds plan from the World Graph; legacy heuristic synthesizers and the
-    // 10-turn tool planner stay behind `KOVO_LEGACY_HEURISTIC_PLANNER=1` (deterministic $0 floor keeps them).
-    const legacyPlanner = process.env.KOVO_LEGACY_HEURISTIC_PLANNER === '1'
-    const legacyHeuristics = legacyPlanner || profiles.length === 0
+    // Every round plans from the pure-fact World Graph (`world-graph.ts` + `llm-planner.ts`); the
+    // deterministic $0 floor (no model profiles) also keeps the bounded BOLA matrix + second-order auto-steps.
+    const deterministicFloor = profiles.length === 0
 
     // Single-snapshot per-round read cache eliminating 6+ redundant full-table DB scans per round.
     let cachedFacts: Fact[] | null = null
     let cachedSteps: ChainStep[] | null = null
     let cachedEndpoints: CoordinatorEndpoint[] | null = null
-    let cachedFindings: ReturnType<CoordinatorDeps['listFindings']> | null = null
-    let cachedApiDeps: CoordinatorApiDependency[] | null = null
+    let cachedFindings: CoordinatorFinding[] | null = null
     const getUntaintedFacts = (): Fact[] => (cachedFacts ??= this.pageAll((offset, limit) =>
       this.storage.listFacts(fresh.id, { includeTainted: false, limit, offset })))
     const getChainSteps = (): ChainStep[] => (cachedSteps ??= this.storage.listChainSteps(fresh.id, updated.goalRevision))
     const getEndpoints = (): CoordinatorEndpoint[] => (cachedEndpoints ??= this.pageAll((offset, limit) =>
       this.storage.listEndpoints(fresh.id, { limit, offset })))
-    const getFindings = (): ReturnType<CoordinatorDeps['listFindings']> => (cachedFindings ??= this.listCoordinatorFindings(fresh.id))
-    const getApiDeps = (): CoordinatorApiDependency[] => (cachedApiDeps ??= this.collectCoordinatorApiDependencies(updated))
+    const getFindings = (): CoordinatorFinding[] => (cachedFindings ??= this.listCoordinatorFindings(fresh.id))
     const invalidateSteps = () => { cachedSteps = null }
-    const invalidateFacts = () => { cachedFacts = null }
+    const chainHopsNow = (): ChainHop[] => extractChainHops({ facts: getUntaintedFacts(), findings: getFindings(), endpoints: getEndpoints(), roundNo })
+    const countConfirmed = (): number => getFindings().filter(finding => finding.status === 'confirmed').length
+    const countPendingOob = (): number => getFindings().filter(isPendingOobFinding).length
 
     // v7 M2 white-box-first default: when source repos are mounted, seed Tier-A AST/RBAC/dataflow
     // leads BEFORE generic black-box floor leads or BOLA auto-steps.
@@ -6760,20 +6205,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           signal: task.controller.signal,
         })
         invalidateSteps()
-        if (!sourceMounted && updated.capabilityTier > 0) {
-          const addedComposites = this.promoteRuntimeCompositeWave1Steps(updated, approvedOrigins)
-          funnel.planned += addedComposites
-          funnel.enqueued += addedComposites
-          if (addedComposites > 0) invalidateSteps()
-        }
       } catch (err) { this.noteLifecycleWarning(updated.id, 'runChainPlanner.seedInvariants', err) }
-    } else {
-      try {
-        const postSync = this.syncPostFloorRuntimeInvariants(updated, approvedOrigins, { sourceMounted })
-        funnel.planned += postSync.wave1StepsCreated
-        funnel.enqueued += postSync.wave1StepsCreated
-        if (postSync.wave1StepsCreated > 0) invalidateSteps()
-      } catch (err) { this.noteLifecycleWarning(updated.id, 'runChainPlanner.syncPostFloorRuntimeInvariants', err) }
     }
     let tierAPlannerSteps = 0
     if (sourceMounted) {
@@ -6797,43 +6229,15 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
     const initialFacts = getUntaintedFacts()
     const factIds = new Set(initialFacts.map(fact => fact.id))
-    const stepsBeforeChain = getChainSteps()
-    const remainingBudget = Math.max(0, dynamicStepBudget - stepsBeforeChain.length)
     const maxConcForPlan = Math.max(1, Math.min(maxWorkerConcurrency, updated.workerConcurrency || defaultWorkerConcurrency))
     const waveBufferTarget = Math.max(12, maxConcForPlan * 2)
-    const coordinator = createGraphCoordinator({
-      deps: this.coordinatorDeps(updated, {
-        getEndpoints,
-        getFacts: getUntaintedFacts,
-        getFindings,
-        getApiDependencies: getApiDeps,
-      }),
-      approvedOrigins: [...approvedOrigins],
-      budgetUsd: Math.max(0, Number((updated.budgetUsd - updated.spentUsd).toFixed(4))),
-      maxDispatchSteps: plannerWaveDispatchCap(maxConcForPlan, remainingBudget),
-    })
 
-    // Explicit chaining round: runs on round >= 2, and also on round 1 when Phase-0/floor already
-    // yielded >= 2 composable typed ChainHop artifacts. Deterministic hypotheses dispatch *before*
-    // the LLM turn so a planner failure can never leave an empty window.
-    let chainSteps = 0
-    const greyBoxApiDeps = !sourceMounted ? getApiDeps() : []
-    const extractedHops = coordinator.extractChainHops(roundNo)
-    if (roundNo >= 2 || extractedHops.length >= 2 || (!sourceMounted && (greyBoxApiDeps.length >= 1 || approvedOrigins.size >= 2)) || (profiles.length > 0 && hasAgenticSealedCapabilities(this.storage.capabilityLedger(updated.id)))) {
-      try {
-        chainSteps = this.dispatchChainRound(updated, coordinator, dynamicStepBudget, factIds, funnel, {
-          existingSteps: stepsBeforeChain,
-          existingFacts: initialFacts,
-          apiDependencies: !sourceMounted ? greyBoxApiDeps : getApiDeps(),
-          sourceMounted, hops: extractedHops,
-          llmMode: profiles.length > 0 ? 'agentic' : 'deterministic-no-llm',
-        })
-        if (chainSteps > 0) {
-          invalidateSteps()
-          invalidateFacts()
-        }
-      } catch { /* additive */ }
-    }
+    // Mirror typed ChainHop artifacts (facts, confirmed findings, role-exclusive endpoints) into the
+    // CapabilityLedger as quarantined capability_only nodes; the World Graph planner proposes chains.
+    const hopsAtStart = chainHopsNow()
+    try {
+      this.syncChainHopsToLedger(this.storage.capabilityLedger(updated.id), hopsAtStart)
+    } catch (err) { this.noteLifecycleWarning(updated.id, 'runChainPlanner.syncChainHops', err) }
 
     const allSteps = getChainSteps()
     const allUntaintedFacts = getUntaintedFacts().filter(fact => approvedOrigins.has(fact.origin))
@@ -6854,7 +6258,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     )
     const confirmedBolaSets = buildConfirmedRouteSets(confirmedBolaRefs)
     let bolaAutoSteps = 0
-    if (legacyHeuristics && (updated.capabilityTier < 2 || personas.length < 2)) {
+    if (deterministicFloor && (updated.capabilityTier < 2 || personas.length < 2)) {
       for (const origin of activeOrigins) {
         this.emitPreconditionUnmet(updated.id, {
           dedupeKey: `planner_bola:${origin}:${updated.capabilityTier < 2 ? 'tier' : 'persona_count'}`,
@@ -6870,7 +6274,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         })
       }
     }
-    if (legacyHeuristics && updated.capabilityTier >= 2 && personas.length >= 2 && allSteps.length < dynamicStepBudget) {
+    if (deterministicFloor && updated.capabilityTier >= 2 && personas.length >= 2 && allSteps.length < dynamicStepBudget) {
       const typeGroups = new Map<string, BolaTestQueueItem[]>()
       for (const item of buildBolaTestQueue(allUntaintedFacts, personas, activeOrigins, this.storage.listResourceSamples(run.id))) {
         const remainingVariants = item.variants.filter(v =>
@@ -6933,7 +6337,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
     // Auto-enqueue verification for each new cross-persona or active-HTML second-order surface,
     // skipping routes already confirmed by a host-verified CompositeProofReceipt.
-    const secondOrderAutoSteps = !legacyHeuristics ? 0 : this.queueSecondOrderSurfaceSteps(
+    const secondOrderAutoSteps = !deterministicFloor ? 0 : this.queueSecondOrderSurfaceSteps(
       updated,
       activeOrigins,
       allUntaintedFacts,
@@ -6952,7 +6356,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const activePreLlm = [...this.host.active.values()].filter(job =>
       job.assignment.runId === run.id && job.assignment.phase === 'investigation').length
     const prevFrontier = this.plannerEvidenceFrontier.get(run.id)
-    const confirmedNow = coordinator.queryFindings({ status: 'confirmed', limit: 1 }).total
+    const confirmedNow = countConfirmed()
     const newConfirmedForGate = prevFrontier ? Math.max(0, confirmedNow - prevFrontier.confirmed) : 0
     const seenEdgesPreGate = this.plannerSeenCausalEdges.get(run.id)
     const ledgerPreGate = this.storage.capabilityLedger(run.id)
@@ -6974,7 +6378,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       queueEmptyOrDraining: readyPreLlm === 0 && activePreLlm === 0,
     })
     if (!llmGate.invokeLlm) {
-      const deterministicAdded = tierAPlannerSteps + detLeadSteps + chainSteps + bolaAutoSteps + secondOrderAutoSteps
+      const deterministicAdded = tierAPlannerSteps + detLeadSteps + bolaAutoSteps + secondOrderAutoSteps
       const dispatchedTotal = stepsPreLlm.filter(step => step.assignedWorkerId !== null).length
       funnel.dispatched = dispatchedTotal
       funnel.dispatchedThisRound = Math.max(0, dispatchedTotal - (this.host.dispatchFunnels.get(run.id)?.dispatched ?? 0))
@@ -7012,31 +6416,20 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     }
 
     // v7 precision guard: remember the evidence frontier across rounds. A round that adds no
-    // runtime_confirmed finding and no chain primitive is dry; two consecutive dry rounds after the
+    // runtime_confirmed finding and no typed chain hop is dry; two consecutive dry rounds after the
     // high-priority queue drains end the planner.
-    const evidenceFrontier = prevFrontier ?? { confirmed: confirmedNow, primitives: coordinator.deriveChainPrimitives().length }
-    let toolDispatched = 0
-    let plan: LlmPlannerDecision
-    if (legacyPlanner) {
-      const legacy = await this.runLegacyToolPlannerTurn(updated, profiles, task, {
-        coordinator, roundNo, activeOrigins, dynamicStepBudget, stepsPreLlm, confirmedForPlanner, personas,
-        openProofGaps: openProofGapsPreLlm, factIds, detLeadFactIds, funnel, onEnqueued: invalidateSteps,
-      })
-      toolDispatched = legacy.toolDispatched
-      plan = decidePlannerAnswer(legacy.answer, Number.MAX_SAFE_INTEGER)
-    } else {
-      // Pure-fact World Graph (read-only, bounded) -> one tool-free planner turn or the $0 floor.
-      const worldGraph = collectWorldGraphFromStore(this.storage, updated, {
-        approvedOrigins: [...activeOrigins], confirmedRefs: confirmedForPlanner,
-        programGraph: sourceMounted ? this.coordinatorProgramGraph(getEndpoints()) : null,
-        onWarning: (stage, err) => this.noteLifecycleWarning(run.id, `runChainPlanner.worldGraph.${stage}`, err),
-      })
-      plan = await planWithWorldGraph({
-        ...llmRunHooks(this.storage, run.id), goal: updated.goal, roundNo, snapshot: worldGraph,
-        snapshotJson: serializeWorldGraph(worldGraph, 4096), approvedOrigins: [...activeOrigins], profiles,
-        remainingStepCap: Math.max(0, dynamicStepBudget - stepsPreLlm.length), signal: task.controller.signal,
-      })
-    }
+    const evidenceFrontier = prevFrontier ?? { confirmed: confirmedNow, primitives: hopsAtStart.length }
+    // Pure-fact World Graph (read-only, bounded) -> one tool-free planner turn or the $0 floor.
+    const worldGraph = collectWorldGraphFromStore(this.storage, updated, {
+      approvedOrigins: [...activeOrigins], confirmedRefs: confirmedForPlanner,
+      programGraph: sourceMounted ? this.coordinatorProgramGraph(getEndpoints()) : null,
+      onWarning: (stage, err) => this.noteLifecycleWarning(run.id, `runChainPlanner.worldGraph.${stage}`, err),
+    })
+    const plan: LlmPlannerDecision = await planWithWorldGraph({
+      ...llmRunHooks(this.storage, run.id), goal: updated.goal, roundNo, snapshot: worldGraph,
+      snapshotJson: serializeWorldGraph(worldGraph, 4096), approvedOrigins: [...activeOrigins], profiles,
+      remainingStepCap: Math.max(0, dynamicStepBudget - stepsPreLlm.length), signal: task.controller.signal,
+    })
     if (!this.host.currentCoordinator(run.id, task)) return
     // Invalidate cached findings/facts/steps after the async LLM session in case workers updated the DB.
     cachedFacts = null
@@ -7054,7 +6447,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const currentRun = this.storage.run(run.id)
     const currentApproved = this.host.approvedOriginsSet(currentRun)
     const existingSteps = this.storage.listChainSteps(run.id, currentRun.goalRevision)
-    let addedCount = tierAPlannerSteps + detLeadSteps + chainSteps + bolaAutoSteps + secondOrderAutoSteps + toolDispatched
+    let addedCount = tierAPlannerSteps + detLeadSteps + bolaAutoSteps + secondOrderAutoSteps
 
     for (const cancelId of plan.cancelStepIds) {
       const target = existingSteps.find(step => step.id === cancelId)
@@ -7089,8 +6482,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     // Deterministic scheduler guard outside the LLM: budget/requests/wall/K=2/done+pending OOB.
     const emptyRounds = addedCount === 0 ? (this.plannerEmptyRounds.get(run.id) ?? 0) + 1 : 0
     this.plannerEmptyRounds.set(run.id, emptyRounds)
-    const chainPrimitivesAfterRound = coordinator.deriveChainPrimitives().length
-    const confirmedAfterRound = coordinator.queryFindings({ status: 'confirmed', limit: 1 }).total
+    const chainPrimitivesAfterRound = chainHopsNow().length
+    const confirmedAfterRound = countConfirmed()
     const newChainPrimitives = Math.max(0, chainPrimitivesAfterRound - evidenceFrontier.primitives)
     const newRuntimeConfirmed = Math.max(0, confirmedAfterRound - evidenceFrontier.confirmed)
     this.plannerEvidenceFrontier.set(run.id, {
@@ -7136,7 +6529,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       completedAssignments: completedSinceLastRound,
       confirmedCompositeReceipts,
       verifiedHopReceipts: newHopEvents,
-      pendingAsyncOrOob: coordinator.queryFindings({ status: 'pending_oob', limit: 1 }).total,
+      pendingAsyncOrOob: countPendingOob(),
       budgetUsdSpent: latestForProgress.spentUsd,
       budgetUsdLimit: latestForProgress.budgetUsd,
       elapsedMs: Math.max(0, Date.now() - latestForProgress.createdAt),
@@ -7184,7 +6577,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       maxDurationMs: this.host.maxDurationMs,
       emptyRounds,
       coordinatorDone: plan.done,
-      pendingOob: coordinator.queryFindings({ status: 'pending_oob', limit: 1 }).total,
+      pendingOob: countPendingOob(),
       highPriorityQueueEmpty: queueDrained,
       consecutiveDryRounds: dryRounds,
       verifiedHopReachExpansions,
@@ -7336,7 +6729,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       costUsd: Math.max(0, Number((this.storage.run(run.id).spentUsd - updated.spentUsd).toFixed(6))),
     })
     this.storage.event(run.id, 'planner.round', `Planner round ${roundNo}: added ${addedCount} steps.`, {
-      roundNo, addedCount, chainSteps, bolaAutoSteps, secondOrderAutoSteps, detLeadSteps, toolDispatched,
+      roundNo, addedCount, bolaAutoSteps, secondOrderAutoSteps, detLeadSteps,
       done: plan.done, plannerMode: plan.mode, providerCalls: plan.providerCalls, worldGraphBytes: plan.snapshotBytes,
       decision: stopEval.decision, reason: stopEval.decision === 'stop' ? decision.reason : 'continue',
       terminationReason: stopEval.decision === 'stop' ? decision.reason : null,

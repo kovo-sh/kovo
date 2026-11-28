@@ -10,7 +10,6 @@
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { coordinatorPlannerPrompt } from '../src/server/agent-session.ts'
 import {
   Execution,
   extractAssignedTargetRoutes,
@@ -262,16 +261,11 @@ test('nextPlannerDryRounds ignores Round 1 and mid-wave rounds with 0 newly comp
   }), 0)
 })
 
-test('plannerWaveDispatchCap buffers 2 waves (>= 12 or maxConc * 2) and coordinatorPlannerPrompt hints 12 hypotheses', () => {
+test('plannerWaveDispatchCap buffers 2 waves (>= 12 or maxConc * 2)', () => {
   assert.equal(plannerWaveDispatchCap(6, 40), 12)
   assert.equal(plannerWaveDispatchCap(8, 40), 16)
   assert.equal(plannerWaveDispatchCap(4, 40), 12)
   assert.equal(plannerWaveDispatchCap(6, 7), 7)
-  const prompt = coordinatorPlannerPrompt({
-    goal: 'verify api', roundNo: 1, capabilityTier: 2, approvedOrigins: [origin],
-    budgetRemaining: { usd: 2, requests: 500 }, dynamicStepBudget: 40, pendingOob: 0, chainSteps: [],
-  })
-  assert.match(prompt, /up to 12 diverse unconfirmed hypotheses/i)
 })
 
 test('runChainPlanner buffers 2 waves on Round 1 and never increments dryRounds on Round 1 or 0-completion mid-wave Round 2', async (t) => {

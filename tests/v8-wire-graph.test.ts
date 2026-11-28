@@ -7,17 +7,15 @@
  *  2. `PAIR_WEIGHTS`, `THREE_HOP_SETS`, and `FOUR_HOP_SETS` are retired from `graph-coordinator.ts`,
  *     and zero v8 benchmark literals appear in our wired `src/server/` modules.
  *  3. `ExecReconPlanner.seedCapabilityLedgerInvariants` wires `synthesizeInvariants` /
- *     `inferRuntimeInvariantHypotheses` / `toCapabilityLedgerSeeds` in BOTH white-box (mounted source:
- *     Entity x Surface Guard Asymmetries, Cross-Service Trust Boundaries, Entity Lifecycle Slices)
- *     and grey-box/black-box runtime parity modes, seeding strictly quarantined `capability_only` nodes.
- *  4. `planChainRound` executes `CapabilityLedger` + `FrontierScheduler` causal frontier planning
- *     (depth 1..6, exact EVI beam ranking, `capability_only` quarantine respect, negative-edge
- *     dead-end filtering, and strictly bounded <= 2 KB hop-checkpoint briefs).
+ *     `toCapabilityLedgerSeeds` in white-box mode (mounted source: Entity x Surface Guard Asymmetries,
+ *     Cross-Service Trust Boundaries, Entity Lifecycle Slices), seeding strictly quarantined
+ *     `capability_only` nodes; no-source runs seed nothing (the World Graph planner owns them).
+ *  4. A depth-4 causal DAG in `CapabilityLedger` yields a strictly bounded <= 2 KB hop-checkpoint brief.
  *  5. `FrontierWaveController` + `coordinatorSchedulerDecision` + `nextPlannerDryRounds` enforce:
  *     - Frontier-progress termination (continue when verified `HopReceipt` expands reach even
  *       before terminal confirmation),
  *     - 2-strike dead-end pruning persisted as negative edges in `CapabilityLedger` and suppressed
- *       from follow-on `planChainRound` and wave selections,
+ *       from follow-on wave selections,
  *     - Pre-hydrated `<= 2 KB` hop-checkpoint briefs on depth `>= 2` assignments.
  */
 import assert from 'node:assert/strict'
@@ -37,7 +35,6 @@ import {
   DRY_ROUND_LIMIT,
   FrontierWaveController,
   ReinvestigationGuard,
-  chainHypothesisDispatchSteps,
   coordinatorSchedulerDecision,
   formatHopCheckpointForAssignment,
   nextPlannerDryRounds,
@@ -48,17 +45,10 @@ import {
   type ExecReconPlannerHost,
 } from '../src/server/exec-recon-planner.ts'
 import {
-  FrontierScheduler,
   MAX_CHECKPOINT_BRIEF_BYTES,
   type FrontierBranch,
   type VerifiedHopHandle,
 } from '../src/server/frontier-scheduler.ts'
-import {
-  createGraphCoordinator,
-  planChainRound,
-  type ChainPrimitive,
-  type CoordinatorEndpoint,
-} from '../src/server/graph-coordinator.ts'
 import {
   synthesizeInvariants,
   toCapabilityLedgerSeeds,
@@ -260,7 +250,7 @@ describe('v8 M0/M2/M3 Graph & Orchestrator Wiring', () => {
     assert.equal(storage.capabilityLedger('run-wire-a').getCapability(capId)?.capId, capId)
   })
 
-  test('End-to-end: Store -> synthesizeInvariants -> CapabilityLedger -> depth-4 causal planChainRound -> 2-strike negative-edge suppression -> <= 2 KB hop-checkpoint brief', async (t) => {
+  test('End-to-end: Store -> synthesizeInvariants -> CapabilityLedger -> depth-4 causal DAG -> <= 2 KB hop-checkpoint brief -> 2-strike negative-edge suppression', async (t) => {
     const { storage } = makeStore(t, 'kovo-v8-wire-e2e-')
     const setup = await setupApprovedRun(storage, { seeds: [ORIGIN_EDGE, ORIGIN_API, ORIGIN_APP], tier: 2 })
     const run = storage.run(setup.runId)
@@ -412,54 +402,20 @@ describe('v8 M0/M2/M3 Graph & Orchestrator Wiring', () => {
       targetTimestampMs: 4000,
     })
 
-    // 3. Plan depth-4 causal frontier via planChainRound backed by CapabilityLedger + FrontierScheduler.
-    const scheduler = new FrontierScheduler({ beamWidth: 12 })
-    const planned = planChainRound({
-      primitives: [],
-      endpoints: [
-        { id: 'ep-approve', origin: ORIGIN_API, method: 'POST', pathTemplate: '/api/transfers/:id/approve', roleExclusive: true },
-      ],
-      maxHops: 4,
-      limit: 12,
-      approvedOrigins: [ORIGIN_EDGE, ORIGIN_API, ORIGIN_APP],
-      capabilityLedger: ledger,
-      frontierScheduler: scheduler,
-      waveNo: 2,
-    })
-    const depth4 = planned.find(h => h.hops === 4 && h.capabilityIds?.includes(c4))
-    assert.ok(depth4, `expected depth-4 causal chain reaching ${c4}, got hops=${planned.map(h => h.hops).join(',')}`)
-    assert.deepEqual(depth4!.capabilityIds, [c1, c2, c3, c4])
-    assert.deepEqual(depth4!.edgeBindingKinds, ['value_binding', 'derived_crypto_binding', 'state_transition_binding'])
-    assert.ok((depth4!.evi ?? 0) > 0, 'expected exact EVI score on planned frontier hypothesis')
-    assert.ok(depth4!.checkpointBrief, 'expected pre-hydrated HopCheckpointBrief on depth-4 hypothesis')
-    assert.equal(depth4!.checkpointBrief!.doNotRediscover, true)
-    assert.ok(
-      (depth4!.checkpointBytes ?? Infinity) <= MAX_CHECKPOINT_BRIEF_BYTES,
-      `checkpoint brief must be <= ${MAX_CHECKPOINT_BRIEF_BYTES} bytes, got ${depth4!.checkpointBytes}`,
-    )
-    assert.equal(Buffer.byteLength(depth4!.checkpointJson!, 'utf8'), depth4!.checkpointBytes)
-
-    // Dispatch conversion preserves <= 2 KB checkpoint brief on depth >= 2 steps.
-    const dispatchSteps = chainHypothesisDispatchSteps([depth4!])
-    assert.equal(dispatchSteps.length, 1)
-    assert.ok(dispatchSteps[0]!.checkpointBrief)
-    assert.ok(Buffer.byteLength(dispatchSteps[0]!.checkpointJson!, 'utf8') <= MAX_CHECKPOINT_BRIEF_BYTES)
-
-    // Quarantined depth-1 capability_only nodes are NEVER promoted as standalone 1-hop hypotheses.
-    const depth1Only = planChainRound({
-      primitives: [],
-      minHops: 1,
-      maxHops: 1,
-      approvedOrigins: [ORIGIN_EDGE, ORIGIN_API, ORIGIN_APP],
-      capabilityLedger: ledger,
-    })
-    assert.equal(depth1Only.length, 0, 'quarantined capability_only nodes must never be emitted as standalone 1-hop hypotheses')
+    // 3. The depth-4 causal lineage hydrates a strictly bounded <= 2 KB hop-checkpoint brief.
+    const brief = ledger.buildHopCheckpointBrief(c4, MAX_CHECKPOINT_BRIEF_BYTES)
+    assert.equal(brief.doNotRediscover, true)
+    for (const capId of [c1, c2, c3, c4]) {
+      assert.ok(brief.capabilityHandles.includes(capId), `brief must carry lineage handle ${capId}`)
+    }
+    const formattedBrief = formatHopCheckpointForAssignment(brief, MAX_CHECKPOINT_BRIEF_BYTES)
+    assert.ok(formattedBrief.bytes <= MAX_CHECKPOINT_BRIEF_BYTES, `checkpoint brief must be <= ${MAX_CHECKPOINT_BRIEF_BYTES} bytes, got ${formattedBrief.bytes}`)
 
     // 4. 2-strike dead-end pruning via FrontierWaveController writes negative edge to CapabilityLedger
-    //    and suppresses the pruned branch on subsequent planChainRound & selectNextWave calls.
+    //    and suppresses the pruned branch on subsequent wave admissions.
     const controller = planner.frontierControllerFor(run.id, { beamWidth: 10 })
     const branchToPrune: FrontierBranch = {
-      branchKey: depth4!.branchKey!,
+      branchKey: 'e2e_depth4_branch',
       depth: 4,
       verifiedHops: [c1, c2, c3, c4].map((capId, idx): VerifiedHopHandle => ({
         hopIndex: idx + 1,
@@ -524,22 +480,7 @@ describe('v8 M0/M2/M3 Graph & Orchestrator Wiring', () => {
       true,
     )
 
-    // Fresh planChainRound and fresh FrontierWaveController both suppress the pruned 4-hop branch!
-    const replanned = planChainRound({
-      primitives: [],
-      maxHops: 4,
-      limit: 12,
-      approvedOrigins: [ORIGIN_EDGE, ORIGIN_API, ORIGIN_APP],
-      capabilityLedger: ledger,
-      frontierScheduler: new FrontierScheduler({ beamWidth: 10 }),
-      waveNo: 4,
-    })
-    assert.equal(
-      replanned.some(h => h.branchKey === depth4!.branchKey),
-      false,
-      '2-strike pruned negative edge in CapabilityLedger must suppress the dead-end branch in planChainRound',
-    )
-
+    // A fresh FrontierWaveController synced from CapabilityLedger suppresses the pruned 4-hop branch.
     const siblingController = new FrontierWaveController({ ledger, beamWidth: 10 })
     assert.equal(
       siblingController.admitBranch({ ...branchToPrune, branchKey: 'sibling_retry_branch' }),
@@ -548,7 +489,7 @@ describe('v8 M0/M2/M3 Graph & Orchestrator Wiring', () => {
     )
   })
 
-  test('Grey-box / black-box runtime parity seeds quarantined hypotheses into CapabilityLedger without mounted source', async (t) => {
+  test('Grey-box / black-box runs without mounted source seed zero heuristic invariant hypotheses (World Graph owns no-source planning)', async (t) => {
     const { storage } = makeStore(t, 'kovo-v8-wire-greybox-')
     const setup = await setupApprovedRun(storage, { seeds: [ORIGIN_API], tier: 2 })
     const run = storage.run(setup.runId)
@@ -556,43 +497,15 @@ describe('v8 M0/M2/M3 Graph & Orchestrator Wiring', () => {
 
     const result = await planner.seedCapabilityLedgerInvariants(run, {
       mode: 'grey-box',
-      runtime: {
-        personaObservations: [
-          {
-            persona: 'revoked_admin',
-            isRevokedOrDemoted: true,
-            surface: 'http',
-            serviceOrigin: ORIGIN_API,
-            method: 'GET',
-            path: '/api/secrets/:id',
-            status: 401,
-          },
-          {
-            persona: 'revoked_admin',
-            isRevokedOrDemoted: true,
-            surface: 'sse',
-            serviceOrigin: ORIGIN_API,
-            method: 'GET',
-            path: '/sse/secrets/stream',
-            status: 200,
-          },
-        ],
-        openApiOperations: [
-          { method: 'GET', path: '/api/secrets/:id', security: [{ bearerAuth: [] }], serviceOrigin: ORIGIN_API },
-          { method: 'POST', path: '/api/secrets/batch', security: [], serviceOrigin: ORIGIN_API },
-        ],
-      },
       approvedOrigins: new Set([ORIGIN_API]),
     })
 
     assert.equal(result.mode, 'grey-box')
-    assert.ok(result.seededCount >= 2, `expected >= 2 grey-box quarantined seeds, got ${result.seededCount}`)
-    const ledger = storage.capabilityLedger(run.id)
-    const nodes = ledger.listCapabilities()
-    assert.ok(nodes.length >= 2)
-    assert.ok(nodes.every(n => n.promotionStatus === 'capability_only'))
-    assert.ok(nodes.some(n => n.provenance === 'runtime_discovery'))
-    assert.ok(nodes.some(n => n.temporalState === 'revoked'))
+    assert.equal(result.seededCount, 0)
+    assert.equal(result.synthesis.hypotheses.length, 0)
+    assert.equal(result.wave1ChainStepsCreated, 0)
+    assert.equal(storage.capabilityLedger(run.id).listCapabilities().length, 0)
+    assert.equal(planner.ensureWave1InvariantChainSteps(storage.run(run.id), new Set([ORIGIN_API])), 0, 'already-seeded runs add no Wave-1 steps')
   })
 
   test('Frontier-progress termination continues waves on verified HopReceipt reach expansion before terminal confirmation', async (t) => {
@@ -710,40 +623,5 @@ describe('v8 M0/M2/M3 Graph & Orchestrator Wiring', () => {
       frontierDecision: progress,
     })
     assert.equal(schedDecision.decision, 'continue')
-  })
-
-  test('planChainRound supports causal depth up to 6 hops cleanly via FrontierScheduler beam search', () => {
-    const primitives: ChainPrimitive[] = [
-      { kind: 'leaked_token', origin: ORIGIN_EDGE, value: 'secret:f1', evidenceIds: ['e1'], factIds: ['f1'], endpoint: '/edge/tok', detail: 'hop1' },
-      { kind: 'discovered_id', origin: ORIGIN_APP, value: 'obj-1', evidenceIds: ['e2'], factIds: ['f2'], endpoint: '/app/obj', detail: 'hop2' },
-      { kind: 'stored_write', origin: ORIGIN_APP, value: 'stored:c1', evidenceIds: ['e3'], factIds: ['f3'], endpoint: '/app/comment', detail: 'hop3' },
-      { kind: 'ssrf_internal_reach', origin: ORIGIN_API, value: 'ssrf:hook', evidenceIds: ['e4'], factIds: ['f4'], endpoint: '/api/webhook', detail: 'hop4' },
-      { kind: 'workflow_state_handle', origin: ORIGIN_API, value: 'workflow:wf1', evidenceIds: ['e5'], factIds: ['f5'], endpoint: '/api/jobs/wf1', detail: 'hop5' },
-      { kind: 'admin_route', origin: ORIGIN_API, value: 'admin:/admin/release', evidenceIds: ['e6'], factIds: ['f6'], endpoint: '/admin/release', detail: 'hop6' },
-    ]
-    const endpoints: CoordinatorEndpoint[] = [
-      { id: 'ep6', origin: ORIGIN_API, method: 'POST', pathTemplate: '/admin/release', roleExclusive: true },
-    ]
-    const coordinator = createGraphCoordinator({
-      deps: {
-        listEndpoints: () => endpoints,
-        listFacts: () => [],
-        listFindings: () => [],
-        approvedOrigins: () => [ORIGIN_EDGE, ORIGIN_APP, ORIGIN_API],
-      },
-      approvedOrigins: [ORIGIN_EDGE, ORIGIN_APP, ORIGIN_API],
-    })
-    const planned = planChainRound({
-      primitives,
-      endpoints,
-      maxHops: 6,
-      limit: 16,
-      approvedOrigins: [ORIGIN_EDGE, ORIGIN_APP, ORIGIN_API],
-    })
-    const depth6 = planned.find(h => h.hops === 6)
-    assert.ok(depth6, `expected a 6-hop chain hypothesis, got hops=${planned.map(h => h.hops).join(',')}`)
-    assert.equal(depth6!.chainHops?.length, 6)
-    assert.ok((depth6!.checkpointBytes ?? Infinity) <= MAX_CHECKPOINT_BRIEF_BYTES)
-    assert.ok(coordinator.queryEndpoints({ roleExclusive: true }).total === 1)
   })
 })
